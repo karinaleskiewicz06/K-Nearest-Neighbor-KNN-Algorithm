@@ -1,0 +1,147 @@
+GPU Telemetry Annotation and Cost Attribution Framework
+
+Summary
+-------
+This document defines a standard, audit-friendly framework for annotating GPU-based inference telemetry and deriving tenant-level cost attribution. The goal is to make per-request and per-batch cost signals reliable, low-overhead, and actionable across hosted, Dedicated, and Private deployments.
+
+Intended audience
+-----------------
+- Infra engineers responsible for GPU fleet, billing pipeline, and Prometheus/Otel instrumentation.
+- Platform engineers who implement request routing, batching, and tenant isolation.
+- SREs and finance partners who consume cost reports and SLO-aligned billing.
+
+Context and motivation
+----------------------
+We run mixed workloads (hosted API + dedicated + private). Current gaps we repeatedly see: inconsistent tenant tagging across layers, missing kernel-level telemetry for quantized workloads, and cost reports that lag or misattribute warm-pool/eviction costs. This framework standardizes: annotation schema for telemetry emitted by request routers and serving agents; enrichment rules in the metrics/billing pipeline; and verification/runbook steps to protect billing correctness during infra changes.
+
+High-level requirements
+-----------------------
+1. Non-repudiable request lineage: every inference request must carry a unique request_id, tenant_id, route_id, model_version and scheduling_bucket.
+2. Low-overhead tagging: the annotation path must not add >1% p99 latency and should avoid copying large KV caches.
+3. Billing granularity: cost attribution must support per-tenant daily aggregates and per-route hourly breakdowns.
+4. Backfill/rescue modes: telemetry gaps must be reconstructible using request logs + scheduler traces.
+
+Annotation schema (required fields)
+----------------------------------
+All services in the request path (API gateway, router, batching service, runtime) must annotate telemetry with the following canonical keys. These appear as attributes on OpenTelemetry spans and as labels on Prometheus metrics produced by the serving runtime.
+
+Canonical tags (table):
+- request_id (string): example req_20250112_abc123 — global request lineage across components
+- tenant_id (string): example tenant_42 — primary cost owner
+- route_id (string): example text-gen-chat — logical API route for product-level allocation
+- model_version (string): example gptx-7b-v2-q4 — model variant for quantization cost profile
+- schedule_bucket (string): example warmpool-medium — placement / batching policy used
+- gpu_instance_type (string): example nvidia-a100-80gb — hardware dimension for per-hour cost mapping
+- batch_size (int): example 8 — used to apportion per-token GPU time
+- tokens_input (int): example 64 — token counts for generation workloads
+- tokens_output (int): example 128 — output tokens for cost apportionment
+- comp_time_ns (int): example 1200000000 — measured kernel time in nanoseconds
+
+Implementation notes
+--------------------
+- Tag propagation: use OpenTelemetry context propagation across internal RPCs (HTTP/gRPC). We supply a small client library (annotations-sdk) that standardizes header names: X-Req-Id, X-Tenant-Id, X-Route-Id, X-Model-Version, X-Schedule-Bucket.
+- Runtime metrics: serving runtime emits a per-inference histogram of comp_time_ns and a counter of gpu_cycles with labels matching the canonical keys. Prometheus metric names: redwood_inference_infer_duration_ns, redwood_inference_gpu_cycles_total.
+- Partial instrumentation: if a component cannot attach all fields (legacy sidecars), it MUST pass request_id and tenant_id; downstream components must enrich remaining fields as available.
+
+Cost model mapping (summary)
+---------------------------
+We compute incremental cost per inference using three orthogonal signals: GPU wall-time, effective GPU nominal hourly rate (by instance type and region), and shared system overhead (eg storage, egress). Apportionment equation (per request):
+
+  cost_request = (comp_time_ns / 1e9) * hourly_rate_per_sec * occupancy_multiplier + shared_cost_share
+
+Where hourly_rate_per_sec = (instance_hourly_rate / 3600) and occupancy_multiplier corrects for batching efficiency (derived from batch_size, kernel throughput).
+
+Cost bucket mapping (table):
+- nvidia-a100-80gb: hourly_rate_usd=8.50, storage_share_hour_usd=0.12, notes=high-memory large models
+- nvidia-h100-80gb: hourly_rate_usd=12.00, storage_share_hour_usd=0.15, notes=peak throughput, higher amortized
+- t4: hourly_rate_usd=0.90, storage_share_hour_usd=0.03, notes=small eval CI pools
+
+Enrichment pipeline (high-level flow)
+-------------------------------------
+1. Serving runtime writes OTLP spans to the tracing collector. Spans include canonical tags.
+2. Metrics and events are ingested by Prometheus/OTEL pipeline; metrics with labels are forwarded to our billing pipeline (kafka topic: billing.metrics).
+3. Billing pipeline joins metrics with hourly inventory pricing (from cloud-accounts service) and tenant allocation rules to produce per-tenant hourly aggregates.
+4. Aggregates are written to the cost warehouse (table redwood_billing.gpu_usage_daily) and surfaced to finance dashboards and chargeback exports.
+
+CLI / Terraform patterns for preserving tags
+--------------------------------------------
+- When creating autoscaling groups or node pools, attach node metadata tags that our node exporter picks up and maps to gpu_instance_type and region. Example Terraform snippet (HCL):
+resource "aws_autoscaling_group" "gpu_pool" {
+  tags = [
+    { key = "redwood:gpu_instance_type", value = "nvidia-a100-80gb", propagate_at_launch = true },
+    { key = "redwood:pool_role", value = "inference-warm", propagate_at_launch = true }
+  ]
+}
+
+- Ensure IAM policies allow the billing exporter service to read instance metadata and node tags. A minimal least-privilege statement is included in the IaC module: redwood-iam/gpu-billing-reader.
+
+Validation and QA checklist (pre-deploy)
+--------------------------------------
+1. Unit: annotations-sdk passes integration tests for header propagation and fallback behaviors.
+2. Staging: run a 24h synthetic workload that emits all canonical labels and validate aggregation parity with simulated golden dataset.
+3. Performance: no more than +1% p99 latency from header adds and span creation.
+4. Billing sanity: daily aggregate per-tenant cost does not diverge >2% from modelled expected given synthetic traffic.
+
+Runbook: missing telemetry or malformed tags
+------------------------------------------
+Step-by-step recovery procedure when the billing pipeline detects >0.5% of usage records with missing tenant_id or model_version:
+1. Flag and quarantine affected hourly aggregates in the billing UI.
+2. Query kafka topic billing.metrics for spans with request_id present but missing tenant_id.
+3. Cross-reference request_id with api-gateway logs (retention 30d) to attempt reconstruction. Example log query (CloudWatch Insights):
+   fields @timestamp, @message | filter request_id = "REQ123" | parse @message /tenant_id=(?<tenant_id>[^ ]+)/
+4. If reconstruction fails, escalate to infra oncall: tag incident with label billing-mdr and follow the incident process for cost reconciliation.
+5. If >5% of a tenant's daily usage lost, finance will be notified and temporary credit buckets will be considered while backfill is performed.
+
+Monitoring and alerting rules
+----------------------------
+Suggested alerts (Prometheus/Alertmanager):
+- Alert: BillingTelemetryMissingHigh
+  Expr: sum(rate(redwood_inference_requests_total{tenant_id=""}[1h])) / sum(rate(redwood_inference_requests_total[1h])) > 0.005
+  For: 30m
+  Severity: P1
+  Runbook: follow "Runbook: missing telemetry"
+
+- Alert: CostAnomalyPerTenant
+  Expr: increase(redwood_billing_cost_usd[24h]) > (expected_cost_by_tenant * 1.4)
+  For: 1h
+  Severity: P2
+
+Operational best practices
+-------------------------
+- Prefer tenant-bound warm-pools for high-volume customers to reduce cross-tenant overhead and simplify attribution.
+- Annotate long-running KV cache rebuild jobs with job_reason and attach the tenant_id of the seeding operation to avoid misattribution.
+- For experiments (A/B, model rollouts), ensure route_id includes experiment id (ex: text-gen-chat.v2-rollout-42) so chargeback can map to feature projects.
+
+Ownership and roadmap items
+---------------------------
+- Ownership: infra/telemetry owns the annotations-sdk and billing exporter. gpu-fleet owns runtime metric emissions. cloud-accounts owns hourly pricing feed.
+- Next quarter priorities:
+  - Add GPU power draw telemetry (Watt) for on-prem cost modeling.
+  - Implement streaming backfill utility that reconciles traces with request logs for the last 90 days.
+
+Appendix: example OTEL span (serialized snippet)
+---------------------------------
+- trace_id: abcd1234
+- span_id: span9876
+- name: inference.request
+- attributes: request_id=req_20250112_abc123, tenant_id=tenant_42, route_id=text-gen-chat, model_version=gptx-7b-v2-q4, schedule_bucket=warmpool-medium, gpu_instance_type=nvidia-a100-80gb, batch_size=8, tokens_input=64, tokens_output=128, comp_time_ns=1200000000
+
+Frequently asked questions
+--------------------------
+Q: What happens if a customer runs on Private and we cannot access node tags?
+A: Private deployments must provide a pricing manifest at onboarding that maps node labels to hourly rates; the billing exporter will pull that manifest from the private control plane during scheduled syncs.
+
+Q: Do we attach tenant_id for internal eval workloads?
+A: Yes — internal tenants should use reserved tenant ids (tenant_internal_eval) and be excluded from customer-facing chargeback exports by a per-tenant flag in the allocation rules.
+
+Contact and escalation
+----------------------
+- Primary: Priya Natarajan (infra/telemetry) — priya@redwood-inference.internal
+- Oncall: infra-pager (PagerDuty)
+- Finance contact: Alicia Park (finance) — alicia@redwood-inference.internal
+
+Change log
+----------
+- 2024-05-02: Created initial draft outlining canonical tags and pipeline flow.
+- 2024-09-12: Added Terraform snippet and validation checklist after staging run.
+- 2025-01-15: Published final version; added GPU instance pricing table and runbook recovery steps.

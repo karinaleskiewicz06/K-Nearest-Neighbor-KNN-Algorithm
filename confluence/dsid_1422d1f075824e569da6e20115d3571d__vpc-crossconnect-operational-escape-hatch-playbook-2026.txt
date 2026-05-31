@@ -1,0 +1,142 @@
+VPC crossconnect operational escape-hatch playbook
+
+Summary
+-------
+This playbook documents an operator-focused "escape hatch" for private deploys using VPC crossconnects (peerings, Dedicated Interconnect, or private WAN fabric). It is intended for urgent mitigation when crossconnect or inter-region control-plane degradation threatens tenant SLAs or causes KV-cache divergence and routing blackholes. The goal is to describe safe, reversible operator actions that preserve tenant data integrity and minimize customer impact until engineering or networking can resolve the underlying fabric issue.
+
+When to use this playbook
+------------------------
+Use this playbook when ANY of the following are true: 
+- Control plane region-to-region RPC error rate > 5% sustained for 3 minutes and auto-fallback did not preserve throughput.
+- Data-plane RTT degradation > 100 ms p95 between local tenant proxy and remote model shard AND packet loss > 2%.
+- Crossconnect BGP session drops to < 80% adjacency or route flaps causing > 30% request errors to a tenant for > 2 minutes.
+- KV cache inconsistency alerts (kv-cache-reconcile-failures) observed on > 5% of backend pods after a partial network partition.
+
+Prerequisites and safety constraints
+-----------------------------------
+Operators must confirm the following before executing any escape-hatch steps: 
+1) Incident owner assigned and pager notified. (Run: incident assign <oncall-team>)
+2) Maintenance window permission if a tenant-facing interruption is expected.
+3) Backups and forensic snapshots: ensure latest telemetry and artifacts are preserved (see Evidence collection).
+4) Immutable rollback path exists for any configuration change (route or policy).
+
+SLOs and thresholds referenced
+----------------------------
+- Control plane availability objective: 99.95% per region.
+- Tenant e2e latency target for private VPC: p95 < 150 ms.
+- Immediate mitigation threshold (escape hatch): error rate spike > 5% or p95 latency > 250 ms.
+
+Immediate containment (first 10 minutes)
+--------------------------------------
+1) Quick triage: determine containment domain (control plane vs data plane). Run the following queries in observability:
+   - metrics.query("sum(rate(rpc_errors_total[1m])) by (region)")
+   - metrics.query("histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le,region))")
+2) If BGP adjacency unstable: do NOT withdraw all routes. Instead, isolate the failed adjacency and move traffic to configured fallback peers using controlled route-preference changes.
+3) Announce to affected operators and customers: use the Customer Communication Template (section below).
+
+Operator actions (ordered, reversible steps)
+-------------------------------------------
+This sequence is intentionally conservative; each step is reversible and documented with the rollback command. Execute one step at a time and wait 60–120 seconds for telemetry to settle before proceeding.
+
+1) Place region-level traffic into safemode degrader (non-destructive)
+   - Purpose: throttle or queue new long-running requests to prevent cascading resource pressure.
+   - Command: operatorctl region-safemode enable --region <REGION> --throttle 0.3
+   - Validation: watch request_shed_rate and queue_depth metrics.
+   - Rollback: operatorctl region-safemode disable --region <REGION>
+
+2) Promote local fallback model variants for latency-sensitive tenants
+   - Purpose: steer tenant routing to locally pinned model variants (smaller or quantized) to reduce cross-region calls.
+   - Command: operatorctl model-rollout promote --tenant <TENANT> --variant local-quantized-v1 --priority emergency
+   - Validation: per-tenant latency and token-cost metrics; ensure responses remain within business rules.
+   - Rollback: operatorctl model-rollout demote --tenant <TENANT> --variant local-quantized-v1
+
+3) If BGP route instability continues, perform a controlled route-preference shift (BGP local-pref bump) to prefer alternate transit
+   - Purpose: avoid total path loss and maintain forward progress.
+   - Safety: only change local-pref for affected prefixes; set a TTL for the change (10 minutes) to auto-revert.
+   - Example command (network automation): terraform apply -var 'prefixes=["10.40.0.0/16"]' -var 'local_pref=200' -target module.bgp.policy --auto-approve
+   - Rollback: Revert terraform change or run: terraform apply -var 'local_pref=100' -target module.bgp.policy --auto-approve
+
+4) If KV cache divergence detected, trigger a staged resync sequence
+   - Detect: run kvctl check --scope region --since 15m. Look for > 0.5% missing keys per shard.
+   - Stage 1 (non-blocking): kvctl repair --shard <SHARD> --mode incremental --rate-limit 200/s
+   - Stage 2 (if Stage 1 insufficient): kvctl repair --shard <SHARD> --mode snapshot-restore --window 10m (this will cause increased I/O; schedule with care)
+   - Validation: kvctl check should return zero divergence and kvcache_sync_lag < 30s.
+   - Rollback: Cancel long-running repair: kvctl cancel --task <TASK_ID>
+
+5) Operator emergency proxy (temporary local-only proxy)
+   - Purpose: short-circuit crossconnect for a small set of tenants by running a local proxy that honors token scope but pins to local compute.
+   - Command (deploy): kubectl -n operator apply -f manifests/emergency-proxy-<tenant>.yaml
+   - Manifest notes: proxy must run with read-only mount to local KV snapshot and NOT accept config pushes.
+   - Rollback: kubectl -n operator delete -f manifests/emergency-proxy-<tenant>.yaml
+
+Routing rollback decision matrix
+-------------------------------
+Use this matrix to select whether to change route preferences or keep trying application-level mitigations.
+
+- Symptom: transient packet loss (1–3%), small RTT increase (10–50 ms) -> Avoid routing changes; use safemode and model promotion.
+- Symptom: sustained packet loss (>3%) OR route flaps across multiple peers -> Perform route-preference shift for affected prefixes.
+- Symptom: full adjacency down -> Activate alternate transit and, if unavailable, place affected tenants into planned outage with customer notice.
+
+Evidence collection (mandatory before destructive actions)
+-------------------------------------------------------
+1) Snapshot control-plane RPC logs (last 60m): logctl export --service control-plane --since 60m --out /tmp/cp-logs-<ts>.tar.gz
+2) Capture BGP RIB and adjacencies: netctl bgp dump --peer all > /tmp/bgp-<ts>.txt
+3) Store KV-head checksums: kvctl checksum --all > /tmp/kvck-<ts>.json
+4) Ingest the artifacts into incident blobstore: incident upload /tmp/*-<ts>* --tag <INCIDENT_ID>
+
+Customer communication templates
+-------------------------------
+Short status update (email/slack):
+- Subject: [Incident <INCIDENT_ID>] Temporary service routing mitigation in <REGION>
+- Body: We are currently mitigating a networking disruption affecting private VPC crossconnects in <REGION>. Short-term mitigations are in place to preserve availability; you may see elevated latency or degraded throughput for a subset of requests. We will provide updates every 30 minutes. Owner: <NAME>.
+
+Full outage cadence: first notice (T+0), follow-ups (T+30m), T+2h engineering summary. Use incidentctl notify-customer --id <INCIDENT_ID> --template mitigation-update
+
+Telemetry queries and dashboards (quick list)
+-------------------------------------------
+- Control plane error spikes: metrics.query("sum(rate(control_plane_rpc_errors[1m])) by (region)")
+- BGP churn: metrics.query("rate(bgp_updates_total[5m])")
+- KV divergence: metrics.query("sum(kv_cache_drift_shards_total{status=\"diverged\"})")
+- Request p95 e2e: metrics.query("histogram_quantile(0.95, sum(rate(request_duration_seconds_bucket[5m])) by (le,tenant))")
+- Recommended dashboards: "VPC Crossconnect Health", "KV Consistency Overview", "Safemode Events"
+
+Post-incident remediation checklist
+----------------------------------
+1) Root cause analysis: assign RCA owner and timeline within 48 hours.
+2) Remove temporary route preferences and confirm BGP stability for 24 hours.
+3) Run full KV reconciliation and snapshot verification.
+4) Convert any emergency-proxy usage into a controlled, documented feature if repeatedly used.
+5) Update this playbook with lessons learned.
+
+Ownership and escalation
+------------------------
+- First responder (oncall-networking): Pager: #network-oncall. Primary Slack: #network-ops.
+- Control plane engineering lead: Priya Sundaram (priya@redwood.ai)
+- SRE incident commander: Matteo Fischer (matteo@redwood.ai)
+- Customer success escalation for major customer impact: Sana Ortiz (sana@redwood.ai)
+
+Appendix: sample commands and quick references
+--------------------------------------------
+- Check BGP adjacency: netctl bgp show peers --peer <PEER_IP>
+- Dump RIB for prefix: netctl bgp rib --prefix 10.40.0.0/16
+- Trigger kv incremental repair: kvctl repair --shard sh-42 --mode incremental --rate-limit 200/s
+- Promote emergency variant for tenant: operatorctl model-rollout promote --tenant acme-corp --variant low-latency-edge-v2 --priority emergency
+
+Change log
+----------
+- 2026-01-12: Initial draft (A. Patel).
+- 2026-03-05: Added KV resync staging and evidence collection steps (reviewers: M. Ruiz, E. Park).
+
+Notes and safe-guards
+---------------------
+- Never perform a global route withdraw as a first step. Global withdrawals have historically caused multi-region evictions and lengthy recoveries.
+- Prefer application-level mitigations (safemode, model promotion, emergency proxy) before fabric-level manipulations except when data-plane is fully severed.
+- All terraform or network automation changes must include a TTL tag so that accidental permanent preference changes are avoided.
+
+Document links and references
+----------------------------
+- See also: operator-handback-and-custodian-rollforward-playbook (operator procedures).
+- Observability guides: "VPC Crossconnect Health" dashboard in Dashboards library.
+- KV consistency design doc: /confluence/eng-serving-runtime/kv-cache-consistency-design-2025.json
+
+End of playbook.

@@ -1,0 +1,372 @@
+Design Spec: Rollout Controller Integration with SLO Monitoring (Auto-pause/Auto-rollback)
+
+## Summary
+This document specifies how the Rollout Controller will integrate with Redwood’s SLO monitoring system to automatically *pause* or *rollback* a model rollout (canary/A-B/staged) when latency or error-rate SLOs breach within the scope of the rollout.
+
+The design introduces:
+- A controller-side **SLO Evaluator** that queries rollout-scoped SLO monitors via **slo-toolkit**
+- A policy-driven decision engine (pause vs rollback vs suppress)
+- A structured **audit trail** for every evaluation/decision
+- Console-facing APIs to view auto-actions and reasons
+
+## Goals
+1. Automatically mitigate regressions during rollouts using SLO signals:
+   - p95/p99 latency (route-scoped)
+   - error rate (5xx / upstream failures)
+   - optional saturation signals where defined and stable
+2. Evaluate breaches using **burn-rate + multi-window** logic with **minimum sample gating** and **debounce** to reduce flapping.
+3. Apply actions scoped to the rollout step:
+   - Pause rollout at current step
+   - Rollback to last-known-good model version / revert traffic split to baseline
+4. Ensure auditability:
+   - Record decision inputs, monitor references, policy version, and correlation IDs
+   - Expose in Console timeline and logs
+5. Maintain backward compatibility and safe rollout of this feature behind flags.
+
+## Non-goals (initial release)
+- Autonomous multi-region failover orchestration beyond pause/rollback.
+- Quality/eval-based rollback signals (prompt-set regressions). These may be added later as an additional signal source.
+
+## Glossary
+- **Rollout**: A deployment plan that changes traffic from a baseline model version to a candidate model version, via steps.
+- **Scope**: The dimensions defining which traffic/metrics the rollout concerns: {service/route, model_id + version, region, customer_tier}.
+- **SLO monitor**: A monitor that evaluates SLI against an objective (latency, error rate) and can provide burn-rate and sample counts.
+- **Burn-rate**: Consumption rate of error budget over a window, typically compared to a threshold.
+
+## High-level architecture (text diagram)
+
+[Console UI] 
+    | (view + manage policies; view audit timeline)
+    v
+[Console Backend] <-----------------------------+
+    |                                          |
+    | (GET rollout auto-actions; filters)       | (event stream subscription)
+    v                                          |
+[Event Stream / Audit Topic] ------------------+
+    ^
+    | (emit audit events for eval/decision/action)
+    |
+[Rollout Controller]----------------------------------------------+
+    |                                                             |
+    | (1) reads policy/config                                     |
+    | (2) evaluates SLOs per step                                 |
+    | (3) executes pause/rollback                                 |
+    v                                                             |
+[Policy Engine / Config Service]                                  |
+                                                                    
+[Rollout Controller SLO Evaluator] -----> [slo-toolkit] -----> [Metrics backend]
+         |                                 |                   (Prom/OTel + SLO store)
+         |                                 |
+         +---- staleness/sample data ------+
+
+[Incident Management] (optional input)
+    ^
+    | (known incident / suppression signals)
+    +----[Incident-bot / incident state provider]
+
+## Components and responsibilities
+### 1) Rollout Controller (existing)
+- Owns rollout state machine and step transitions.
+- Executes traffic shifts for canary/A-B and model version pinning.
+- Emits rollout lifecycle events.
+
+### 2) SLO Evaluator (new module within Rollout Controller)
+- Computes rollout scope for the active step.
+- Queries SLO monitor statuses via slo-toolkit adapter.
+- Applies evaluation logic (windows + burn-rate + min samples + debounce).
+- Produces an **Evaluation Result** that feeds the decision engine.
+
+### 3) Monitor Adapter (new; controller → slo-toolkit)
+- Provides a stable interface for:
+  - `GetRolloutScopedSloStatus(scope, slo_type, windows)`
+  - returning: burn-rate, good/total counts, timestamps, and monitor IDs.
+- Handles caching and backoff to avoid hot-looping the SLO provider.
+
+### 4) Policy Engine integration (schema + validation)
+- Stores per-service defaults and per-rollout overrides.
+- Enforces safe bounds (min windows, max sensitivity, min sample caps, etc.).
+
+### 5) Rollback Executor (existing + enhancements)
+- Performs idempotent traffic reversion to last-known-good state.
+- Rate-limits step-down during rollback to avoid compounding incidents.
+
+### 6) Audit + Console
+- Emits structured audit events for:
+  - evaluation runs
+  - decisions (pause/rollback/suppress/noop)
+  - action execution outcome
+- Console reads from controller-backed API (or via backend service) to display timeline and details.
+
+## Data flow
+### A) Evaluation trigger points
+SLO evaluation runs at the following times:
+1. **On step start**: after traffic shift completes and step is “active”.
+2. **Periodic polling** while step is active: default every 60s (configurable; floor 30s).
+3. **On rollout state transitions** that change scope (e.g., region expansion, tier expansion).
+
+Rationale:
+- Step start evaluation catches immediate regressions.
+- Periodic polling detects slower-burn regressions.
+- Scope changes require re-binding monitors.
+
+### B) Monitor lookup + query
+Given `RolloutScope`:
+- service/route: e.g., `inference-gateway /v1/chat/completions`
+- model: `model_id`, `candidate_version`, `baseline_version`
+- region: `us-east-1`
+- customer_tier: `hosted-self-serve | dedicated | private`
+
+The adapter queries slo-toolkit with a rollout-scoped selector. slo-toolkit resolves the correct monitor(s) and returns current statuses.
+
+If multiple monitors apply (e.g., p95 latency and error-rate), the evaluator queries each and computes per-signal outcomes.
+
+### C) Evaluation output
+Evaluator outputs:
+- `overall_state`: OK | BREACH_FAST | BREACH_SLOW | INSUFFICIENT_DATA | STALE | ERROR
+- Per-signal detail: latency_p95, latency_p99, error_rate (and optional saturation)
+- Evidence: burn-rate values, windows used, samples, timestamps, monitor IDs
+- Gate decisions: min-samples satisfied? debounce satisfied? suppression active?
+
+The decision engine uses this output with policy to decide `noop | pause | rollback | suppress`.
+
+## Breach evaluation logic
+### Signal eligibility
+Eligible signals for auto-mitigation are restricted to monitors that:
+- are marked “safe_for_auto_action=true” (from SRE coverage audit)
+- have stable labels matching rollout scope
+- provide sample counts and last-updated timestamps
+
+If a monitor exists but is not eligible, the evaluator records `suppression_reason=MONITOR_NOT_ELIGIBLE` and takes no auto-action.
+
+### Windows and burn-rate
+We use dual windows:
+- **Fast burn**: 5m window (detect sharp regressions)
+- **Slow burn**: 30m window (detect sustained regressions)
+
+Default breach rule (configurable by policy):
+- Trigger `BREACH_FAST` if burn-rate(5m) ≥ `fast_burn_threshold`
+- Trigger `BREACH_SLOW` if burn-rate(30m) ≥ `slow_burn_threshold`
+
+Recommended defaults by tier (initial):
+- Hosted self-serve:
+  - latency: fast=14x, slow=6x
+  - error rate: fast=14x, slow=6x
+- Dedicated/private:
+  - latency: fast=10x, slow=4x
+  - error rate: fast=10x, slow=4x
+
+Notes:
+- Burn-rate thresholds reflect how aggressively we consume budget relative to objective; exact mapping depends on SLO objective definitions in SRE doc.
+- Policies may choose “pause-only” for fast burn and “rollback” for slow burn or repeated fast burns.
+
+### Minimum sample gating
+To avoid false positives on low traffic steps:
+- Each signal has a minimum sample requirement per window.
+- Evaluation is considered actionable only when **both**:
+  1) `min_requests_5m` satisfied for fast window decisions
+  2) `min_requests_30m` satisfied for slow window decisions
+
+Proposed defaults:
+- latency windows: min_requests_5m=300, min_requests_30m=2000
+- error-rate windows: min_requests_5m=200, min_requests_30m=1500
+
+If below minimums:
+- evaluator returns `INSUFFICIENT_DATA` and does not pause/rollback.
+- audit logs include sample counts and the gating reason.
+
+### Debounce / holdoff (anti-flap)
+We implement two mechanisms:
+1. **Decision debounce**: require N consecutive actionable breaches before triggering an action.
+   - default: 2 consecutive evaluations (e.g., 2 minutes at 60s poll)
+2. **Post-action holdoff**: after a pause/rollback decision, do not trigger another auto-action for the same rollout for a holdoff period.
+   - default: 10 minutes
+
+State is maintained per rollout_id + step_id + signal.
+
+### Staleness and missing data
+Staleness rule:
+- If the monitor’s `last_updated_at` is older than `stale_after_seconds` (default 180s), treat as `STALE`.
+
+Missing data rule:
+- If no matching monitor is found for the scope, treat as `MISSING_MONITOR`.
+
+Controller behavior:
+- Default for `STALE` or `MISSING_MONITOR`: **do not rollback**; optionally **auto-pause** only if policy has `fail_closed_on_missing_monitor=true`.
+- Always emit an audit event and a metric for visibility.
+
+Rationale:
+- Rolling back based on unknown data is risky; pausing can be a safer guardrail for high-SLA tiers when explicitly opted in.
+
+### Suppression inputs
+Suppression can come from:
+- Admin override (Console-admin API) with justification and TTL
+- Known incident / telemetry outage indicator (optional integration)
+- Rollout policy suppression windows (e.g., “do not act within first X minutes of step start”)
+
+When suppressed:
+- Evaluation still runs and is logged, but decision outcome is `SUPPRESSED` with reason.
+
+## Action decision tree (pause vs rollback)
+Decision is policy-driven, but the controller uses the following default tree.
+
+Inputs:
+- evaluation overall state: OK | BREACH_FAST | BREACH_SLOW | INSUFFICIENT_DATA | STALE | ERROR
+- suppression state
+- rollout type: canary | A/B | staged
+- current step traffic fraction
+- previous actions taken in this rollout
+
+Default decision tree:
+1. If suppression active → Decision = SUPPRESS (no state change)
+2. If evaluation = OK → Decision = NOOP
+3. If evaluation = INSUFFICIENT_DATA → Decision = NOOP (emit audit; do not pause/rollback)
+4. If evaluation = STALE or MISSING_MONITOR:
+   - If policy `fail_closed_on_missing_monitor=true` → Decision = PAUSE
+   - Else → Decision = NOOP (emit audit + alert)
+5. If evaluation = BREACH_FAST:
+   - If policy `fast_breach_action=pause` → PAUSE
+   - If policy `fast_breach_action=rollback` AND step_traffic_fraction ≥ `min_fraction_for_rollback` (default 10%) → ROLLBACK
+   - Else → PAUSE
+6. If evaluation = BREACH_SLOW:
+   - Default → ROLLBACK (subject to `min_fraction_for_rollback`)
+7. If rollback executor fails:
+   - Rollout transitions to `ROLLBACK_FAILED` and pages oncall (see alerting); controller stops auto-retrying beyond max attempts.
+
+Implementation notes:
+- Rollback is always to *last known-good* baseline for this rollout step (baseline version captured at rollout start).
+- For A/B rollouts, rollback means shifting traffic to baseline (e.g., 100/0 split) with rate-limited steps.
+
+## Data model changes
+### A) Policy schema additions (stored in policy engine)
+New policy section: `auto_mitigation` (names illustrative)
+- `enabled` (bool)
+- `signals` (latency_p95, latency_p99, error_rate, saturation)
+- `windows` (fast=5m, slow=30m)
+- `burn_rate_thresholds` per signal (fast/slow)
+- `min_samples` per signal per window
+- `poll_interval_seconds` (default 60)
+- `decision_debounce_count` (default 2)
+- `post_action_holdoff_seconds` (default 600)
+- `min_fraction_for_rollback` (default 0.10)
+- `fast_breach_action` (pause|rollback)
+- `slow_breach_action` (rollback|pause)
+- `fail_closed_on_missing_monitor` (bool; default false)
+- `safe_bounds` enforced by policy engine validation (e.g., min poll 30s; max sensitivity; min samples upper caps)
+
+### B) Rollout state additions (controller DB)
+We add fields to rollout execution state:
+- `auto_mitigation_enabled_effective` (bool; computed at rollout start)
+- `auto_mitigation_policy_version` (string)
+- `last_evaluation_at` (timestamp)
+- `last_auto_action_at` (timestamp)
+- `evaluation_state_cache` (serialized; bounded size; includes per-signal last N outcomes for debounce)
+
+### C) Audit event schema (event stream)
+We emit audit events for:
+- `rollout.slo_evaluation.completed`
+- `rollout.auto_action.decided`
+- `rollout.auto_action.executed`
+
+Required fields (high level; see ADR-0128):
+- rollout_id, step_id, service, route, model_id, candidate_version, baseline_version, region, customer_tier
+- monitor_ids (list), slo_types (list)
+- windows, burn_rates, sample_counts, last_updated_at
+- decision: NOOP | PAUSE | ROLLBACK | SUPPRESS
+- decision_reason: e.g., FAST_BURN, SLOW_BURN, INSUFFICIENT_DATA, STALE_MONITOR, ADMIN_SUPPRESSION
+- policy_version
+- correlation_id / trace_id
+- actor: `rollout-controller` (and `admin_user` when override is applied)
+
+Retention and access:
+- Audit events are retained per standard audit retention policy; Console shows a subset appropriate for internal users.
+
+## API endpoints
+This section lists the primary APIs impacted. Exact paths may be adjusted during implementation; the intent and response shape must match.
+
+### 1) Console Backend → Rollout Controller (read)
+- `GET /api/rollouts/{rollout_id}/auto-actions?start=...&end=...&limit=...`
+  - Returns a timeline of evaluation and action events with summary fields and links.
+- `GET /api/rollouts/{rollout_id}/auto-actions/{event_id}`
+  - Returns detailed evidence: burn-rates, sample counts, monitor references.
+
+### 2) Console Backend → Policy Engine (write/read)
+- `GET /api/policies/{service}/rollout`
+- `PUT /api/policies/{service}/rollout` (includes `auto_mitigation` section)
+  - Validates safe bounds; rejects unsafe thresholds (clear error messages for UI).
+
+### 3) Admin override / suppression
+- `POST /api/rollouts/{rollout_id}/auto-mitigation/suppress`
+  - body: reason, ttl_seconds
+- `DELETE /api/rollouts/{rollout_id}/auto-mitigation/suppress`
+- `GET /api/rollouts/{rollout_id}/auto-mitigation/suppression`
+
+RBAC:
+- Suppression endpoints are admin-only and must be audited with user identity.
+
+### 4) Internal controller hook points (non-public)
+- `EvaluateSloAndDecideAction(rollout_id, step_id)` invoked by scheduler/state transitions.
+- `ExecuteAutoAction(decision)` invoked when decision resolves to pause/rollback.
+
+## Observability
+### Metrics (controller)
+The controller emits:
+- Counters for evaluations and decisions by outcome and reason.
+- Gauges for monitor staleness / missing monitor occurrences.
+- Histograms for evaluation latency (query + compute).
+
+Label constraints:
+- Rollout ID is high-cardinality; do not use as a label on high-volume metrics.
+- Use rollout_id only in logs/traces and audit events, not as a Prometheus label.
+
+### Dashboards & alerts (owned by SRE/Observability)
+- “Auto-rollback triggered” notifications (Slack notify; page only if rollback fails)
+- “Monitor missing/stale for auto-mitigation-enabled service” alerts (notify; page when widespread)
+- “Repeated auto-pauses without rollback” (notify; indicates persistent regressions)
+
+## Failure modes and mitigations
+1. **False positives due to small sample sizes**
+   - Mitigation: minimum sample gating + debounce.
+2. **Metric lag / stale monitor**
+   - Mitigation: staleness detection; configurable fail-closed pause-only for high tiers; explicit missing-monitor alerting.
+3. **Rollback oscillation / repeated trigger loops**
+   - Mitigation: post-action holdoff; do not auto-resume; require human intervention to restart rollout.
+4. **Controller restarts lose debounce state**
+   - Mitigation: persist minimal evaluation state in controller DB; ensure idempotent actions.
+5. **Rollback executor partial failure**
+   - Mitigation: idempotency keys per rollback attempt; rate-limited traffic shifts; terminal `ROLLBACK_FAILED` state with paging.
+6. **Policy misconfiguration (too sensitive)**
+   - Mitigation: policy engine validation + safe bounds + UI warnings.
+
+## Backward compatibility and rollout plan
+- Feature is behind a flag: `rollout_auto_mitigation_enabled` (default off).
+- Existing rollouts:
+  - If created before enablement, they are not retrofitted unless explicitly restarted.
+  - Policy defaults do not change behavior unless `auto_mitigation.enabled=true`.
+- Progressive enablement:
+  1) Dev/staging: pause-only
+  2) Internal prod canary routes: rollback enabled for error-rate only
+  3) Expand to latency signals once monitor coverage and dashboard readiness are confirmed
+
+## Open questions
+1. Should we allow “pause on fast burn, rollback on slow burn” as a first-class template in Console (recommended) vs requiring manual configuration?
+2. How do we ingest “known incident” state reliably across Hosted/Dedicated/Private control planes (especially for Private deployments)?
+3. For Private/on-prem: what is the minimal SLO monitor provider contract we can assume, and what’s the fallback if burn-rate APIs are not available?
+
+## Appendix A: Example policy snippet (for documentation)
+Example (illustrative; final schema owned by policy engine):
+- enabled: true
+- signals: latency_p99 + error_rate
+- windows: 5m/30m
+- thresholds: fast=14x slow=6x
+- min samples: 300/2000
+- fast action: pause
+- slow action: rollback
+- post-action holdoff: 10m
+
+## Appendix B: Example evaluation timeline (Console)
+- 12:01:00 Evaluation completed (OK)
+- 12:02:00 Evaluation completed (BREACH_FAST latency_p99; samples ok)
+- 12:03:00 Evaluation completed (BREACH_FAST latency_p99; debounce satisfied)
+- 12:03:01 Decision: PAUSE (reason=FAST_BURN)
+- 12:03:02 Action executed: rollout paused at step 2 (20% traffic)
+- 12:03:05 Notification posted to #eng-oncall-rollouts with rollout_id and dashboard links

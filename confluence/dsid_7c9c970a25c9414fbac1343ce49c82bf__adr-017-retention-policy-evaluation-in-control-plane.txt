@@ -1,0 +1,237 @@
+ADR-017: Retention policy evaluation in control plane
+
+## Status
+Published (ADR-017)
+
+## Decision summary
+Retention policies are evaluated in the **control plane**. Data plane components (log/telemetry stores, purge jobs, exporters) consume a **resolved “effective policy snapshot”** produced by the control plane and do not independently recompute precedence/validation rules.
+
+We will:
+- Centralize evaluation, precedence rules, and validation in the control plane (Retention Policy Service + evaluator module).
+- Cache effective policy snapshots in the control plane (in-memory + Redis) with explicit invalidation on policy changes.
+- Make policy changes and evaluation outputs auditable via immutable change history and audit log events.
+
+## Context
+The “Retention controls + compliance reporting pack” program requires consistent enforcement of customer-configurable retention policies across multiple data classes and deployment modes (Hosted / Dedicated / Private). The platform includes multiple storage systems and pipelines (request/response logs, audit logs, traces/metrics, artifacts) where TTL enforcement is implemented via scheduled purge jobs and/or native TTL features.
+
+Key requirements:
+- Consistent behavior and terminology (TTL, purge semantics, legal hold, exceptions).
+- Strong auditability for customer security reviews and internal audits.
+- Operational safety: idempotent purge jobs, observable lag, and safe rollouts.
+- Avoid duplicate logic across many services and minimize drift in precedence rules.
+
+## Problem statement
+Where should retention policies be evaluated and resolved into enforceable settings?
+
+Two broad options:
+1) Evaluate in the data plane (each service/store computes applicable policy based on tenant + region + data class + overrides).
+2) Evaluate in the control plane (one canonical evaluation engine; data plane consumes effective results).
+
+## Drivers
+- **Auditability:** Single source of truth for “what was the policy at time T?”
+- **Consistency:** Avoid divergent implementations of precedence rules.
+- **Performance and reliability:** Data plane should be lightweight; control plane must scale and avoid hot paths.
+- **Change safety:** Policy changes must be tracked, reviewed, and rolled out predictably.
+- **Compliance reporting:** Report pack needs authoritative exports of current and historical retention config.
+
+## Considered options
+### Option A: Evaluate in data plane
+Each store/purge job would fetch raw policy objects and compute effective values locally.
+
+Pros:
+- Reduced dependency on control plane for effective policy reads.
+- Potentially simpler request path if policy is needed inline.
+
+Cons:
+- Multiple implementations of precedence/validation (high drift risk).
+- Harder to audit and reproduce effective policy at time T across services.
+- Increased blast radius when rules change.
+
+### Option B: Evaluate in control plane (chosen)
+A centralized evaluator resolves raw policy + defaults + overrides into an effective snapshot. Data plane uses the snapshot.
+
+Pros:
+- Canonical evaluation behavior; lower drift.
+- Central audit trail and reproducible effective policy at time T.
+- Enables standardized exports for compliance reporting.
+
+Cons:
+- Control plane becomes a dependency for policy distribution.
+- Requires caching/invalidation and resilience plan for outages.
+
+## Decision
+We choose **Option B**: evaluate retention policies in the **control plane**.
+
+### What “evaluation” includes
+The control plane evaluator is responsible for:
+- Validation of policy inputs (min/max TTL by tier, data-class support, region constraints).
+- Precedence rules across:
+  - Product-tier defaults (Hosted/Dedicated/Private)
+  - Tenant-level policy
+  - Data class overrides (e.g., request_logs vs audit_logs)
+  - Region overrides (when supported)
+  - Legal hold and approved exceptions
+- Computing a normalized effective representation used by enforcement systems.
+- Producing a stable export format for compliance packages (see ADR-018).
+
+### What is *not* evaluated in the data plane
+Data plane services do not:
+- Interpret tier defaults.
+- Apply precedence rules.
+- Decide whether an override is valid.
+
+Data plane services only:
+- Read an effective snapshot (or receive it via config distribution).
+- Enforce TTL/purge according to the effective values.
+
+## Effective policy snapshot
+### Snapshot characteristics
+The effective snapshot is a read-optimized, explicit representation that answers:
+- For this tenant + region, what is the retention TTL per data class?
+- Are there holds/exceptions that block deletion for a data class?
+- When was this computed and from which raw config version?
+
+Minimum fields (conceptual; exact schema tracked in the policy service doc):
+- tenant_id
+- region (or “global”)
+- snapshot_version (monotonic)
+- policy_revision_id (raw policy revision)
+- generated_at
+- data_classes: effective_ttl_days per class
+- holds: active holds and scope (data class, time window where applicable)
+- notes: warnings (e.g., disabled logging mode for a class)
+
+### Data class alignment
+Data classes referenced in evaluation must match Security terminology:
+- request_logs (request/response logs)
+- prompts_and_completions (only if explicitly stored; may be disabled by configuration)
+- audit_logs
+- traces
+- metrics
+- artifacts (e.g., eval datasets where applicable)
+
+## Caching strategy
+We cache effective snapshots in the control plane to avoid recomputation and reduce latency.
+
+### Cache layers
+1) **Process-local cache** in the Retention Policy Service (fast path)
+- Key: (tenant_id, region)
+- TTL: 30 seconds
+- Eviction: LRU bounded by tenant count
+
+2) **Redis distributed cache** (shared across service replicas)
+- Key: retention:effective:{tenant_id}:{region}:{policy_revision_id}
+- TTL: 10 minutes
+- Negative caching: 60 seconds for “no policy configured” (tenant uses defaults)
+
+### Cache invalidation
+Invalidation is event-driven with TTL backstop:
+- On policy create/update/delete OR hold/exception change:
+  - Increment policy_revision_id
+  - Publish invalidation event (internal bus topic: retention.policy.changed)
+  - Evict local cache entries for affected tenant_id across replicas
+  - Allow Redis entries to expire naturally OR evict by prefix when feasible
+
+### Consistency model
+- Effective snapshot reads are **eventually consistent** with target propagation under 60 seconds.
+- Purge jobs must tolerate a short propagation delay and rely on verification metrics (see Monitoring).
+
+## Auditability and change history
+### Requirements
+We must be able to answer:
+- Who changed retention settings?
+- What changed (diff), when, and why (reason/issue link)?
+- What was the effective retention at any point in time?
+
+### Control plane audit trail
+The Retention Policy Service will:
+- Store an immutable revision log for retention policy objects and hold/exception objects.
+- Record the actor (user/service), authentication context, source (Console/API/Terraform), and request ID.
+
+### Audit log events
+On each change, emit audit events (exportable via the audit-log-exporter):
+- retention_policy.created
+- retention_policy.updated
+- retention_policy.deleted
+- retention_hold.created
+- retention_hold.released
+- retention_exception.approved
+- retention_exception.revoked
+
+Each event must include:
+- tenant_id
+- policy_revision_id
+- actor_id + actor_type
+- changed_fields summary
+- justification (free text + ticket link when provided)
+
+### Evidence expectations
+Compliance report generation will include:
+- Current effective snapshot export
+- Change history for a requested time window
+- Audit log coverage summary of retention change events
+
+## Operational and reliability considerations
+### Control plane dependency
+Data plane enforcement must not hard-fail if the control plane is temporarily unavailable.
+
+Mechanisms:
+- Purge jobs operate on the **last known effective snapshot** persisted locally (per store) with:
+  - max_staleness: 24 hours for continuing enforcement
+  - alerts if snapshot age > 2 hours (configurable per environment)
+- If no snapshot has ever been fetched, jobs must fall back to **secure tier defaults** (favor longer retention vs accidental over-deletion) and emit a high-severity alert.
+
+### Why “favor longer retention” on missing policy
+Accidental deletion is typically irreversible and creates customer impact. Temporary over-retention is treated as a compliance risk and must be surfaced via alerts and evidence, but is safer than permanent data loss. This posture is explicitly documented in the retention controls overview and risk assessment.
+
+### Performance
+Effective snapshot evaluation is not on the request serving path for inference traffic. Enforcement reads occur via scheduled jobs and admin/reporting flows.
+
+## Security considerations
+- Policy write endpoints require Security Admin / Org Admin privileges (RBAC enforced in control plane).
+- Hold/exception actions require additional approval workflow as documented in Legal Hold & Exceptions.
+- All policy and hold objects are classified as internal configuration; exports for customers must be scoped to their tenant.
+- Snapshots must not include sensitive request content; only configuration metadata.
+
+## Monitoring and verification
+To ensure evaluation + distribution behaves correctly, we will track:
+- retention_effective_snapshot_age_seconds{tenant,region}
+- retention_policy_propagation_lag_seconds{tenant,region} (time from change event to observed snapshot update in data plane)
+- retention_policy_eval_failures_total (by error class: validation, datastore, cache)
+
+Verification dashboards and alerts are defined in the Retention Controls Verification Dashboards page.
+
+## Consequences
+### Positive
+- Single, testable evaluation engine and precedence rules.
+- Stronger compliance story: reproducible effective policy + audit trail.
+- Lower engineering overhead across stores/purge jobs.
+
+### Negative / tradeoffs
+- Requires robust caching/invalidation and snapshot distribution.
+- Control plane changes (schema/rules) must be managed carefully with backwards compatibility.
+
+## Implementation notes (non-normative)
+- Evaluator module lives with the control plane Retention Policy Service and is used by:
+  - Console read views (effective retention display)
+  - Export endpoints for compliance pack
+  - Data plane snapshot fetch endpoint
+- Policy changes must be tagged with a policy_revision_id and persisted before publishing invalidation.
+- Data plane consumers should use ETag/If-None-Match semantics to reduce bandwidth and avoid thrash.
+
+## Rollout plan
+1) Land evaluator + snapshot endpoint behind feature flag (internal tenants only).
+2) Enable for audit_logs and request_logs enforcement stores first.
+3) Add traces/metrics and artifact classes once enforcement paths are ready.
+4) Turn on compliance pack exports using the same snapshot representation.
+
+## Open questions
+- Private/on-prem deployments: confirm whether snapshot distribution is pull-based only (recommended) or supports push for restricted networks.
+- Region override semantics: confirm which tiers allow per-region differences and how to represent “global” vs explicit region entries.
+- Legal hold scope: whether holds can be time-windowed per class in v1 or only “hold all” for a class.
+
+## References
+- Retention policy schema and validation rules
+- Legal hold and retention exceptions policy
+- Data deletion and TTL enforcement standards
+- ADR-018: Compliance report pack export format

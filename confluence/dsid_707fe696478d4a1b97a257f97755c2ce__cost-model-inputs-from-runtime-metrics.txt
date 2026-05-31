@@ -1,0 +1,316 @@
+Cost Model Inputs from Serving Runtime Metrics (v1)
+
+## Overview
+This document defines the *runtime-exported inputs* required by the Standard Cost Model (SCM) to produce consistent per-request and aggregated cost breakdowns across Console, Optimize, and finance reporting.
+
+The Serving Runtime is the source of truth for:
+- Prefill vs decode token accounting (including accepted/emitted vs attempted tokens)
+- KV cache behavior (hits/misses, reuse, evictions)
+- Batching and scheduling outcomes (batch sizes, queue times, GPU occupancy proxies)
+- Quantization execution path identifiers (what actually ran on-GPU)
+
+This page is a contract between Serving Runtime, Telemetry, and the Cost Model service.
+
+### Scope
+**In scope (v1):** metrics emitted per request (or per request stage) that the cost model needs to explain cost deltas driven by caching/batching/quantization and to allocate runtime-attributable costs.
+
+**Out of scope (v1):** full kernel-level profilers, per-layer timing breakdowns, and proprietary hardware counters. We prefer coarse but stable identifiers and low-cardinality metrics that can be aggregated safely.
+
+---
+
+## Contract principles
+1. **Deterministic semantics:** A metric means one thing across all runtimes and deployment modes.
+2. **Low cardinality by design:** Values must be bounded; raw histograms are preferred over unbounded sets.
+3. **Stage-aware accounting:** Prefill and decode are first-class stages for both token and time/cost attribution.
+4. **Execution-path truth:** The cost model keys off what the runtime *actually executed* (kernel/quant path ID), not what the request asked for.
+5. **Backwards compatibility:** New fields are additive. Renames require dual-write for ≥2 releases and a deprecation notice.
+
+---
+
+## Emission model
+Runtime emits a single logical record per request with optional stage sub-metrics.
+
+### Required record identifiers
+These identifiers must be present on every record so Telemetry can join with platform and billing primitives:
+- **request_id**: globally unique within a region; UUID string
+- **tenant_id**: Redwood tenant/org identifier
+- **project_id**: project/workspace identifier (if applicable)
+- **deployment_mode**: hosted | dedicated | private
+- **region**: e.g., us-east-1
+- **model_id**: catalog model identifier (pinned version)
+- **model_revision**: immutable model revision hash or build id
+- **runtime_build_id**: runtime binary build/version
+- **hardware_sku**: canonical GPU SKU label (e.g., a100-80gb, h100-sxm)
+
+Note: Several of these come from the control plane; however the runtime must *pass through* the identifiers it was scheduled with, so the emitted record is self-contained.
+
+---
+
+## Metrics: tokens & stages
+The SCM requires tokens to be attributed to prefill vs decode consistently.
+
+### Definitions
+- **prefill_tokens**: number of prompt tokens processed in the initial forward pass for the accepted prompt.
+- **decode_tokens_emitted**: number of tokens emitted to the client (including streamed tokens).
+- **decode_tokens_attempted**: number of decode steps attempted, including tokens that were later suppressed/rolled back by stop conditions.
+
+In v1 cost breakdowns, Console uses **decode_tokens_emitted** for customer-visible token counts, while internal performance modeling may use **decode_tokens_attempted** to explain compute waste. Both are exported to allow reconciliation.
+
+### Fields (required)
+- **tokens.prefill.accepted** (int, tokens)
+- **tokens.decode.emitted** (int, tokens)
+- **tokens.decode.attempted** (int, tokens)
+- **tokens.total.accepted** (int, tokens) = prefill.accepted + decode.emitted
+
+### Fields (recommended)
+- **tokens.prefill.cached_reused** (int, tokens)
+  - Number of prefill tokens for which KV state was reused from cache (see KV cache section).
+
+---
+
+## Metrics: KV cache
+KV cache behavior is the most important runtime-only driver for cost differences across otherwise identical requests.
+
+### KV cache semantic model
+We track cache at the request level in terms of:
+- **prefix reuse**: how many prompt tokens did not require compute because their KV states were available
+- **missed compute**: how many tokens required prefill compute
+- **evictions**: how often we had to evict KV blocks, causing lower hit rates and/or recomputation
+
+### Fields (required)
+All units and semantics below must be stable across implementations.
+
+1) **kv_cache.enabled** (bool)
+- True if the request was eligible to use KV caching (even if hit_rate is 0).
+
+2) **kv_cache.lookup_status** (enum)
+- allowed values: disabled | no_key | hit | partial_hit | miss | error
+- “partial_hit” indicates some prefix tokens were reused but not the full eligible prefix.
+
+3) **kv_cache.prefix_tokens_eligible** (int, tokens)
+- Number of prompt tokens eligible for KV reuse (after normalization, templates, and routing decisions).
+
+4) **kv_cache.prefix_tokens_reused** (int, tokens)
+- Subset of eligible prefix tokens whose KV states were reused.
+
+5) **kv_cache.blocks_reused** (int, blocks)
+- Count of KV blocks reused (block size is runtime-defined but must be consistent within a runtime_build_id).
+
+6) **kv_cache.blocks_written** (int, blocks)
+- New KV blocks written for this request.
+
+7) **kv_cache.evictions** (int, blocks)
+- Number of blocks evicted attributable to this request’s execution window.
+
+### Fields (recommended)
+- **kv_cache.eviction_reason** (enum): capacity | ttl | policy | fragmentation | unknown
+- **kv_cache.cache_namespace** (string, bounded)
+  - A small, bounded label (e.g., tenant-scoped vs global) used for debugging hit rate differences. Must not include tenant IDs or unbounded values.
+
+### Validation rules
+- prefix_tokens_reused ≤ prefix_tokens_eligible
+- lookup_status = hit implies prefix_tokens_reused = prefix_tokens_eligible
+- lookup_status = disabled implies kv_cache.enabled = false and all kv_cache.* counts are 0
+
+---
+
+## Metrics: batching & scheduling
+Batching and scheduling outcomes influence effective GPU time per token, and are required to explain unit-cost changes as batching configuration changes.
+
+### Concepts
+- **request queue time**: time from runtime receiving the request until it is assigned to a batch for prefill
+- **continuous batching**: decode steps can be interleaved across requests; this affects decode efficiency metrics
+
+### Fields (required)
+1) **scheduler.queue_time_ms** (int, ms)
+- Time from request enqueue to first execution (prefill start).
+
+2) **scheduler.prefill_batch_size** (int, requests)
+- Number of requests included in the batch for the prefill stage.
+
+3) **scheduler.decode_max_batch_size_observed** (int, requests)
+- Maximum number of concurrently active sequences in the decode loop while this request was active.
+
+4) **scheduler.decode_mean_batch_size** (float, requests)
+- Mean active batch size across decode steps for this request.
+
+5) **scheduler.tokens_per_step_mean** (float, tokens/step)
+- Mean tokens advanced per decode step across the batch while this request was active.
+
+### Fields (recommended)
+- **scheduler.prefill_microbatch_count** (int)
+  - If prefill is microbatched internally.
+- **scheduler.decode_steps** (int)
+  - Number of decode iterations observed for this request.
+- **scheduler.throttled** (bool)
+  - True if scheduler throttling engaged (capacity protection / SLO protection).
+- **scheduler.throttle_reason** (enum): gpu_mem | queue_depth | fairness | overload | unknown
+
+### Cardinality constraints
+- throttle_reason and lookup_status must be enums with a fixed set.
+- No per-request lists of batch composition or other request IDs.
+
+---
+
+## Metrics: latency & runtime time attribution
+The SCM uses runtime wall times for reconciliation and drift analysis, and to allocate overhead when configured.
+
+### Fields (required)
+- **timing.request_total_ms** (int, ms)
+- **timing.prefill_compute_ms** (int, ms)
+- **timing.decode_compute_ms** (int, ms)
+
+### Fields (recommended)
+- **timing.serialization_ms** (int, ms)
+- **timing.network_overhead_ms** (int, ms)
+- **timing.runtime_overhead_ms** (int, ms)
+
+Notes:
+- “compute_ms” includes time spent executing model kernels and any runtime-managed waits in the execution stream.
+- “overhead” fields are for internal diagnostics; the SCM may use them for overhead allocation policies depending on ADR-022 configuration.
+
+---
+
+## Metrics: quantization execution path
+The SCM must know what quantization *actually ran* to apply the correct throughput/cost profile and to support Optimize what-if projections.
+
+### Required identifiers
+1) **quant.profile_id** (string)
+- Stable identifier from the model catalog (e.g., qfp16, int8-awq-v2, fp8-e4m3fn).
+- Must match catalog IDs used by Optimize and SCM.
+
+2) **quant.execution_path_id** (string)
+- Runtime-chosen execution path identifier. Examples:
+  - fp16_tensorcore_v3
+  - int8_awq_gemm_v2
+  - fp8_mixed_precision_v1
+- Must be bounded and versioned by runtime_build_id; avoid embedding raw kernel hashes.
+
+3) **quant.kernel_family** (enum)
+- allowed values: fp16 | bf16 | fp8 | int8 | int4 | mixed | unknown
+
+### Recommended identifiers
+- **quant.kv_cache_dtype** (enum): fp16 | bf16 | fp8 | int8 | unknown
+- **quant.weights_dtype** (enum): fp16 | bf16 | fp8 | int8 | int4 | unknown
+- **quant.activations_dtype** (enum): fp16 | bf16 | fp8 | int8 | unknown
+
+### Failure mode requirement
+If quantization metadata is missing, runtime must set:
+- quant.profile_id = "unknown"
+- quant.execution_path_id = "unknown"
+- quant.kernel_family = unknown
+
+Do not omit the fields; omission complicates downstream schema negotiation and drift triage.
+
+---
+
+## Request outcome & safety signals
+These are used by SCM and Console to avoid attributing costs incorrectly in partial or failed requests.
+
+### Fields (required)
+- **outcome.status** (enum): success | client_cancel | timeout | rate_limited | server_error
+- **outcome.http_status_code** (int)
+- **outcome.retry_count** (int)
+
+### Fields (recommended)
+- **outcome.error_class** (enum): none | overload | oom | invalid_request | upstream_dependency | unknown
+- **outcome.fallback_taken** (bool)
+- **outcome.fallback_reason** (enum): capacity | model_unavailable | policy | safety | unknown
+
+---
+
+## Example payload (runtime → telemetry)
+This example shows the shape Telemetry should expect; actual transport may be OTLP attributes + metrics, but fields and semantics must match.
+
+{
+  "request_id": "req_7bdf1d2c-4a65-4d0b-b1b4-7c2dbf2d2b33",
+  "tenant_id": "tnt_3f2c...",
+  "project_id": "prj_91a...",
+  "deployment_mode": "hosted",
+  "region": "us-east-1",
+  "model_id": "rw-llama-3-70b-instruct",
+  "model_revision": "rev_2026-02-01_8b1c",
+  "runtime_build_id": "runtime-1.38.2",
+  "hardware_sku": "h100-sxm",
+
+  "tokens.prefill.accepted": 1142,
+  "tokens.decode.emitted": 268,
+  "tokens.decode.attempted": 270,
+  "tokens.total.accepted": 1410,
+
+  "kv_cache.enabled": true,
+  "kv_cache.lookup_status": "partial_hit",
+  "kv_cache.prefix_tokens_eligible": 900,
+  "kv_cache.prefix_tokens_reused": 740,
+  "kv_cache.blocks_reused": 185,
+  "kv_cache.blocks_written": 95,
+  "kv_cache.evictions": 0,
+
+  "scheduler.queue_time_ms": 12,
+  "scheduler.prefill_batch_size": 6,
+  "scheduler.decode_max_batch_size_observed": 28,
+  "scheduler.decode_mean_batch_size": 19.4,
+  "scheduler.tokens_per_step_mean": 18.7,
+
+  "timing.request_total_ms": 832,
+  "timing.prefill_compute_ms": 241,
+  "timing.decode_compute_ms": 523,
+
+  "quant.profile_id": "fp8-e4m3fn",
+  "quant.execution_path_id": "fp8_mixed_precision_v1",
+  "quant.kernel_family": "fp8",
+
+  "outcome.status": "success",
+  "outcome.http_status_code": 200,
+  "outcome.retry_count": 0
+}
+
+---
+
+## Implementation notes (runtime owners)
+### Where to compute these metrics
+- Token counts should be emitted from the tokenizer + generation loop with a single canonical counter source.
+- Prefill/decode compute times should be measured at the runtime scheduling boundary (not client-side).
+- KV cache metrics must be emitted by the cache subsystem, not inferred from prompt hashes downstream.
+- Quantization execution path should be emitted by the kernel selection / execution plan component.
+
+### OTLP mapping guidance
+- Prefer OTLP **span attributes** for identifiers and enums.
+- Prefer OTLP **metrics** for numeric counters/timers, but ensure they can be joined by request_id (trace ID) in Telemetry.
+- Avoid high-frequency per-token events; export aggregate per-request values.
+
+---
+
+## Data quality & conformance testing
+Telemetry and SCM require conformance checks to avoid silent drift.
+
+### Required checks (CI + staging)
+- Prefill/decode tokens must satisfy: total.accepted = prefill.accepted + decode.emitted
+- queue_time_ms ≥ 0; compute_ms ≥ 0
+- lookup_status enum membership validation
+- quant.profile_id must be one of: catalog-known IDs OR "unknown" (alert on unknown rate)
+
+### Recommended runtime perf-suite tests
+- KV cache hit/miss scenario replay: verify prefix_tokens_reused behavior across known prompt templates
+- Batching scenario replay: verify decode_mean_batch_size monotonicity under controlled load
+- Quantization A/B: verify execution_path_id changes when profile changes, and remains stable within a runtime_build_id
+
+---
+
+## Ownership & change process
+- **Owning team:** Serving Runtime (Scheduling + Kernel Selection)
+- **Primary owners:** Omar El-Sayed (KV cache/prefill-decode), Sofia Ivanova (scheduling), Grace Kim (quantization execution)
+
+### Change policy
+- Any semantic change requires an ADR or an addendum to the SCM schema docs.
+- Breaking changes require:
+  1) Dual-write old+new for at least 2 runtime releases
+  2) Telemetry backfill/translation plan (if needed)
+  3) Sign-off from SCM service owner (Platform) and Telemetry lead
+
+---
+
+## Open questions / v2 candidates
+- Representing *cache warm-rate* explicitly (Optimize request): likely requires aggregate workload metrics rather than per-request fields.
+- Differentiating “compute stalled due to memory pressure” vs “scheduler queueing” using additional runtime counters.
+- Standardizing microbatch-level visibility without increasing cardinality.

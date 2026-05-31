@@ -1,0 +1,189 @@
+Telemetry ingest and aggregation patterns for private deployments
+
+Overview:
+
+This document describes recommended patterns for ingesting, aggregating, and securely transporting telemetry from Redwood Private deployments (VPC and on-prem). It focuses on minimizing customer data exposure, reducing operator cost and network egress, and ensuring robust observability for day-2 operations. The guidance applies to control-plane, runtime-level telemetry (serving runtime, model load/eviction), and customer-facing request traces where permitted by the customer contract.
+
+Goals and constraints:
+
+- Secure: all telemetry must be authenticated and encrypted in transit with tenant-level isolation where required.
+- Minimal customer impact: local aggregation to reduce egress and CPU for telemetry producers.
+- Explainable sampling: sampling rules must be auditable and reversible.
+- Configurable retention: customers choose local retention windows and export policies.
+- Operable: clear runbooks for debug, failover, and rollback.
+
+High-level architecture patterns:
+
+1) Local edge aggregator (recommended default)
+- Lightweight collector runs in the tenant namespace (sidecar or daemonset) and accepts structured logs, metrics (Prometheus exposition), and traces (OTLP).
+- Responsibilities: batching, compression, local aggregation (rollups), schema validation, PII redaction, and upstream forwarding.
+- Benefits: reduces egress, centralizes sampling logic, enforces local data minimization.
+
+2) Tiered aggregation + long-tail store
+- Short retention locally (e.g., 7 days) with aggregated rollups sent to a regional aggregation cluster.
+- Full-fidelity events are retained only for a configured period or when flagged by incident workflows.
+- Use this for regulated customers wanting limited off-site retention.
+
+3) Trusted forwarder (customer-managed)
+- For highest-security customers, allow customers to host a forwarder inside their VPC that selectively forwards telemetry to Redwood control plane (optional).
+- Authentication via mTLS + signed attestation.
+
+Transport and authentication recommendations:
+
+- Protocols: OTLP/gRPC for traces and metrics; HTTPS or Kafka (TLS) for logs. OTLP/HTTP can be used for environments that block gRPC.
+- Auth: mTLS is preferred for private deployments. When mTLS is not possible, use short-lived API keys issued by the private control plane and bound to a service identity.
+- Encryption: TLS 1.2+ (TLS 1.3 preferred). Enforce cipher suites per security standards.
+- Key management: integrate with customer KMS where required; otherwise use Redwood-managed KMS with customer-hold configuration.
+
+Schema and data minimization:
+
+- Envelope model (JSON):
+  - top-level fields: timestamp, service, environment, level, tenant_id (hashed), trace_id, span_id, body_type, body (object or string), pii_flags (list).
+  - All tenant-identifying fields must be hashed or replaced with an opaque id unless explicit opt-in is documented in the contract.
+
+- Example JSON schema snippet (for logs):
+{
+  "timestamp": "2026-01-12T15:04:05Z",
+  "service": "redwood-serving",
+  "environment": "prod-us-east-1",
+  "level": "info",
+  "tenant_id": "sha256:abcd...",
+  "trace_id": "...",
+  "body_type": "json",
+  "body": {
+    "event": "model_load",
+    "model_name": "rwd-llama2-7b"
+  },
+  "pii_flags": []
+}
+
+Sampling and aggregation rules:
+
+- Default policy: sample 1% of request traces per tenant, with an adaptive reservoir sampler that increases sampling to 5% on detected error spikes or SLA regressions.
+- High-fidelity mode: can be enabled per-tenant for a short window (e.g., 2 hours) via the control plane for incident investigation.
+- Aggregation rollups: 1m and 1h bucketing for token latencies, error rates, and throughput.
+
+Retention and export policies:
+
+- Local retention defaults: logs=7d, metrics=30d (prometheus-series head + remote write), traces=3d.
+- Export rules: aggregated rollups -> Redwood regional aggregation (optional), raw events only when retention and export explicitly enabled in contract.
+- Export format: remote_write for Prometheus; OTLP for traces; compressed JSON lines (gzip) or Kafka for logs.
+
+Operational SLOs and alerts (suggested):
+
+- Collector availability: 99.9% per week.
+- Forwarding success rate: >= 99.5% of batched events delivered within 1 minute. Alert if delivery fails for >5 minutes.
+- Sampling integrity: configured sampling rate within ±0.5% of target over 1-hour window.
+
+Firewall and network controls (minimum):
+
+- Outbound: allow egress to aggregator endpoint on port 443 (TLS) and to NTP (UDP 123).
+- Inbound: collectors listen only on loopback or internal overlay interfaces. Do not open collector ports to public internet.
+- Recommended DNS entries: telemetry.local.redwood (CNAME to private collector IP).
+
+Example fluent-bit config (edge aggregator)
+
+- This snippet demonstrates local collection, JSON parsing, PII redaction, and OTLP forwarding:
+
+[INPUT]
+    Name   tail
+    Path   /var/log/redwood/*.log
+    Parser json
+    Tag    redwood.logs
+
+[FILTER]
+    Name    lua
+    Match   redwood.logs
+    script  /etc/fluent-bit/scripts/pii_redact.lua
+    call    redact
+
+[OUTPUT]
+    Name          otlp
+    Match         redwood.logs
+    Host          otlp-collector.local
+    Port          4317
+    TLS           On
+    TLS.Verify    On
+    Certificate   /etc/collector/certs/client.crt
+    Key           /etc/collector/certs/client.key
+
+Operational runbook (install -> validate -> rollback):
+
+1) Pre-install checks (operator):
+   - Confirm customer export policy and retention SLAs.
+   - Confirm network firewall rules and DNS resolution for telemetry endpoints.
+   - Verify node clock sync (chrony/ntpd).
+
+2) Install aggregator:
+   - Deploy DaemonSet in tenant namespace: telemetry-aggregator:v1.3.
+   - Apply ConfigMap with sampling rules and retention windows.
+   - Rotate service identity certs and ensure mTLS handshake succeeds.
+
+3) Validate:
+   - smoke test: run log generator and confirm events appear in local aggregation with expected sampling rate.
+   - metrics: check collector_export_success_total with Prometheus query: sum(rate(collector_export_success_total[5m])) / sum(rate(collector_export_attempts_total[5m])) >= 0.995
+   - trace test: create a synthetic trace via curl to local sidecar and ensure trace appears in control-plane debug index (if export enabled).
+
+4) Rollback (if install failed):
+   - Set forwarding to blackhole: kubectl annotate namespace telemetry.redwood/forwarding=disabled --overwrite
+   - Scale down DaemonSet: kubectl scale ds telemetry-aggregator --replicas=0 -n <tenant-namespace>
+   - Restore previous ConfigMap and restart kube-proxy if network rules were changed.
+
+Debug commands and checks:
+
+- Collector logs: kubectl -n <tenant-namespace> logs ds/telemetry-aggregator -f
+- Test OTLP endpoint locally: curl -v --cacert /etc/collector/ca.pem --cert /etc/collector/client.pem https://otlp-collector.local:4317/healthz
+- Check sampling rate: kubectl exec -n <tenant-namespace> telemetry-aggregator-0 -- /bin/collectorctl sampling-status
+
+Privacy and compliance controls:
+
+- Redaction rules must be enforced at the edge aggregator by default. The default rule set scrubs the following: IP addresses, email addresses, credit-card-like sequences, user-auth tokens and raw input prompt text unless explicit customer opt-in permits prompt export.
+- Audit trail: all sampling or export changes must create an auditable change record in the private control plane with operator identity, time, and reason.
+
+Ownership and rollout plan:
+
+- Owner: observability-runtime team (primary), security-team (policy review).
+- Rollout phases:
+  1. Pilot with 3 internal private customers (2 weeks)
+  2. Extended pilot with 10 customers (4 weeks)
+  3. General availability (GA) and doc publication.
+
+Testing checklist before GA:
+
+- End-to-end encrypted forwarding validated across at least two network topologies (VPC peering + direct connect).
+- Sampling logic tested under load (simulate 10k rps per tenant).
+- Backpressure handling: aggregator must persist to local disk and retry with exponential backoff when upstream is unavailable.
+
+Risks and mitigations:
+
+- Risk: accidental export of PII or customer prompts. Mitigation: default-deny redaction, automatic tests that scan exported events for prompt-like patterns, contract-level opt-in for prompt exports.
+- Risk: aggregator becomes single point of failure. Mitigation: run aggregator as DaemonSet across nodes with local persistence and multi-node forwarding endpoints.
+
+References and related pages:
+
+- See onprem-telemetry-sampling-privacy-cost-playbook-2025 for redaction rules and cost tradeoffs.
+- See post-installation-telemetry-and-acceptance-checklist-2026 for validation scripts and acceptance criteria.
+
+Appendix: Sample audit event (JSON)
+
+{
+  "event_type": "telemetry_export_change",
+  "operator": "julien.rousseau@redwood.ai",
+  "timestamp": "2026-02-28T11:16:00Z",
+  "tenant_hashed": "sha256:abcd...",
+  "change": "export_enabled",
+  "reason": "incident investigation - elevated latencies"
+}
+
+Contact and escalation:
+
+- Primary on-call for rollout: observability-runtime oncall (pager duty: OR-telemetry)
+- Escalation: security-team -> eng-platform -> eng-sre
+
+If you are implementing a custom forwarder or need customer-specific retention/crypto requirements, open a design review with the security team and include the forwarder configuration and KMS integration details.
+
+Document change log:
+
+- 2026-01-12: initial draft (Ava Martinez)
+- 2026-02-15: added fluent-bit example and sampling clarifications (Julien Rousseau)
+- 2026-03-02: updated retention defaults and rollout plan after pilot feedback (Maya Chen)

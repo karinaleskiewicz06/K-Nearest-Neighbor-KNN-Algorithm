@@ -1,0 +1,302 @@
+Runtime Optimization Config Apply Pipeline (Versioned Safe Apply + Rollback)
+
+## Overview
+This page describes how the Serving Runtime fetches, caches, and applies *versioned* Optimization Configs, and how it safely rolls back to a prior known-good version.
+
+Optimization Configs control runtime tuning knobs that materially impact cost/latency/reliability, including:
+- Batching heuristics (e.g., continuous batching targets, max batch tokens)
+- Caching toggles and KV/prefix cache settings
+- Quantization profile selection (where supported per model)
+
+The runtime must support:
+- **Versioned, immutable configs** (apply a specific version ID)
+- **Idempotent application** (safe retries, safe duplicate events)
+- **Partial rollout safety** (canary/percentage-based apply)
+- **One-click rollback** with predictable time-to-mitigate
+
+Non-goals for this document:
+- Control plane data model and API details (covered in the Optimization Config Service page)
+- Console UX flows (covered in Console & Tooling docs)
+
+---
+
+## Key concepts and terminology
+**Optimization Config Version (OCV):** Immutable record with an ID like `ocv_01J2R...`, created in the control plane.
+
+**Effective config:** The config version that a worker uses for request execution at a given moment.
+
+**Scope:** The target set for a config apply. In runtime terms, scope is resolved to a routing key with dimensions:
+- `tenant_id` (or `account_id`)
+- `deployment_id` (Hosted/Dedicated)
+- `model_id` (and optional `variant_id`)
+- `region`
+
+**Apply transaction:** Runtime-local state machine that stages changes and only flips to a new effective config once preconditions are met.
+
+**Checkpoint:** A persisted marker used to ensure safe progress and safe rollback across restarts.
+
+---
+
+## High-level data flow
+### 1) Control plane creates/validates/applies
+1. Operator (Console/API) creates a new Optimization Config Version.
+2. Control plane validates schema + semantic constraints.
+3. Control plane starts a staged rollout (e.g., canary 5% → 25% → 100%), gated by SLO and (for quantization) eval signals.
+4. Control plane updates the *desired* config version per scope/shard and publishes a change event.
+
+### 2) Runtime receives desired version and applies safely
+1. Runtime components (routers and model workers) fetch desired version for the relevant scope and cache it.
+2. Workers apply the new version using an idempotent apply transaction.
+3. Workers emit metrics tagged with `config_version` and `apply_state`.
+4. Control plane observes rollout health and either progresses, pauses, or triggers rollback.
+
+### Text diagram
+Control Plane (Optimization Config Service + Rollout Controller)
+  -> change event (apply/promote/rollback)
+  -> Desired Version per scope/shard
+
+Runtime
+  Router: resolves scope/shard -> selects worker pool -> forwards requests
+  Worker: fetches config version -> validates local compatibility -> apply transaction -> serves with effective config
+
+---
+
+## Runtime components and responsibilities
+### Router / Frontend (request routing)
+- Resolves request routing keys (tenant/model/region) and applies shard/percentage assignment used by the canary controller.
+- Adds response debug headers when enabled:
+  - `x-redwood-optimization-config-version: <ocv_id>`
+  - `x-redwood-optimization-config-apply-state: stable|applying|rolled_back` (best-effort)
+
+### Worker / Model executor
+- Maintains a local cache of config payloads by version.
+- Applies config updates using a transaction with checkpoints.
+- Guarantees idempotency and safe re-application.
+
+### Runtime Config Agent (sidecar thread inside worker process)
+- Subscribes/polls for desired version changes (implementation differs by environment, see below).
+- Drives apply transaction and reports apply status.
+
+---
+
+## Fetch and caching strategy
+### Sources of truth
+- **Desired version** is owned by the control plane (per scope/shard).
+- **Config payload** is retrieved by version ID from the Optimization Config Service.
+
+### Runtime cache layers
+1. **Version pointer cache (desired version):**
+   - Small object: `{scope_key, desired_ocv_id, updated_at}`
+   - TTL: 15s (Hosted/Dedicated), configurable in Private
+   - Invalidation: change events (when available) + TTL as fallback
+
+2. **Config payload cache (by OCV ID):**
+   - Stores the full normalized config payload and a checksum
+   - TTL: 10 minutes (payloads are immutable; TTL mostly protects memory)
+   - LRU eviction, max size by worker memory budget
+
+3. **Derived settings cache:**
+   - Parsed/compiled runtime settings derived from payload (e.g., precomputed batching limits)
+   - Evicted alongside payload
+
+### Eventing vs polling
+- Hosted/Dedicated: runtime receives config change events via internal event stream (best-effort), with polling as fallback.
+- Private: polling is always available; event stream is optional depending on installation.
+
+---
+
+## Apply transaction (worker)
+Workers treat config application as a safe transaction with explicit checkpoints. This prevents mixed or partially applied state within a single worker.
+
+### State machine
+States (persisted):
+- `STABLE(ocv=A)`
+- `FETCHING(ocv=B)`
+- `STAGING(ocv=B)`
+- `COMMITTING(ocv=B)`
+- `STABLE(ocv=B)`
+- `ROLLING_BACK(from=B,to=A)`
+
+Checkpoints are persisted to local durable storage (host path / ephemeral disk depending on env) so that worker restart resumes safely.
+
+### Step-by-step
+1. **Detect desired version**
+   - If `desired_ocv_id == effective_ocv_id`: no-op
+   - If new: transition to `FETCHING`
+
+2. **Fetch config payload by version**
+   - GET by `ocv_id` with strong read consistency requirements handled by service
+   - Verify checksum and schema version
+
+3. **Local compatibility checks (runtime-level semantic validation)**
+   These checks are fast, deterministic, and prevent applying settings that would crash or violate worker invariants. Examples:
+   - Quant profile exists for `model_id` and runtime build supports it
+   - Batching settings within runtime hard limits (e.g., `max_batch_tokens <= runtime_cap`)
+   - Cache toggles are compatible with model architecture (e.g., KV cache required for streaming)
+
+   If checks fail: worker reports `apply_failed` and remains on prior stable version. Control plane gate should halt progression.
+
+4. **Stage changes (no traffic impact yet)**
+   - Build derived settings structures
+   - Pre-allocate buffers where applicable
+   - Prepare cache policy changes (do not invalidate until commit unless required)
+
+5. **Commit (atomic switch of effective config)**
+   - Swap effective config pointer to `ocv=B`
+   - Apply any required cache invalidation rules
+   - Emit `optimization_config_apply_success` with tags
+
+6. **Post-commit stabilization window**
+   - Worker monitors immediate internal health signals (e.g., executor errors)
+   - If local failures exceed threshold, worker can self-trigger a local rollback to last stable (guardrail; control plane remains source of truth)
+
+### Atomicity boundary
+We guarantee atomicity at the **worker level**: a worker either serves entirely with OCV A or OCV B after commit. We do not guarantee cluster-wide atomicity (rollouts are staged by design).
+
+---
+
+## Idempotency and retries
+### Idempotency rules
+The apply pipeline is designed so that repeating any step produces the same outcome:
+- Fetching the same immutable version returns identical payload
+- Applying a version already applied is a no-op
+- A restart resumes from the last checkpoint (does not re-run destructive actions twice)
+
+### Common retry scenarios
+- Duplicate change events
+- Polling reads desired version multiple times during rollout
+- Worker restart mid-apply
+
+### Concurrency controls
+Workers enforce a single-flight apply per `(scope_key, worker_instance)`:
+- A per-worker mutex (or async lock) ensures only one apply transaction executes at a time.
+- If a rollback request arrives while applying, rollback wins (see Race conditions).
+
+---
+
+## Rollback mechanism
+Rollback is implemented as “apply the prior known-good version” and uses the same transaction machinery.
+
+### How rollback is triggered
+- Control plane changes desired version pointer back to a previous OCV (or to a promoted stable version).
+- Control plane emits audit events and a change event.
+- Runtime sees desired version revert and applies it.
+
+### Worker-level rollback behavior
+When switching from OCV B back to OCV A:
+- Worker follows the apply transaction steps with `desired_ocv_id=A`.
+- Cache invalidation is handled carefully:
+  - If B enabled aggressive caching and A disables it, we invalidate relevant caches at commit.
+  - If B changed batching heuristics only, we avoid full cache clears.
+
+### “Last known-good” definition
+Workers track `last_stable_ocv_id` locally for guardrail rollback. The authoritative “known-good” is owned by the control plane (promotion semantics).
+
+---
+
+## Race conditions and mixed-state protections
+### Concurrent apply and rollback
+A known failure mode is interleaving `apply(B)` and `rollback(A)` leaving a worker in an undefined state.
+
+Mitigations:
+- Single-flight apply ensures only one transaction runs.
+- Desired-version reads are checked at each checkpoint. If desired version changes mid-apply:
+  - Abort staging/commit if safe to do so
+  - Restart transaction toward latest desired version
+- Commit step is guarded by a compare-and-set of `pending_ocv_id` → `effective_ocv_id`.
+
+### Partial rollout “mixed worker states”
+During canary rollouts, some workers will legitimately run different versions. We must ensure:
+- Metrics are always tagged with `config_version` so gates can compare cohorts.
+- Router/shard assignment is stable for a request (avoid per-request flapping). We use a deterministic shard function based on `(tenant_id, request_id)` for percentage rollout cohorts.
+
+---
+
+## Observability and required metrics
+### Required tags
+All runtime metrics impacted by optimization settings must include:
+- `tenant_id` (or anonymized tenant hash where required)
+- `model_id`
+- `region`
+- `config_version` (effective)
+- `rollout_id` (when available)
+
+### Key metrics emitted by runtime
+- `runtime_optimization_config_effective_version` (gauge)
+- `runtime_optimization_config_apply_success_total` / `_failure_total`
+- `runtime_optimization_config_apply_latency_ms` (histogram)
+- Request SLO metrics with config tags:
+  - `requests_5xx_rate`
+  - `request_latency_p95_ms`, `request_latency_p99_ms`
+  - `tokens_per_second`, `queue_depth`, `gpu_utilization`
+
+### Log events
+Workers emit structured logs on state transitions:
+- `optimization_config.apply.start`
+- `optimization_config.apply.commit`
+- `optimization_config.apply.fail` (with reason code)
+- `optimization_config.rollback.start/commit`
+
+### Dashboard expectations
+See: `eng-sre/dashboards-and-alerts/optimization-rollout-health-dashboard`.
+At minimum, dashboards must support filtering by `config_version` and annotate apply/rollback events.
+
+---
+
+## Failure modes and runtime behavior
+| Failure mode | Symptom | Runtime behavior | Operator expectation |
+|---|---|---|---|
+| Cannot fetch payload | 5xx/timeout to config service | Keep serving with current effective version; retry with backoff | Rollout gate should pause; SRE investigates service health |
+| Local compatibility check fails | Worker reports apply failure | Stay on prior stable; emit failure with reason | Fix config or runtime capability; do not progress rollout |
+| Crash during apply | Worker restarts | Resume from checkpoint; do not double-apply destructive steps | Apply should eventually converge; rollback remains available |
+| Desired version flaps | Multiple changes in short window | Worker applies latest desired; intermediate versions may be skipped | Control plane should enforce cooldowns; Console warns on rapid changes |
+| Cache invalidation causes latency spike | p95 increases immediately after commit | Prefer targeted invalidation; allow small transient; emit metric `cache_invalidation_count` | Gate thresholds should account for small transient; rollback if sustained |
+
+---
+
+## Performance considerations
+- Config fetch and parsing must be off the request critical path.
+- Apply operations should not block token generation threads. The Config Agent performs staging and a minimal commit action guarded by a short lock.
+- Recommended apply latency targets (per worker):
+  - Batching-only changes: p50 < 250ms, p95 < 1s
+  - Cache policy changes: p50 < 500ms, p95 < 2s
+  - Quant profile switches: model-dependent; typically staged during low traffic and/or requires worker restart in some configurations
+
+---
+
+## Environment-specific notes
+### Hosted + Dedicated
+- Event stream is enabled; polling is fallback.
+- `config_version` may be surfaced in response headers for debugging when account setting `debug_headers=true`.
+
+### Private (VPC/on-prem)
+- Polling always works; event stream may be disabled.
+- Operators can pin a config version and apply/rollback via installer/Helm/Terraform integration.
+- If the private deployment runs with restricted egress, ensure the config service endpoint is available within the private control plane network.
+
+---
+
+## Operational guidance (runtime-owned)
+- If you suspect an optimization config regression, follow the runbook: `eng-platform/runbooks/rollback-optimization-config`.
+- Runtime team on-call should focus on:
+  - Worker apply failures with reason codes
+  - Unexpected cache invalidation spikes
+  - Any evidence of non-convergence (workers stuck in `STAGING` or oscillating)
+
+---
+
+## Appendix A: Reason codes for apply failures
+Runtime reports a normalized reason code to reduce triage time:
+- `FETCH_TIMEOUT`
+- `FETCH_5XX`
+- `SCHEMA_VERSION_UNSUPPORTED`
+- `MODEL_NOT_COMPATIBLE`
+- `QUANT_PROFILE_NOT_AVAILABLE`
+- `BATCHING_LIMIT_EXCEEDS_CAP`
+- `CACHE_MODE_UNSUPPORTED`
+- `INTERNAL_EXCEPTION`
+
+---
+
+## Appendix B: Example log line (structured)
+`{"event":"optimization_config.apply.commit","tenant_id":"tnt_123","model_id":"llama3-70b","region":"us-east-1","from_ocv":"ocv_01J2...A","to_ocv":"ocv_01J2...B","apply_latency_ms":412,"worker_id":"wrk_9f2c"}`

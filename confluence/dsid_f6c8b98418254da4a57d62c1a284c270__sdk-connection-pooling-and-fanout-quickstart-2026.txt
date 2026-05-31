@@ -1,0 +1,198 @@
+SDK Connection Pooling and Fanout Quickstart
+
+Overview
+
+This quickstart describes recommended connection pooling and request fanout patterns for Redwood SDK clients. It targets backend services that make high-throughput calls to the Redwood API (generation, embeddings, reranking). The goal is to reduce tail latency, avoid connector saturation at the network layer, and provide predictable token-cost accounting when fanout is required.
+
+Use cases covered
+
+- High QPS microservices that call Redwood for short-lived generation requests.
+- Batch/parallel embedding workloads (concurrent tenants).
+- Fanout workflows where a single user action triggers 3–10 parallel model calls (e.g., multi-hypothesis generation + reranker).
+
+Principles and tradeoffs
+
+1) Keep a modest, bounded pool per process — prefer many small pools over one global unbounded pool.
+2) Prefer async concurrency primitives with backpressure (semaphores, rate limiters) over naive thread-per-request models.
+3) When fanout > N (where N is configurable), consider sequential or staged execution to preserve latency SLOs and cost budgets.
+4) Instrument both pool usage and request-level downstream metrics so capacity issues are observable before customers notice.
+
+Quickstart patterns
+
+Pattern A — Single-host connection pool (recommended for stateless API servers)
+
+- Maintain a fixed-size HTTP/HTTP2 connection pool to the Redwood endpoint.
+- Per-process pool size = min(64, max(8, CPU_cores * 8)) as a starting heuristic.
+- Combine with an async semaphore to cap in-flight API calls to the pool size.
+
+Example: Node.js (axios + generic-pool)
+
+const axios = require('axios');
+const genericPool = require('generic-pool');
+const HttpsAgent = require('https').Agent;
+
+const agent = new HttpsAgent({ keepAlive: true, maxSockets: 64 });
+const client = axios.create({ baseURL: process.env.REDWOOD_URL, httpsAgent: agent, timeout: 30000 });
+
+// Simple semaphore (toy example)
+const { Sema } = require('async-sema');
+const poolSemaphore = new Sema(32); // in-flight cap
+
+async function callRedwood(payload) {
+  await poolSemaphore.acquire();
+  try {
+    const res = await client.post('/v1/generate', payload, { headers: { 'Authorization': `Bearer ${process.env.REDWOOD_KEY}` } });
+    return res.data;
+  } finally {
+    poolSemaphore.release();
+  }
+}
+
+Notes: tune maxSockets to match process-level CPU and expected concurrency. Keep separate agent/client instances for long-running worker vs short-lived request handlers.
+
+Pattern B — Controlled fanout (recommended for multi-call UX flows)
+
+- Limit simultaneous branch calls with a bounded concurrency pool.
+- Stagger start times slightly to avoid synchronized bursts across instances.
+- If branches are independent but result sizes vary, prefer pessimistic token budgeting + adaptive early cancellation.
+
+Staged fanout algorithm (recommended)
+
+1) Sort branches by predicted cost (if available) or worst-case estimate.
+2) Reserve slot tokens equal to branch concurrency cap (K).
+3) Start first K branches in parallel; as each completes, start the next.
+4) If cumulative token usage exceeds a configured budget, cancel lower-priority branches and return partial results.
+
+Example: Python (asyncio + aiohttp + asyncio.Semaphore)
+
+import asyncio
+import aiohttp
+
+REDWOOD_URL = "https://api.redwood.ai"
+REDWOOD_KEY = "${REDWOOD_KEY}"
+
+async def fetch(session, payload):
+    async with session.post(REDWOOD_URL + '/v1/generate', json=payload, headers={'Authorization': f'Bearer {REDWOOD_KEY}'}) as resp:
+        return await resp.json()
+
+async def staged_fanout(branches, concurrency=4, token_budget=10000):
+    semaphore = asyncio.Semaphore(concurrency)
+    results = []
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=concurrency*2, force_close=False)) as session:
+        async def run_branch(branch):
+            async with semaphore:
+                return await fetch(session, branch['payload'])
+        for coro in asyncio.as_completed([run_branch(b) for b in branches]):
+            res = await coro
+            results.append(res)
+            # token tracking pseudo-code: if tokens_used > token_budget: break
+    return results
+
+Pattern C — Dedicated worker pool for heavy throughput (batching-friendly)
+
+- For embedding and batching workloads, use dedicated worker processes with larger connection pools and explicit batching logic.
+- Worker pool size should match GPU/CPU and memory footprint; keep API request backpressure at the entrypoint.
+
+Configurations table (recommended starting values)
+
+| Component | Setting | Rationale | Starting value | Notes |
+|---|---:|---|---:|---|
+| Per-process max sockets | maxSockets | Network concurrency to Redwood | CPU_cores * 8, capped at 64 | Reduce if using many processes on same host |
+| In-flight API semaphore | concurrency cap | Limits RPC concurrency | 32 | Tune down if 503s/connection errors rise |
+| Fanout concurrency (K) | per-request parallel branches | Limits parallel branches | 4 | Increase for low-latency critical flows |
+| Token budget | per-request token cap | Cost control for fanout | 8k tokens | Used for early-cancellation logic |
+| Request timeout | per-call | Avoid hung sockets | 30s | Shorter for latency-sensitive endpoints |
+
+Telemetry and instrumentation (must-haves)
+
+- Metrics to emit from SDK or service:
+  - redwood.pool.max_sockets (gauge)
+  - redwood.pool.in_flight (gauge)
+  - redwood.request.latency_ms (histogram)
+  - redwood.request.status_counts (counter, by status code)
+  - redwood.fanout.active_branches (gauge)
+  - redwood.fanout.cancelled_branches (counter)
+  - redwood.token.usage_per_request (histogram)
+
+- Important derived alerts:
+  - pool_in_flight / max_sockets > 0.9 for > 5m -> investigate pooling saturation
+  - 5xx rate > 1% and > 50 requests/min -> possible API throttling or misconfigured timeouts
+  - average token usage per-request trending up > 25% week-over-week -> check prompt changes
+
+Common failure modes and canonical fixes
+
+1) Symptoms: sudden spike in connection resets and 5xx for many clients.
+   Fixes: verify keepAlive agent is enabled, reduce pool size if host-level limits (ulimit / ephemeral ports) are reached, increase TCP TIME_WAIT reuse on busy hosts.
+2) Symptoms: high tail latency with large fanout jobs.
+   Fixes: enable staged fanout, add per-branch time budget and early cancellation, enforce token budget.
+3) Symptoms: intermittent auth errors when rotating credentials in mid-flight.
+   Fixes: implement safe key rotation: preload new key into pool handshake or restart worker processes at controlled cadence.
+
+Operational runbook (triage flow)
+
+1) Confirm scope: are errors scoped to one service or pervasive? Check redwood.request.status_counts by service.
+2) Check pool metrics: are in_flight near max_sockets? If yes, reduce concurrency cap and investigate upstream load.
+3) Check downstream network: increased TCP retransmits or socket exhaustion on host level. Use netstat/ss and dstat.
+4) If fanout-related, look at redwood.fanout.active_branches and cancelled_branches. Consider toggling fanout staging.
+5) If token-cost spike, locate deployments with sudden prompt changes using telemetry and revert/mitigate.
+
+Rollout guidance for applying changes
+
+- Canary steps for concurrency tuning:
+  1. Deploy new setting to 1 instance group (5% traffic).
+  2. Monitor pool saturation and 5xx over 15 minutes.
+  3. If healthy, increase to 25% and repeat.
+  4. At 100%, run a synthetic load test for 1 hour.
+
+- Safe fallback: configuration should be feature-flagged or env-var driven so rollback requires only a config change or process restart.
+
+Checklist for SDK authors (must ship with all language SDKs)
+
+- Default client uses connection keep-alive and a configurable maxSockets.
+- Expose a concurrency/semaphore primitive or helper class for staged fanout.
+- Built-in telemetry hooks (emit the metric names above) and a pluggable metrics sink.
+- Documentation example for both per-request and worker-process usage patterns.
+- Clear guidance on key rotation best practices.
+
+Example configuration snippets (YAML)
+
+server:
+  redwood_client:
+    base_url: "https://api.redwood.ai"
+    max_sockets: 48
+    in_flight_limit: 32
+    request_timeout_seconds: 30
+    fanout:
+      max_parallel_branches: 4
+      per_request_token_budget: 8000
+
+Troubleshooting quick hits
+
+- If you see a spike in TIME_WAIT sockets: reduce per-process pool and increase number of worker processes, or enable socket reuse at OS level.
+- If you observe 429s: verify client-side rate limiting; introduce jitter and exponential backoff on retries.
+- If embedding batch latency is high: increase batch size on worker and reduce network concurrency at entrypoint; consider colocating workers.
+
+Ownership and contacts
+
+- SDK patterns owner: Eng DX (Priya Raman)
+- Runtime/infrastructure contact: Serving Runtime (Dmitri Kozlov)
+- SRE on-call: see /confluence/eng-sre/runbooks
+
+References and related reading
+
+- API contract: /confluence/eng-developer-experience/api-examples/api-deterministic-output-samples-and-canonical-fixes-2025
+- Fanout patterns reference: /confluence/eng-developer-experience/quickstarts-and-templates/client-request-shaping-and-local-fallback-playbook-2026
+- Pooling and kernel-level notes: /confluence/eng-serving-runtime/kernel-and-scheduling
+
+Appendix — small checklist before a major rollout
+
+1) Add telemetry for redwood.pool.* and redwood.fanout.* in your feature branch.
+2) Run load test that matches production percentiles (p50/p90/p99) and observe connection reuse rates.
+3) Validate safe key rotation in a staging environment.
+4) Confirm that configuration is env-var controllable and that SRE can remotely rollback.
+
+Document history
+
+- 2026-08-15: initial draft by Priya Raman
+- 2026-09-01: reviewer feedback incorporated (Maya Chen)
+- 2026-10-01: published after SRE review

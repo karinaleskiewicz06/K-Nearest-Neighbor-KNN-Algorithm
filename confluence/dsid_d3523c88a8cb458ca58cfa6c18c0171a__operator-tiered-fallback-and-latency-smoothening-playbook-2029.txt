@@ -1,0 +1,172 @@
+Operator tiered fallback and latency smoothening playbook
+
+Summary
+-------
+This playbook describes a tiered fallback and latency-smoothening strategy for Redwood Private deployments (VPC and on-prem). It explains detection signals, automated and manual remediation steps, configuration matrices for thresholds and pacing, operator CLI recipes, and validation tests. The goal is to preserve customer SLOs and safety fences while minimizing costly fallbacks and data exposure during transient resource stress.
+
+Scope
+-----
+- Applies to private deployments running the Redwood Inference runtime (control-plane + data-plane) in VPC and on-prem topologies.
+- Targets request-level latency SLOs, per-tenant throughput, KV-cache availability, and safe model-fallback behaviors.
+- Does NOT replace incident postmortems or change-control processes. Use this playbook during operational incidents, pre-scheduled maintenance windows, and automated canaries.
+
+Objectives
+----------
+1. Detect latency-affecting conditions early (queueing, cache misses, GPU thermal events, long tail RPCs).
+2. Apply graduated mitigation tiers (local pacing, per-tenant QoS, model quantized fallback, regional routing) before app-level fallbacks.
+3. Provide clear operator run steps with minimal blast radius and reversibility.
+4. Log and capture forensic evidence for compliance-sensitive customers.
+
+Key SLOs and thresholds
+---------------------
+- Tenant p50 generation latency: 150ms (SLO target)
+- Tenant p95 generation latency: 600ms (SLO target)
+- Error rate (5xx): <0.5% (SLO)
+- KV cache miss rate: baseline depends on tenant; trigger when miss rate >20% sustained for 2 minutes
+
+Alerting signals (metric-based)
+-----------------------------
+- service.request.latency.p95 > 800ms for 3 consecutive minutes
+- service.gpu.queue_length > 40% of available slots for 1 minute
+- kvcache.miss_rate > 20% for 2 minutes
+- node.temperature.gpu > 85C for any node for 30s
+- error.rate.5xx > 1% for 1 minute
+- sudden spike in cold-starts: cold_start_rate increase > 5x baseline in 3 min window
+
+Failure modes and recommended tiered actions
+------------------------------------------
+Table: Tier -> Trigger -> Primary action -> Fallback action -> Operator notes
+| Tier | Trigger | Primary action | Fallback action | Operator notes |
+| 1: Local pacing | transient queue growth OR p95 spike < 2x SLO | Enable per-runtime request pacing at 10–30ms delay windows | None | Short lived; automated by autoscaler policy |
+| 2: Tenant QoS | sustained p95 > 2x SLO OR tenant accounts for >30% queue | Apply per-tenant rate limiting and dynamic priority queueing | Redirect low-priority tenant traffic to degraded model variant | Communicate via telemetry tag tenant.priority |
+| 3: Model degradation | KV miss rate high OR memory pressure | Swap tenant to quantized/low-precision model variant (warm swap) | Graceful degrade to local smaller model; enable response-rate limiter | Ensure model-compatibility signatures match |
+| 4: Regional reroute | rack/zone GPU thermal or partial network partition | Route eligible tenant requests to secondary region/control-plane | Trigger cross-region canary and preservation mode | Requires operator approval if customer SLA restricted |
+| 5: Controlled fallback | control-plane instability OR mass eviction risk | Quiesce new deployments; enable fallback to hosted Redwood gateway (if allowed) | Incident escalation and manual rollback | Record evidence bundle before switching |
+
+Operator runbook (detection -> mitigation -> verification)
+--------------------------------------------------------
+1. Detection (first 90s)
+   - Confirm alert: check p95 latency, GPU queue, KV miss, and node temperatures in console.
+   - Gather context: affected tenant(s), timestamp, request traces (use trace ID filter), and recent deploys.
+
+2. Triage (90–300s)
+   - Run quick health checks:
+     a. kubectl get pods -l service=redwood-runtime -n tenant-<id>
+     b. rcli runtime metrics --tenant <id> --last 5m
+   - If thermal/GPU pressure: check node-level cgroups and evictions: kubectl describe node <node-name>
+
+3. Apply Tier 1 (automated): local pacing
+   - Command (operator tool):
+     rcli runtime patch --runtime <runtime-id> --set pacing.window_ms=25 --set pacing.mode=token-bucket
+   - Observe metrics for 2 minutes; if p95 improves, progressively reduce pacing window.
+
+4. Apply Tier 2 (per-tenant QoS)
+   - When tenant causes >30% of queue: enable tenant QoS profile
+     rcli tenant qos apply --tenant <id> --profile constrained-high |
+     cat <<EOF
+     {
+       "max_rps": 50,
+       "burst": 25,
+       "priority": "medium"
+     }
+     EOF
+   - Notify Customer Success and operator team via PagerDuty tag.
+
+5. Apply Tier 3 (model quantized fallback - warm swap)
+   - Pre-conditions: quantized model version must be present in model cache and signed.
+   - Warm-swap command:
+     rcli model swap --tenant <id> --from <model:vX> --to <model:vX-quant> --strategy warm --timeout 300s
+   - Verification: sample generation quality using smoke eval set (3 prompts). If acceptable, keep; else rollback.
+
+6. Apply Tier 4 (regional reroute)
+   - Only for tenants with multi-region allowance. Steps:
+     a. Enable routing rule in control-plane:
+        rcli route set --tenant <id> --preferred-region secondary-region --weight 70
+     b. Trigger canary with 5% traffic for 5 minutes; monitor 4xx/5xx and latency.
+   - If cross-region adds unacceptable latency, revert.
+
+7. Apply Tier 5 (controlled fallback to hosted gateway)
+   - Requires customer permission and operator lead approval.
+   - Steps:
+     a. Create evidence bundle: rcli evidence capture --tenant <id> --window 15m --output /tmp/evidence-<id>.tar.gz
+     b. Switch routing: rcli route set --tenant <id> --gateway hosted-redwood --grace 120
+     c. Notify Security and Customer Success.
+
+Rollback checklist (for model swaps and routing changes)
+---------------------------------------------------
+- Verify evidence bundle exists and upload to evidence store.
+- Rollback model swap: rcli model swap --tenant <id> --to <model:previous> --strategy warm --timeout 300s
+- Revert routing: rcli route unset --tenant <id> --preferred-region secondary-region
+- Remove temporary QoS rules: rcli tenant qos remove --tenant <id> --profile constrained-high
+- Post-rollback validation: run 10 synthetic requests against tenant's smoke prompts and confirm p95 < SLO*1.2
+
+Configuration matrix (example values)
+----------------------------------
+| Parameter | Default | Recommended during Tier 1 | Operator note |
+| pacing.window_ms | 0 | 10–50 | Lower improves latency but can reduce throughput |
+| kvcache.eviction_threshold | 85% | 75% | Reduce to force earlier eviction and warm swap for models |
+| model.swap.timeout_s | 120 | 300 | Allow longer for warm swap on large models |
+| tenant.qos.max_rps | unlimited | 10–200 | Set per-tenant based on contract |
+
+Telemetry and forensic evidence collection
+----------------------------------------
+Operators must capture the following when performing Tier 3–5 actions:
+- Trace IDs for impacted requests (CSV)
+- Model artifact checksums and signatures
+- Node snapshots (kubectl get events, top, describe node)
+- Telemetry window (metrics, logs, traces) exported using:
+  rcli telemetry export --tenant <id> --from <ts-iso> --to <ts-iso> --output s3://evidence-bucket/<id>/window.tar.gz
+
+Automation recipes and safe defaults
+----------------------------------
+- Implement automated Tier 1 pacing policy: if p95 > 2x SLO AND queue_length > 30% for 60s, apply pacing.window_ms=20 for 60s.
+- Auto-promote model warm swaps only if 3-sample smoke eval passes (fuzzy-match >= 0.8).
+- Lock Tier 4 reroutes behind an operator approval gate unless tenant has auto-reroute flag enabled.
+
+Testing and verification plan
+---------------------------
+1. Regression canaries for each tier: synthetic workload generator to simulate queued arrivals and cache churn.
+2. Wired test steps for Tier 3:
+   - Deploy quantized replica to model cache on staging.
+   - Simulate KV miss storm and verify warm-swap completes in < model.swap.timeout_s.
+   - Run smoke eval and measure similarity and latency.
+3. Disaster rehearsal quarterly: execute Tier 4 reroute for a non-production tenant and verify evidence capture and rollback.
+
+Owner and escalation paths
+------------------------
+- Primary owner: eng-private-deployments/runbooks (oncall rota)
+- Secondary: eng-sre (capacity and thermal events)
+- Escalation: PagerDuty -> SRE lead -> Platform engineering manager -> CTO if incident impacts >5% revenue or regulated tenants.
+
+Post-incident actions
+--------------------
+- Create incident ticket with timeline and attach evidence bundle.
+- Run a lightweight RCA: 5 Whys plus timeline of changes.
+- Update this playbook with any discovered missing automation or thresholds.
+
+References and related templates
+------------------------------
+- Operator change-control template: /confluence/eng-private-deployments/deployment-guides/operator-certification-and-knowledge-transfer-protocol-2026
+- Model artifact signing and provenance spec: /confluence/eng-private-deployments/onprem-packaging/model-artifact-supplychain-and-image-attestation-spec-2026
+- Telemetry export guide: /confluence/eng-private-deployments/day-2-ops/post-installation-telemetry-and-acceptance-checklist-2026
+
+Appendix A: CLI examples
+-----------------------
+- Apply pacing: rcli runtime patch --runtime r-abc123 --set pacing.window_ms=20
+- Apply QoS: rcli tenant qos apply --tenant t-321 --profile constrained-high --max-rps 50
+- Swap model: rcli model swap --tenant t-321 --from large-model:v4 --to large-model:v4-quant --strategy warm
+- Create evidence bundle: rcli evidence capture --tenant t-321 --window 15m --output /tmp/evidence-t321.tar.gz
+
+Appendix B: Quick checklist for on-call
+--------------------------------------
+- Confirm alert and scope within 3 minutes.
+- Apply automated Tier 1 pacing if configured.
+- If no improvement in 5 minutes, escalate to Tier 2 and notify CS.
+- For any model swap, create evidence bundle prior to swap when feasible.
+- After stabilization, run smoke eval and record outputs in incident ticket.
+
+Document change log
+-------------------
+- 2027-06-15: Created by Aisha Patel (initial draft).
+- 2028-09-12: Added telemetry export recipes and automated pacing rules (Michael Chen).
+- 2029-02-01: Formalized Tier 4 reroute approval gates and evidence capture (Sofia Martinez).

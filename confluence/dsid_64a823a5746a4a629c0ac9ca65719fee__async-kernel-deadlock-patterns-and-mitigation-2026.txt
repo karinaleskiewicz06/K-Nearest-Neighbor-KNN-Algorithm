@@ -1,0 +1,127 @@
+async-kernel-deadlock-patterns-and-mitigation-2026
+
+Summary:
+
+This document catalogs recurring async-kernel deadlock patterns observed in the runtime between 2024–2026, diagnostic signatures, short-term mitigations, and durable remediation paths. It is intended for oncall engineers, runtime kernel authors, scheduler owners, and SREs.
+
+Scope and impact:
+- Affects the serving runtime's asynchronous kernel handoff and cooperative preemption paths.
+- Symptoms range from elevated tail latency (p99.99 spikes) to full request stalls on specific model variants, sometimes causing partial loss of capacity on a GPU node for minutes.
+- Customers: observed primarily under mixed workloads (long-context chat + short embeddings) and during kernel rollouts or topology changes.
+- Business impact: can exceed alerting SLOs (p95 latency > 2x target) and trigger failover cascades in the orchestrator.
+
+High-level patterns (observed signatures):
+1) Handoff-starvation deadlock
+   - Trigger: a kernel A holding a per-shard mutex waits for a KV cache warmup callback that is scheduled on the same worker thread which is blocked on A’s completion.
+   - Telemetry: kernel_handoff_wait_ms for shard X increases; kernel_active_threads==0 while gpu_dispatch_queue_depth>0; repeated trace annotations: "handoff:await-kv-warmup".
+
+2) Interleaved-batch lock inversion
+   - Trigger: two concurrent request cohorts (cohort-long and cohort-short) acquire locks in opposite orders during batch assembly and commit; when a preemptible kernel tries to preempt a non-cooperative kernel, both wait for slot credits.
+   - Telemetry: increasing lock_contention_count, per-kernel credit_backoff_ms, and a correlated rise in per-request queue_time.
+
+3) Async-callback-livelock from external IO
+   - Trigger: a plugin or sidecar performing model-variant lookup issues synchronous filesystem or network calls within an async callback that is expected to be non-blocking; the callback holds scheduler-internal state and prevents kernel completion.
+   - Telemetry: long-running callback traces labeled "sidecar-sync-io"; blocked thread stack traces show user call into sidecar library.
+
+Detection rules and useful queries:
+- Metrics to monitor (recommended):
+  - kernel_handoff_wait_ms (histogram)
+  - kernel_dispatch_backpressure_ratio (gauge)
+  - lock_contention_count (counter) broken down by lock name
+  - gpu_dispatch_queue_depth (gauge)
+  - kernel_active_threads (gauge)
+  - kernel_stall_retries (counter)
+
+- Example alert condition (immediate page):
+  - WHEN: 5m avg(kernel_handoff_wait_ms{p99} > 500ms) AND gpu_dispatch_queue_depth > 4
+  - WHY: indicates persistent handoff slippage with backpressure building on dispatch queue
+  - ACTION: page runtime-oncall, include node id and recent trace ids
+
+- Useful log search patterns:
+  - "handoff:await-kv-warmup" OR "sidecar-sync-io" OR "lock_acquire_timeout"
+  - Example logQL: {app="runtime"} |= "handoff:await-kv-warmup" | json | line_format "{{.shard}} {{.kernel_id}} {{.duration_ms}}"
+
+Repro steps (minimal, non-customer data sandbox):
+1) On the dev cluster, deploy the synthetic-deadlock-replayer service (see repo infra/synthetic-deadlock).
+2) Configuration snippet (YAML) for reproducer:
+   - concurrent_long_cohorts: 6
+   - short_cohort_rate: 200/s
+   - enable_sidecar_sync_io: true
+   - kv_warmup_latency_ms: 200
+
+3) Run: `./replayer --target-node=node-7 --duration=600s --profile=handoff-starvation`
+4) Observe metrics: p99 kernel_handoff_wait_ms > 500ms and kernel_active_threads drop to near 0 while gpu_dispatch_queue_depth rises.
+
+Live investigation playbook (oncall):
+1) Triage and scope
+   - Identify affected nodes (metric: gpu_dispatch_queue_depth > 0 for > 60s).
+   - Gather recent traces (trace IDs indicated by trace_sampler for the node).
+2) Quick mitigations (fast, reversible)
+   - If pattern is handoff-starvation: disable KV-prefetch warmup (runtime flag: --kv-warmup=false) for the node or toggle to low-concurrency mode.
+   - If pattern is plugin IO: flip plugin sandboxing mode to async (flag: --plugin-sync-to-async=true) or unload the plugin (if safe).
+   - If lock inversion suspected: enable priority-boost (flag: --sched-priority-boost=on) to break inversion while preserving safety.
+3) Evacuate traffic (if mitigations insufficient)
+   - Evacuate the node from the pool using orchestrator: drain node with graceful timeout 120s, failing fast if operator needs to reclaim capacity.
+4) Capture artifacts
+   - Collect full core dumps (gcore), runtime thread stacks, and kernel dispatcher traces and attach to incident. Use `collect-runtime-artifacts --node node-7 --since 2026-10-03T10:00:00Z`.
+
+Long-term remediations and design recommendations:
+- Contract-level changes
+  - Enforce async-safety contracts: any callback executed in the runtime must be annotated and rejected at load-time if it performs sync IO or acquires runtime locks. Introduce linker-time or load-time checks for common blocking syscalls.
+  - Introduce cooperative timeout windows for long kernels: kernels must periodically yield within a configured window (default 50ms) or be preempted at a safe checkpoint.
+
+- Scheduler improvements
+  - Deterministic lock ordering: define and enforce a global lock ordering table for the most frequently contended locks (kv-warmup-lock, batch-assemble-lock, checkpoint-lock). See proposed table below:
+
+  +----------------------+----------------------------+
+  | Lock name            | Ordering priority (lower=first) |
+  +----------------------+----------------------------+
+  | scheduler-global     | 1                          |
+  | kv-warmup-lock       | 2                          |
+  | batch-assemble-lock  | 3                          |
+  | kernel-state-lock    | 4                          |
+
+  - Kernel handoff grace protocol: when a kernel attempts handoff, a small rendezvous token is acquired; if rendezvous cannot be satisfied inside 100ms, the originator will release non-critical locks and retry to avoid circular waits.
+
+- Observability and testing
+  - Add a dedicated deadlock detector stage in the nightly microbenchmark suite that runs the synthetic-deadlock-replayer across combinatorial cohort ratios and kernel variants.
+  - Add deterministic unit tests for priority-boost and lock ordering with a simulated scheduler.
+
+Safe rollout guidance for fixes:
+- Canary algorithm: start with 1% canary traffic on patched scheduler + kernel (min 3 nodes). Validate metrics for 6 hours. Gate criteria: no p99.9 kernel_handoff_wait_ms regression, lock_contention_count reduced by >= 50% on canary.
+- Fallback: automatic rollback if canary sees kernel_active_threads drop by > 30% or if dispatcher error rate increases > 0.5% above baseline.
+
+SOP snippets (commands):
+- Disable kv warmup on a single node (useful temporary mitigant):
+  kubectl -n infra exec node-agent--node-7 -- sh -c 'svcctl set-flag runtime --kv-warmup=false && svcctl restart runtime'
+
+- Collect kernel dispatcher traces:
+  curl -s "http://node-7.internal:9090/debug/dispatcher/traces?since=10m" > dispatcher-traces-node-7.json
+
+- Minimal gdb backtrace capture (if the node is unresponsive):
+  sudo gcore $(pgrep runtime) && sudo gdb --batch --pid $(pgrep runtime) -ex 'thread apply all bt' -ex 'quit' > bt-node-7.txt
+
+Owner and escalation:
+- Primary owner: runtime-kernel-team (oncall alias: runtime-kernel-oncall)
+- Secondary: eng-sre (alias: eng-sre-oncall)
+- For customer-impacting incidents, page customer-success-sre and the PM for the affected model tier.
+
+Related pages and artifacts:
+- See synthetic-deadlock test harness: git://repo/infra/synthetic-deadlock (internal)
+- Trace examples attached to this page: trace-2026-06-11-node-7 (internal)
+
+Appendix: example stack snapshot (sanitized) showing common deadlock layout:
+- Thread 1: runtime::kernel::kv_warmup_wait() -> runtime::kv::lock() -> waiting for checkpoint-lock
+- Thread 2: runtime::scheduler::batch_commit() -> runtime::kernel::lock() -> waiting for kv_warmup-lock
+- Thread 3: plugin::variant_lookup() -> sync DNS resolve -> holds scheduler-global context
+
+Notes and caveats:
+- Many deadlock signatures are transient and only appear with a precise mix of cohort shapes; synthetic replayer helps reproduce but may not capture third-party plugin-induced deadlocks.
+- Changes that add preemption points must be verified against model fidelity experiments to ensure they do not materially regress latency stability for long-context workloads.
+
+Change history:
+- 2026-05-12: Document created (Maya Chen)
+- 2026-07-01: Added quick mitigation flags and example commands (Ethan Park)
+- 2026-10-03: Expanded detection queries and added canary gating thresholds (Rina Patel)
+
+End of document.

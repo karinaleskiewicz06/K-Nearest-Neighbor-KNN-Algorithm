@@ -1,0 +1,421 @@
+Fleet Readiness Service (FRS) — Control Plane Service Documentation
+
+## Overview
+Fleet Readiness Service (FRS) is the Redwood control-plane component responsible for:
+- Recording and serving the canonical **node readiness state** during fleet bring-up (Dedicated + shared capacity).
+- Persisting **validation results and artifacts** produced by the provisioning orchestrator and node validation agent.
+- Exposing APIs to internal tools (Fleet UI, capacity ops tooling, SRE dashboards) to answer: “Is this node safe to join serving pools?” and “Why did it fail?”
+- Emitting **telemetry** (metrics, logs, and traces) used for time-to-ready SLIs/SLOs and triage.
+
+FRS is part of the Provision-to-Ready automation sprint and implements the readiness model defined in ADR-017.
+
+---
+
+## Service ownership and support
+**Owner team:** Platform Control Plane (eng-platform)
+
+**Primary on-call:** Platform Control Plane
+- Escalation path: Platform on-call → Infra/Fleet on-call (for infra-side failures) → SRE (for SLO/alerting issues)
+
+**Key partners:**
+- Infra/Fleet: provisioning orchestrator, Terraform outputs, pool metadata
+- SRE/Observability: SLIs/SLOs, dashboards/alerts, tracing standards
+- Security/Compliance: image channel audit events, least-privilege access, artifact retention
+
+---
+
+## Responsibilities (and non-goals)
+### Responsibilities
+1) **Canonical state tracking**
+- Maintain current readiness state per node.
+- Enforce valid state transitions.
+- Preserve transition timestamps for time-to-ready measurement.
+
+2) **Validation result persistence**
+- Store step-level validation outcomes (pass/fail/skip), durations, and pointers to logs/artifacts.
+- Normalize failure reasons into operator-actionable categories.
+
+3) **API for internal tooling**
+- Provide read APIs for summarization (counts by state, top failures) and drill-down (node details, validation history).
+- Provide controlled write APIs for state updates (only approved control-plane identities).
+
+4) **Telemetry and audit events**
+- Emit metrics and traces for:
+  - time-to-ready
+  - failure rates by step
+  - quarantine counts
+  - API health
+- Emit audit events for high-impact changes (e.g., pool image channel/version updates) when applicable.
+
+### Non-goals
+- FRS does **not** perform provisioning actions (instance creation, kubelet bootstrap, CNI setup).
+- FRS does **not** run validations; it only records results produced by external actors.
+- FRS is **not** a generic artifact store; it stores metadata and pointers (object storage) rather than large logs inline.
+
+---
+
+## System context and data flow
+### High-level flow (Provision → Validate → Ready)
+1) **Infra allocates** GPU instances and bootstraps base OS + kubelet.
+2) **Provisioning Orchestrator** runs orchestration steps (join cluster, apply configs, deploy validation agent, etc.).
+3) **Node Validation Agent (DaemonSet)** executes pre/post-flight checks and produces validation results.
+4) Orchestrator and/or validation agent **POST results to FRS**.
+5) FRS updates node state to **Validating** and then **Ready** (or **Quarantined**) based on gating policy.
+6) Control plane and fleet tooling consult FRS before adding a node to **serving pools**.
+
+### Integration points
+- Provisioning Orchestrator → FRS: state transitions, step telemetry, orchestration metadata
+- Validation Agent → FRS: validation results + artifact pointers
+- Fleet UI / Ops Tooling → FRS: node search, readiness summaries, failure reasons
+- SLO Toolkit / Observability → FRS: event timestamps for SLI computation, exported metrics
+
+---
+
+## Readiness states and transitions
+FRS implements the canonical state machine from ADR-017.
+
+### States
+- **Allocated**: Capacity exists and is assigned to a pool, but node has not started provisioning.
+- **Provisioning**: Orchestrator is bringing the node to a baseline Kubernetes-joined configuration.
+- **Validating**: Node is running required validation gates (hardware + config + runtime smoke tests).
+- **Ready**: Node has passed required validations and is eligible to join serving pools.
+- **Quarantined**: Node is blocked from serving due to repeated failures or quarantine-worthy signals; requires operator action.
+
+### Authoritative signals
+- **State writes:** Only control-plane service identities (provisioning orchestrator) may mutate readiness state.
+- **Validation results:** Validation Agent writes results; FRS uses them to compute gating outcomes.
+- **Heartbeat / liveness:** FRS uses control-plane writes + freshness windows (not agent heartbeats) as the authoritative readiness state. Heartbeats are treated as diagnostic signals, not state authority.
+
+### Transition rules (summary)
+- Allocated → Provisioning: orchestration started
+- Provisioning → Validating: node joined cluster + baseline config applied + validation agent deployed
+- Validating → Ready: all required checks passed
+- Validating → Quarantined: quarantine-worthy check fails OR failure count exceeds threshold
+- Any → Quarantined: manual operator action (restricted)
+
+Invalid transitions are rejected (HTTP 409) with a reason.
+
+---
+
+## Data model
+FRS stores (at minimum) the following entities.
+
+### NodeReadiness (current state)
+Fields:
+- node_id (internal canonical ID)
+- provider_instance_id (e.g., i-…)
+- cluster_id
+- pool_id (Dedicated pool or shared pool)
+- region
+- gpu_type (A100/H100/L40S/etc.)
+- image_channel (candidate/stable)
+- image_version (immutable build identifier)
+- state (Allocated/Provisioning/Validating/Ready/Quarantined)
+- state_reason (short operator-readable string)
+- last_transition_at
+- created_at
+- updated_at
+
+### ReadinessEvent (append-only transition log)
+Fields:
+- node_id
+- from_state / to_state
+- transition_at
+- actor (service identity)
+- request_id / trace_id
+- metadata (small key/value tags; see cardinality constraints)
+
+### ValidationRun and ValidationResult
+ValidationRun fields:
+- run_id
+- node_id
+- run_kind (preflight/postflight)
+- started_at / completed_at
+- overall_status (pass/fail)
+- orchestrator_attempt (int)
+
+ValidationResult fields:
+- run_id
+- check_name (e.g., gpu_health, driver_parity, kubelet_join, nccl_smoke, runtime_smoke, perf_canary)
+- status (pass/fail/skip)
+- duration_ms
+- failure_category (see below)
+- failure_code (stable string for dashboards)
+- failure_summary (operator-readable)
+- artifact_refs (pointers only)
+
+### Failure categories (normalized)
+- GPU_HARDWARE (ECC/Xid, unhealthy GPU)
+- DRIVER_TOOLKIT (driver/CUDA/NCCL mismatch)
+- K8S_JOIN (kubelet/CSR/CNI)
+- NETWORK_FABRIC (bandwidth/latency/NCCL fabric)
+- STORAGE (mounts/IOPS)
+- RUNTIME_SMOKE (inference runtime failure)
+- PERF_REGRESSION (perf canary below threshold)
+- CONFIG_DRIFT (baseline config mismatch)
+- UNKNOWN (fallback)
+
+---
+
+## Artifact storage
+FRS stores pointers (URIs) to artifacts produced by orchestrator/agent.
+
+### Artifact types
+- validation logs (bundled)
+- diagnostic snapshots (nvidia-smi, dmesg excerpts)
+- NCCL test output
+- runtime smoke test output
+- perf canary results summary
+
+### Storage policy
+- Artifacts are stored in object storage (internal bucket). FRS stores:
+  - uri
+  - sha256
+  - byte_size
+  - created_at
+  - retention_class
+
+### Retention
+- Default retention: 14 days for validation artifacts
+- Extended retention (restricted): 30–90 days for incident-linked runs (ticket/incident ID required)
+
+### Access control
+- Artifact URIs are not world-readable; access requires internal auth + membership in approved groups.
+- FRS returns URIs only to authorized identities; otherwise returns redacted pointers.
+
+---
+
+## API (internal)
+All endpoints are internal-only behind the control-plane gateway.
+
+### Authentication and authorization
+- mTLS + service identity for machine-to-machine calls.
+- User access via gateway-issued JWT with RBAC scopes.
+
+Roles/scopes:
+- frs.read: view readiness + validation details
+- frs.write_state: mutate readiness state (restricted)
+- frs.write_validation: submit validation runs/results
+- frs.quarantine_override: manual quarantine/unquarantine (very restricted)
+
+### Core endpoints
+#### Get node readiness
+GET /internal/fleet-readiness/v1/nodes/{node_id}
+Returns current readiness state and latest validation summary.
+
+#### List nodes (filters)
+GET /internal/fleet-readiness/v1/nodes?pool_id=&region=&gpu_type=&state=&image_channel=
+Supports pagination.
+
+#### Readiness summary for UI
+GET /internal/fleet-readiness/v1/summary?pool_id=&region=
+Returns counts by state and top failure codes (no per-node identifiers in summary).
+
+#### Record a state transition
+POST /internal/fleet-readiness/v1/nodes/{node_id}/transition
+Body (example):
+{
+  "to_state": "Validating",
+  "reason": "kubelet joined; validation agent deployed",
+  "actor": "provisioning-orchestrator",
+  "request_id": "...",
+  "metadata": {
+    "pool_id": "ded-123",
+    "region": "us-east-1",
+    "gpu_type": "a100"
+  }
+}
+Notes:
+- Invalid transitions return 409 with expected_state.
+- Metadata is subject to cardinality constraints (see Telemetry section).
+
+#### Submit a validation run
+POST /internal/fleet-readiness/v1/nodes/{node_id}/validation-runs
+Creates a run_id.
+
+#### Submit validation results
+POST /internal/fleet-readiness/v1/validation-runs/{run_id}/results
+Accepts multiple results per run.
+
+#### Quarantine/unquarantine (operator override)
+POST /internal/fleet-readiness/v1/nodes/{node_id}/quarantine
+POST /internal/fleet-readiness/v1/nodes/{node_id}/unquarantine
+Restricted; emits audit log entries.
+
+### Idempotency and retries
+- Write endpoints support Idempotency-Key header.
+- Orchestrator retries are expected; FRS de-dupes by (node_id, to_state, request_id) where possible.
+
+---
+
+## Readiness gating and serving pool admission
+FRS is the source of truth for whether a node may join a serving pool.
+
+Admission rule (current):
+- Only nodes in **Ready** state may be added to serving pools.
+- Nodes in **Validating** may remain schedulable for validation workloads only.
+- Nodes in **Quarantined** are tainted and blocked from inference workloads.
+
+If capacity is constrained, operators may temporarily bypass gating via feature flag, but this must be treated as an incident-level decision with explicit approval and rollback plan.
+
+---
+
+## Telemetry
+FRS exports metrics and traces following observability standards (low-cardinality labels; no per-node IDs in metrics labels).
+
+### Metrics (examples)
+Service health:
+- frs_http_requests_total{route,method,status}
+- frs_http_request_duration_ms_bucket{route,method}
+- frs_db_query_duration_ms_bucket{operation}
+
+Readiness state:
+- frs_nodes_in_state{state,region,pool_type,gpu_type}
+- frs_state_transitions_total{from_state,to_state,region,pool_type,gpu_type}
+
+Validation:
+- frs_validation_checks_total{check_name,status,region,pool_type,gpu_type}
+- frs_validation_check_duration_ms_bucket{check_name,region,pool_type,gpu_type}
+- frs_failure_codes_total{failure_code,region,pool_type,gpu_type}
+
+Time-to-ready:
+- frs_time_to_ready_seconds_bucket{region,pool_type,gpu_type}
+
+### Tracing
+- Every write request attaches trace_id; FRS creates spans:
+  - frs.transition.write
+  - frs.validation_run.create
+  - frs.validation_results.write
+  - frs.summary.read
+- Downstream calls (DB, object-store signer) are wrapped in child spans.
+
+### Logs
+- Structured JSON logs with fields: request_id, trace_id, actor, node_id (allowed in logs), pool_id, region, gpu_type, operation, outcome.
+- Logs are the correct place for per-node identifiers (not metric labels).
+
+### Cardinality constraints
+- DO NOT include node_id, instance_id, or run_id as metric labels.
+- Allowed labels are limited to: region, pool_type (dedicated/shared), gpu_type, image_channel, state, check_name, failure_code.
+
+---
+
+## Reliability: SLIs/SLOs (service-level)
+FRS participates in the overall Provision-to-Ready SLOs and also maintains service health SLOs.
+
+### Service SLO targets (initial)
+- Availability: 99.9% monthly for read APIs; 99.5% for write APIs (writes depend on external actors)
+- Latency:
+  - p95 < 250ms for GET /summary
+  - p95 < 400ms for GET /nodes (filtered)
+  - p95 < 500ms for POST write endpoints (excluding client retries)
+
+### Error budget policy
+- If burn rate exceeds threshold, pause rollout expansion (additional regions/GPU types) until stabilized.
+
+---
+
+## Operational procedures
+### Common operator workflows
+1) Node stuck in Validating
+- Check latest ValidationRun and failing checks.
+- Confirm whether failure is flake vs deterministic.
+- If deterministic and quarantine-worthy: quarantine node, reimage/retry per runbook.
+
+2) High quarantine counts causing capacity shortfall
+- Identify top failure codes via /summary and dashboards.
+- If caused by a new image version/channel: stop promotion, consider rollback.
+- If caused by NCCL/network flakes: tune timeouts/retries; consider lowering sensitivity temporarily with SRE approval.
+
+3) Artifact access request
+- Ensure user has approved group access.
+- Provide dashboard links and the node details view; do not paste raw URIs in tickets unless necessary.
+
+### Runbooks and references
+- Provision-to-ready failures triage: confluence://eng-infra/runbooks/provision-to-ready-failures-triage-runbook
+- SLOs and alerting: confluence://eng-sre/reliability-initiatives/provision-to-ready-slo-and-error-budget
+- Dashboards: confluence://eng-platform/dashboards-and-alerts/provision-to-ready-dashboards
+
+---
+
+## Failure modes and mitigations
+### DB unavailable / high latency
+Impact: UI and orchestrator writes fail; readiness states may not progress.
+Mitigations:
+- Circuit-breaker on client side; retry with exponential backoff.
+- Page Platform on-call if write error rate breaches threshold.
+
+### Metric tag explosion
+Impact: monitoring instability and alert noise.
+Mitigations:
+- Enforce label allowlist in code review.
+- If detected in prod: hotfix to remove offending labels; backfill dashboards if needed.
+
+### Incorrect state transitions
+Impact: nodes admitted prematurely or blocked incorrectly.
+Mitigations:
+- Strict transition validation (409s on invalid transitions).
+- Audit log for manual overrides.
+- Post-deploy canary: ensure Ready requires required check set.
+
+### Artifact access leakage
+Impact: security incident.
+Mitigations:
+- Signer service with short-lived tokens.
+- Redaction for unauthorized callers.
+- Audit logs for artifact URI requests.
+
+---
+
+## Security and compliance
+- RBAC enforced at gateway and service layer.
+- Manual quarantine/unquarantine is an auditable action.
+- Image channel/version changes are audited (where initiated through control-plane tooling).
+- Least privilege: validation agent may only write validation results for its node_id; orchestrator may write transitions for nodes in its assigned pools.
+
+---
+
+## Configuration and deployment
+- Deployed as a control-plane service in each major region.
+- Backed by regional database (multi-AZ) with read replicas for summary endpoints.
+- Feature flags:
+  - frs.enable_quarantine (default: on)
+  - frs.enforce_ready_gate_for_serving_pool (default: on in staged rollout regions)
+  - frs.allow_manual_override (default: off; requires break-glass)
+
+---
+
+## Change management
+- API changes must be backwards compatible for internal clients.
+- New validation check names require:
+  1) documented semantics and failure codes
+  2) dashboard updates
+  3) runbook updates if quarantine-worthy
+
+---
+
+## Appendix: Check naming conventions
+Use snake_case and keep names stable across releases.
+Examples:
+- gpu_health
+- driver_parity
+- kubelet_join
+- network_throughput
+- storage_iops
+- nccl_smoke
+- runtime_smoke
+- perf_canary
+
+Failure codes should be stable strings suitable for dashboards, e.g.:
+- GPU_XID_ERROR
+- DRIVER_VERSION_MISMATCH
+- CUDA_MINOR_MISMATCH
+- KUBELET_CSR_TIMEOUT
+- NCCL_ALLREDUCE_TIMEOUT
+- PERF_P50_REGRESSION
+
+---
+
+## Appendix: Quick links (internal)
+- FRS service repo: (internal) control-plane/redwood/fleet-readiness-service
+- Grafana dashboards: see confluence://eng-platform/dashboards-and-alerts/provision-to-ready-dashboards
+- Alerts: “Provision-to-Ready” alert group in on-call tool

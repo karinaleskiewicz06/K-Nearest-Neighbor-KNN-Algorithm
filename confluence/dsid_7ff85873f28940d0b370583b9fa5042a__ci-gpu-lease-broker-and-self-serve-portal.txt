@@ -1,0 +1,147 @@
+ci-gpu-lease-broker-and-self-serve-portal
+
+Overview
+
+This document describes the CI GPU Lease Broker and Self-Serve Portal: an internal service that mediates short-lived GPU allocations for CI/eval workloads, enforces tenant quotas and cost-centers, and integrates with our CI systems (Buildkite, GitLab Runner) and IaC pipeline (Terraform dynamic sandbox modules). It is intended for infra engineers, SREs, and CI owners.
+
+Goals
+- Provide a low-latency API for CI jobs to request ephemeral GPU slots with predictable fairness.
+- Account GPU usage to cost-centers and tag Cloud billing correctly.
+- Minimize wasted warm-up time by reusing warm pools and seeding KV caches where appropriate.
+- Offer strong guardrails to prevent budget overruns and noisy-neighbor issues.
+
+Scope and non-goals
+- In-scope: ephemeral GPU leasing for CI/eval (max lease 6 hours), integration with Buildkite and GitLab Runners, lease ledger, quota enforcement, preemption orchestration, warm-pool hints.
+- Out-of-scope: long-running dedicated tenant workloads (use Redwood Dedicated) and private on-prem orchestration.
+
+Actors and services
+- Lease Broker API (internal service): issues JWT-backed lease tokens, writes ledger entries.
+- Lease Ledger DB (Postgres): authoritative record of outstanding leases, owner, cost-center, tags, image fingerprint.
+- Provisioner (controller): reconciles leases to GPU node attachments via Kubernetes CRDs + Terraform dynamic sandboxes.
+- Warm-Pool Manager: maintains a small pool of pre-warmed nodes per region/flavor.
+- CI Integrations: Buildkite plugin and GitLab Runner helper that call the broker and attach the token to job environment.
+- Cost Allocator: periodic job that converts ledger rows to billing exports.
+
+SLOs & monitoring (primary metrics)
+- API latency: P50 < 60ms, P95 < 300ms (for token issuance).
+- Queue wait: 95th percentile < 30s for small (<=4GB) requests during normal hours.
+- Preemption spike: < 3% of active leases preempted per hour target.
+- Lease leak rate: < 0.25% of leases remain after 2x TTL without reconciliation.
+- Billing tag fidelity: 99.9% of consumed GPU-hours include a cost-center tag.
+
+Instrumentation and dashboards
+- Dashboards: Broker API latency, active leases by tenant, average lease duration, preemption events, warm-pool occupancy, billing tag compliance.
+- Alerts (pager):
+  - broker-api-5xx-rate > 1% sustained for 5m -> page oncall-infra.
+  - queue-wait-95 > 120s for 5m -> page oncall-sre.
+  - leak-detector-count > 5 in 1h -> page infra-leases.
+
+Operational runbook: common incidents
+1) Broker API returns 500s at scale
+   1. Confirm via dashboard that error rate spike correlates with traffic.
+   2. Increase provisioner replicas (k8s deployment: ingress-broker) by 2x using kubectl scale if CPU/latency metrics show saturation.
+   3. If DB is the bottleneck (Postgres CPU or connection saturation), promote read replicas and temporarily disable non-essential background reconciliations (warm-pool refresh).
+   4. Rollback recent deploy if metrics started after deployment; follow normal CD rollback.
+
+2) Large preemption wave (many leases get preempted)
+   1. Identify preemption cause: node preemption vs. provider reclaim. Check cloud events and node-level logs.
+   2. If provider-driven (spot/interrupt), trigger immediate warm-pool refill in unaffected regions and route new leases away from affected capacity zones.
+   3. If caused by overpacking policy change, revert policy and run a controlled drain in small batches.
+   4. Communicate to CI teams via #infra-alerts channel and annotate affected ledger rows with "preemption:mass" tag for billing adjustments.
+
+3) Stuck lease (job exited but lease remains active)
+   1. Run lease-reconciler job to probe the attached node and job heartbeat.
+   2. If job absent for > 10m and health-checks negative, mark lease for forced reclaim and attach reclaim_reason=orphan.
+   3. Notify owner (email/Slack from ledger owner field) with a one-click reclaim link.
+
+4) Warm-pool exhaustion leading to long cold-starts
+   1. Increase warm-pool target for the affected region/flavor via the admin portal.
+   2. As an immediate mitigation, mark small jobs as "best-effort" allowing fractional multiplexing on lightly loaded nodes.
+   3. Post-incident: run a demand forecast job and update warm-pool sizing policy.
+
+Lease lifecycle (how it works)
+- Request: CI job POST /v1/leases {flavor, max_duration, cost_center, image_hash, tags} with bearer service token.
+- Broker: evaluates quota, fairness score (sliding-window per-tenant consumption), warm-pool hints and returns lease token and node assignment (if immediate) or queue position.
+- Provisioner: watches for new active leases and reconciles attachments (K8s PVC, node affinity, TF dynamic sandbox apply).
+- Run: job uses lease token to mount GPU and begins work. Lease heartbeat every 30s optional.
+- Expire/Reclaim: upon TTL or job completion, provisioner detaches resources and records final usage in ledger.
+
+Fairness and quota model (short)
+- Quotas: two-dimensional: concurrency slots and hourly GPU-hour cap per cost-center.
+- Fairness score calculation:
+  - score = alpha * recent_gpu_hours + beta * queued_jobs + gamma * priority_override
+  - alpha/beta/gamma are tunable in config service (default alpha=1.0 beta=0.5 gamma=2.0).
+- Scheduler favors lower-score tenants but provides occasional credit for bursty tenants (token-bucket).
+
+CI integration examples
+- Buildkite plugin (snippet)
+  - CLI call for job:
+    curl -X POST -H \"Authorization: Bearer $BROKER_TOKEN\" -H \"Content-Type: application/json\" \
+    -d '{"flavor":"a2-medium","max_duration_minutes":120,"cost_center":"ai-team","image_hash":"sha256:..."}' \
+    https://broker.internal/v1/leases
+  - Broker returns JSON:{"lease_token":"eyJ...","node":"gpu-a2-07","attach_cmd":"/opt/redeem --token=..."}
+
+- GitLab Runner helper: the helper will call the API at runner startup and export GPU_DEVICE environment variables if lease granted. Failures fall back to cpu-only (configurable).
+
+Terraform / IaC considerations
+- Pattern: the Lease Broker does not run Terraform at request time for every lease. The Provisioner maintains a pool of pre-created dynamic sandboxes represented as K8s NodePools and NodeClaim CRs.
+- Example snippet for terraform module usage (admin/operator):
+  module "ci_gpu_sandbox" {
+    source = "git::ssh://git@infra-repo//modules/ci-gpu-sandbox?ref=v0.4.0"
+    region = "us-west-2"
+    flavor = "a2-medium"
+    min_prepared = 2
+    warm_pool_size = 3
+    tags = { team = "infra", purpose = "ci-broker" }
+  }
+
+- Module responsibilities: creation of node pools, IAM service account for the provisioner, Cloud NAT/epheremal EIP policy for egress, and a small image cache bucket. Ensure module creates billing-tags on node metadata for cost allocation.
+
+Security and tokens
+- Lease tokens are short-lived JWTs (default TTL 1h) signed by infra-kms and include claims: lease_id, owner, cost_center, allowed_mounts.
+- CI tokens are scoped to project-level principal; cross-tenant requests must be approved via workspace policy.
+- Admin role: admin-broker role can bypass certain quota checks for emergency flows. Use sparingly and audit via CloudTrail.
+
+Upgrade and rollout steps (for changes to broker/provisioner)
+1. Create canary deployment in staging with parity config and run at 5% of CI traffic using routing flag.
+2. Run load test mimicking 10K small launches and validate SLOs for 1h.
+3. Gradually increase traffic to 25% and monitor preemption and queue wait.
+4. If regressions occur, revert canary and capture metrics for postmortem.
+5. When promoting, use a blue/green deployment and a short feature-flag window to disable new fairness algorithm.
+
+Cost controls and throttles
+- Soft caps: warn tenant owners via Slack when 75% of hourly cap consumed.
+- Hard caps: deny new leases after 100% cap unless emergency override used.
+- Emergency override: admin token with reason tag recorded into ledger.
+
+Post-incident checklist
+- Timeline: reconstruct events from broker API logs and lease ledger.
+- Usage reconciliation: run billing export and reconcile ledger->billing for the incident window.
+- Blame and remediation: identify misbehaving jobs (large image pulls, leaking sessions), add guardrails (image size limits, session TTL), and deploy patch.
+
+Appendix: troubleshooting commands
+- Force reclaim a lease: curl -X POST -H \"Authorization: Bearer $ADMIN\" https://broker.internal/v1/leases/{lease_id}/reclaim
+- Probe lease ledger for orphaned entries: psql -c \"SELECT lease_id, owner, created_at FROM leases WHERE status='active' AND created_at < now() - interval '2 hours';\"
+- Refill warm-pool (operator CLI): infractl warm-pool refill --region us-west-2 --flavor a2-medium --count 2
+
+Ownership and contacts
+- Primary owner: infra-ci ( rotation: @infra-oncall )
+- Secondary owner: platform-ops@redwood.com
+- Pager: #infra-pager (Slack) -> infra oncall escalation policy
+
+FAQ and known limitations
+- Q: Why not Terraform-per-lease?
+  A: Terraform at request-time has high latency and Terraform state contention; we prefer pre-created sandboxes reconciled by a controller.
+- Q: Can a CI job request >6 hours?
+  A: Not via the broker. Long-running runs should request Dedicated capacity via the Dedicated onboarding flow.
+- Q: How do we handle large image pulls causing network egress spikes?
+  A: The module tags heavy-image jobs; the Cost Allocator can throttle or charge a differential egress surcharge to the cost-center.
+
+Change log
+- 2024-08-15: initial draft (Maya Patel).
+- 2024-10-02: added warm-pool heuristics and fairness parameters (Diego Ramirez).
+- 2025-01-20: expanded incident playbook and onboarding steps; added Terraform module snippet (Priya Shah).
+
+References
+- See also: /confluence/eng-infra/ci-cd-and-build/ephemeral-gpu-pools-for-ci-and-eval-runs.json (operational patterns)
+- See also: /confluence/eng-infra/terraform-and-iac/gpu-lease-ledger-and-claim-module.json (ledger schema and api)

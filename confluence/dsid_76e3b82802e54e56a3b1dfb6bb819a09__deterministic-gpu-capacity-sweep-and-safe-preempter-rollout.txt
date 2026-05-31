@@ -1,0 +1,131 @@
+Deterministic GPU capacity sweep and safe preempter rollout
+
+Summary:
+This runbook defines a deterministic, auditable process for sweeping GPU capacity across regions and instance classes, and for performing a safe rollout of the preempter (spot eviction handler) changes that affect placement and eviction behavior. It is intended for infra engineers performing planned capacity changes, allocator updates, or kernel/runtime rollouts that interact with the preemption surface.
+
+Scope:
+- Applies to all production GPU clusters that serve inference workloads (gpu-pool-* / gpu-allocator).* 
+- Includes changes to: allocator config, preempter binary, eviction scoring, warm-pool seeding, and cross-region burst policies.
+- Excludes CI/eval sandbox pools (use the ephemeral sandbox runbook for those).
+
+Goals and SLOs:
+- Maintain allocation success rate >= 99.0% for on-demand requests during sweep windows.
+- Keep tenant P95 scheduling latency < 20s for non-burst flows, and < 60s for burst flows.
+- No individual tenant should observe > 5% increased 1m error rate attributable to placement during rollout windows.
+
+When to run this process:
+1. New preempter binary or scoring change that affects eviction/placement order.
+2. Large capacity rebalance across regions (>= 10% pool size change).
+3. Introducing a new GPU SKU or IoT driver kernel that may change node readiness semantics.
+4. Post-incident hardening where allocator behavior needs deterministic validation.
+
+Preflight checks (run before any sweep):
+- Verify active release and canary nodes: kubectl get pods -n infra | grep gpu-allocator | grep Running
+- Confirm CI/CD pipeline green: buildkite:gpu-allocator-canary and buildkite:preempter-unit-tests passed in last 24h.
+- Billing threshold: confirm no outstanding egress/billing alarms related to target pools.
+- Alerting baseline snapshot: export alert rates for last 2 hours (Prometheus query example below).
+
+Prometheus (examples):
+- Allocation success rate by pool: 
+  sum(rate(gpu_allocator_alloc_success_total[5m])) / (sum(rate(gpu_allocator_alloc_success_total[5m])) + sum(rate(gpu_allocator_alloc_fail_total[5m])))
+- Scheduling latency p95: histogram_quantile(0.95, sum(rate(gpu_allocator_schedule_latency_seconds_bucket[5m])) by (le, pool))
+
+Safety gates (must pass to proceed):
+- Canary allocation success rate >= 99.5% and p95 latency <= 12s for 60m after canary deploy.
+- No new eviction spikes: evictions per-minute for canary cluster <= baseline * 1.2.
+- Operational owners sign-off in Slack #infra-gpu-safety with the canary job link.
+
+Deterministic sweep plan (high level):
+1. Prepare manifest: update allocator config in gitops repo (terraform/helm chart). Include a timestamped sweep-id (sweep-2025-02-01-<team>-<id>).
+2. Dry-run terraform/helm: terraform plan and helm template in a throwaway namespace. Check diffs and run the config validator (scripts/validate-allocator-config.py).
+3. Canary deploy: one AZ in region-us-west1 / 5% of fleet. Observe for 60-90 minutes.
+4. Gradual sweep: increase to 25% then 60% then 100% following a 2x observation cadence (e.g., 60 -> 120 -> 240 min).
+5. Post-sweep audit: run drift detection, export logs and attach to the sweep ticket.
+
+Step-by-step procedure:
+- Step 0: Open a change request ticket in the Infra CHANGES board and link to the sweep manifest. Include expected downtime (should be zero), risk category, rollback plan, and primary/secondary owners.
+
+- Step 1: Create sweep-id and branch
+  - git checkout -b sweep/allocator/sweep-<sweep-id>
+  - Update values: allocator.eviction_score_weight and preempter.revive_delay_seconds only if approved by allocator owner.
+
+- Step 2: Run CI static checks and unit tests\  - make ci-fast\  - buildkite will run: gpu-allocator-unit, preempter-lint, and config-lint pipelines.
+
+- Step 3: Dry-run and validation\  - terraform plan -var-file=secrets.tfvars -out plan.out\  - steward validate-config --file=helm-values.yaml --policy=allocator-safety.yaml\  - If validation fails, abort and assign to owner.
+
+- Step 4: Canary deploy (us-west1-a)\  - kubectl apply -f canary-helm-values.yaml -n infra-canary\  - Wait for pods: kubectl rollout status deploy/gpu-allocator -n infra-canary --timeout=10m\  - Observe metrics and traces:\    - PromQL queries from preflight.\    - Traces: Jaeger lookups for request id sample during canary.\    - Logs: kubectl logs -n infra-canary deploy/gpu-allocator --since=30m | grep -E \"ERROR|WARN|evict\"\  - Run tenant smoke tests: ./tools/tenant-smoke.sh --pool infra-canary --tokens 100
+
+- Step 5: Expand sweep windows\  - If canary passes gates after 60m, promote to 25% of fleet (apply helm with region selectors). Monitor for 120m.\  - If 25% passes, promote to 60% with 240m observation.\  - After 60% stable, promote to 100% with continuous monitoring for 6 hours.
+
+Rollback criteria (any triggers cause immediate rollback):
+- Allocation success rate drops below 98.0% for the entire fleet for 10m.
+- Scheduling p95 > 60s sustained for 5m and correlated with allocator changes.
+- Eviction count spike > baseline * 2 for any tenant for 10m.
+- Any customer-reported severity >= 2 issues that trace to allocator changes.
+
+Rollback steps:
+1. Set change state to ROLLBACK in the sweep ticket and notify #infra-ops and oncall.
+2. Rollback via gitops: git revert <sweep commit> && git push && trigger flux/argocd sync for affected namespaces.
+3. Scale up warm-pool: kubectl scale sts warm-pool --replicas=<previous-size> -n infra
+4. If the preempter binary was changed, revert the image tag in the deployment: kubectl set image deploy/preempter preempter=registry.redwood-infra/preempter:<old-tag> -n infra
+5. Observe metrics for 30 minutes; if stable, close rollback with a post-incident ticket.
+
+Operational checks during sweep (dashboard checklist):
+| Check | Query / Command | Threshold |
+|------|------------------|-----------|
+| Allocation success rate (fleet) | prom query (see preflight) | >= 99.0% |
+| Scheduling p95 (critical pools) | histogram_quantile(0.95, ...) | <= 60s |
+| Eviction rate (per tenant) | rate(gpu_node_evictions_total[5m]) | <= baseline*1.5 |
+| Node readiness churn | kubectl get nodes -l gpu=true | < 2 nodes/flap in 10m |
+| CI status | buildkite pipeline | green |
+
+Post-sweep audit and artifacts to attach:
+- Terraform plan.out, helm diffs, and the sweep manifest.
+- Prometheus screenshots (allocation success, p95, evictions) for each sweep step.
+- Jaeger sample traces for any increased latency spans.
+- Logs from preempter and gpu-allocator for the canary window.
+- Signed-off checklist from reviewers.
+
+Automation and CI integration notes:
+- Use buildkite job gpu-allocator-sweep that takes sweep-id and target-percent as params. This job will run plan, validation, and kick ArgoCD sync if gates are met.
+- The job must create a synthetic telemetry tag (sweep_id label) in Prometheus so all metrics during the sweep are filterable. Example: \"sweep_id=\"sweep-2025-02-01-ops-42\"\" in the allocator generator.
+- Terraform must run with -lock-timeout=10m and plan locked to the sweep branch.
+
+Terraform/IaC checklist (must be part of commit):
+- All changes in terraform/ or charts/ must include a CHANGELOG entry.
+- Use the module gpu-allocator::policy with schema version bump when changing eviction weights.
+- Run terraform validate and gosec scan.
+
+Ownership and escalation:
+- Primary owner: @aisha.patel (allocator team)
+- Secondary owner: @diego.ramos (gpu-fleet)
+- Pager duty: infra-gpu oncall (see team rota)
+- If customer impact is detected, follow the incident process and engage customer-success for communications.
+
+Postmortem and continuous improvement:
+- For any rollback or user-visible incident, open a postmortem in the CHANGES board. Include timeline, metric deltas, root cause analysis, and a remediation plan.
+- Update this runbook with lessons learned, and add new validation scripts to tools/ when gaps are found.
+
+Appendix: Example helm snippet to add sweep label
+```yaml
+allocator:
+  env:
+    - name: SWEEP_ID
+      value: "sweep-2025-02-01-ops-42"
+  podAnnotations:
+    telemetry.redwood.com/sweep_id: "sweep-2025-02-01-ops-42"
+```
+
+Example kubectl and argocd commands:
+- Trigger argocd: argocd app sync gpu-allocator --prune --timeout 600s
+- Force image rollback: kubectl set image deploy/gpu-allocator gpu-allocator=registry.redwood-infra/gpu-allocator:<old-tag> -n infra
+
+Contact and links:
+- Infra runbooks index: /confluence/eng-infra/runbooks/index
+- GPU allocator repo: git@github.com:redwood-inference/gpu-allocator
+- CI pipelines: buildkite.com/redwood/gpu-allocator
+- Oncall rota and pager details: /confluence/people-ops/oncall-rota
+
+Notes and rationale:
+This deterministic sweep design reduces blast radius by enforcing strict canary gates, time-bound observation windows, and automated telemetry tagging to simplify post-sweep analysis. It balances velocity for infra teams with measurable safety margins for customers.
+

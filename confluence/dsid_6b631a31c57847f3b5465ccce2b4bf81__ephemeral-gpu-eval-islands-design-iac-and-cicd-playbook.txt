@@ -1,0 +1,158 @@
+Ephemeral GPU Eval Islands: design, IaC modules, and CI/CD playbook
+
+Summary:
+This document defines the architecture, Terraform/IaC modules, CI/CD pipeline, networking constraints, and runbook for 'Ephemeral GPU Eval Islands' — short-lived, tenant-isolated GPU environments used to run reproducible model evaluation workloads (unit/regression evals, parameter sweeps, deterministic bench runs). The goal is to provide fast, cost-controlled, auditable eval capacity that integrates with existing Redwood eval harnesses while minimizing blast radius for networking and billing.
+
+Why we built this
+- Problem: Long-running shared evaluation pools create noisy neighbor interference, expensive idle time, and make reproducibility and billing attribution difficult.
+- Objective: provide disposable per-eval or per-PR GPU environments that are:
+  - Reproducible (identical runtime bundles & artifacts)
+  - Isolated (network & IAM fences)
+  - Cost-conscious (auto-terminate, reservation-aware)
+  - Auditable (logging, provenance, artifact signing)
+
+High-level architecture
+1) Control plane (hosted): a lightweight coordinator service (eval-island-controller) running in the Redwood control account that accepts requests from CI jobs and schedules an island creation workflow.
+2) IaC templates: Terraform modules that create a tenant-unique VPC slice, ephemeral node group (GPUs), access bastion, and ephemeral credentials.
+3) Image and runtime: OCI runtime bundle (immutable image with pinned wheels, kernel settings, CUDA/cuDNN versions) stored in internal registry and referenced via digest.
+4) CI/CD: GitHub Actions / Buildkite pipeline step that invokes controller and runs eval harness inside the island; artifacts pushed back to the canonical artifact store.
+5) Observability & security: ephemeral audit logs forwarded to central logging (retention policy), egress restrictions, and short-lived KMS-wrapped keys for credentialing.
+
+Diagram (text)
+- Developer PR -> CI step (create-island) -> eval-island-controller -> Terraform module (ephemeral-island) -> Cloud provider creates VPC, GPU nodes, bastion -> CI uploads artifact -> eval runs -> artifacts to blobstore, logs to central logging -> controller tears down island or marks for retain-on-failure.
+
+SLOs and constraints
+- Provisioning latency: median 180s, P95 < 420s.
+- Eval run time: target <= 2 hours for CI jobs; > 2 hours require explicit approval.
+- Auto-termination: islands auto-delete after 4 hours of idle time or 6 hours after provision, whichever comes first (configurable per pipeline).
+- Cost threshold: alert on per-island cost > $50/hour (burst policy).
+
+Ownership and contact
+- Owner: Infrastructure - CI/CD & GPU Platform
+- Primary oncall for provisioning failures: eng-infra oncall rotation
+- Maintainers: Aisha Patel (author), Miguel Torres (networking), Samira Khan (ci/cd)
+
+Terraform / IaC module design
+- Module name: redwood_ephemeral_gpu_island
+- Inputs (selected):
+  - tenant_id (string): CI job or PR identifier
+  - image_digest (string): pinned OCI digest for runtime bundle
+  - gpu_type (string): optional, default p4d.24xlarge (or cloud equivalent)
+  - desired_count (number): default 1
+  - auto_terminate_minutes (number): default 240
+  - egress_whitelist (list): CIDR/IPs allowed for outbound from island
+  - extra_tags (map): billing tags (team, repo, pr)
+- Outputs (selected):
+  - bastion_ssh (string): bastion endpoint
+  - kubeconfig_uri (string): short-lived kubeconfig or connection string
+  - terraform_state_id (string): state pointer for tear-down
+
+Module contract (requirements)
+| Requirement | Rationale | Constraint |
+| --- | --- | --- |
+| Deterministic image | Reproducibility | Must reference OCI digest, not tag |
+| Egress fencing | Prevent data exfiltration | Default deny, explicit whitelist required |
+| Short-lived creds | Least privilege | IAM keys must expire in <= 12 hours |
+
+Example module usage (Terraform pseudo):
+```
+module "eval_island" {
+  source = "git::ssh://git.internal/redwood/infra-modules.git//ephemeral_gpu_island"
+  tenant_id = "pr-1234"
+  image_digest = "sha256:abcd..."
+  gpu_type = "a100-80gb"
+  desired_count = 1
+  egress_whitelist = ["10.234.0.0/16", "199.59.148.0/22"]
+  extra_tags = { team = "eval", repo = "rl-evals", pr = "1234" }
+}
+```
+
+CI/CD integration pattern
+- Pattern name: create-run-teardown
+- Steps (GitHub Actions example):
+  1) Checkout & verify PR metadata.
+  2) Call eval-island-controller API /cli to create island. Controller returns connection info and a short-lived credential.
+  3) Wait for "ready" signal (poll P95 420s).
+  4) Upload eval input artifacts to island artifact staging (S3 path or PVC).
+  5) SSH/remote-exec into bastion and kick off eval harness or trigger Kubernetes Job.
+  6) Stream logs back to CI and central logging.
+  7) On success: push artifacts to canonical artifact store and request island destruction.
+  8) On failure: mark island for retain-for-debug (default 24h) and notify oncall.
+
+GitHub Actions workflow snippet (pseudo):
+```
+- name: Create GPU eval island
+  run: |
+    curl -sSf -X POST $CONTROLLER/create -d '{"tenant":"pr-1234","image":"sha256:abcd...","ttl":240}' | jq . > island.json
+- name: Wait for island ready
+  run: ./scripts/wait_for_island.sh --meta island.json --timeout 600
+- name: Run eval
+  run: ./scripts/remote_eval.sh --island island.json --job config/eval.yaml
+```
+
+Networking and security controls
+- VPC model: islands are created in a dedicated ephemeral VPC peered to control account VPC via short-lived VPC peering or a non-routable proxy endpoint to avoid cross-tenant lateral movement.
+- Subnetting: islands use private-only subnets; bastion placed in a tightly controlled management subnet with explicit security-group rules.
+- Egress: default DENY. Allowlist must be supplied by pipeline (CIDR, service endpoints). Allowlisted targets must be on the approved-service registry (artifact store, container registry, telemetry endpoints).
+- IAM: controller issues short-lived role-assumption tokens (STS) that grant minimal access (launch, tag, describe, destroy). No long-lived SSH keys.
+- KMS: per-island ephemeral data keys encrypted with a tenant-scoped KMS key; key usage is audited and rotated per run.
+
+Observability and artifact provenance
+- Logging: island control plane and node logs forwarded to central logging with "island_id" tag. Logs are retained per compliance policy (30 days default for eval).
+- Metrics published: provisioning_time_seconds, island_active_seconds, gpu_utilization_percent, artifact_upload_seconds, cost_estimate_usd.
+- Provenance: each artifact saved must include a provenance.json with fields: image_digest, terraform_state_id, pipeline_sha, git_ref, requester, created_at. Signed by CI job private key and verified on later replay.
+
+Runbook: common failure modes and run steps
+1) Provisioning stuck > 10 minutes in "creating"
+  - Check controller logs (controller service).
+  - Check cloud provider quota errors (vCPU/GPU limits). If quota hit, escalate to eng-infra SRE.
+  - Temporary mitigation: switch to alternative GPU family (configurable fallback) or run on shared eval pool.
+2) Island boots but nodes not joining (kube/k8s not Ready)
+  - SSH into bastion, run diagnostics: `systemctl status redwood-runtime`, `docker ps -a`, `dmesg`.
+  - Check image digest availability in registry.
+  - If kernel driver mismatch (NVIDIA driver issue), mark island for teardown and file a driver-canary ticket.
+3) Egress blocked for artifact uploads
+  - Verify allowed endpoints in island terraform state.
+  - If missing, abort job and request temporary allowlist; do not add wide-open egress rules.
+4) Cost spike alert (> $50/hr)
+  - Controller triggers auto-snapshot and pauses assigned workloads. Oncall evaluates if run is legitimate; if not, terminate island and file cost incident.
+5) Post-failure teardown not completing
+  - Use state pointer to run a forced destroy via controller: `controller destroy --state-id ...`. If cloud API 5xx, file incident and mark resources for manual reclamation.
+
+Operational considerations and best practices
+- Use small, reproducible eval datasets within islands — large dataset transfer is expensive; prefer pre-seeded artifact staging in the trusted artifact store.
+- Prefer model sharding and distributed eval only when necessary — distributed jobs increase networking complexity and failure risk.
+- Enforce artifact provenance signing for any artifact that will be used in regression comparisons.
+- Maintain a curated fallback image list that controller can use when the primary image digest is failing or unavailable.
+
+Cost control knobs
+- Auto-terminate idle islands (configurable TTL).
+- Reservation-aware scheduling: prefer spot/discounted capacity for non-blocking evals; require approval for on-demand.
+- Per-team spend caps enforced in controller with soft/ hard limits.
+
+Testing and rollout plan
+1) Alpha: internal infra team, synthetic evals, limited to dev account (2 weeks)
+2) Beta: select ML teams, expand GPU families and add spot fallback (6 weeks)
+3) GA: self-serve for all teams, integrate billing tags and QBR reports (quarterly)
+
+Appendix: quick checklists
+- Preflight checklist for a CI job:
+  - [ ] image_digest set to trusted digest
+  - [ ] egress_whitelist minimal and validated
+  - [ ] ttl configured and within org limits
+  - [ ] billing tags present (team, repo, pr)
+
+- Post-mortem checklist for failed island:
+  - [ ] collect controller logs and island logs (store under artifacts/pr-1234/fail-debug/)
+  - [ ] attach provenance.json for all produced artifacts
+  - [ ] run cost reconciliation and update cost incident if > $50/hr
+
+Notes and links
+- See related: ephemeral gpu pools for ci and eval runs (internal): /confluence/eng-infra/ci-cd-and-build/ephemeral-gpu-pools-for-ci-and-eval-runs.json
+- Terraform module source: git::ssh://git.internal/redwood/infra-modules.git//ephemeral_gpu_island (internal)
+- Contact: infra-gpu-platform@redwood.internal for onboarding and quota requests
+
+Change history:
+- 2025-06-15: Draft created by Aisha Patel
+- 2025-07-10: Added cost controls and egress model (review Miguel)
+- 2025-09-02: Production rollout notes and SLO revisions (Samira)

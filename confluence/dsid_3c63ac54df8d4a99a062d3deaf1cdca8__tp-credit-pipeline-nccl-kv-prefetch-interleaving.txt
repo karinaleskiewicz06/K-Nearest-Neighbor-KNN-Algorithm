@@ -1,0 +1,157 @@
+TP Credit Pipeline: NCCL Pipelining + KV Prefetch Crediting + Interleaved Kernel Launches
+
+h1. Overview
+This page describes Redwood Inference’s credit-based tensor-parallel (TP) scheduling system that improves overlap between NCCL communication and compute by introducing a lightweight flow-control primitive (“credits”). Credits are also integrated with KV-cache prefetch so that expensive host-side prefetch work yields when collective pressure is high, reducing host stalls and tail latency.
+
+This document supersedes the implementation notes originally captured in PR-51402. The core design remains the same, but the rollout state, knobs, and a few implementation details have been updated since the initial merge.
+
+h1. Motivation
+Multi-GPU TP workloads can experience intermittent host-side stalls when:
+* KV-cache prefetch threads (host work + DMA staging) contend with NCCL launch/hostbuffer management.
+* Large collectives and large prefetch bursts serialize kernel launches on the host.
+* A small number of long-sequence requests create head-of-line blocking for mixed traffic.
+
+Prior scheduling overlapped comm/compute but lacked backpressure. Credits provide that backpressure while enabling controlled interleaving of smaller compute kernels.
+
+h1. Key Concepts
+h2. Credits
+A credit represents permission to have an “in-flight collective window” for a TP group. Launch paths consume credits; completion returns them.
+* Credits are scoped per TP group.
+* Credits are intentionally lightweight to avoid host contention.
+* Credit starvation should result in bounded waiting (no host OOM / runaway buffering).
+
+h2. KV Prefetch Crediting
+KV prefetch requests must acquire credit (or yield) when the system is under collective pressure. This prevents prefetch bursts from amplifying host stalls.
+
+h2. Interleaved Kernel Launches
+When credits permit, the runtime can issue smaller micro-kernel launches (sub-chunked GEMM/attention components) to increase comm/compute overlap and reduce serialization.
+
+h1. Architecture
+h2. Components
+1) TP Credit Allocator
+* Maintains a pool of credits per TP group.
+* Tracks outstanding collective windows.
+* Exposes fast-path APIs for launch threads.
+
+2) NCCL Launcher Integration
+* Collectives consume credits on launch and return them on completion.
+* Hostbuffer metadata includes a credit token so downstream host work can attribute pressure correctly.
+
+3) KV Prefetcher Integration
+* Prefetch uses a try-acquire pattern.
+* On low credit availability, prefetch yields and returns a suggested backoff.
+
+4) Kernel Interleaver
+* Schedules smaller compute chunks when credits are available.
+* Uses conservative defaults to avoid regressions on low-bandwidth topologies.
+
+h2. Token / ABA Safety (Updated)
+The original implementation used a 32-bit composed token (credit_id:epoch) to avoid ABA when reusing small credit ids.
+Update since initial merge:
+* The token is now treated as a 64-bit logical identifier internally (still compact on the wire where possible) to reduce the probability of epoch wrap under long-lived high-QPS services.
+* The debug endpoint presents both the short id and the full token for correlation.
+
+h1. Configuration
+h2. Feature Flag (Updated)
+The credit pipeline is controlled by an environment flag:
+* REDWOOD_TP_CREDIT_PIPELINE
+
+Rollout status (as of 2026-03-12):
+* Hosted clusters: default ON for A100/H100 NVLink tiers.
+* Hosted ethernet tiers: default ON with conservative autotune caps.
+* Dedicated clusters: default OFF unless explicitly enabled by the deployment owner.
+
+h2. Primary Knobs
+The system supports explicit overrides (prefer per-route or per-model configuration when possible):
+
+| Knob | Type | Default | Notes |
+|---|---|---|---|
+| tp.credit_pipeline.enabled | bool | derived from REDWOOD_TP_CREDIT_PIPELINE | Hard gate for all credit behavior |
+| tp.credit_pipeline.max_credits | int | autotune | Upper bound for in-flight collective windows |
+| tp.credit_pipeline.min_credits | int | 1 | Safety floor |
+| tp.credit_pipeline.prefetch_yield_ms | int | 2 | Suggested backoff when prefetch yields |
+| tp.interleaver.enabled | bool | true when credit pipeline enabled | Can be disabled independently for debugging |
+| tp.interleaver.chunk_bytes | int | autotune | Chunk size for micro-kernel splitting |
+
+h2. Autotune Heuristics (Expanded)
+Autotune selects initial values based on:
+* Topology tier (NVLink vs. PCIe vs. ethernet)
+* TP degree
+* Model shape hints (hidden size, head count, typical batch)
+* Historical bandwidth/latency telemetry (when available)
+
+Update since initial merge:
+* Autotune now clamps credits more aggressively on ethernet tiers with known CPU launch bottlenecks.
+* A small adaptive adjustment can be enabled to nudge credits within a bounded range based on recent tp.credit_waits rates (disabled by default for Dedicated; enabled for Hosted canaries).
+
+h1. Observability
+h2. Metrics
+The following metrics are emitted:
+* tp.credit_grants
+* tp.credit_waits
+* tp.prefetch_yields
+* tp.interleaver.splits
+* tp.interleaver.queue_depth
+
+Operational guidance:
+* Rising tp.credit_waits with stable throughput can be normal under heavy load.
+* Rising tp.credit_waits + rising token latency suggests under-provisioned credits or a topology mismatch.
+* Rising tp.prefetch_yields during long-seq bursts is expected and preferable to host stalls.
+
+h2. Tracing
+Tracing tags are attached to correlate stalls with credit starvation:
+* tp_credit_token
+* tp_credit_wait_reason
+* tp_prefetch_deferred
+
+h2. Debug Endpoints (Updated)
+Available when runtime debug endpoints are enabled:
+* /_debug/tp/credits  (snapshot of credit pool + per-GPU summary)
+* /_debug/tp/credit_metrics (recent wait/yield counters)
+
+Update since initial merge:
+* /_debug/tp/credit_state now includes interleaver queue depth and the current autotune-selected parameters to simplify canary comparisons.
+
+h1. Performance Notes
+Representative results observed during rollout (median of 10 runs; numbers vary by model and topology):
+* 8xA100 NVLink TP transformer-20b: throughput +10–13%, 95th token latency -15–20% under mixed short/long sequences.
+* 4xA40 ethernet TP 7b streaming workloads: throughput +6–10%, p99 token latency -10–16% after conservative autotune caps.
+* Pathological large KV prefetch bursts: host stalls reduced from hundreds of ms to typically <50ms via prefetch backpressure.
+
+Known trade-offs:
+* Very small collectives can see slightly higher launch latency if credits are set too low.
+* Over-aggressive interleaving can increase kernel launch overhead; use autotune defaults unless profiling indicates otherwise.
+
+h1. Operational Runbook (Quick)
+1) Confirm the feature is enabled
+* Check REDWOOD_TP_CREDIT_PIPELINE and runtime config dumps.
+
+2) Check for regressions
+* Compare tp.credit_waits, tp.prefetch_yields, and token latency before/after enabling.
+* If p99 latency increases, temporarily disable tp.interleaver.enabled first to isolate effects.
+
+3) Triage common symptoms
+* High tp.credit_waits + low GPU utilization: increase tp.credit_pipeline.max_credits modestly (or verify topology classification).
+* High tp.prefetch_yields + slow warmup: consider raising prefetch concurrency only if host headroom exists; do not disable yielding as a first step.
+* Burst-related tail spikes: verify interleaver chunk_bytes isn’t set too large for the workload.
+
+4) Disable safely if needed
+* Set REDWOOD_TP_CREDIT_PIPELINE=0 (or tp.credit_pipeline.enabled=false) and redeploy.
+* Capture /_debug/tp/credits and a short trace segment for follow-up.
+
+h1. Implementation References
+Primary code areas (names may differ by branch):
+* runtime/tp/credit_allocator.*
+* runtime/tp/nccl_launcher.*
+* runtime/tp/kernel_interleaver.*
+* runtime/kv/kv_prefetcher.*
+* runtime/metrics/tp_metrics.*
+
+h1. Known Limitations and Follow-ups
+* Autotune remains conservative on some high-bandwidth topologies; further dynamic adaptation is planned behind an additional safety gate.
+* Under extreme heterogeneous mixes, allocator fairness can be improved (investigating a small priority queue for tiny collectives).
+
+h1. Changelog
+* 2026-02-25: Initial merge (credit-based NCCL pipelining + KV prefetch crediting + interleaver) behind REDWOOD_TP_CREDIT_PIPELINE.
+* 2026-03-05: Default enabled for Hosted NVLink tiers after canary validation.
+* 2026-03-12: Debug endpoint /_debug/tp/credit_state added; token handling hardened to reduce epoch wrap risk; autotune clamps updated for ethernet tiers.

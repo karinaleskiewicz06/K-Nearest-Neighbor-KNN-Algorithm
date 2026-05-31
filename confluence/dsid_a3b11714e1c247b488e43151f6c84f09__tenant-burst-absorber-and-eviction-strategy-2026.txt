@@ -1,0 +1,151 @@
+Tenant burst absorber and eviction strategy
+
+Summary
+-------
+This operational playbook documents a repeatable, low-risk pattern for absorbing short-duration tenant bursts in private (VPC / on-prem) deployments and executing targeted eviction when necessary. The goal is to preserve global SLOs (p90 latency <= 120ms, error rate <= 0.5%) while minimizing user-visible degradation and preserving tenant isolation guarantees.
+
+Scope
+-----
+- Applies to Redwood Private control-plane + runtime deployments running the inference node pool with KV cache and model hot-swap support.
+- Focused on short-to-medium bursts (minutes to hours) and chronic elevated load patterns. Not intended for total datacenter outages or hardware failures—see separate disaster/runbooks.
+
+Assumptions and prerequisites
+-----------------------------
+- Observability: per-tenant metrics ingested into telemetry pipeline (token_rps, tokens_per_second, active_sessions, cache_hit_ratio, queue_length, latencies p50/p90/p99, gpu_utilization).
+- Rate-limiter and quota enforcement via tenant admission controller.
+- Operator role with access to operator CLI and limited control-plane APIs.
+- Runbook-tested canary and rollback automation available in the operator toolkit.
+
+Key concepts and rationale
+-------------------------
+1) Burst absorber: a time-limited buffer layer and soft-throttles that let transient spikes be absorbed without immediate full eviction of tenant work. This is implemented by:
+   - short-lived queuing (max queue time 60s)
+   - adaptive batch size reduction to prioritize latency-sensitive requests
+   - temporary credit-based bump for tenants with stable historical behavior
+2) Eviction: a last-resort, surgical eviction of tenant runtime working set (KV entries, prefetched model shards) to reclaim memory/GPU cache. Eviction targets cached artifacts and not persistent customer data.
+3) Safety gates: any eviction action requires crossing multiple thresholds and a human-confirmable breakglass when impact > predefined blast radius.
+
+SLOs and thresholds (recommended defaults)
+-----------------------------------------
+- Global latency SLO: p90 <= 120ms, p99 <= 450ms.
+- Soft-throttle trigger: queue_length > 1500 OR aggregate_token_rps > (cluster_capacity_tokens_per_sec * 0.75) for 30s.
+- Eviction trigger (candidate): sustained cache_memory_pressure > 85% for 2 minutes AND p90 latency degradation > 25% relative to baseline for 3 minutes.
+- Eviction hard failover (auto): cache_memory_pressure > 95% for 30s and OOM risk predicted by model.
+
+Operational controls and runbook steps
+------------------------------------
+1) Detection and classification (automated)
+   - Alert: Burst-Absorber-Triggered when soft-throttle trigger fires. Pager to oncall.
+   - Automated classifier tags tenant as: transient_spike / sustained_burst / malformed_traffic.
+   - Gather: recent 15m of per-tenant metrics + traffic sample (first 200 requests), include prompt size distribution.
+
+2) Immediate absorber measures (automated; no human approval)
+   - Apply per-tenant soft-throttle (token rate reduction by up to 40%) for 60s.
+   - Reduce worker batch_size for the tenant path to min_batch_size for 45s.
+   - Increase admission controller queue depth cap for tenant by +10% for 30s to allow inflight completion.
+   - Begin pre-warm of eviction candidate buckets (mark coldable cache entries).
+
+3) Operator validation (human in loop, 5–10 minutes)
+   - Operator CLI: run `rdoctl observe tenant <tenant-id> burst --window 15m` to surface impact graph and candidate eviction keys.
+   - Validate classifier: confirm whether traffic looks legitimate (payment webhook retries, scheduled job, or bot).
+   - If classified as malformed: apply immediate tighter throttle and block offending tokens.
+
+4) Eviction decision matrix (if absorber measures insufficient)
+   - Condition A (surgical eviction): per-tenant cache_pressure > 90% and the tenant’s recent cache_hit_ratio < 0.2 for 5 minutes -> evict cold-prefetch segments and low-ranked KV keys.
+   - Condition B (partial tenant eviction): tenant contributes > 20% of cluster_token_rps and cluster memory pressure > 88% -> evict tenant working set after human signoff.
+   - Condition C (automated fallback): cluster wide memory > 95% and OOM risk > 70% -> automated eviction of least-recently-used tenant cache segments with audit entry and immediate notif to oncall.
+
+Eviction procedure (surgical)
+----------------------------
+1) Pre-eviction: snapshot and audit
+   - Create snapshot: `rdoctl snapshot cache --tenant <tenant-id> --reason burst-evict-YYYYMMDDHHMM`
+   - Record evidence bundle (metrics, sample requests, owner contacts).
+2) Execute eviction (operator-guided)
+   - Run dry-run to list candidate keys: `rdoctl cache list-cold --tenant <tenant-id> --limit 500`
+   - Evict low-ranking keys in small batches (50 keys per step) with 30s delay between batches. Example command: 
+```
+rdoctl cache evict --tenant <tenant-id> --keys-from dryrun-output.json --batch-size 50 --delay 30s --annotate "burst-evict"
+```
+3) Monitor
+   - Watch p50/p90 latencies, cache_hit_ratio, and token success rate. If p90 improves within 3 minutes, continue next batch. If p90 worsens by > 20% roll back last batch.
+4) Rollback path
+   - If eviction causes unacceptable regression, run `rdoctl cache restore --snapshot <snapshot-id> --tenant <tenant-id> --fastpath` and escalate.
+
+Configuration table (operator-editable params)
+-------------------------------------------
+Parameter | Default | Purpose
+--- | ---: | ---
+soft_throttle_window | "60s" | Duration to apply soft throttle on detection
+soft_throttle_max_reduction | "40%" | Max percent reduction of token rate for soft throttle
+eviction_batch_size | "50" | Number of cache keys evicted per step in surgical eviction
+eviction_cooldown | "30s" | Delay between eviction batches
+cache_memory_pressure_warn | "85%" | Begin human-review when exceeded
+cache_memory_pressure_critical | "95%" | Trigger automated fallback eviction
+absorber_queue_cap | "+10%" | Temporary queue depth increase for transient absorption
+max_auto_eviction_blast_radius | "5%" | Max percentage of tenant working set allowed to be auto-evicted without human approval
+
+Example operator-ready YAML (for runtime config)
+------------------------------------------------
+```yaml
+burst_absorber:
+  enabled: true
+  soft_throttle:
+    window: 60s
+    max_reduction_pct: 40
+  absorber_queue_increase_pct: 10
+  min_batch_size: 8
+eviction:
+  enabled: true
+  batch_size: 50
+  cooldown: 30s
+  memory_pressure_warn_pct: 85
+  memory_pressure_critical_pct: 95
+  auto_eviction_blast_radius_pct: 5
+```
+
+Telemetry and evidence collection checklist
+-----------------------------------------
+- Ensure per-tenant metrics have 10s granularity for the duration of bursts.
+- Capture 200-sample request body/headers (redact PII) when classifier marks traffic malformed.
+- Maintain audit trail for every eviction action (who, why, snapshot id, keys evicted).
+
+Post-incident analysis and follow-up actions
+-------------------------------------------
+1) Postmortem: Required when any eviction affects > 2% of a tenant working set or when rollback is performed.
+2) Blameless root cause analysis with owners assigned for: system tuning, customer communication, and QOL changes.
+3) Suggested mitigations after repeated bursts:
+   - Propose tenant-specific rate-limit increase request workflow for high-throughput customers.
+   - Add tenant-specific pre-warm job to prefetch keysets for scheduled heavy jobs.
+   - Consider upgrading dedicated pools or recommending Dedicated plan if sustained load recurring.
+
+Acceptance tests and canary validation
+------------------------------------
+- Synthetic workload generator: run 10x expected token RPS for 10 minutes against canary cluster and assert: no auto-eviction without crossing critical thresholds; absorber soft throttles fire and rollback passes.
+- Regression test: run eviction dry-run and verify last-10m of snapshot restore in a staging environment within 3 minutes.
+
+Operator cheat sheet (quick commands)
+-----------------------------------
+- Observe tenant burst: `rdoctl observe tenant <tenant-id> burst --window 15m`
+- Dry-run eviction list: `rdoctl cache list-cold --tenant <tenant-id> --limit 500`
+- Start surgical eviction (operator): `rdoctl cache evict --tenant <tenant-id> --keys-from dryrun.json --batch-size 50 --delay 30s`
+- Restore snapshot: `rdoctl cache restore --snapshot <snapshot-id> --tenant <tenant-id> --fastpath`
+
+Owner and escalation
+--------------------
+- Primary owner: eng-private-deployments oncall (team: engineering).
+- Secondary: runtime-SRE (team: eng-sre).
+- Customer communication: customer-success for customer-impacting actions.
+- Security: involve security team if samples include unexpected sensitive data.
+
+Risks and trade-offs
+--------------------
+- Evicting cache reduces immediate memory pressure but may increase downstream request latency as cold entries are rehydrated. We prefer small-step evictions and short cooldowns.
+- Auto-eviction must have conservative blast-radius; overaggressive automation risks customer-impacting behavior.
+
+Appendix: decision log and history
+--------------------------------
+- 2025-11-12: Initial absorber concept prototyped for hosted API.
+- 2026-01-10: This document created and trialed against two private-customer incidents.
+- 2026-03-22: Thresholds tuned after postmortem for tenant A; reduced auto_eviction_blast_radius from 10% to 5%.
+
+Contact: Aisha Patel (aisha@redwood.com) — for clarifications and runbook drills.

@@ -1,0 +1,271 @@
+ADR-0127: SLO breach evaluation strategy for rollout auto-actions (burn-rate, sample gating, debounce/holdoff)
+
+## Status
+Published (effective for Auto-rollback on SLO breach MVP)
+
+## Context
+Redwood’s rollout controller (canary, staged rollouts, and A/B) is being integrated with latency and error-rate SLO monitors to automatically **pause** or **rollback** a rollout when an SLO breach occurs.
+
+A naïve “threshold exceeded -> rollback immediately” implementation causes **oscillation** and **false positives** due to:
+- Natural tail latency variability during small-traffic canary steps.
+- Metric ingestion lag and partial telemetry outages.
+- Transient bursts (GC pauses, noisy neighbors, autoscaler step changes).
+- SLO monitor windowing effects (brief spikes shouldn’t always cause action).
+
+We need a breach evaluation strategy that is:
+- Sensitive to real regressions (fast detection).
+- Robust against noise (avoids flapping/paging storms).
+- Consistent across Hosted, Dedicated, and Private deployments.
+- Auditable and explainable in Console (“why did we rollback?”).
+
+This ADR defines the **burn-rate + dual-window** approach, plus **minimum sample gating** and **debounce/holdoff** to prevent oscillation.
+
+## Decision
+We will trigger rollout auto-actions based on **dual-window burn-rate evaluation** with **minimum sample-size gating**, **staleness checks**, and **debounce/holdoff**.
+
+### Summary of chosen approach
+1) **Signals:** Eligible SLO signals for MVP
+- Error rate (5xx + explicit upstream errors) SLO burn rate.
+- Latency p95 and/or p99 (service-defined) SLO burn rate.
+- Optional saturation signals are allowed but are *not* gating signals in MVP unless the service declares them as part of the SLO definition.
+
+2) **Evaluation windows:** Dual-window confirmation
+- **Fast window:** 5 minutes (detect acute regressions quickly).
+- **Slow window:** 30 minutes (confirm sustained regression / protect against brief spikes).
+
+3) **Burn-rate thresholding:** Service/tier policy controls the burn-rate thresholds for each signal.
+- Default policy uses “fast + slow” burn-rate thresholds rather than raw metric thresholds.
+- For latency, the underlying monitor computes burn rate for the latency SLO objective (e.g., p95 < target).
+- For errors, burn rate is computed for the error budget objective.
+
+4) **Minimum sample-size gating:** Do not trigger auto-actions unless we have sufficient volume.
+- Requires minimum request count in the fast and slow windows.
+- Prevents flapping when canary step is at very low traffic.
+
+5) **Debounce/holdoff:** Prevent repeated actions and rollback loops.
+- Require consecutive evaluations before action (debounce).
+- After an auto-action, impose a holdoff period where we continue to evaluate but do not trigger another auto-action for the same rollout step.
+
+6) **Staleness & missing data behavior:**
+- If the monitor is missing or stale beyond a defined threshold, we **fail-safe by pausing** (not rolling back) when auto-actions are enabled, unless policy explicitly chooses “no action”.
+- We emit explicit “monitor missing/stale” events and metrics.
+
+## Rationale
+This decision optimizes for reducing SLA violations while minimizing false positives and oscillations:
+- Dual-window burn-rate is a proven pattern (fast burn + slow burn) for balancing sensitivity and robustness.
+- Minimum sample gating addresses the most common false positive in canaries: “high burn rate at low volume.”
+- Debounce/holdoff prevents repeated rollback/pause loops during unstable telemetry or during recovery.
+- “Pause on monitor missing/stale” is safer than continuing to advance a rollout blind; “rollback on missing data” is too aggressive and can create churn.
+
+## Detailed specification
+
+### Terminology
+- **SLO**: Objective defining acceptable service behavior (latency and/or errors). 
+- **Error budget**: Allowed “badness” over the SLO period.
+- **Burn rate**: Speed of consuming error budget relative to the SLO period.
+- **Fast/slow windows**: Short and long evaluation windows used together.
+- **Debounce**: Require N consecutive failing evaluations before acting.
+- **Holdoff**: Cooldown period after an auto-action to prevent immediate re-trigger.
+
+### Default evaluation parameters (MVP defaults)
+These defaults are safe and can be overridden by policy templates with guardrails.
+
+| Parameter | Default | Notes |
+|---|---:|---|
+| evaluation_interval | 60s | Controller evaluates once per minute per active rollout step. |
+| fast_window | 5m | Burn-rate window. |
+| slow_window | 30m | Burn-rate window. |
+| fast_burn_threshold | 14.0 | Tier-specific defaults may differ; see SRE SLO definitions page. |
+| slow_burn_threshold | 6.0 | Tier-specific defaults may differ. |
+| min_requests_fast | 300 | Per (route, model_version, region, tier) scope. |
+| min_requests_slow | 1500 | Per scope. |
+| debounce_consecutive_failures | 2 | Requires two consecutive failing evaluations. |
+| action_holdoff_after_pause | 10m | No additional auto-action while in holdoff. |
+| action_holdoff_after_rollback | 20m | Longer holdoff to avoid thrash. |
+| monitor_stale_after | 3m | If monitor data timestamp older than this, treat as stale. |
+| monitor_missing_behavior | pause | Default: pause rollout; do not rollback. |
+
+Notes:
+- Burn-rate thresholds are chosen to catch serious regressions quickly without reacting to short jitter. Exact defaults by customer tier (Self-serve vs Dedicated vs Private) are defined in the SRE page referenced above.
+- Minimum request defaults assume typical production volumes. Low-traffic services should adjust thresholds or disable auto-actions until enough traffic exists.
+
+### Scope of evaluation
+Evaluation must match the exact rollout scope to avoid false attribution:
+- service / route
+- model name + **model version** (candidate vs baseline)
+- region
+- customer tier (self-serve / dedicated / private)
+- rollout_id and step_id (for audit linking)
+
+If the monitor system cannot provide this exact dimensionality, the adapter must:
+- Prefer the closest safe scope that does not mix candidate and baseline traffic.
+- Otherwise report “monitor unsupported for scope” -> treat as missing.
+
+### Decision logic (per signal)
+For each signal (error, latency):
+1) Query monitor provider for:
+- burn_rate_fast, burn_rate_slow
+- request_count_fast, request_count_slow
+- as_of_timestamp (freshness)
+- monitor_id, slo_id
+
+2) Evaluate readiness gates:
+- If as_of_timestamp older than monitor_stale_after: status = STALE
+- If request_count_fast < min_requests_fast OR request_count_slow < min_requests_slow: status = INSUFFICIENT_SAMPLE
+
+3) Evaluate breach:
+- breach = (burn_rate_fast >= fast_burn_threshold) AND (burn_rate_slow >= slow_burn_threshold)
+
+4) Apply debounce:
+- Maintain per (rollout_id, step_id, signal) state of consecutive breach evaluations.
+- Only produce a “BREACH_CONFIRMED” when consecutive breaches >= debounce_consecutive_failures.
+
+### Combined decision logic (across signals)
+MVP policy supports:
+- **Any-of**: if any eligible signal is confirmed breached -> action candidate.
+- **All-of**: optional stricter mode; requires all configured signals to confirm breach.
+
+Default: **Any-of** (safer for catching real incidents quickly).
+
+### Action selection logic
+Action depends on rollout type and policy:
+- Canary / staged rollout:
+  - Default action on confirmed breach: **pause** if still in early steps; **rollback** if at or beyond configured step threshold (e.g., >= 10% traffic) OR if error SLO breaches.
+- A/B:
+  - Default action on confirmed breach: **shift traffic back to baseline** (effectively rollback traffic split), then pause experiment.
+
+Important: this ADR defines *evaluation*; the exact action mapping is controlled by policy and implemented in the rollout controller executor.
+
+### Holdoff behavior
+After an auto-action is executed:
+- Record holdoff_start and holdoff_duration.
+- Continue to evaluate and emit metrics, but **suppress further auto-actions** for that rollout step until holdoff expires.
+- If an operator manually changes rollout state (e.g., resumes), holdoff may be cleared only if policy permits and the manual action is audited.
+
+### Missing / stale monitor behavior
+When auto-actions are enabled and required monitors are missing/stale:
+- Missing or unsupported: emit outcome = MONITOR_MISSING.
+- Stale: emit outcome = MONITOR_STALE.
+- Default behavior: **pause** (not rollback), because we cannot confidently assert improvement or regression.
+
+Rationale:
+- Failing open (do nothing) risks advancing a bad rollout without safety rails.
+- Rolling back on missing data is too disruptive and can cause churn during telemetry issues.
+
+Policy may override to:
+- no_action (explicitly opt out)
+- pause (default)
+
+Rollback-on-missing is disallowed by guardrails in MVP.
+
+## Guardrails and safety bounds
+To prevent unsafe configurations and oscillation, the policy engine will enforce:
+- fast_window must be < slow_window.
+- debounce_consecutive_failures must be 1–5.
+- min_requests thresholds must be non-negative and capped to avoid impossible requirements.
+- holdoff durations must be >= 0 and capped (e.g., max 60m) to avoid indefinitely stuck rollouts.
+- burn-rate thresholds must be within a safe range (e.g., 1.0–100.0) and validated per signal.
+
+If validation fails, auto-actions are disabled for the rollout and an audit event is written with the config error.
+
+## Alternatives considered
+
+### A) Raw metric thresholds (e.g., p99 latency > X ms for Y minutes)
+Pros:
+- Easy to understand.
+- Does not require burn-rate monitors.
+
+Cons:
+- Hard to set safely across services and tiers.
+- Tail latency is workload-dependent; thresholds drift with batching/sequence mix.
+- Does not naturally map to error budget consumption.
+
+Decision: Rejected. Burn-rate is more robust and consistent with SLO practice.
+
+### B) Single-window burn-rate (only 5m or only 30m)
+Pros:
+- Simpler.
+
+Cons:
+- 5m-only is noisy and causes flaps.
+- 30m-only is too slow; can violate SLA before acting.
+
+Decision: Rejected. Dual-window captures both “fast burn” and “sustained burn.”
+
+### C) Immediate action on first confirmed breach (no debounce)
+Pros:
+- Fastest reaction.
+
+Cons:
+- High false positive risk due to monitor jitter, ingestion delays, and transient spikes.
+
+Decision: Rejected. We require consecutive evaluations.
+
+### D) Change-point detection / anomaly detection
+Pros:
+- Potentially more sensitive to regressions without static thresholds.
+
+Cons:
+- Operational complexity; harder to explain/audit.
+- Risk of model drift and tuning burden.
+
+Decision: Deferred. May be revisited after MVP with sufficient historical data.
+
+### E) Compare candidate vs baseline directly (delta-based) rather than SLO burn-rate
+Pros:
+- Detects regressions even when both are within SLO.
+
+Cons:
+- Requires stable traffic split and robust experiment statistics.
+- Can overreact to small deltas at low volume.
+
+Decision: Not in MVP. We may add delta-based “quality of service regression” signals later.
+
+## Consequences
+
+### Positive
+- Lower probability of rollback oscillation and paging storms.
+- More reliable automated mitigation during real regressions.
+- Clear audit narratives: “fast burn >= X and slow burn >= Y for N consecutive evaluations with >= min samples.”
+
+### Negative / trade-offs
+- Potential delayed response if min sample requirements are not met in early canary steps.
+- If monitors are missing/stale, rollouts will pause more often (safe but may slow releases).
+
+## Implementation notes
+- The monitor adapter must expose burn-rate and sample-size data per scope; caching is permitted as long as freshness guarantees are met.
+- Evaluation state (consecutive failures, last action timestamp, holdoff) must be persisted in the rollout controller’s step state store to survive restarts.
+- All outcomes (OK, INSUFFICIENT_SAMPLE, STALE, MISSING, BREACH_PENDING_DEBOUNCE, BREACH_CONFIRMED, ACTION_SUPPRESSED_HOLDOFF) must emit standard metrics and audit events.
+
+## Operational guidance
+- Service teams enabling auto-actions must ensure monitors exist for the required scope and have sufficient traffic for min sample thresholds.
+- On-call should treat “monitor missing/stale -> pause” events as either telemetry issues or rollout config gaps; triage is covered in the auto-rollback runbook.
+
+## Open questions (tracked in design spec / Linear)
+- Per-signal defaults by customer tier (final numbers) and whether Dedicated/Private should use stricter slow-window thresholds.
+- Whether saturation should be eligible as a gating signal for specific services with known failure modes.
+- Whether to allow rollback on missing/stale monitors for narrowly scoped internal services (currently disallowed by guardrails).
+
+## Appendix: Pseudocode (illustrative)
+EvaluateStep(rollout_id, step_id, scope):
+- if now < holdoff_until(step_id): emit ACTION_SUPPRESSED_HOLDOFF; return
+- for signal in configured_signals:
+  - data = query_monitor(signal, scope)
+  - if data.missing: mark signal as MONITOR_MISSING
+  - else if now - data.as_of > monitor_stale_after: mark as MONITOR_STALE
+  - else if data.req_fast < min_fast or data.req_slow < min_slow: mark as INSUFFICIENT_SAMPLE
+  - else if data.br_fast >= thr_fast and data.br_slow >= thr_slow:
+      increment consecutive_failures
+      if consecutive_failures >= debounce_n: mark as BREACH_CONFIRMED
+    else:
+      reset consecutive_failures
+      mark as OK
+- combine signals per any-of / all-of
+- if combined indicates breach_confirmed:
+    execute action per policy (pause/rollback/shift)
+    set holdoff
+    audit event with snapshot refs
+
+---
+Owner: Eng SRE (SLO semantics) + Rollout Controller (implementation)
+Primary contacts: Sean Gallagher, Jada Williams, Jordan Lee

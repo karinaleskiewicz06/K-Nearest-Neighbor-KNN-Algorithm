@@ -1,0 +1,173 @@
+Opportunistic Scheduling and Eviction Contracts — Design & Runbook
+
+Summary
+-------
+This page describes the opportunistic scheduling model and the formal eviction contracts used by the runtime to preserve SLOs while optimizing for cost and throughput. It combines a design overview, scheduling rules, pragmatic implementation details, a profiling checklist, a benchmarking plan, and an on-call runbook for eviction-related incidents.
+
+Goals
+-----
+- Preserve 99th percentile tail-latency SLOs for latency-sensitive routes.
+- Maximize GPU utilization and reduce per-token cost using opportunistic consolidation.
+- Provide deterministic, auditable behavior when eviction occurs (handoff + warm-up).
+- Instrumentation and regression checks to detect adverse quality or latency impacts.
+
+Scope
+-----
+This document applies to: 
+- Multi-tenant inference runtime on heterogeneous GPU pools.
+- Scheduler components that make per-request placement decisions and kernel handoff.
+- Eviction/handoff logic used by the KVCache manager and session lifecycle controller.
+
+Non-goals
+---------
+- Low-level kernel optimization details (covered separately in kernel-and-scheduling docs).
+- Long-term capacity planning (covered in eng-sre/capacity-planning).
+
+High-level design
+-----------------
+1. Priority Bands: requests are classified into 3 bands — latency-critical (band A), economical-high-throughput (band B), and best-effort/background (band C). Classification is a deterministically applied function using request metadata (route, customer tier, model variant, deadline hints).
+
+2. Opportunistic Packing: when GPUs are underutilized, the scheduler will co-locate band B/C work with band A in non-blocking way using: 
+   - kernel slice isolation (time-sliced or slot-based),
+   - soft admission tokens (credit-based) and
+   - KVCache partition isolation to avoid eviction storms.
+
+3. Eviction Contracts: for every placement decision a compact, three-field eviction contract is recorded: 
+   - keep_until (wall-clock or token-count),
+   - restore_cost_budget (estimated extra tokens to rehydrate),
+   - handoff_policy (none | live-migrate | graceful-evict-and-warmup).
+
+4. Handoff & Warmup: for live-migrate or graceful-evict-and-warmup, the scheduler triggers an asynchronous warmup path: prefetch key KVCache prefixes, preload attention cache state where available, and bias routing for a short warming timeframe (configurable).
+
+Design invariants (must hold)
+----------------------------
+- Deterministic fallback: when capacity shifts, the routing policy must produce consistent placement for identical inputs across a 60s window.
+- Observability-first: every eviction must emit an EvictionEvent with unique id, contract fields, pre/post metrics.
+- Cost-clarity: opportunistic packing must never increase the tail latency of Band A routes beyond configured SLO delta (default: +5ms).
+
+Scheduler algorithms (summary)
+----------------------------
+- Primary: slot-based allocator with soft priorities. Each GPU exposes N time-slots per scheduling epoch. Band A gets preemptive access to earliest slots. Band B/C fill remaining slots opportunistically.
+- Secondary: kernel affinity engine selects an execution kernel variant per-slot to maximize occupancy while respecting sequence length breakpoints.
+- Preemption: cooperative preemption used for in-flight lower-priority requests; the runtime supports resumable slices for models that implement slice checkpoints.
+
+Eviction contract lifecycle (sequence)
+------------------------------------
+1. Allocate -> scheduler writes eviction contract in placement store.
+2. Emit EvictionEvent (state: planned).
+3. If eviction requested, scheduler evaluates handoff_policy: 
+   - live-migrate: initiate memory-transport protocol (only available for co-located shards and compatible kernels).
+   - graceful-evict-and-warmup: drain active generation, spawn warmup worker on target GPU.
+   - none: immediate eviction.
+4. Emit EvictionEvent (state: executed) + post-metrics.
+5. When restored, emit EvictionEvent (state: restored).
+
+Configuration table (defaults and recommended ranges)
+-----------------------------------------------------
+| parameter | default | recommended range | notes |
+|-----------|---------|-------------------|-------|
+| scheduling.epoch_ms | 200 | 50-1000 | granularity of slot epochs; lower => finer preemption but more overhead |
+| scheduling.slots_per_gpu | 8 | 4-32 | total logical slots to allocate |
+| eviction.rehydrate_token_budget | 1200 | 200-10000 | estimated tokens allowed to restore a session; used to prioritize restoration |
+| handoff.timeout_ms | 5000 | 1000-30000 | timeout for live-migrate attempts |
+| packing.bandB_util_threshold | 0.45 | 0.2-0.9 | if GPU utilization < threshold, allow bandB opportunistic packing |
+
+Sample eviction contract (YAML)
+-------------------------------
+```yaml
+eviction_contract:
+  id: "ev-20260210-abc123"
+  keep_until: "2026-02-10T15:42:00Z"
+  restore_cost_budget: "1500"
+  handoff_policy: "graceful-evict-and-warmup"
+  owner: "route:chat-stream-v2"
+```
+
+Placement CLI examples
+----------------------
+- Show current eviction contracts for a GPU node: 
+  $ rtmctl node list-evictions --node gpu-34
+
+- Force immediate eviction for contract id: 
+  $ rtmctl eviction force --id ev-20260210-abc123 --reason "maintenance"
+
+Observability and telemetry
+--------------------------
+Every eviction emits the following telemetry fields: 
+- eviction_id, contract.keep_until, contract.rehydrate_budget, handoff_policy, pre_lat_p50/p95/p99, post_lat_p50/p95/p99, tokens_replayed, warmup_duration_ms, decision_reason.
+
+Define alerts (recommended)
+--------------------------
+1. Eviction error rate > 0.5% over 1h for band A routes -> Pager (SEV2).
+2. Warmup duration median > 1000ms for band A -> Pager (SEV3) + ticket.
+3. Post-eviction tail-latency increase > 8ms sustained 15m -> Pager (SEV2).
+
+Profiling and regression checklist
+--------------------------------
+Run the following when tuning packing or deploying new scheduler variants: 
+1. Baseline profile capturing pre/post tail latency using production-shadow traces for 1h (use 10% traffic mirroring).
+2. Instrument KVCache hit/miss per-session and tokens_replayed histogram.
+3. Run synthetic microbursts (10x baseline QPS for 30s) and verify preemption does not increase 99th percentile beyond allowed delta.
+4. Compare kernel occupancy and slot utilization heatmaps across nodes.
+
+Benchmarking plan
+-----------------
+- Bench goal: show cost-per-1000-token reduction and 99th-latency impact for three workload shapes (short-chat, long-completion, embedding-batch).
+- Bench matrix: vary packing.bandB_util_threshold across [0.25, 0.5, 0.75], epoch_ms across [100,200,500], and measure metrics for 4 hours.
+- Success criteria: <= 5% increase in p99 for Band A, >= 10% utilization improvement, and per-token cost decrease >= 8% vs untuned baseline.
+
+Runtime runbook: Eviction spike incident
+---------------------------------------
+1. Detection: alert fires when eviction error rate > configured threshold or post-eviction p99 delta > 8ms.
+2. Initial triage (first 5 minutes): 
+   - Check EvictionEvent stream for correlated ids and decision_reasons.
+   - Identify node(s) with spike: rtmctl node tail-events --since 15m.
+3. Immediate mitigation (if Band A affected): 
+   - Disable opportunistic packing on affected pool: rtmctl config set packing.enabled=false --pool=pool-x
+   - Increase scheduling.slots_per_gpu to reduce preemption frequency: rtmctl config set scheduling.slots_per_gpu=12 --pool=pool-x
+4. If warmup failures observed: 
+   - Check network transport logs for memory-transport errors.
+   - Re-run warmup manually for top 5 sessions: rtmctl warmup replay --session <id> --target-node <node>
+5. Post-incident: 
+   - Run profiling checklist (see above).
+   - Create postmortem with evacuation timeline, root cause, and follow-ups.
+
+Rollout checklist for scheduler changes
+-------------------------------------
+1. Unit tests for slot allocation, eviction contract write/read, and fallthroughs.
+2. Staging performance bench with shadow traffic (target: p99 within 3ms of baseline).
+3. Gradual canary (5% traffic, 30m) with automated rollback if alerts trigger.
+4. Increment to 25%, 50%, 100% with monitoring windows and manual check points.
+
+Ownership and contacts
+----------------------
+- Design + code owners: eng-serving-runtime/scheduler team (primary: Aisha Patel).
+- Observability: eng-platform/dashboards (Evelyn Zhang).
+- Incident escalation: eng-sre oncall.
+
+Appendix A: Example observability query (pseudo-SQL)
+--------------------------------------------------
+SELECT eviction_id, handoff_policy, pre_p99, post_p99, (post_p99 - pre_p99) as delta
+FROM eviction_events
+WHERE route = 'chat-stream-v2' AND ts >= now() - interval '30m'
+ORDER BY delta DESC
+
+Appendix B: Implementation notes and gotchas
+-------------------------------------------
+- Keep contract writes idempotent: when reassigning, mutate in-place rather than append to avoid retention leaks.
+- Coordinating live-migrate requires kernel compatibility matrix; explicit guards prevent attempts across incompatible kernels.
+- Beware of eviction cascades: if bandB warmup floods nodes, fallback to immediate throttling for bandB for 60s.
+
+Related reading
+---------------
+- See runtime-architecture docs on execution contracts and stable fallbacks for broader context.
+- See quantization rollout safety playbook when eviction impacts quality due to model variant changes.
+
+Change log
+----------
+- 2025-09-15: Initial draft.
+- 2026-02-10: Add warmup timeout guidance, CLI examples, and profiling checklist.
+
+Feedback and review
+------------------
+If you have implementation questions or suggestions for metrics, add comments on this page or ping the reviewers listed above.

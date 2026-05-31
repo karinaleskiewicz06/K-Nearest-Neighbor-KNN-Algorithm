@@ -1,0 +1,158 @@
+Platform operator handbook: degraded KV and prefix cache mitigation
+
+Overview
+========
+This runbook describes detection, triage, and mitigation steps when the platform's key-value (KV) cache layer or the prefix-caching proxy exhibits degraded behavior. It focuses on common operational modes for Redwood's inference platform: hosted API traffic, dedicated pools, and private (VPC) deployments. The goal is to restore acceptable latency and cost profiles while minimizing user-visible errors.
+
+Scope
+-----
+- Services in scope: kv-cache-service (primary in-memory LRU store), prefix-cache-proxy (frontend that implements prefix/KV prefix lookups and TTL logic), routing-service (request routing), and inference-gateway (edge).
+- Out of scope: long-term data store corruption, customer-managed on-prem caches (follow customer runbooks).
+
+Owner & stakeholders
+---------------------
+- Primary oncall owner: Platform SRE rotation (pager: platform-sre@redwood.internal).
+- Secondary escalation: Serving Runtime oncall.
+- Product/PM notified for customer-impacting incidents.
+- Reliability lead: Priya Malhotra.
+
+Background & common failure modes
+--------------------------------
+KV and prefix caching are used to reduce per-token cost and latency by avoiding repeated model compute for repeated prefixes and frequently requested context. Common failure modes we see in production:
+1) Eviction storms: sudden drop in hit-rate due to a large influx of unique keys, often after a rollout or synthetic test.
+2) Hotkey amplification: a small set of keys receives huge QPS and causes latency spikes/backpressure in downstream inference pools.
+3) Inconsistent TTL/metadata mismatch between prefix-cache-proxy and backing kv-cache-service after a schema or config rollout.
+4) Memory leaks or GC stalls in a kv-cache shard (manifest as growth in RSS and long pause times).
+5) Network partition / degraded inter-shard communication leading to increased miss rates and retry cascades.
+
+Symptoms & immediate indicators
+--------------------------------
+- Service-level: 95th/99th percentile request latency for inference-gateway increases by >2x baseline.
+- Cache metrics: cache_hit_rate < 70% for >5 minutes (baseline typically 85–95%).
+- Hotkey signals: single-key QPS > 10x median tenant QPS or > 200 req/s sustained; increased tail latency on particular key paths.
+- Resource metrics: kv-cache-service RSS growth > 20% in 5 minutes or GC pause > 200ms.
+- Errors: 5xx from prefix-cache-proxy, increased retry counts in routing-service logs.
+- Alerts: CACHE-HIT-RATE-DEGRADATION (SEV2), KV-MEMORY-GROWTH (SEV2), HOTKEY-LATENCY-SPIKE (SEV1 if customer impact).
+
+Impact matrix (quick decision guide)
+-----------------------------------
+- Tier A (customer-facing errors or broad latency regressions): Activate SEV1. Actions: immediate mitigation, traffic-steering to fallback model variants, page the Serving Runtime oncall.
+- Tier B (elevated latency but errors limited to retries): SEV2. Actions: throttles, targeted evictions, configuration rollbacks.
+- Tier C (single-shard resource issue with isolated tenants): SEV3. Actions: shard restart, node drain.
+
+Runbook: detection and immediate actions
+--------------------------------------
+1) Triage: confirm alert source and scope
+   - Open the incident channel (#incident-platform-kv).
+   - Check Grafana dashboard: "KV Cache — Health & Hotkeys" (dash ID: 8271).
+   - Query metrics (Prometheus):
+     - cache_hit_rate = sum(cache_hits) / sum(cache_requests) by (pool)
+     - kv_rss_bytes and kv_gc_pauses_seconds_count by (instance)
+   - Check logs for repeated errors: 
+     kubectl -n platform logs deployment/prefix-cache-proxy --since=15m | grep "ERR_CACHE" | tail -n 200
+
+2) Short-term mitigations (select according to severity)
+   - Global degraded hit-rate, no memory anomaly: enable conservative routing fallback to bypass prefix-cache-proxy for low-priority tenants. Command: platform-cli routing set-fallback --scope=low --duration=30m --reason="kv-hit-rate-drop"
+   - Hotkey detected: enable per-key throttling and local denylist:
+     - Add offending key to hotkey-denylist via admin API: POST /admin/hotkeys {"key":"<KEY>","action":"throttle","rate":50} 
+     - Apply on both prefix-cache-proxy and routing-service.
+   - Memory leak or GC stalls on one shard: drain the shard and restart process:
+     - kubectl cordon node <node> && kubectl rollout restart statefulset/kv-cache-service -n platform --selector=shard=<shard-id>
+   - TTL mismatch after rollout: temporarily set prefix-cache-proxy config to use legacy TTL mode via the feature-flag service: ffctl set prefix-cache-legacy-ttl true --ttl=30m
+
+3) If latency remains high after short-term mitigation:
+   - Activate traffic steering: move 20–40% of traffic for affected routes to dedicated fallback model (model_id: rwd-small-fallback). Use routing-service API: POST /routing/steer {"routes": ["/v1/generate"], "fraction": 0.3, "target":"rwd-small-fallback"} 
+   - Notify Customer Success for any tenants whose requests were steered.
+
+4) If errors escalate to SEV1 (widespread 5xx or user-visible failures):
+   - Escalate to Serving Runtime and Eng leadership.
+   - Consider global rollback of the most recent deploy affecting prefix-cache-proxy or kv-cache-service. Rollback steps depend on deployment type (blue/green vs canary):
+     - For canary: platform-cli deploy rollback --service=prefix-cache-proxy --to-tag=<previous-sha>
+     - For blue/green: switch traffic to the previous green group in load-balancer (LB control in console).
+
+Operational actions and durable fixes
+-----------------------------------
+- Increase cache capacity on affected pool (temporary): scale statefulset kv-cache-service replicas to handle hotkey traffic spikes: kubectl scale statefulset/kv-cache-service --replicas=<n> -n platform. Use with caution; this increases memory footprint and cost.
+- Apply targeted eviction: via admin API call POST /admin/evict {"prefix":"/user/andy/", "shards": [3,4], "reason":"eviction-during-incident"}
+- Roll forward a hotfix (if required) with config changes to prefix-cache-proxy that limit per-key memory allocation to 8MB and enforce LRU smoothing.
+
+Monitoring, dashboards and alert tuning
+--------------------------------------
+Key dashboards to consult:
+- "KV Cache — Health & Hotkeys" (Grafana 8271): hit-rate, per-key QPS heatmap, per-shard memory, GC duration.
+- "Routing — Cache Fallbacks" (Grafana 8124): fraction of requests bypassing cache, error budget impact.
+- "Platform Overview" (Grafana 8001): top-level latency, errors across services.
+
+Suggested alert thresholds (examples you can tune per pool):
+- CACHE-HIT-RATE-DEGRADATION: if cache_hit_rate < 70% for 5 minutes (SEV2).
+- HOTKEY-LATENCY-SPIKE: if any key 99th pctl latency > 500ms and key QPS > 200 for 2 minutes (SEV1).
+- KV-MEMORY-GROWTH: if rss growth > 25% in 10 minutes or rss > configured_capacity*0.95 (SEV2).
+- PREFIX-TTL-MISMATCH: config_hash(prefix-cache-proxy) != config_hash(kv-cache-service) after deploy (SEV2).
+
+Post-incident: root cause analysis and remediation checklist
+----------------------------------------------------------
+1) Collect artifacts:
+   - Grafana snapshots, Prometheus queries, logs from prefix-cache-proxy and kv-cache-service, deployment history, and feature flag changes.
+2) RCA template (fill within 48 hours):
+   - Title, primary cause, contributing factors, incident timeline, detection gap, mitigation timeline, follow-ups.
+3) Follow-up actions (examples):
+   - Add pre-deploy TTL compatibility check to CI.
+   - Improve per-key throttling algorithm to prefer token-bucket smoothing.
+   - Add an automated canary guard that blocks config rollouts which reduce global hit-rate by >5% in canary window.
+   - Expand observability: per-tenant cache hit-rate and error tagging.
+
+Testing, drills and runbook validation
+------------------------------------
+- Quarterly game-day: run synthetic hotkey tests using loadgen (tool: cache-loadgen v1.3) against a sandbox pool. Verify throttling paths and eviction APIs.
+- Canary test checklist for prefix-cache-proxy changes:
+  1. Deploy to canary pool (2% traffic).
+  2. Run synthetic traffic with representative prefix distribution for 30 minutes.
+  3. Validate cache_hit_rate delta < 3% and no memory regressions.
+  4. Promote on pass, abort and rollback on fail.
+
+Implementation notes & handy references
+-------------------------------------
+- Admin APIs:
+  - POST /admin/hotkeys {key, action, rate}  -- adds or updates hotkey policy
+  - POST /admin/evict {prefix, shards, immediate}
+  - GET /admin/health  -- returns per-shard health and memory metrics
+- Feature flags and config paths:
+  - prefix-cache-legacy-ttl (ffctl)
+  - kv-cache-max-per-key-bytes (service config, default 16MB)
+- CLI snippets:
+  - platform-cli metrics query "sum(cache_requests) by (pool)" --from=15m
+  - platform-cli routing set-fallback --scope=low --duration=30m --reason="kv-hit-rate-drop"
+
+Example emergency sequence (short-form)
+--------------------------------------
+1) Alert: CACHE-HIT-RATE-DEGRADATION triggers.
+2) Triage: confirm hit-rate drop on Grafana 8271, check for recent deploys.
+3) Mitigate: enable routing fallback for low-priority tenants (platform-cli).
+4) If hotkey: add offending key to denylist and throttle (admin API).
+5) If shard memory: cordon + restart shard.
+6) If failure persists: traffic-steer to fallback model and call SEV1.
+7) After stabilization: gather artifacts and open an RCA.
+
+Appendix: quick reference table
+------------------------------
+- Service names: kv-cache-service, prefix-cache-proxy, routing-service, inference-gateway.
+- Dashboards: KV Cache 8271, Routing Cache 8124, Platform Overview 8001.
+- Common CLI tools: platform-cli, ffctl, kubectl.
+- Admin endpoints: /admin/hotkeys, /admin/evict, /admin/health.
+
+Related runbooks and docs
+-------------------------
+- See platform runbook: predictive-scale-and-eviction-playbook (for capacity control).
+- See systems doc: multitenant-workload-slicing-and-queue-demultiplexing (for tenant isolation patterns).
+
+Contact and escalation matrix
+-----------------------------
+- Platform SRE oncall: platform-sre@redwood.internal (primary)
+- Serving Runtime oncall: runtime-oncall@redwood.internal (secondary)
+- Reliability lead: priya.malhotra@redwood.internal
+
+Document history
+----------------
+- 2025-11-12: Created by Samir Patel.
+- 2026-02-20: Expanded mitigation section and added alert tuning recommendations (reviewers: Arielle Kim, Jensen Ortiz).
+

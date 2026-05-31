@@ -1,0 +1,208 @@
+GPU developer sandbox: self-serve onboarding & security playbook
+
+Summary
+-------
+This playbook documents the end-to-end self-serve onboarding process for developer sandbox GPU workspaces. It combines Terraform/IaC patterns, CI/CD snippets, network/security controls, and a short runbook to help developers create short-lived, cost-accountable GPU sandboxes that are safe to run unchecked evaluation jobs and informal experiments.
+
+Why this exists
+----------------
+- Developers need low-friction access to GPU capacity for prototyping without submitting tickets to infra.
+- The infra team must retain guardrails for cost, network egress, and data access while enabling self-serve.
+
+Goals and non-goals
+-------------------
+Goals:
+- Provide a reproducible Terraform module and GitHub Actions template to create a developer sandbox in under 15 minutes.
+- Ensure sandboxes are isolated network-wise, have IAM least privilege, and expire automatically.
+- Emit cost & usage telemetry and tag resources for chargeback.
+
+Non-goals:
+- This is not a replacement for Dedicated GPU reservations used by steady production traffic.
+- Not intended for regulated datasets that require VPC-only or on-prem packaging.
+
+Audience
+--------
+Primary: software and ML engineers who need short-term GPU access. Secondary: infra engineers and oncall SREs who will support and maintain the IaC modules.
+
+Scope
+-----
+- cloud providers: AWS (initial rollout), with notes for GCP/Azure follow-ups.
+- resource surface: single GPU node (p3/p4 family), bastion-less SSH via ephemeral certs, private subnet with NAT egress controls.
+- lifecycle: create -> run -> auto-expire (7 days default) -> optional extend -> destroy.
+
+Prerequisites
+-------------
+1. Developer must have a Redwood developer account and be in the "sandbox-users" IAM group.
+2. Developer must have GitHub SSO linked to Redwood.
+3. The target AWS account must be onboarded to our cross-account role catalog (see related pages).
+
+High-level architecture
+-----------------------
+- Each sandbox is provisioned into a tenant-specific sub-account as a tagged resource set: VPC, subnet, EC2 GPU node (or EKS nodegroup), security group, IAM role, CloudWatch log group, and cost allocation tags.
+- A central controller (lightweight Lambdas + Step Functions) handles TTL enforcement and cleanup.
+- Telemetry flows to CloudWatch and Cost Explorer with a tag prefix: redwood:sandbox:<github-username>.
+
+Text diagram:
+controller (step function) -> provisioner (terraform apply via CI job) -> aws account (VPC, GPU instance, IAM)
+
+Network & security controls
+---------------------------
+- All sandboxes are placed in a private subnet with NAT Gateway egress.
+- Outbound egress to external IPs is filtered via an egress proxy (squid cluster) with allowlist for known package registries (pypi, docker registries).
+- Security groups:
+  - ssh-from-bastion: blocked by default. Access provided via ephemeral SSH cert (see Access model).
+  - gpu-management: allows outbound 443/80 to registries and only necessary ports for the workload.
+- IAM: AssumeRole via short-lived role (sts:AssumeRole) mapped from GitHub OIDC tokens. The role grants ec2:Describe/Start/Stop limited to resources tagged with redwood:sandbox.<user>.
+- KMS: Optional CMK per-account to encrypt EBS and logs for restricted teams.
+
+Access model
+------------
+1. Developer triggers sandbox creation via a GitHub Actions workflow in a repo template.
+2. Workflow obtains OIDC token and calls our central provisioning action which runs terraform in a delegated account role.
+3. Once provisioned, the workflow returns an ephemeral SSH cert (valid 1 hour) and a Jupyter access URL (if the optional Jupyter module was requested).
+
+Terraform module and variables (usage)
+-------------------------------------
+- Module name: redwood/sandbox-gpu/aws
+- Purpose: abstract account onboarding, tagging, TTL, network placement, and security groups.
+
+Example module call:
+```hcl
+module "sandbox_gpu" {
+  source           = "git::ssh://git@github.com/redwood-infra/terraform-modules.git//sandbox-gpu/aws"
+  github_user      = var.github_user
+  ttl_hours        = 168  # 7 days default
+  instance_type    = var.instance_type
+  allowed_egress   = ["pypi.org", "registry-1.docker.io"]
+  enable_jupyter   = true
+  tags = {
+    "redwood:owner" = var.github_user
+    "redwood:purpose" = "developer-sandbox"
+  }
+}
+```
+
+Key variables (table):
+- ttl_hours: number (default 168) - how long before auto-destroy
+- instance_type: string (default p3.2xlarge) - selects GPU SKU
+- allowed_egress: list(string) - hostnames allowed outbound
+- enable_jupyter: bool - deploys Jupyter reverse-proxy
+- tags: map(string) - chargeback tags required
+
+Outputs:
+- ssh_cert_url: string - short-lived cert endpoint
+- jupyter_url: string - (optional) internal-reverse-proxy URL
+
+CI/CD pipeline example (GitHub Actions snippet)
+------------------------------------------------
+name: Provision GPU Sandbox
+
+on: [workflow_dispatch]
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Assume sandbox role and run Terraform
+        uses: redwood-infra/terraform-runner@v1
+        with:
+          terraform_dir: ./infra/sandbox
+          vars: |
+            github_user=${{ github.actor }}
+            ttl_hours=168
+
+      - name: Fetch access artifacts
+        run: |
+          curl -fsS "$SSH_CERT_URL" -o /tmp/sandbox_user_cert.pem
+          echo "JUPYTER_URL=$JUPYTER_URL"
+
+Notes:
+- The terraform-runner action handles OIDC -> AssumeRole and executes terraform apply in the target account. It records run metadata into the provisioning audit table.
+
+Onboarding flow (detailed)
+-------------------------
+1. Developer forks the "gpu-sandbox-template" repo and opens the workflow dispatcher.
+2. The workflow uses OIDC to get a token and calls the terraform-runner.
+3. Terraform creates resources and writes the sandbox metadata to the central DynamoDB audit table with ttl (for cleanup).
+4. The workflow posts a Slack ephemeral message to the developer with the Jupyter URL and SSH cert download link.
+5. After ttl_hours expire, the controller tries a graceful shutdown (stop instance), then final destroy after 24 hours if not extended.
+
+Extension and revocation
+------------------------
+- To extend: developer re-runs the GitHub workflow with a new ttl_hours value (max 14 days). The action updates the DynamoDB ttl and tags.
+- Immediate revocation: infra oncall can invoke the controller's revoke endpoint (internal API) to force destroy.
+
+Runbook: common failures and remediation
+--------------------------------------
+1. Failure: terraform apply hangs on instance creation (quota exceeded).
+   - Symptoms: api errors referencing RequestLimitExceeded or InsufficientInstanceCapacity.
+   - Remediation: check the account's quota and GPU capacity pool in the capacity dashboard. If capacity is insufficient, either change instance_type to a smaller SKU or open a capacity request via the infra capacity page.
+
+2. Failure: Jupyter URL returns 502 from reverse proxy.
+   - Symptoms: proxy logs show upstream refused connection.
+   - Remediation: verify the instance's health (cloudwatch metrics), ensure the Jupyter service started (systemd unit: jupyter.service), check SGs for outbound socket to proxy, and rotate the NAT if egress health is degraded.
+
+3. Failure: User cannot retrieve SSH cert (401).
+   - Symptoms: cert endpoint returns unauthorized.
+   - Remediation: confirm GitHub OIDC claim mapping for the user, check DynamoDB audit for provisioning record and proper tags.
+
+SLOs & monitoring
+------------------
+- Provisioning time: median 6 minutes, P95 < 12 minutes. Alert on P95 > 20 minutes for 5 runs in 1 hour.
+- Cleanup success: 99% of sandboxes are destroyed within 36 hours of TTL expiration. Alert when cleanup failures exceed 2% in 24 hours.
+- Cost telemetry: tag ingestion must be present for 100% of sandboxes; missing tags generate a ticket to infra-cost.
+
+Ownership & escalation
+----------------------
+- Module ownership: infra/iac team (primary) - contact: iac-owners@redwood.com
+- Oncall: infra-sre rotation covers 24x7 for provisioning incidents (page: eng-infra/eng-sre/oncall-rotations).
+- Escalation path: developer -> infra-iac Slack channel -> infra-sre -> platform engineering manager.
+
+Change and rollout plan
+-----------------------
+1. Pilot: invite-only 10 engineering teams for 30 days, collect metrics and UX feedback.
+2. Measure: provisioning time, failure modes, and average cost per sandbox.
+3. Gradual rollout: open to company with soft quotas, then enable self-serve in 4 weeks if metrics are healthy.
+
+Testing and validation checklist
+-------------------------------
+- Terraform unit test: module-level terratest coverage for networking, tags, and TTL behavior.
+- Integration test: provision -> run a simple GPUs MXNet job -> verify logs and metrics emitted.
+- Security review: ensure IAM role policies are least-privilege and KMS keys used where required.
+
+Operational cost controls
+------------------------
+- Default TTL of 7 days; auto-stop at TTL, final destroy 24h later unless extended.
+- Per-user soft quota: 2 concurrent sandboxes by default. Quotas enforced by the controller and as IAM permission boundaries.
+- Chargeback: all resources tagged with redwood:owner and redwood:project, surfaced monthly to Finance.
+
+Templates and code references
+----------------------------
+- Terraform module repo: git@github.com:redwood-infra/terraform-modules.git//sandbox-gpu/aws
+- GitHub Actions template: github.com/redwood-infra/templates/gpu-sandbox-workflow
+- Provisioning controller: internal repo redwood-infra/sandbox-controller
+
+References & related pages
+-------------------------
+- See also: eng-infra/terraform-and-iac/gpu-provisioning-immutable-state-and-disaster-recovery.json
+- See also: eng-infra/ci-cd-and-build/ephemeral-gpu-pools-for-ci-and-eval-runs.json
+
+Appendix: quick commands for oncall
+-----------------------------------
+- Check provisioning queue: aws dynamodb query --table-name redwood-sandbox-audit --index-name status-index --key-condition-expression "status = :s" --expression-attribute-values '{":s":{"S":"PENDING"}}'
+- Force destroy a sandbox: curl -X POST -H "Authorization: Bearer $ONCALL_TOKEN" https://provisioning.internal.redwood/api/v1/sandbox/<id>/destroy
+- Restart jupyter on instance: ssh -i /path/to/key ec2-user@<ip> 'sudo systemctl restart jupyter.service'
+
+Document history
+----------------
+- 2024-05-14: Created by Maya Thompson (initial draft)
+- 2024-09-02: Added egress proxy and OIDC-based cert flow (reviewer: Liam Chen)
+- 2025-01-10: Published with TTL and quota defaults updated after pilot feedback
+
+Questions or suggestions? Ping #infra-iac on Slack or email iac-owners@redwood.com.

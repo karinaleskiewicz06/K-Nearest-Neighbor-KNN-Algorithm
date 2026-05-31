@@ -1,0 +1,130 @@
+Tenant GPU FinOps Enforcement and Terraform Billing Shim
+
+Summary:
+This page describes the Tenant GPU FinOps Enforcement pattern and the accompanying Terraform billing shim we use to reconcile real-time meter data with tenant chargeback and quota systems. The goal is to provide a low-latency, auditable, and IaC-friendly mechanism to ensure tenants are billed correctly for GPU consumption (spot vs reserved vs burst), network egress, and special accelerator SKUs. This document covers architecture, Terraform module API, deployment and CI/CD gates, runbook for billing mismatches, and operational SLAs.
+
+Problem statement:
+- Multiple cloud accounts and cross-account burst pools produce billing signals that are not 1:1 with logical tenant requests.
+- Cost attribution must be accurate within 2% monthly and reconcilable within 24 hours for finance audits.
+- We need automated enforcement to prevent runaway costs (e.g., uncontrolled burst to spot pools) while preserving developer self-service.
+
+High-level design:
+1) Meter collector: lightweight sidecar service (meter-proxy) that samples GPU allocation events, instance metadata, and egress tags and emits compact events to the metering pipeline.
+2) Billing shim (terraform-billing-shim): a Terraform-friendly module that translates tenant ID tags and allocation identifiers into billing entities and exposes a verification hook for CI.
+3) Reconciler: a scheduled job that reconciles cloud invoice line-items with internal meter events and publishes discrepancy alerts to FinOps Slack channel and PagerDuty.
+4) Enforcement agent: a policy controller that can apply quick throttles (token bucket) or deny-list rules on tenant allocations during detected anomalies.
+
+Ownership and SLAs:
+- Metering infra team: owner-metering-infra@redwood.com (operational)
+- Billing reconciliation: owner-finops-automation@redwood.com (runs daily job)
+- Enforcement agent oncall: infra-oncall rotation (SLO: reconcile and escalate any >1% tenant discrepancy within 6 hours; emergency throttle applied in <5m during runaway event)
+
+Terraform billing shim: module API (recommended pattern)
+This section documents the recommended Terraform module (one file example). The module is intentionally small: it only declares the billing entity and a raw verification hook that CI/CD calls after environment promotion.
+
+Example usage (HCL):
+```
+module "tenant_billing_shim" {
+  source = "git::ssh://git@repo.redwood.com/terraform-modules//billing-shim?ref=v1.2.0"
+
+  tenant_id        = var.tenant_id
+  billing_entity   = "tenant-${var.tenant_id}"
+  region           = var.region
+  account_id       = var.account_id
+  enforcement_tags = {
+    finops-tier = var.finops_tier
+    team        = var.team
+  }
+
+  # verification hook: CI will post event_id to the metering system and expect 'verified' status
+  verification_hook = {
+    endpoint = "https://metering.redwood.internal/v1/verify"
+    secret   = var.verification_secret
+  }
+}
+```
+
+Minimal module outputs (table):
+- billing_entity_id: string (tenant billing entity UUID)
+- verification_status_url: string (status URL for CI webhooks)
+
+CI/CD integration and gating
+- Gate 1 (pre-apply): Terraform plan must include billing_shim resource references for any GPU-enabled tenant environments. Missing billing_shim triggers a policy-as-code deny in the pipeline.
+- Gate 2 (post-apply): Run the verification_hook with the current allocation snapshot. The verification endpoint must return a signed status blob. CI fails if verification returns error or timeout > 30s.
+- Gate 3 (periodic): Nightly reconciliation job validates that the last 24h of allocation events have a matching billing_entity_id and tenant tags. Discrepancies raise issue in FinOps board.
+
+Policy-as-code rules (examples):
+- deny-apply-if-no-billing-shim: any tf workspace provisioning GPU subnet without a linked billing_shim must fail.
+- warn-burst-without-tier: if tenant uses burst pools > 20% of monthly quota and finops-tier = "standard", create a warning card.
+
+Reconciliation pipeline and metrics
+- Inputs: cloud invoice lines, meter events (tokenized), allocation metadata, reserved vs spot mapping table.
+- Outputs: daily reconciliation report CSV stored in s3://finops-reconciliations/<YYYY-MM-DD>/, anomaly alerts slack message, PagerDuty trigger when tenant discrepancy > 5% or cost > $5k unexpected.
+
+Key reconciliation metrics to monitor:
+- daily_recon_coverage_pct (target >= 99.0%)
+- tenant_discrepancy_pct_24h (target <= 2.0%)
+- reconcile_latency_hours (target <= 24h)
+
+Operational runbook: billing mismatch (short version)
+1) Triage: alert routes to FinOps and Metering infra. Check daily_recon report in S3 and the reconciler logs.
+2) Validate sample: pick representative invoice lines and match to meter events by allocation_id. If allocation_id absent, look up instance metadata and VPC flow logs.
+3) If discrepancy < 2%: annotate incident as non-actionable and create a retrospective card.
+4) If discrepancy 2%–5%: assign to owner-metering-infra, create immediate ticket, and request verification run (replay of allocation events).
+5) If discrepancy > 5% or cost delta > $5k: escalate to oncall enforcement team, consider applying temporary throttle on tenant via enforcement agent.
+6) Postmortem: required for any throttles applied or >5% discrepancies. Include timeline, root cause, and proposed IaC fix.
+
+Example troubleshooting commands
+- Pull reconciler logs (k8s): kubectl -n finops logs deploy/reconciler --since=24h | grep ${TENANT_ID}
+- Trigger manual verification: curl -sS -X POST -H 'Authorization: Bearer ${SHIM_SECRET}' -d '{"tenant_id":"T123","snapshot":"s3://..."}' https://metering.redwood.internal/v1/verify
+- Export tenant allocations for audit: rfetch allocations --tenant T123 --from 2025-10-01 --to 2025-10-31 --format csv > tenant-allocs.csv
+
+Security and compliance notes
+- Metering events contain allocation identifiers and tenant IDs; do not include raw PII. Tokenize any user-facing identifiers before storing in long-term S3.
+- Verification hooks use mTLS for the verification endpoint. Secrets used by the Terraform module should be stored in the global KMS and referenced via short-lived tokens in CI.
+- All reconciliation reports are retained for 3 years for audit purposes in our compliance S3 bucket.
+
+Rollout plan and incremental adoption
+1) Pilot: select 3 mid-market tenants with mixed reserved/spot usage for a 2-week pilot. Run reconciler in read-only mode.
+2) Beta: enable post-apply verification gate for new tenant infra deployments. Collect metrics for 30 days.
+3) Enforce: enable pre-apply failure for missing billing_shim across all GPU-enabled terraform workspaces.
+4) Continuous improvement: monthly review with FinOps and Platform teams to tune thresholds and add new enforcement rules.
+
+Backwards compatibility and migration notes
+- For legacy tenants without billing_entity tags, run the migration script: python tools/migrate_legacy_billing_entities.py --tenant TID --region us-west-2. The script creates billing entities and writes a migration manifest to s3://finops-migrations/.
+- The reconciler accepts a mapping file legacy_map.csv for up to 90 days of co-existence.
+
+Appendix: sample verification response (signed JSON blob)
+```
+{
+  "billing_entity_id": "be-7f8a2d",
+  "tenant_id": "T123",
+  "status": "verified",
+  "window": "2025-11-02T00:00:00Z/2025-11-02T23:59:59Z",
+  "signature": "BASE64_SIGNATURE"
+}
+```
+FAQs
+- Q: What happens if Terraform fails the verification step during deployment?
+  A: The deployment pipeline will fail. For emergency deployments, run the bypass workflow only with approval from FinOps lead and an explicit ticket. Bypass requires an audit annotation and will be rate-limited.
+
+- Q: Can enforcement throttle reserve-bound workloads?
+  A: Enforcement prefers to shift burst allocations or apply token-bucket throttles. Reserve-bound workloads owned by the tenant are only throttled after manual approval except in cases of severe runaway cost.
+
+Related diagrams and artifacts:
+- Diagram: metering-flow-overview (Confluence attachment)
+- Terraform module repo: git@repo.redwood.com:terraform-modules/billing-shim
+- Reconciler job: k8s CronJob reconciler-finops@prod
+
+Contact and escalation matrix:
+- Primary owner: Maya Thompson (maya@redwood.com)
+- Metering infra Slack: #infra-metering
+- FinOps Slack: #finops
+- PagerDuty: FinOps-Reconciler (alias: pd-finops-recon)
+
+Change log:
+- 2024-02-14: Initial draft and architecture proposal.
+- 2024-08-09: Added CI/CD gating and verification hook details.
+- 2025-11-03: Updated reconciliation SLAs and added migration script instructions.
+
+End of document.

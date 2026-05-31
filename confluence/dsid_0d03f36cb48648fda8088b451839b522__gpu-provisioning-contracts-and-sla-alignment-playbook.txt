@@ -1,0 +1,196 @@
+GPU Fleet Provisioning Contracts and SLA Alignment Playbook
+
+Overview:
+
+This playbook describes the operational and infrastructure patterns we use to translate commercial provisioning commitments (Reserved/Dedicated capacity contracts, burst credits, enterprise SLAs) into concrete GPU fleet actions: IaC provisioning, network/account boundaries, SLO mapping, CI/CD promotion gates, and runbooked incident responses. Intended audience: infra engineers, SRE, platform product managers, and account engineering.
+
+Goals:
+- Ensure contractual capacity commitments are backed by provable infrastructure and alerting.
+- Make Terraform/IaC modules and CI/CD flows the single source of truth for provisioning and deprovisioning.
+- Define SLO translation (e.g., 99.9% p99 < 120ms token latency) to provisioning, warm pools, and routing fallbacks.
+- Minimize noisy-neighbor and egress cost exposure via tenant fencing and cross-account policies.
+
+Scope and non-goals:
+- Scope: Hosted and Dedicated GPU capacity, multi-account VPC patterns, Terraform modules for reserved pools, CI/CD gating for promotions, and incident runbooks for capacity/SLA breaches.
+- Non-goal: This is not a financial contract template or legal terms-of-service wording. Contract wording remains with Finance & Legal.
+
+Key terms (quick reference):
+- Reserved Capacity (RC): Customer-committed GPU pool with guaranteed throughput and billing commit.
+- Burst Credits: Time-limited capacity available above RC for elastic load.
+- Warm Pool: Pre-initialized model-serving GPUs kept in idle (non-evictable) state to meet latency SLOs.
+- Tenant Fence: Network+compute isolation pattern that keeps tenant traffic and egress isolated.
+
+1) SLA classes and operational implications
+
+We define three SLA classes (mapping used across sales/ops):
+- Platinum: 99.95% uptime, p99 token latency target enforced by dedicated warm pools and cross-region replicas.
+- Gold: 99.9% uptime, soft warm pool with burst-credit-backed capacity for short spikes.
+- Bronze: best-effort, scalable on spot/ephemeral pools with fallback routing to lower-cost model variant.
+
+For each class we define minimum infra guarantees that must be represented in IaC and observable in dashboards. Example mapping:
+- Platinum -> dedicated reserved pool (N GPUs), 2-region replication, warm_pool_size >= 20% expected steady QPS, network egress SLA of 99.99%.
+- Gold -> reserved baseline (smaller), burst credit policy with 15-minute hold window, warm_pool_size >= 5% steady QPS.
+- Bronze -> no warm pool requirement, tolerate preemption and higher latency fallbacks.
+
+2) Sizing methodology (how many GPUs: deterministic + buffer)
+
+Inputs:
+- Expected steady QPS and peak QPS (per-customer) from sales forecast
+- Model per-token compute estimate (tokens/sec per GPU) from perf profile
+- Latency SLO target and acceptable queueing/packing latency
+- Preemption and spot loss risk multiplier (for non-dedicated pools)
+
+Sizing steps (high level):
+1. Convert peak QPS -> peak token/sec by multiplying average tokens generated per request.
+2. Divide by efficient tokens/sec per GPU (choose baseline kernel/quantization profile).
+3. Add headroom: +20% for warm-pool buffer for Platinum; +10% for Gold; +0% for Bronze with burst credits.
+4. For cloud preemptible/spot usage, multiply by 1.25 to preserve availability under typical preemption patterns.
+
+Quick example:
+- Peak 2,000 requests/min, avg 40 tokens per request => 1,333 tokens/sec.
+- Model_profile: 8,000 tokens/sec per A100-simulated unit (quantized path) => base GPUs = ceil(1333/8000) = 1.
+- Add Platinum headroom 20% -> 1.2 -> round up to 2 GPUs reserved, plus warm pool parity of 1 GPU pre-warmed.
+
+3) IaC and Terraform module patterns (practical guidelines)
+
+Standard modules we require for all reserved pools:
+- reserved_gpu_pool (module): exposes inputs: pool_name, region, gpu_type, gpu_count, warm_pool_size, owner_tag, burst_credit_policy_id, network_attachment.
+- tenant_fence (module): builds cross-account IAM roles, VPC peering/privatelink, egress NAT gateway cells, and egress-shaper tag bindings.
+- reserved_autoscaler (module): configures autoscale policy with cooldowns, preempt-aware sizing, and cost-annotation export.
+
+Best-practices and guardrails:
+- Module interface must avoid implicit defaults for critical fields (gpu_count, region, egress_vpc). All must be explicit in per-tenant tfvars.
+- Use policy-as-code OPA gate in CI to reject PRs that reduce warm_pool_size for Platinum tiers or that remove tenant_fence references.
+- Keep module outputs minimal and stable: pool_id, prometheus_labels (map), network_attachment_id.
+
+Example snippet (include in repo README):
+```hcl
+module "reserved_pool_acme" {
+  source            = "git::ssh://git@repo/infra-modules.git//reserved_gpu_pool?ref=v1.4.2"
+  pool_name         = "acme-prod-platinum-pool"
+  region            = "us-west-2"
+  gpu_type          = "a100-80gb"
+  gpu_count         = 8
+  warm_pool_size    = 2
+  owner_tag         = "platform-acme"
+  burst_credit_policy_id = "bp-acme-2025"
+  network_attachment = module.tenant_fence_acme.network_attachment_id
+}
+```
+
+4) Account and networking patterns (cross-account, VPC, egress)
+
+Design principles:
+- Every reserved pool lives in a customer-owned AWS account if requested (private offering). For hosted/dedicated, pools live in Redwood accounts with per-tenant AWS IAM roles & VPC namespaces.
+- Tenant fences must include: egress NAT pools, egress shaper, and per-tenant IP prefix tag.
+- Use transit gateways or privatelink for cross-account model artifact pulls; avoid relying on public S3 endpoints for production inference.
+
+Network checklist per pool:
+- VPC with explicit ingress/egress security groups (deny-by-default).
+- Egress NAT gateway cluster with cost-tagging annotation.
+- Prometheus pushgateway endpoint and per-pool log sink (structured logs).
+- Flow logs enabled and sampled at 100% for Platinum pools for first 30 days after provisioning.
+
+5) CI/CD and image lifecycle (promotion gates)
+
+CI/CD assumptions:
+- All IaC changes flow via GitOps: feature -> PR -> OPA policy checks -> plan + apply via pipeline (self-service vsops-approved pipeline).
+- GPU image artifacts follow a signed promotion: build -> canary image in dev pools -> bake tests -> promote to reserved pools.
+
+Promotion gates for high-SLA pools:
+- Performance gate: p50/p95/p99 inference latencies measured on canary traffic must meet thresholds within 7 days.
+- Stability gate: memory OOMs == 0, kernel crashes == 0 for canary period.
+- Cost gate: per-token cost delta < 10% unless approved.
+
+6) Provisioning runbook: creating a new Reserved Capacity (RC) pool
+
+Runbook steps (operators):
+1. Confirm contract with Finance & Sales and verify SKU (region, gpu_type, term length, burst credits).
+2. Create per-tenant tfvars file from template (see repo/infrastructure/rc-templates).
+3. Open IaC PR with module invocation; include required labels: rc-provision, owner-team, sla-tier.
+4. OPA checks must pass; if they fail, address policy violations (most common: missing warm_pool_size, missing network_attachment).
+5. Run terraform plan in CI, review plan for unexpected destroy actions.
+6. Apply in staging region and run validation tests (end-to-end perf smoke, network egress verification, artifact pull test).
+7. Apply in primary production region.
+8. Post-provision validation: check warm pool health, export metrics to Grafana dashboards, enable flow log retention and alerting.
+
+Validation checklist (post-provision):
+- Prometheus metrics: gpu_utilization, kv_cache_hit_rate, serve_latency_p99.
+- Dashboards: Reserved Pool Overview with cost annotation and tenant labels.
+- Alerts: p99 latency breach, serve_errors > 0.5% sustained for 5m, egress_rate spike > 2x baseline.
+
+7) SLA breach triage runbook (short form)
+
+When the Customer-facing SLA alert triggers (p99 latency breach or pad outage):
+1. Pager duty triage owner (on-call) acknowledges within 5 minutes.
+2. Check pool health and warm pool count: kubectl/infra-tooling -> pool/{pool_id}/nodes.
+3. Verify network path: VPC flow logs & privatelink endpoints.
+4. Check autoscaler logs and recent Terraform changes (search PRs with rc-provision or scaling labels).
+5. If capacity exhausted: immediately enable cross-region fallback pool if configured; escalate to capacity-ops to adjust reserved_autoscaler target.
+6. If noisy neighbor suspected: engage tenant-quota controller to temporarily set per-tenant queues to 50% and initiate live-transparent throttling.
+7. Notify account engineering and provide estimated TTR and mitigation steps.
+
+Post-incident actions:
+- Create an incident summary, include timeline, root cause, and remediation plan.
+- If provisioning issue: update IaC module to include the missing guardrail and run policy audit across similar pools.
+
+8) Observability and dashboards (required signals)
+
+Minimum signals exposed per reserved pool (prometheus metric names):
+- redis_kv_cache_hits_total
+- serve_requests_total{tenant}
+- serve_errors_total{tenant,error_code}
+- serve_latency_seconds_bucket (p50/p90/p95/p99)
+- gpu_memory_used_bytes
+- egress_bytes_total
+
+Alerts (recommended thresholds):
+- p99 latency > SLA threshold for 10m -> SEV2
+- serve_errors_total rate > 0.5% sustained 5m -> SEV1
+- GPU OOM event -> SEV1
+- Egress_rate > 3x baseline for 5m -> SEV2 (possible exfiltration or runaway job)
+
+9) Ownership and cadence
+
+Owners:
+- Capacity-ops (primary): provisioning, autoscaler tuning, cost reconciliations.
+- Platform infra: IaC modules, OPA policies, CI/CD pipelines.
+- Oncall SRE: triage and immediate mitigation.
+
+Cadence:
+- Quarterly capacity review with Sales & Finance to reconcile committed pools vs actual usage.
+- Monthly IaC policy sweep (OPA violations) and tagging audit.
+- Warm pool sizing review after major model or kernel releases.
+
+10) Appendix: common failure modes & mitigations
+
+Failure: Warm pool fails to initialize after provisioning
+- Likely causes: missing network_attachment, artifact pull error, image signature mismatch.
+- Mitigation: verify network attachment in module outputs, perform manual artifact pull from pool subnet, check image signature and re-bake if necessary.
+
+Failure: Sudden serve_errors spike with no capacity shortage
+- Likely causes: model regressions, input distribution shift, KV cache corruption.
+- Mitigation: rollback to previous model variant, invalidate cache prefix, begin regression evaluation harness.
+
+Failure: Egress billing shock
+- Likely causes: tenant mis-configuration, public internet fallback, data-exfil pipeline.
+- Mitigation: enable egress shaper, move tenant to dedicated NAT gateway cell, open support case with cloud provider to backfill billing anomalies.
+
+Related artifacts and repos:
+- infra-modules repo (reserved_gpu_pool, tenant_fence, reserved_autoscaler)
+- provisioning-playbooks repo (per-tenant tfvars templates and validation scripts)
+- monitoring repo (grafana dashboards and alert rules)
+
+Contacts and escalation list:
+- Capacity-ops: capacity-ops@redwood.ai (PagerDuty: capacity-oncall)
+- Platform infra: platform-infra@redwood.ai
+- Account engineering (for contract clarifications): ae-team@redwood.ai
+
+Document history and next steps:
+- 2024-09-12: initial draft and runbook scope by Aisha Patel.
+- 2024-12-05: added warm pool sizing rules and CI gates after Q4 audit.
+- 2025-02-10: incorporated cross-account tenancy clarifications and new Terraform module versioning requirement.
+
+If you are provisioning a new RC pool and this playbook is insufficient or you have a non-standard contract (multi-region with customer-managed network appliances), contact Platform Infra before opening IaC PR to avoid mid-provision rework.
+
+End of playbook.

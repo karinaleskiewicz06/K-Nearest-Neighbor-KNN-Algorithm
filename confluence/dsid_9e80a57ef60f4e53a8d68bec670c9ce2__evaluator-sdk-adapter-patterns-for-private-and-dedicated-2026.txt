@@ -1,0 +1,173 @@
+Evaluator SDK: adapter patterns for private and dedicated eval integrations
+
+Summary
+
+This document describes the Evaluator SDK adapter patterns and operational guidance for integrating Redwood's eval harness into Dedicated and Private deployments. It covers design patterns for pluggable adapters, runtime requirements, telemetry mapping, privacy safeguards (DP-friendly workflows), quantization-aware evaluation hooks, and a recommended rollout checklist for operators. The target audience is applied ML engineers, platform engineers, and SREs responsible for operating eval pipelines inside customer-isolated environments.
+
+Goals
+
+- Provide repeatable adapter implementations that minimize changes to the central eval harness while allowing environment-specific integrations.
+- Ensure consistent telemetry and metric semantics across Hosted, Dedicated, and Private eval runs.
+- Surface quantization and KV-cache artifacts in eval results to enable safe model promotion.
+- Maintain privacy-preserving defaults when running shadow/recorded traffic in customer-controlled networks.
+
+When to use this doc
+
+- You are integrating Redwood's eval harness into a Dedicated cluster or a Private (VPC/on-prem) control plane.
+- You need consistent metrics and artifact collection between hosted and private evals.
+- You need a privacy-preserving shadow evaluation pipeline for customer traffic.
+
+Design overview
+
+The Evaluator SDK is split into three layers:
+
+1) Core harness: evaluation logic, scoring, sample orchestration, and result aggregation.
+2) Adapter interface (stable): a thin shim that implements environment-specific behaviors (persistence, RPC, telemetry, secrets).
+3) Runtime plugins: small, replaceable modules that adapt to local infra (S3 vs. MinIO, Prometheus pushgateway vs. remote write, HSM vs. KMS).
+
+Adapter responsibilities
+
+Each adapter must implement the following logical responsibilities (interface-level):
+
+- storage_put(key, payload, metadata): persist artifacts (responses, token traces, KV cache snapshots).
+- storage_get(key): read artifact for replay or analysis.
+- telemetry_emit(metric_name, value, labels): emit evaluation metrics with canonical labels.
+- secret_get(secret_ref): fetch credentials (wraps KMS/HSM call if needed).
+- request_send(endpoint, payload, timeout_ms): invoke a runtime endpoint (used for shadow-routing or live model probes).
+- sanitize_input(input): enforce privacy filters (PII redaction/zeroization) before storing.
+
+Pattern 1 — File-backed adapter (recommended for Private evals)
+
+- Use case: on-prem or air-gapped evals where object stores are available via POSIX or S3-compatible APIs.
+- Implementation notes: adapter writes to local object store under /var/lib/eval/artifacts/<run-id> and emits a manifest.json. Use atomic renames for finalize.
+
+Example config snippet (confluence-style table represented in text):
+
+| key | value | notes |
+| --- | ----- | ----- |
+| storage.type | s3 | MinIO endpoint for private deployments |
+| storage.bucket | eval-artifacts-prod | per-customer bucket |
+| auth.kms | hsm:/slot1 | optional HSM URI |
+
+Pattern 2 — Prometheus-bridge adapter (telemetry-forwarding)
+
+- Use case: Dedicated deployments push eval metrics into customer's Prometheus (pull) or centralized remote_write endpoint.
+- Implementation notes: provide two modes — pushgateway for short-lived runs or remote_write for high-throughput. Normalize metric names to the canonical schema used by hosted evals (see Metric mapping).
+
+Metric mapping (canonical)
+
+- eval.samples.count (int) — total inputs run
+- eval.latency.p50_ms, eval.latency.p95_ms, eval.latency.p99_ms (ms)
+- eval.quality.score.<metric> (float) — e.g., bleu, f1, semantic-similarity
+- eval.kv_cache.hit_rate (float) — measured on replayed long-context probes
+- eval.quant.delta_perplexity (float) — difference vs. fp16 baseline
+
+Adapters MUST emit these names or provide a 1:1 mapping table in their config.
+
+Pattern 3 — RPC proxy adapter (for dedicated control planes)
+
+- Use case: Dedicated control planes cannot reach the central model registry. Adapter proxies requests to local model-serving endpoints and returns standard responder objects.
+- Implementation notes: validate model version IDs against a local whitelist before invoking to prevent unintended promotions. Implement circuit-breakers and exponential backoff.
+
+Privacy & PII safeguards
+
+When dealing with customer traffic you must treat recorded inputs as sensitive. The adapter interface includes sanitize_input which is invoked before any artifact is persisted. Default sanitization rules:
+
+1) Remove 1st- and 2nd-party PII (emails, SSNs, credit card numbers) using Redwood's pii-redactor regex set (v2).
+2) Hash long-form free-text using blake2b-64 for indexing while storing redacted text.
+3) For DP-mode runs (used for shared benchmarks), the adapter should apply per-sample Gaussian noise to embedding vectors and redact token-level attention maps.
+
+DP-mode example (YAML config snippet):
+
+```yaml
+privacy:
+  mode: dp
+  dp_epsilon: "2.0"
+  dp_delta: "1e-6"
+  embedding_noise_std: 0.03
+  redact_attention: true
+```
+
+Running quantization-aware evals
+
+Quantization introduces subtle failure modes. The Evaluator SDK provides hooks to capture artifacts that matter to promotion decisions:
+
+- kv_cache_snapshot: capture representative KV cache after a 1k token warmup run (format: base64 gzipped protobuf).
+- perf_profile: per-step flops/op timings and kernel selection logs (text).
+- logits_diff: per-token L2 difference vs. float baseline for a small probe set.
+
+The adapter must support streaming large artifacts to object storage with resumable multipart uploads. For air-gapped sites, provide an offline export tool (tar + manifest + signature).
+
+Operational checklist for deploying Eval SDK adapters
+
+1) Preflight (owner: platform team)
+   - Confirm object store endpoints and credentials are provisioned.
+   - Verify Prometheus remote_write or pushgateway is reachable.
+   - Validate KMS/HSM integration with secret_get contract.
+
+2) Canary (owner: applied ML)
+   - Run a 1000-sample synthetic benchmark with dp mode off. Verify metric parity within tolerance against hosted baseline.
+   - Confirm emitted metrics appear in metrics backend with correct labels.
+
+3) Shadow validation (owner: product/platform)
+   - Shadow 1% of production traffic for 24 hours with privacy.mode: redact. Compare quality.score.* and latency percentiles.
+
+4) Promotion gating (owner: model-onboarding)
+   - Require: eval.quality.score.semantic_similarity >= hosted_baseline - 0.02 AND eval.kv_cache.hit_rate >= 0.9
+   - Require: eval.quant.delta_perplexity <= 5.0 for quantized candidates
+
+5) Rollout (owner: eng-sre)
+   - Gradual rollout schedule: 5% -> 25% -> 60% -> 100% with 24h observation windows and automated rollback on regression alerts.
+
+Integration examples
+
+1) Minimal Python adapter skeleton\n```python
+class FileAdapter(AdapterBase):
+    def __init__(self, root):
+        self.root = root
+    def storage_put(self, key, payload, metadata):
+        path = os.path.join(self.root, key)
+        atomic_write(path, payload)
+    def telemetry_emit(self, name, value, labels):
+        # map to prometheus or local sink
+        push_metric(name, value, labels)
+    def sanitize_input(self, input):
+        return pii_redact(input)
+```
+
+2) Example eval run command (CLI)
+
+```bash
+redwood-eval run --suite semantic-sim --samples 5000 --adapter-config ./adapter.yaml --run-id r2026-02-10-01
+```
+
+Troubleshooting & common pitfalls
+
+- Missing metric labels: ensure adapters add the canonical labels: run_id, suite, model_id, env (private/dedicated/hosted). Alerts will trigger if run_id is absent.
+- Multipart uploads failing in air-gapped mode: use the offline export tool and verify manifest signature before ingestion.
+- Baseline mismatch: if quant.delta_perplexity >> threshold, capture logits_diff and kv_cache_snapshot and open a triage run using regression-triage playbook.
+
+Ownership and contacts
+
+- Evaluator SDK maintainer: Marco Liang (applied-ml infra) — slack: @marco.liang
+- Platform adapter support: Eng Platform team — eng-platform oncall
+- Security/privacy review: Aisha Patel (security)
+
+Appendix: artifact schema (text table)
+
+| artifact | format | retention default |
+| kv_cache_snapshot | base64+gz+pb | 30d |
+| perf_profile | text | 90d |
+| logits_diff | csv | 30d |
+| manifest.json | json | 90d |
+
+Backwards compatibility notes
+
+- Adapters must support the v1 storage contract until 2027-06-30. The v2 contract introduces multipart checksums and signed uploads; set compatibility: v1 in adapter.yaml to opt in.
+
+References
+
+- eval-mesh-and-workload-fingerprinting (internal) — mapping for workload ids and labels
+- shadow-deployment-eval-playbook-for-private-and-dedicated (internal) — step-by-step for shadowing production traffic
+
+If you plan to implement an adapter, please open a design RFC in the Applied ML repo and tag reviewers: @Aisha, @Diego.

@@ -1,0 +1,169 @@
+VPC Entropy Segmentation and Tenant Shielding Playbook
+
+Summary:
+
+This playbook describes a pragmatic, reproducible approach for reducing cross-tenant interference in VPC-based private deployments using entropy segmentation, tenant shielding, and telemetry contracts. It complements existing network segmentation guidance by focusing on runtime-level request steering, KV-cache partitioning, and telemetry sampling so tenants cannot unintentionally degrade each other or observe noisy neighbor behavior.
+
+Intended audience:
+- Field engineers and operators responsible for private deployments (on-prem and VPC).
+- SRE and runtime teams implementing tenant-level guards.
+- Solutions engineers validating customer acceptance tests.
+
+Goals and non-goals:
+- Goals:
+  - Ensure tenant noisy-neighbor incidents are detected and mitigated within 2 minutes of onset.
+  - Limit tenant-induced 99th-percentile tail latency increase for co-located tenants to <20ms above baseline.
+  - Provide a clear telemetry and evidentiary contract for customer audits.
+- Non-goals:
+  - This playbook does not replace network-level isolation (VPC/NSG rules) — it augments them.
+
+Core components described:
+1) Entropy segmentation (logical request partitioning)
+2) Tenant Shield Controller (runtime-side enforcement)
+3) Telemetry contract and sampling strategy
+4) Operational runbook: detection, mitigation, and rollback
+5) Acceptance and SLO verification checklist
+
+1) Entropy segmentation overview
+- Concept: split request traffic into deterministic shards based on an entropy key (tenant_id + request_fingerprint). Each shard maps to a bounded set of runtime workers and KV-cache partitions. The goal is to limit blast radius for pathological workloads and to bound working set interference.
+- Components: vpc-proxy (edge ingress), shard-mapper service, tenant-shield-controller, runtime-kv-partitioner.
+
+Design constraints and assumptions:
+- We assume tenants present a tenant_id token in the request header (X-Redwood-Tenant).
+- Shards should be sized to keep typical KV working set < 8 GB per shard for current model footprints (adjust per customer HW profile).
+- Shard count is configurable per deployment and can be different per tenant tier.
+
+Shard mapping algorithm (summary):
+- Compute H = siphash(tenant_id || fingerprint)
+- shard = H mod N_shards_for_tenant
+- N_shards_for_tenant is chosen from tenant profile table (see Acceptance checklist).
+
+2) Tenant Shield Controller (TSC)
+- Purpose: enforce runtime limits and apply mitigation rules when a tenant's shard exhibits anomalous resource consumption.
+- Key features:
+  - Rate-limit enforcement (per-shard and per-tenant)
+  - Soft-eviction tokens for bursts (burst_budget with decay)
+  - Dynamic KV cache eviction policy (TTL + recency + tenant-cost-weighting)
+  - Cross-tenant telemetry fence to prevent cross-tenant KV reads (logical ACL at runtime)
+
+Operational behaviors:
+- Normal mode: shard tokens allocated, eviction thresholds at 70% of shard memory budget.
+- Degraded mode: when shard memory or CPU > 90% sustained for >30s, TSC throttles new requests to that shard to target 50% CPU within 60s.
+- Quarantine mode: for repeated violations (3 triggers in 24h), shard is placed in quarantine and moved to a dedicated fallback pool (lower-cost model variant) with notice to tenant owner.
+
+Example TSC config snippet (YAML):
+
+--8<-- start config
+tenant_shield_controller:
+  global_shard_memory_budget_gb: "8"
+  per_tenant_shard_counts:
+    free: 2
+    standard: 8
+    enterprise: 32
+  eviction_threshold_pct: 70
+  degraded_threshold_pct: 90
+  degraded_sustain_seconds: 30
+  quarantine_triggers: 3
+  quarantine_window_hours: 24
+  burst_budget_tokens: 500
+  burst_decay_seconds: 300
+--8<-- end config
+
+3) Telemetry contract and sampling strategy
+- Purpose: deliver sufficient evidence to SLO owners and customers while controlling telemetry volume and respecting privacy.
+- Mandatory telemetry fields for every request (ingress): timestamp, tenant_id, shard_id, model_id, route, latency_ms, cpu_ms, mem_mb, kv_hit_bool, token_count. These must be present at 100% sampling for aggregated histograms.
+- High-cardinality traces (full request payloads) should be sampled at 0.1% by default for standard tenants, 1% for enterprise (configurable and chargeable).
+
+Sampling policy table (text):
+| Data type | Default sampling | Retention | Rationale |
+| Aggregated metrics | 100% (histograms) | 90d | Needed for SLOs and billing accuracy |
+| Detailed traces | 0.1% standard / 1% enterprise | 30d | Debugging noisy neighbor incidents |
+| KV access logs (per-shard) | 1% | 30d | Investigate cache pollution attacks |
+
+Telemetry ingest and labeling requirements:
+- Telemetry must be labeled with tenant_confidentiality_level (public/internal/regulated). Regulated tenants require telemetry to be stored in customer-controlled buckets or excluded from sample exports.
+- All telemetry exports must pass through the telemetry-aggregator service and be subject to PII scrubbing hooks.
+
+4) Operational runbook: detection, mitigation, and rollback
+Detection: automated detectors running in runtime-observability:
+- Detector A (memory-pressure): rolling 10s window where per-shard mem_mb > 90th percentile × 1.5 for 30s.
+- Detector B (latency-spike): per-shard p99 latency delta > baseline_p99 × 2 for 60s.
+- Detector C (kv-churn): kv_hit_ratio drops > 30% vs baseline over 2 minutes.
+
+When detector fires, the following steps are executed automatically (fast path):
+1) Mark shard as degraded in TSC and apply per-shard throttle to ingress (target QPS reduction = 50% or to move p99 under SLO).
+2) Snapshot recent telemetry and store in quarantine bucket (tagged with incident ID).
+3) Notify oncall via pager with incident playbook link and suggested actions.
+
+Operator checklist (human-in-the-loop):
+1) Validate detection signal (confirm telemetry snapshot).
+2) Identify triggering tenant(s) and determine if the workload is expected (deployments, customer load test, crawler).
+3) If unexpected, apply one of the following mitigations in order:
+   a) Tighten per-tenant rate-limit policy to safe_qps (calculated: safe_qps = current_qps × 0.6).
+   b) Increase shard count for affected tenant (if hardware available) to reduce per-shard working set.
+   c) Move shard to fallback pool with quantized/cheaper model variant.
+4) If problem persists for >30 minutes, escalate to Product & Customer Success to coordinate a tenant-facing mitigation and possible SLA credits.
+
+Rollback considerations (software changes):
+- If a TSC change causes false positives, the recommended rollback is:
+  1) Set TSC.mode=gradual_offline (disables quarantine and degraded enforcement but keeps monitoring).
+  2) Revert last TSC release using the canary rollback script (see CLI below).
+  3) Re-run telemetry verification for 60 minutes.
+
+Canary rollback CLI example:
+
+redwood-ops rollback tsc --deployment=tenant-shield-controller --to=release-2026-11-18 --grace=120
+
+5) Acceptance criteria and SLO verification checklist
+- Tenant isolation SLOs (applies after playbook enabled):
+  - Per-tenant p99 latency overhead vs dedicated baseline <= 20ms  (measured over 1h window).
+  - No cross-tenant KV leakage incidents (0 tolerated) in 90 days.
+  - Detection-to-mitigation time <= 2 minutes for automated actions.
+
+Acceptance and smoke tests (run in staging with representative tenants):
+1) Synthetic noisy-neighbor test: run a workload that generates 200% of expected KV churn on 1 shard and assert that degraded mode triggers and latency for other tenants stays below threshold.
+2) Shard-splitting test: increase N_shards_for_tenant and validate KV hit ratio recovers within 5 minutes.
+3) Telemetry export test: enable 1% trace sampling for tenant X and confirm trace appears in customer-controlled export bucket (if regulated).
+
+Operational metrics dashboard (recommended panels):
+- Shard memory utilization (per-tenant heatmap)
+- Per-tenant p50/p95/p99 latency (route-level)
+- KV hit ratio and churn rate (per-shard)
+- Number of degraded/quarantined shards (trend)
+- Telemetry sampling rate and export errors
+
+Ownership and run cadence
+- Owner: runtime-sre (primary), serving-runtime (secondary), field-ops (customer-facing).
+- Oncall: runtime-sre for automated mitigation, field-ops for customer communication.
+- Quarterly review: review tenant shield thresholds after any large capacity/quantization changes.
+
+Customer-facing notes (what to tell customers):
+- We employ runtime tenant shielding to protect customer workloads. Shielding may involve routing some requests to fallback model variants or applying short throttles during sustained resource pressure.
+- For regulated customers we provide options to increase shard counts, reserve dedicated pool capacity, or require explicit telemetry export controls.
+
+Appendix A — Example incident timeline (text):
+- 00:00 Detector A fires (kv-churn). Automatic throttle applied to shard 14 at 00:01. Telemetry snapshot saved. Pager fired to runtime-sre at 00:02. Operator applied shard-split at 00:09 and throttle relaxed at 00:12. Incident closed at 01:00 after 4 consecutive windows of healthy telemetry.
+
+Appendix B — Templates and commands (useful snippets):
+- Increase shard count for tenant (operator CLI):
+  redwood-ops tenant update-shards --tenant=acme-corp --shards=16 --reason="mitigate-kv-churn"
+
+- Force move shard to fallback pool:
+  redwood-ops shard migrate --shard=tenantX-3 --target-pool=fallback-quantized --force --reason="noisy-neighbor"
+
+- Telemetry export check (example jq):
+  aws s3 ls s3://redwood-telemetry-exports/tenantX/incident-39485/ | head -n 20
+
+Notes and known limitations:
+- Entropy segmentation reduces but does not eliminate noisy neighbor risk; tenants with extreme burstiness should be offered dedicated pools.
+- Shard increases have overhead (re-partitioning warms caches slowly); prefer reactive throttles for short bursts and shard-splits for persistent high working set.
+- This playbook requires tenants to include tenant_id in request headers; for legacy integrations we provide a token-mapping proxy but recommend migrating.
+
+References and related pages:
+- See related runbooks for KV cache migration and rollback in day-2-ops.
+- See customer requirements library for minimum HW and network specifications when requesting dedicated pools.
+
+Document change log:
+- 2026-06-15: Created by Maya Liu.
+- 2026-09-03: Add quarantine mode thresholds and sampling policy adjustments (reviewers Priya Menon, Daniel Ross).
+- 2026-12-08: Clarified degraded mode timings and added canary rollback CLI snippet (reviewer Oscar Hernández).

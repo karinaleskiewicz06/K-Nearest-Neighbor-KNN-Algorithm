@@ -1,0 +1,148 @@
+Operator workflows for LLM KV-cache sharding and rebalancing
+
+Summary
+======
+This document describes operator-facing workflows for KV-cache sharding and rebalancing used by Redwood's inference runtime. It covers why rebalancing is needed, safe sequencing for metadata changes, CLI and API examples operators should use, SLO and metric guardrails, automated rebalancing heuristics, manual intervention patterns, and a short retrospective checklist after a rebalance event. The goal is to minimize tail-latency regressions and cache miss storms while preserving multitenant isolation guarantees.
+
+Scope and audience
+===================
+- Audience: Platform operators, runtime oncall, and SREs owning GPU pool allocation and cache orchestration.
+- Scope: Logical KV (key-value) attention cache shards used by the serving runtime (service name: runtime-cache-coordinator) and the operator-facing tooling that manipulates shard placement and replication. This doc does not cover model weights placement or network-level routing changes.
+
+Why shard and rebalance
+=======================
+- Sharding distributes KV memory and hot-spot traffic across GPU nodes to reduce eviction rates and avoid single-node saturation.
+- Rebalancing is required when:
+  1. a node is decommissioned or enters maintenance,
+  2. tenant load patterns change (hot prefixes move between tenants),
+  3. autoscaling triggers new nodes, or
+  4. observed cache-out ratios exceed thresholds.
+- Incorrect rebalancing causes: cache miss amplification, increased token generation latency, and potential SLO violations.
+
+Owner and runbook integration
+============================
+- Primary owner: eng-platform/runtime-ops.
+- Escalation: runtime-oncall -> eng-platform pager -> runtime-sre.
+- This workflow is integrated with platform runbooks: runtime-cache-eviction-runbook and cold-start-warmup-orchestration. Ensure links to those pages are present in incident tickets.
+
+Key metrics and SLO guardrails
+=============================
+Use these metrics to decide whether to run or abort a rebalance. All values are team defaults; adjust for customer priorities and dedicated clusters.
+
+- SLOs:
+  - 95th percentile generation latency: <= 120 ms (hosted clusters), <= 200 ms (dedicated).
+  - Token-level success rate: >= 99.95%.
+- Metrics to inspect before/during/after:
+  - cache.miss_rate (per-shard and per-tenant)
+  - cache.byte_utilization (per-node GPU memory used by KV cache)
+  - serving.tail_latency_95, serving.tail_latency_99
+  - eviction.rate and eviction.storm_alerts
+  - prefix.hot_keys_count and prefix.skew_ratio
+
+Thresholds (alert triggers):
+- If cache.miss_rate increases by > 3x for a shard within 5 minutes of a rebalancing action, automatically roll back placement.
+- If eviction.rate > 500 evictions/sec for a node sustained for 2+ min, mark node overloaded and pause rebalances targeting it.
+
+Automated rebalancing policies (runtime behavior)
+================================================
+The runtime supports two automated modes; operators can control via the runtime-cache-coordinator API.
+
+- mode: conservative (default). Moves >30% of keys off a source node only when destination nodes have >20% free cache headroom. Rate limit: 5% of a shard's keyspace per minute.
+- mode: opportunistic. Aggressively equalizes byte utilization across nodes with rate limit up to 20% per minute. Used for planned scale-outs only.
+
+Operators should prefer conservative mode for production clusters with mixed-tenancy.
+
+Safe manual rebalance procedure (step-by-step)
+============================================
+Preconditions: Confirm maintenance window and that cluster autoscaler is stable. Notify slack channel #runtime-ops with ETA.
+
+1) Preflight checks (operator):
+   a) kubectl get pods -n runtime | grep cache-coordinator -> ensure coordinator is healthy.
+   b) Query metrics: "curl -s http://metrics-api.internal/runtime?metric=cache.byte_utilization" and inspect top-5 nodes.
+   c) Snapshot current shard placement: "runtimectl placement snapshot --output=placement-YYYYMMDD.json". Save to ticket.
+
+2) Dry-run placement plan:
+   a) Generate a plan: "runtimectl plan-rebalance --source node-05 --targets node-07,node-09 --dry-run"
+   b) Validate plan: look for key movement counts and estimated warmed bytes per target.
+
+3) Execute conservative rebalance:
+   a) Start: "runtimectl apply-rebalance --plan plan-id --throttle 5pct_per_min --mode conservative"
+   b) Observe metrics dashboard for 10 minutes. Pay attention to cache.miss_rate and serving.tail_latency_95.
+   c) If miss_rate > 3x baseline or tail latency approaches 90% of SLO, immediately run rollback: "runtimectl rollback --plan plan-id".
+
+4) Post-rebalance validation:
+   a) Verify placement converged: "runtimectl placement status --plan plan-id" shows "completed".
+   b) Run smoke traffic: "ab-client --profile llm-short --qps 50 --duration 300s" against affected route to ensure p95 remains within target.
+   c) Commit placement snapshot: "runtimectl placement snapshot --output=placement-post-YYYYMMDD.json" and attach to ticket.
+
+Emergency manual intervention (hot-fix)
+====================================
+If a node causes an immediate spike in latency or evictions:
+- Step 1: Quarantine node by marking it read-only for new hot shard allocations: "runtimectl node-set node-XX --allocation=hold".
+- Step 2: If serving tail latency is critical, shift traffic away from the node using traffic-shepherd: "ts-shepherd route-modify --node node-XX --weight 0.1".
+- Step 3: If the node is unhealthy, cordon and drain gracefully: "kubectl cordon node-XX && kubectl drain node-XX --ignore-daemonsets --delete-local-data".
+
+Operator CLI and API examples
+============================
+- Snapshot placement (JSON example):
+  runtimectl placement snapshot --output=- | jq '.'
+
+- Plan generation (YAML example):
+  runtimectl plan-rebalance --source node-05 --targets node-07,node-09 --max-bytes 40GB --preferred-tenants tenant:acme-corp --dry-run > acme-plan.yaml
+
+- Apply plan with tagging for audit:
+  runtimectl apply-rebalance --plan acme-plan.yaml --throttle 5pct_per_min --tag "maintenance:2026-02-12"
+
+Implementation notes for operators
+================================
+- Cache replication: We maintain a primary-shard with optional read-only replicas for warmup. During rebalances operators should avoid adding replicas unless explicitly required by warmup procedures.
+- Warmup strategy: Use the runtime warmup API to prefetch top-100 hot prefixes: "runtimectl warmup --plan plan-id --limit 100 --concurrency 20". Warmups reduce miss amplification during cutover.
+- Telemetry retention: Keep detailed rebalance traces for 14 days in traces-store; longer for high-profile customers.
+
+Runbook: incident timeline template
+=================================
+When a rebalance causes a degradation incident, record the following timeline in the incident ticket:
+1) T0 - preflight snapshot id and operator name.
+2) T1 - plan apply start (plan id).
+3) T2 - first metric exceedance (attach graphs).
+4) T3 - mitigation action taken (rollback/quarantine/drain).
+5) T4 - stabilization and verification (p95/p99 check).
+6) T5 - postmortem assignment and follow-ups.
+
+Retrospective checklist (for RCA)
+================================
+- Was the preflight placement snapshot taken and attached?
+- Was dry-run performed and validated?
+- Did automated heuristics misclassify hot keys? Capture hot_keys_count at time of event.
+- Did we hit autoscaler or GPU memory limits unexpectedly?
+- Changes to make: add additional canary traffic ramp, extend warmup concurrency, or adjust rate limits for conservative mode.
+
+Planned roadmap items (2026–2027)
+================================
+- Q2 2026: Add predictive balance estimator using recent prefix access entropy.
+- Q3 2026: Introduce transactional placement apply to make rollbacks faster (<30s).
+- Q4 2026: Per-tenant warmup profiles and quota-aware rebalancing.
+- H1 2027: UI: visual placement planner in Redwood Console with simulated heatmaps.
+
+Appendix: common troubleshooting snippets
+========================================
+- Fetch current cache metrics for node-05:
+  curl -s "http://metrics-api.internal/runtime/series?node=node-05&metric=cache.*" | jq '.'
+- Quick rollback command (when plan-id is known):
+  runtimectl rollback --plan plan-id --force || echo "rollback failed, escalate to runtime-oncall"
+- Export placement snapshots for analysis:
+  runtimectl placement snapshot --since 2026-02-01 --format csv > placement-history.csv
+
+Contacts and ownership
+======================
+- Runtime ops Slack: #runtime-ops
+- Pager: eng-runtime-oncall -> see rota in roster.md
+- Primary doc owner: Maya Chen (maya@redwood.ai)
+- Secondary owner: Raj Patel (raj@redwood.ai)
+
+Change log
+==========
+- 2026-01-12: Initial published draft.
+- 2026-03-01: Added conservative vs opportunistic mode descriptions, tightened rollback thresholds, and added roadmap items.
+
+Last reviewed by: Raj Patel, Evelyn Martinez

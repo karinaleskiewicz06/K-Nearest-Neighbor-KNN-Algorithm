@@ -1,0 +1,211 @@
+ADR-027: Dedicated Throughput SLO Metric Definition (Canonical Metric + Attribution Model)
+
+## Status
+Accepted (ADR-027)
+
+## Decision summary
+We will use **Effective Executed Tokens per Second (tps_executed_effective)** as the canonical throughput metric for Dedicated SLO evaluation, and we will attribute/measure the SLO **per Dedicated deployment (deployment_id)** rather than per route.
+
+We will continue to emit **per-route** and **customer-delivered** throughput metrics for debugging, customer reporting, and product analytics, but they are **not** the SLO source of truth.
+
+---
+
+## Context
+Redwood Dedicated is formalizing a throughput guarantee. We need a canonical metric definition that is:
+- **Stable** across rollouts (canaries/A-B), routing changes, and model upgrades.
+- **Hard to game** (e.g., by priming caches or manipulating streaming chunking).
+- **Comparable** across regions/hardware shapes while acknowledging model-dependent variance.
+- **Actionable** for SRE/Infra (ties directly to capacity accounting and admission control behavior).
+
+The two primary open questions were:
+1) What is “throughput” for the purpose of a contractual SLO? (tokens/sec vs requests/sec, server-time vs wall-time, streaming semantics, cache/batch interactions)
+2) What entity do we attribute the metric to? (deployment vs route)
+
+---
+
+## Decision drivers
+1. **Customer commitment maps to a Dedicated deployment.** Customers buy Dedicated capacity as a deployment (with a pinned tier/shape + configuration); routes are a control-plane abstraction that can change without changing the purchased unit.
+2. **Routes are not stable over time.** Routes can be split/merged, canary’d, shadowed, or temporarily redirected, which makes route-level SLOs brittle and confusing.
+3. **Cache can inflate “delivered throughput” without reflecting compute capacity.** A throughput floor should represent minimum sustained serving capacity under normal operation, not a best-case scenario when cache hit rate is high.
+4. **Streaming chunking must not affect tokens/sec.** Counting tokens incrementally per chunk created double-counting and created incentives to alter chunking.
+5. **We need an SLO metric that supports burn-rate alerting and error budgets.** The metric must be computed from counters/histograms with clear aggregation.
+
+---
+
+## Decision
+### 1) Canonical metric: tps_executed_effective
+**Canonical throughput metric for SLO evaluation:**
+
+**tps_executed_effective (Effective Executed Tokens per Second)**
+
+**Definition (per aggregation window W):**
+- Let each completed request *i* contribute:
+  - **executed_tokens_i** = input_tokens_i + output_tokens_i that were **executed by the model runtime** (i.e., not served purely from prefix/KV cache without model execution).
+  - **active_seconds_i** = max(last_token_sent_at_i − admitted_at_i, ε)
+    - admitted_at: timestamp when request is admitted to the Dedicated deployment (post-auth, post-rate-limit, post-admission-control)
+    - last_token_sent_at: timestamp when the last response token is sent (or final response is returned for non-streaming)
+    - ε = 0.001 seconds (guard against divide-by-zero)
+
+For a deployment in window W:
+- **Executed Tokens (W)** = Σ executed_tokens_i
+- **Active Seconds (W)** = Σ active_seconds_i
+- **tps_executed_effective (W)** = (Executed Tokens (W)) / (Active Seconds (W))
+
+**Why this formulation:**
+- Produces a weighted-average throughput that is robust to concurrency differences.
+- Avoids misleading “throughput spikes” from short requests.
+- Uses server-side timestamps to remove client-side variability.
+- Does not change when streaming is chunked differently.
+
+**Important notes:**
+- This metric is computed from **request-completion accounting**, not per-chunk streaming increments.
+- This metric is the canonical input to the Dedicated throughput SLO evaluator and burn-rate alerting.
+
+#### What is included
+Included in executed_tokens_i:
+- Tokens processed by the model runtime for the admitted request.
+- Both input and output tokens (so long prompts are represented in capacity usage).
+
+Included in active_seconds_i:
+- End-to-end server “active time” from admission to completion, including time spent waiting behind the deployment’s own queue (if any) after admission.
+  - Rationale: if Redwood admits a request and then queues it due to saturation, that is a throughput/serving-capacity symptom we want reflected.
+
+#### What is excluded (for canonical SLO metric)
+Requests are excluded from numerator/denominator for tps_executed_effective if:
+- The request is **rejected at admission** (429/503 due to admission control), since it was not served. (Tracked separately as admission-control drop rate.)
+- The request is **cancelled by the client** before first token is sent.
+- The request uses a **non-SLO-eligible route** (shadow, eval, internal test routes).
+
+Cache-only responses (served without model execution):
+- Are excluded from executed_tokens_i (to prevent cache priming from inflating the SLO metric).
+- Are still captured in a separate “delivered” metric (see below).
+
+> Note: the full list of SLO exclusions (maintenance, customer-side throttling, unsupported models, etc.) is defined in the Dedicated throughput SLO doc. This ADR only defines the canonical metric and attribution model.
+
+---
+
+### 2) Attribution model: per deployment (deployment_id is the SLO entity)
+**We will attribute the SLO to the Dedicated deployment (deployment_id)**.
+
+Canonical SLO evaluation uses metrics aggregated by:
+- deployment_id (required)
+- region (required)
+- model_id + model_version (required for SLO evaluation; used to enforce “pinned model/version” semantics)
+- tier (required; for dashboard slicing and operational policy)
+
+**Why not per route:**
+- Customers buy a Dedicated deployment; routes are a routing/config abstraction.
+- Route definitions change during rollouts; a route-level SLO can “move the goalposts” unintentionally.
+- A single deployment may legitimately serve multiple routes (e.g., internal vs external), and the SLO should reflect the purchased capacity, not route taxonomy.
+
+**How we still support route-level visibility:**
+- We emit the same counters labeled with route_id for slicing.
+- Dashboards will show per-route throughput within a deployment as a diagnostic view.
+- The SLO evaluator will filter to SLO-eligible traffic using a controlled label (slo_eligible="true") rather than trusting arbitrary route naming.
+
+---
+
+## Secondary metrics (non-canonical; for product & debugging)
+We will also standardize and publish the following secondary metrics:
+
+1) **tps_delivered_effective**
+- Same formula as tps_executed_effective, but tokens include all tokens delivered to the client, including cache-only responses.
+- Used for customer-facing dashboards and “what did you observe” conversations.
+
+2) **rps_admitted**
+- Requests admitted per second (deployment-level).
+- Helpful for workloads where token counts are not representative (e.g., rerank-like endpoints), but not sufficient alone for LLM generation.
+
+3) **queue_seconds (p50/p95/p99)**
+- Time from admission to first token.
+- Primary saturation symptom and correlates with throughput floor misses.
+
+---
+
+## Consequences
+### Positive
+- **Stable contractual basis:** The SLO is tied to the purchased object (deployment) rather than control-plane artifacts (routes).
+- **Harder to game:** Cache priming and streaming chunking do not inflate the SLO metric.
+- **Operationally meaningful:** Drops in tps_executed_effective map to concrete causes (GPU saturation, mis-sizing, noisy neighbor, regression).
+- **Compatible with tier-aware routing/admission control:** SRE/Infra can implement protection policies that preserve a deployment’s throughput floor.
+
+### Negative / tradeoffs
+- **Customer confusion risk:** Customers may see higher delivered throughput than executed throughput when cache hit rate is high.
+  - Mitigation: publish both metrics and clearly label which one is contractual.
+- **Requires correct “executed vs cache-only” attribution:** Runtime must mark cache-only responses reliably.
+- **Multi-model deployments get more complicated:** If customers run multiple models under one deployment, SLO evaluation must be explicit about the pinned model/version set.
+  - Mitigation: SLO evaluator filters to configured SLO-eligible model/version(s).
+
+---
+
+## Rejected alternatives
+### A) Requests per second (RPS) as the canonical throughput metric
+Rejected because:
+- RPS ignores prompt/output length; can be gamed with tiny requests.
+- Does not map cleanly to GPU saturation for generation workloads.
+
+### B) Tokens per second computed as rate(tokens_total) over wall-clock time
+Rejected because:
+- Concurrency effects make this misleading unless carefully normalized.
+- Sensitive to windowing artifacts and low-volume periods.
+
+### C) Per-route SLO attribution
+Rejected because:
+- Routes are mutable and operationally overloaded (canary/shadow/internal).
+- Customers buy deployments; route-level SLO does not match billing/provisioning units.
+
+### D) Use “billed tokens” as the canonical numerator
+Rejected because:
+- Billing tokens can reflect policy decisions (discounting, free tiers, promotions) and may include tokens not tied to executed compute.
+- The SLO should track serving capacity, not invoicing behavior.
+
+### E) Count streaming tokens per chunk as they are emitted
+Rejected because:
+- Introduced double counting (see PR-19422) and made chunking an SLO variable.
+- Completion-based accounting is simpler and more robust.
+
+---
+
+## Implementation notes
+### Standard metric events
+For each completed request, emit a single completion event with:
+- deployment_id, region, tier
+- route_id (optional but recommended)
+- model_id, model_version
+- slo_eligible ("true"/"false")
+- executed_input_tokens, executed_output_tokens
+- delivered_input_tokens, delivered_output_tokens
+- admitted_at, first_token_sent_at, last_token_sent_at
+- termination_reason (success|runtime_error|cancelled|timeout)
+
+### Canonical counters/histograms (names are illustrative)
+- ri_request_completions_total{deployment_id, region, model_id, model_version, tier, slo_eligible, termination_reason}
+- ri_tokens_executed_total{deployment_id, region, model_id, model_version, tier, slo_eligible, token_type="input"|"output"}
+- ri_tokens_delivered_total{deployment_id, region, model_id, model_version, tier, slo_eligible, token_type="input"|"output"}
+- ri_active_seconds_total{deployment_id, region, model_id, model_version, tier, slo_eligible}
+- ri_time_to_first_token_seconds_bucket{...} (histogram)
+
+### Example PromQL-style query (5m window)
+**tps_executed_effective**:
+(sum(increase(ri_tokens_executed_total{slo_eligible="true"}[5m])))
+/
+(sum(increase(ri_active_seconds_total{slo_eligible="true"}[5m])))
+
+**tps_delivered_effective**:
+(sum(increase(ri_tokens_delivered_total{slo_eligible="true"}[5m])))
+/
+(sum(increase(ri_active_seconds_total{slo_eligible="true"}[5m])))
+
+---
+
+## Open questions (tracked outside this ADR)
+- Exact SLO measurement windows and burn-rate thresholds (see Dedicated throughput SLO definition doc).
+- Policy for multi-model deployments and how contracts represent model/version pinning.
+- How to present executed vs delivered throughput in Console without confusing customers.
+
+---
+
+## Changelog
+- 2025-03-06: Clarified cache-only handling (executed vs delivered) and explicitly excluded chunk-based streaming token increments from canonical SLO accounting.
+- 2025-02-18: Added explicit rationale for including post-admission queueing in active time.
+- 2025-01-29: Initial acceptance of tokens/sec (effective, executed) + per-deployment attribution.

@@ -1,0 +1,524 @@
+Hot-route capacity protection — Technical Design (Hosted API + Dedicated)
+
+## 1. Summary
+This document describes the end-to-end design for **hot-route capacity protection** across Redwood Inference’s **Hosted API** and **Dedicated** tiers.
+
+The objective is to prevent a small set of high-volume, high-SLA routes (e.g., `/v1/chat/completions`, `/v1/embeddings`, `/v1/rerank`) from causing **fleet-wide tail latency and 5xx cascades**. The system introduces:
+
+- **Tier-aware rate limits and quotas** at the API gateway with consistent 429 semantics.
+- **Priority classes** evaluated in a deterministic policy engine.
+- **Admission control / controlled shedding** in routing based on real-time capacity signals.
+- **Per-route budgets** that reserve capacity for enterprise traffic under pressure.
+- **Observability and operational readiness** (metrics, dashboards, alerts, runbooks, incident-bot notifications).
+
+This design is intentionally incremental: it does **not** replace the serving runtime scheduler; it adds explicit controls and signals so that the scheduler is not forced into unstable regimes.
+
+---
+
+## 2. Background and motivating failure mode
+### 2.1 The incident pattern
+Historically, overload on a single hot route has caused:
+
+- Queue buildup in shared GPU pools → **p99 latency spikes** → client retries amplify load.
+- Increased timeouts → upstream cancellations → wasted compute.
+- Saturation of routing and gateway resources → elevated 5xx → cascading failures.
+
+The 2025-11-03 Sev1 postmortem identified two primary gaps:
+
+1) No deterministic admission control to protect enterprise traffic during overload.
+2) Inconsistent throttling semantics (mixed 429 payloads, unclear reason codes), making Support/SRE response slow and customers surprised.
+
+### 2.2 Design principle
+When overloaded, the system must behave like a controlled valve:
+
+- **Enterprise**: preserve SLOs with explicit reserved budgets and predictable outcomes.
+- **Best-effort/self-serve**: throttle earlier and more predictably (with clear 429s and retry guidance).
+- **Fleet**: surface clear capacity signals and prevent unstable queue growth.
+
+---
+
+## 3. Goals / Non-goals
+### 3.1 Goals
+- Protect fleet health by preventing overload on one hot route/customer/workload shape from degrading shared pools.
+- Guarantee enterprise behavior via explicit priority classes and per-route/per-tier budgets tied to SLOs.
+- Deterministic, auditable policy evaluation with explainable decisions.
+- Low overhead on the request path (bounded latency and cardinality).
+- Observability and operational supportability (dashboards, alerts, runbooks, incident-bot).
+- Progressive rollout with safe defaults and reversible flags.
+
+### 3.2 Non-goals (for this phase)
+- Billing/pricing changes (only hooks/metadata are added).
+- A full fairness scheduler rewrite.
+- Per-token dynamic congestion pricing.
+
+---
+
+## 4. Terminology
+- **Route**: API endpoint and method, e.g. `POST /v1/chat/completions`.
+- **Route group**: a policy-level grouping for limits/budgets, e.g. `chat`, `embeddings`, `rerank`.
+- **Tier**: customer entitlement tier, e.g. `enterprise`, `pro`, `starter`.
+- **Priority class**: execution priority derived from tier + overrides, e.g. `P0_ENTERPRISE`, `P2_BEST_EFFORT`.
+- **Budget**: a per-route-group capacity reservation/limit (requests/s, tokens/s, and/or concurrency).
+- **Overload**: routing/runtime capacity signals indicate elevated risk of SLO burn (queue depth/scheduler lag/timeout rate).
+- **Admission control**: routing-level decision to accept, delay, or shed requests.
+- **Shedding**: deliberate rejection with a controlled 429 response and reason code.
+
+---
+
+## 5. Requirements
+### 5.1 Functional
+- Enforce tier-aware **rate limits and quotas** with consistent 429 payloads and headers.
+- Evaluate policy (priority class + budgets + allowed fallbacks) deterministically.
+- Under overload:
+  - Prefer admitting higher priority traffic.
+  - Shed best-effort traffic first.
+  - Optionally apply controlled fallback policies where explicitly allowed.
+
+### 5.2 Non-functional
+- P50 overhead added to request path by policy evaluation: **< 2ms** in-region.
+- No unbounded tag cardinality in metrics (explicit constraints in §11).
+- Policy decisions must be explainable for escalations (decision log + debug endpoint).
+- Rollout must be reversible per region and per account.
+
+---
+
+## 6. System overview
+### 6.1 Components
+1) **API Gateway** (edge)
+- Authn/authz
+- Rate limit + quota enforcement
+- Standardized 429 response semantics
+- Injects policy context (tenant/tier/route group) into downstream request headers
+
+2) **Policy Engine** (control plane read, data plane evaluate)
+- Evaluates priority class, budgets, fallback guardrails
+- Produces deterministic decision object
+- Logs decisions with stable identifiers (low-cardinality)
+
+3) **Smart Routing Service**
+- Applies admission control under pressure based on capacity signals
+- Routes to appropriate model pool / region / variant
+- Enforces “protect enterprise budget” behavior
+
+4) **Serving Runtime + Scheduler**
+- Executes inference
+- Exports capacity signals (queue depth, scheduler lag, saturation signals)
+
+5) **Telemetry pipeline + SRE dashboards**
+- Aggregates per-route-group and per-tier outcomes
+- Alerting tied to enterprise SLO burn and overload activation
+
+### 6.2 Control plane vs data plane
+- Control plane defines **policies** (route groups, budgets, tier mappings, overrides).
+- Data plane performs **evaluation** with caching and bounded latency.
+
+---
+
+## 7. Priority classes and tier mapping
+### 7.1 Default mapping
+| Tier | Priority class | Notes |
+|------|----------------|------|
+| enterprise | P0_ENTERPRISE | Protected under overload; reserved budgets apply |
+| dedicated (contracted) | P0_ENTERPRISE | Treated as enterprise for routing admission decisions |
+| pro | P1_STANDARD | Not protected by reserved budgets during severe overload |
+| starter/free | P2_BEST_EFFORT | Shed early under pressure |
+| internal | P0_ENTERPRISE | Guarded by allowlist + separate budgets; not a bypass |
+
+### 7.2 Overrides
+We support explicit overrides for specific tenants:
+- Temporary burst exceptions (time-boxed)
+- Route-specific entitlements
+- “No fallback” or “Fallback allowed” constraints
+
+Overrides are stored in policy config and must include:
+- `requestor` (human owner)
+- `ticket_ref` (Jira/Linear)
+- `expires_at`
+
+---
+
+## 8. Route groups and protected routes
+### 8.1 Initial protected route groups (MVP)
+- `chat`: `POST /v1/chat/completions` (streaming + non-stream)
+- `embeddings`: `POST /v1/embeddings`
+- `rerank`: `POST /v1/rerank`
+
+### 8.2 Route identification
+Gateway derives a stable **route_id**:
+- Format: `method + canonical_path`
+- Canonicalization removes version noise only when explicitly configured (avoid accidental grouping).
+
+Routing and telemetry use **route_group** as the primary dimension to avoid high cardinality.
+
+---
+
+## 9. Budget model
+### 9.1 Budget dimensions
+Budgets are represented across three dimensions to match real overload patterns:
+
+1) **Requests per second** (RPS): protects gateway/routing overhead and avoids spiky thundering herds.
+2) **Estimated tokens per second** (TPS): approximates GPU compute demand.
+3) **Concurrency**: caps in-flight requests to prevent runaway queues.
+
+> Note: We use *estimated* tokens at admission time based on request fields (e.g., `max_tokens`) and conservative heuristics. Exact billing tokens are not required for admission decisions.
+
+### 9.2 Budget hierarchy
+Budgets are defined at the following levels (highest precedence first):
+
+1) Tenant + route group override
+2) Tenant override (applies to all route groups)
+3) Tier + route group default
+4) Tier default
+5) Global safety caps (hard ceilings)
+
+### 9.3 Reserved vs shared budgets
+Each route group maintains two logical partitions:
+
+- **Reserved enterprise budget**: only P0 traffic can consume during overload.
+- **Shared budget**: all tiers can consume when the system is healthy.
+
+When healthy, P0 traffic may consume shared budget as needed. Under pressure, P0 is preferentially admitted and best-effort is constrained to protect reserved budget headroom.
+
+### 9.4 Example budget defaults (illustrative)
+These are examples to illustrate structure; actual values are set per region based on capacity planning.
+
+| Route group | Tier | RPS limit | TPS limit (estimated) | Concurrency limit | Reserved? |
+|------------|------|----------:|-----------------------:|------------------:|----------|
+| chat | enterprise | 250 | 1.2M | 3,000 | Yes |
+| chat | starter | 30 | 80k | 250 | No |
+| embeddings | enterprise | 400 | 900k | 2,000 | Yes |
+| embeddings | starter | 60 | 120k | 400 | No |
+| rerank | enterprise | 300 | 600k | 1,500 | Yes |
+
+---
+
+## 10. Request lifecycle and policy evaluation flow
+### 10.1 High-level flow
+1) **Gateway** authenticates, resolves `tenant_id`, determines `tier`, determines `route_group`.
+2) Gateway enforces:
+   - Token-bucket rate limit (short window)
+   - Quota (longer window) where applicable
+3) Gateway calls **Policy Engine** (or uses cached decision) to compute:
+   - priority class
+   - budget keys
+   - fallback guardrails
+4) Gateway forwards request to **Routing** with policy context headers.
+5) **Routing** evaluates real-time capacity signals + budgets and decides:
+   - admit to preferred pool
+   - admit with fallback (if allowed)
+   - shed with 429 (overload)
+6) **Runtime** processes admitted requests and emits capacity signals.
+
+### 10.2 Sequence diagram (text)
+- Client → Gateway: request
+- Gateway → Quota service: evaluate window (cached)
+- Gateway → Policy Engine: evaluate priority + budgets (cached)
+- Gateway → Routing: forward with `x-rw-priority`, `x-rw-route-group`, `x-rw-budget-keys`
+- Routing → Capacity signals store: read current region/pool signals
+- Routing → Runtime pool: dispatch if admitted
+- Routing → Gateway: 429 if shed
+
+### 10.3 Data plane contracts (headers)
+Gateway attaches stable headers:
+- `x-rw-tenant-id: tnt_...` (internal only; not forwarded beyond routing)
+- `x-rw-tier: enterprise|pro|starter|internal`
+- `x-rw-priority: P0_ENTERPRISE|P1_STANDARD|P2_BEST_EFFORT`
+- `x-rw-route-group: chat|embeddings|rerank|other`
+- `x-rw-policy-version: <hash>`
+- `x-rw-budget-key: rg:<route_group>;tier:<tier>;region:<region>` (stable, low cardinality)
+
+Security note: headers are injected server-side; external clients cannot set/override.
+
+---
+
+## 11. Admission control logic (Routing)
+### 11.1 Capacity signals
+Routing uses a small set of signals designed to be reliable and low-latency:
+
+- **Queue depth** per pool/route group (aggregated): `rw_runtime_queue_depth{pool,route_group}`
+- **Scheduler lag** (ms) per pool: `rw_runtime_scheduler_lag_ms{pool}`
+- **GPU saturation** (smoothed) per pool: `rw_pool_gpu_utilization{pool}`
+- **Timeout / cancel rate** per route group: `rw_requests_canceled_rate{route_group,tier}`
+
+Signals are aggregated by pool and route_group; we do not alert on per-tenant metrics.
+
+### 11.2 Overload states
+Routing computes an overload state per (region, pool, route_group):
+
+- **GREEN**: normal operations
+- **YELLOW**: early pressure; begin throttling P2 (best-effort) to prevent queue growth
+- **RED**: sustained overload; enforce enterprise reserved budgets and shed aggressively
+
+Hysteresis:
+- Enter YELLOW if threshold exceeded for > 30s
+- Enter RED if exceeded for > 60s or if 5xx/timeouts spike
+- Exit requires 2–3 minutes below thresholds to avoid flapping
+
+### 11.3 Admission rules
+**GREEN**
+- Admit all tiers subject to gateway rate limits/quotas.
+
+**YELLOW**
+- P0: admit; may consume reserved + shared budgets.
+- P1: admit with tighter concurrency caps.
+- P2: shed once route-group shared budget hits threshold (protect headroom).
+
+**RED**
+- P0: admit up to reserved budget; if reserved is exhausted, return 429 with enterprise-specific message.
+- P1/P2: shed early with overload reason; no retries without backoff.
+
+### 11.4 Shedding granularity
+We shed at routing before dispatch to runtime to avoid wasted queueing.
+
+We only implement “delay/queue” at the gateway for short, bounded durations (future enhancement). Today, we prefer immediate 429 with explicit retry-after.
+
+---
+
+## 12. Gateway enforcement: rate limits and quotas
+### 12.1 Rate limits vs quotas
+- **Rate limit**: short window (e.g., per-second), token bucket; prevents microbursts.
+- **Quota**: longer window (e.g., per-minute/hour/day); protects cost and broad entitlement.
+
+Order of evaluation (gateway):
+1) Authn/authz
+2) Route group mapping
+3) Rate limit
+4) Quota
+5) Policy context injection
+
+### 12.2 Consistent 429 semantics
+All throttling and shedding must return:
+- HTTP status: `429`
+- A stable `error.code`
+- A stable reason header
+- A `Retry-After` or `retry_after_ms`
+
+**Reason taxonomy**
+- `quota_exceeded`: quota window exhausted
+- `rate_limited`: short-window limit hit
+- `overload_shed`: routing admission control shed due to overload
+- `enterprise_budget_exhausted`: P0 request could not be admitted within reserved budget
+- `policy_denied`: explicit policy disallow (e.g., route not allowed on tier)
+
+**Headers**
+- `x-rw-throttle-reason: <reason>`
+- `x-rw-policy-version: <hash>`
+- `retry-after: <seconds>` (where applicable)
+
+### 12.3 Error payload (example)
+```json
+{
+  "error": {
+    "type": "rate_limit_error",
+    "code": "overload_shed",
+    "message": "Request was throttled due to temporary capacity pressure. Please retry with exponential backoff.",
+    "retry_after_ms": 750
+  }
+}
+```
+Streaming behavior: for SSE streaming responses that must terminate mid-stream, we send a consistent terminal event and close the stream (see runtime/gateway compatibility notes in §15.3).
+
+---
+
+## 13. Deterministic decision logging and debugability
+### 13.1 Decision object
+Policy Engine returns a compact decision:
+- `priority_class`
+- `budget_keys` (stable)
+- `fallback_allowed: true|false`
+- `decision_tags` (bounded list)
+
+Routing logs:
+- overload state
+- capacity signal snapshot (coarsened)
+- admit/shed decision
+
+### 13.2 Debug endpoint (internal)
+An internal admin endpoint provides “why was this request throttled?” output for on-call:
+- Input: request_id / trace_id
+- Output: policy decision, route group, tier, overload state, reason code
+
+Access control:
+- Restricted to on-call roles via SSO + audit logs
+- No tenant data payloads returned
+
+---
+
+## 14. Fallback policy guardrails
+Fallback is powerful but risky (quality drift, compliance constraints). For protected routes, fallback is disabled by default unless explicitly allowed.
+
+Rules:
+- Enterprise routes default to **strict admission** (no silent model changes).
+- Allow fallback only when:
+  - Model family is declared compatible
+  - Customer contract allows it
+  - The route group is tagged `fallback_safe`
+
+Fallback dimensions:
+- Model variant (e.g., quantization profile)
+- Pool within region
+- Region fallback (only where data residency permits)
+
+When fallback is used, we annotate responses with internal metadata and emit a metric event for audit.
+
+---
+
+## 15. Data plane integration points
+### 15.1 Gateway
+- Adds tier-aware limiter modules
+- Standardizes 429 payloads/headers
+- Emits request outcome metrics with `route_group` and `tier`
+
+### 15.2 Routing
+- Reads capacity signals at fixed cadence (e.g., 1s) from local cache
+- Computes overload state with hysteresis
+- Applies admission rules and budgets
+- Emits overload activation annotations (for dashboards)
+
+### 15.3 Runtime
+- Exports queue depth and scheduler lag
+- Ensures streaming termination semantics are consistent during shedding/cancellations
+
+### 15.4 Performance constraints
+- Policy engine calls must be cacheable; routing must not block on remote calls on the hot path.
+- All high-cardinality identifiers (tenant_id, request_id) must be excluded from metrics tags.
+
+---
+
+## 16. Observability
+### 16.1 Required metrics (core)
+- `rw_requests_total{route_group,tier,outcome}` where `outcome ∈ {ok,429,5xx,timeout,canceled}`
+- `rw_throttles_total{route_group,tier,reason}` where `reason` is from §12.2
+- `rw_overload_state{route_group,pool}` as a gauge (0/1/2 for GREEN/YELLOW/RED)
+- `rw_runtime_queue_depth{route_group,pool}`
+- `rw_runtime_scheduler_lag_ms{pool}`
+- `rw_admission_decisions_total{route_group,tier,decision}` where `decision ∈ {admit,shed,fallback}`
+
+### 16.2 Cardinality guidance
+Allowed tags: `route_group`, `tier`, `region`, `pool`, `reason`, `decision`.
+
+Not allowed in tags: `tenant_id`, `model`, `request_id`, `prompt_hash`, `account_name`.
+
+### 16.3 Dashboards and alerting
+Dashboards must support:
+- Enterprise p95/p99 latency vs SLO (per route_group)
+- 429 rate by reason (per tier)
+- Overload state timeline with annotations
+- Queue depth and scheduler lag correlations
+
+Alerts:
+- Enterprise SLO burn-rate alerts (multi-window)
+- Overload RED sustained > N minutes with enterprise latency degradation
+- Shedding anomaly (e.g., P0 shedding > threshold)
+
+---
+
+## 17. Configuration model
+### 17.1 Policy config entities
+- `route_groups`: mapping of route_id → route_group
+- `tier_mapping`: tenant_id → tier
+- `priority_mapping`: tier → priority_class
+- `budgets`: (tier, route_group, region) → limits
+- `overrides`: tenant-specific policies with expiry
+- `fallback_matrix`: allowed fallback modes per route_group and tier
+
+### 17.2 Example (conceptual)
+```yaml
+route_groups:
+  "POST /v1/chat/completions": chat
+  "POST /v1/embeddings": embeddings
+
+priority_mapping:
+  enterprise: P0_ENTERPRISE
+  starter: P2_BEST_EFFORT
+
+budgets:
+  - tier: enterprise
+    route_group: chat
+    region: us-east
+    rps: 250
+    tps_est: 1200000
+    concurrency: 3000
+    reserved: true
+
+fallback_matrix:
+  chat:
+    enterprise: strict
+    starter: allowed_in_yellow
+```
+
+---
+
+## 18. Feature flags, rollout strategy, and rollback plan
+### 18.1 Feature flags
+We gate by region and allowlist:
+- `hot_route_protection.enabled` (global master)
+- `hot_route_protection.region_enabled[us-east|eu-west|...]`
+- `hot_route_protection.account_allowlist`
+- `hot_route_protection.enforce_gateway_limits`
+- `hot_route_protection.enforce_routing_admission`
+- `hot_route_protection.enable_overload_metrics`
+
+We also support a “shadow mode”:
+- Evaluate policy + compute overload state
+- Emit metrics and decision logs
+- Do not shed traffic (except existing baseline limits)
+
+### 18.2 Rollout phases
+1) Shadow mode in one region (us-east) for all traffic
+2) Enforce on allowlisted enterprise accounts for protected route groups
+3) Expand to all enterprise accounts in us-east
+4) Multi-region rollout (eu-west next)
+5) Enable best-effort shedding policies after alert tuning
+
+### 18.3 Rollback plan (must be executable in < 5 minutes)
+Rollback triggers:
+- Enterprise 429 (non-quota) > threshold
+- Enterprise p99 latency regression beyond SLO guardrail
+- Unexpected 5xx increase correlated with protection
+
+Rollback actions:
+1) Disable `hot_route_protection.enforce_routing_admission`
+2) If needed, disable `hot_route_protection.enforce_gateway_limits` and revert to legacy limiter
+3) Keep metrics enabled if safe to preserve debugging context
+
+Rollback verification:
+- Confirm overload state returns GREEN (or at least shedding stops)
+- Confirm enterprise p95/p99 recovers
+- Confirm 429 reason distribution returns to baseline
+
+---
+
+## 19. Testing plan
+- Unit tests: policy evaluation determinism, budget precedence, override expiry.
+- Integration tests: concurrent load with mixed tiers; verify P0 admitted while P2 sheds in YELLOW/RED.
+- Load tests: simulate burst on chat; validate enterprise SLO protection and stable fleet health.
+- Game day: coordinated overload injection with SRE observing dashboards and verifying alert behavior.
+
+---
+
+## 20. Failure modes and mitigations
+- **Policy engine unavailable**: use cached last-known-good policy; fail closed only for explicit denies (configurable). Emit `policy_stale` metric.
+- **Capacity signals stale**: degrade to conservative YELLOW behavior for best-effort; never bypass hard safety caps.
+- **Metric cardinality regression**: automatic CI check + runtime guardrails; hotfix playbook.
+- **Misconfigured budgets**: validation on publish; canary rollout; require SRE sign-off for enterprise changes.
+
+---
+
+## 21. Open questions
+- Do we need limited “bounded delay queueing” at gateway (e.g., 50–100ms) to reduce retries, or is immediate 429 preferred universally?
+- Should P1 traffic ever borrow from reserved enterprise budget in GREEN? (Currently: no; reserved is logical only used under pressure.)
+- Standardizing token estimation heuristics across chat/embeddings/rerank to better approximate GPU cost.
+
+---
+
+## 22. Ownership
+- Platform (gateway + policy evaluation): Ethan Park, Amara Diallo, Jordan Lee
+- Routing admission control: Mina Haddad, Elena Popov
+- Runtime signals: Sofia Ivanova, Julian Moore
+- Observability and SLO alignment: Allison Grant, Sergio Costa, Rafael Mendes
+- Support readiness and customer guidance: Dev Patel, Wei Chen
+
+For operational procedures and incident response, see:
+- Runbook: `runbook-overload-protection-and-admission-control`
+- Support doc: `enterprise-priority-429-and-quota-behavior`

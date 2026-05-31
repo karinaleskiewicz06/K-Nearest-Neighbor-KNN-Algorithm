@@ -1,0 +1,340 @@
+Burst Admission Controller (BAC) Service
+
+## Summary
+The Burst Admission Controller (BAC) is an internal, regional control-plane service that makes deterministic, low-latency admission decisions for Dedicated customers attempting to exceed their reserved baseline capacity (“bursting”) by borrowing from Redwood-managed burst pools.
+
+BAC’s core responsibilities are:
+- Enforce guardrails (tenant caps, max burst ratios, cooldown windows, per-pool saturation limits, global fleet safety caps).
+- Apply fairness across tenants sharing a burst pool (weighted token-bucket / WFQ hybrid; see ADR for selection).
+- Produce explainable denial reasons for customers and Support.
+- Emit metering signals for billing and operational telemetry for SRE.
+
+Non-goals:
+- Scheduling/queuing long-running work (BAC returns immediate decisions; callers may implement client-side or gateway queuing/backoff).
+- Cross-region bursting (out of scope for initial release).
+
+## Service owners
+- Primary owner team: Platform Control Plane
+- Eng owner: Ethan Park
+- Secondary owners: Benji Okafor (implementation), Jordan Lee (policy engine integration)
+- SRE partner: Sean Gallagher
+- Infra partner (pool capacity): Vanessa Ortiz
+
+Escalation path:
+1) #eng-platform on Slack (business hours)
+2) #eng-sre (if customer impact, elevated latency, or widespread denials)
+3) Incident Commander per on-call rotation
+
+## Where BAC sits in the system
+BAC is invoked on the request path used by Dedicated data plane routing when a tenant may exceed baseline capacity.
+
+High-level flow (simplified):
+1) Router/gateway computes whether a request would exceed the tenant’s baseline (based on current baseline utilization signals).
+2) If baseline is sufficient, route normally (no BAC call).
+3) If burst may be required, Router calls BAC Admit API with tenant + pool context and a request cost estimate.
+4) BAC returns ADMIT or DENY with reason + retry guidance.
+5) Router applies policy:
+   - ADMIT: route to burst-capable capacity (shared burst pool segment).
+   - DENY: apply backpressure (429/overload), or fall back to non-burst behavior per tenant policy (e.g., queue, degrade model variant, or reject).
+
+Determinism requirement:
+- BAC must be deterministic given the same (policy snapshot + telemetry snapshot + request fields). Router retries must not oscillate due to minor telemetry drift.
+
+## Deployment model
+- Deployed per region (e.g., us-east, us-west, eu-west).
+- Stateless compute pods (Kubernetes), horizontally scalable.
+- Uses regional Redis for short-lived state (token buckets / cooldown tracking) and regional telemetry feeds.
+- Supports regional rollout gates by region + hardware class allow-list.
+
+## Public (internal) APIs
+BAC is internal-only. Primary callers: Smart Routing / gateway. Secondary callers: Console backend (read-only explain endpoints via support tooling), SRE tooling.
+
+### 1) Admit API
+HTTP: POST /v1/burst/admit
+Auth: mTLS + service identity (router/gateway). No end-user auth.
+Timeout budget: 50ms (callers should use 75ms overall including retries).
+
+Request fields (JSON):
+- request_id: string (required; idempotency and tracing)
+- tenant_id: string (required)
+- dedicated_deployment_id: string (required; maps to a Dedicated capacity slice)
+- region: string (required)
+- hardware_class: string (required; e.g., "h100", "l40s")
+- pool_id: string (required; derived from region+hardware_class; validated server-side)
+- priority_tier: string (optional; "standard" | "silver" | "gold"; default from tenant policy)
+- estimated_cost_units: number (required; normalized cost estimate for fairness accounting; see “Cost Units”)
+- baseline_in_use_units: number (optional; for debugging only; BAC does not trust this for policy enforcement)
+- telemetry_snapshot_ts_ms: number (optional; caller-provided snapshot timestamp for determinism hints)
+
+Response fields (JSON):
+- decision: string ("ADMIT" | "DENY")
+- reason_code: string ("OK" if ADMIT; otherwise one of denial codes)
+- retry_after_ms: number (0 if not applicable)
+- decision_ttl_ms: number (if ADMIT, how long the decision/lease is considered valid for metering correlation)
+- policy_hash: string (hash of policy snapshot used)
+- telemetry_snapshot_ts_ms: number (telemetry timestamp used by BAC)
+- debug_ref: string (opaque; safe to share with Support to locate decision details)
+
+Example (ADMIT):
+{
+  "decision": "ADMIT",
+  "reason_code": "OK",
+  "retry_after_ms": 0,
+  "decision_ttl_ms": 2000,
+  "policy_hash": "pol_8b1c6f7",
+  "telemetry_snapshot_ts_ms": 1749550134123,
+  "debug_ref": "bac_01J0V7B1TQ3Y9H1E"
+}
+
+Example (DENY):
+{
+  "decision": "DENY",
+  "reason_code": "DENIED_POOL_SATURATED",
+  "retry_after_ms": 250,
+  "decision_ttl_ms": 0,
+  "policy_hash": "pol_8b1c6f7",
+  "telemetry_snapshot_ts_ms": 1749550134123,
+  "debug_ref": "bac_01J0V7B2K8ZP5M9A"
+}
+
+### 2) Explain (Support Debug) API
+HTTP: POST /v1/burst/explain
+Auth: restricted (RBAC: support_debug:read), audited.
+Purpose: explain why a specific request was admitted/denied.
+
+Request:
+- debug_ref: string (required)
+
+Response (redacted, safe):
+- decision, reason_code
+- evaluated_guardrails: list as text (e.g., “tenant_cap: hit”, “global_cap: ok”)
+- pool_saturation_pct: number (rounded)
+- tenant_bucket_remaining_units: number (rounded)
+- cooldown_remaining_ms: number
+- policy_hash, telemetry_snapshot_ts_ms
+
+Note: This endpoint must never return other tenants’ identifiers, raw per-tenant usage, or customer-sensitive configs.
+
+### 3) Health/metrics
+- GET /healthz (liveness)
+- GET /readyz (readiness; fails if policy cache is empty beyond threshold)
+- GET /metrics (Prometheus)
+
+## Denial reason codes
+BAC denial codes are stable, documented, and surfaced to callers for customer-visible reporting.
+
+Primary codes:
+- DENIED_BURST_DISABLED: tenant not enabled for burst.
+- DENIED_REGION_OR_HW_NOT_ALLOWED: rollout gate blocked (region/hardware class).
+- DENIED_TENANT_CAP: tenant exceeded per-tenant burst cap (hard limit).
+- DENIED_MAX_BURST_RATIO: tenant exceeded max burst ratio relative to baseline.
+- DENIED_COOLDOWN_ACTIVE: tenant in cooldown window after sustained bursting or cap hit.
+- DENIED_POOL_SATURATED: pool has insufficient headroom (local saturation guardrail).
+- DENIED_FLEET_SAFETY_CAP: global cap triggered (platform-wide protection).
+- DENIED_PRIORITY_FAIRNESS: fairness algorithm rejected to prevent starvation/neighbor impact.
+
+Operational/edge codes:
+- ERROR_POLICY_UNAVAILABLE: policy engine/config service unavailable beyond allowed stale window.
+- ERROR_TELEMETRY_STALE: telemetry too stale to make a safe decision.
+- ERROR_INTERNAL: unexpected failure (should be rare; counts toward BAC error budget).
+
+Callers should treat ERROR_* as retriable only if retry_after_ms > 0 and overall request budget allows; otherwise degrade gracefully.
+
+## Core concepts
+### Burst pools
+A burst pool is a shared capacity pool segmented by:
+- region
+- hardware_class
+Optionally segmented by compliance constraints (where applicable) and internal fleet partitioning.
+
+BAC does not provision capacity; it consumes pool state from Fleet Telemetry and enforces the pool’s admission limits.
+
+### Cost Units
+Fairness and caps are enforced using “cost units” rather than raw request counts.
+- Default definition: cost units ≈ estimated GPU-milliseconds for the request’s expected work.
+- Router provides estimated_cost_units; BAC applies guardrails and token bucket accounting in these units.
+
+We intentionally keep units abstract/stable for API evolution; the metering pipeline translates to billable burst GPU-seconds using authoritative runtime signals.
+
+### Determinism & telemetry smoothing
+To minimize oscillation and prevent unfair denials under telemetry lag:
+- BAC uses a bounded-staleness telemetry snapshot per pool.
+- If telemetry is newer than the max staleness threshold, BAC evaluates against that snapshot.
+- If telemetry is stale but within the “soft stale” window, BAC applies conservative smoothing (reduces computed headroom) and may admit only higher-priority tiers.
+- If telemetry exceeds hard stale threshold, BAC returns ERROR_TELEMETRY_STALE with retry guidance.
+
+See: “Failure modes” and the telemetry lag mitigation hotfix notes in the fairness ADR.
+
+## Dependencies
+### Policy/config
+- Control Plane Tenant Config Service (source of truth)
+  - Reads tenant burst enablement and limits
+  - Versioned config with validation
+- Policy Engine
+  - Evaluates guardrail rules (max burst ratio, cooldown policy, fleet safety rules)
+  - Provides deterministic evaluation (policy_hash returned in responses)
+
+### Fleet telemetry
+- FleetPulse (fleet telemetry aggregator; internal)
+  - Inputs: pool capacity, pool utilization, saturation, admission queue depth (if any), health signals
+  - Outputs: per-pool snapshot with timestamps
+
+### State store
+- Redis (regional)
+  - Per-tenant token bucket state (remaining units, refill time)
+  - Cooldown state
+  - Small, bounded cardinality by (tenant_id, pool_id)
+
+### Observability
+- Prometheus metrics via /metrics
+- OpenTelemetry tracing (propagates request_id)
+- Structured logs (redacted) to centralized log pipeline
+
+### Billing/metering
+- Metering Exporter (async)
+  - Emits admission decisions with debug_ref, tenant_id, pool_id, decision_ttl
+  - Downstream joins with runtime burst usage signals to prevent double-counting on retries
+
+### Security/audit
+- Audit logging service for:
+  - Access to /v1/burst/explain
+  - Admin overrides (if enabled in emergency mode)
+- RBAC service for privileged endpoints
+
+## Data model (logical)
+BAC interacts with the following logical entities. (Storage varies by entity.)
+
+1) TenantBurstPolicy (authoritative; Control Plane DB)
+- tenant_id
+- enabled: true/false
+- max_burst_ratio: e.g., 1.5x baseline
+- burst_cap_units_per_min: per-tenant cap in cost units
+- cooldown_seconds: e.g., 300
+- priority_tier: standard/silver/gold
+- denial_mode: immediate_deny | allow_queue (future)
+- allowlist_regions_hw: optional overrides
+
+2) PoolStateSnapshot (authoritative; FleetPulse)
+- pool_id
+- total_capacity_units
+- reserved_safety_margin_units
+- current_in_use_units
+- computed_headroom_units
+- saturation_pct
+- snapshot_ts_ms
+
+3) TenantBucketState (ephemeral; Redis)
+- key: (tenant_id, pool_id)
+- remaining_units
+- last_refill_ts_ms
+- cooldown_until_ts_ms
+
+4) DecisionRecord (ephemeral; logs/metrics; optional short-lived cache)
+- debug_ref
+- request_id
+- decision + reason_code
+- policy_hash
+- telemetry_snapshot_ts_ms
+- estimated_cost_units
+
+Retention:
+- Logs: per platform standard
+- Explain lookups: best-effort (typically 24–72 hours, depending on log retention and debug index)
+
+## Guardrail evaluation order (current)
+BAC evaluates in a strict order to keep outcomes explainable and predictable:
+1) Rollout gates (region/hardware class allow-list)
+2) Tenant burst enabled check
+3) Telemetry validity (hard stale cutoff)
+4) Global fleet safety cap
+5) Pool headroom check (local saturation)
+6) Per-tenant hard caps (max ratio and cap units)
+7) Cooldown enforcement
+8) Fairness/anti-starvation enforcement (tier weights + smoothing)
+
+Important: Even for high priority tiers, global fleet safety and hard stale telemetry gates are not bypassable.
+
+## Performance and scaling targets
+BAC is on the request path only when baseline is exceeded; it must be fast.
+
+Targets:
+- p50 latency: < 5ms
+- p99 latency: < 20ms
+- Availability: 99.95% (regional)
+- Error rate (5xx + ERROR_INTERNAL): < 0.1%
+
+Operational notes:
+- BAC should degrade safely: when in doubt, deny with an explainable reason rather than admitting and risking fleet impact.
+- BAC uses aggressive timeouts to policy/telemetry dependencies; beyond the allowed stale window it should return ERROR_POLICY_UNAVAILABLE or ERROR_TELEMETRY_STALE.
+
+## Failure modes and expected behavior
+1) Policy engine unavailable
+- BAC uses last known-good policy snapshot for up to the configured stale window.
+- After stale window: deny with ERROR_POLICY_UNAVAILABLE.
+
+2) Fleet telemetry lag / stale snapshots
+- Within soft stale window: conservative headroom, may deny more aggressively.
+- Beyond hard cutoff: ERROR_TELEMETRY_STALE.
+
+3) Redis unavailable
+- BAC cannot enforce fairness/cooldowns reliably.
+- Behavior: fail closed for burst admission (DENY with ERROR_INTERNAL), emit high-severity alert.
+
+4) Pool overload (saturation)
+- DENIED_POOL_SATURATED with retry_after_ms based on pool refill estimate.
+- If sustained: global circuit breaker may engage (DENIED_FLEET_SAFETY_CAP).
+
+5) Retry storms
+- Callers must use idempotency (request_id) and follow retry_after_ms.
+- Metering pipeline uses idempotency keys to prevent double-counting.
+
+## Feature flags and emergency controls
+BAC supports the following kill switches (controlled via Control Plane config, audited):
+- burst_global_disable: disables all burst admissions (still returns reasons).
+- burst_disable_by_region_hw: disables specific pools.
+- burst_disable_by_tenant: tenant-level disable.
+- fleet_safety_cap_override: emergency-only; requires SRE + executive approval; all uses audited.
+
+## Metrics (selected)
+BAC emits Prometheus metrics with controlled cardinality (tenant_id is NOT a label).
+
+Counters:
+- bac_admit_total{pool_id, priority_tier}
+- bac_deny_total{pool_id, reason_code, priority_tier}
+- bac_error_total{pool_id, error_type}
+
+Gauges:
+- bac_pool_headroom_units{pool_id}
+- bac_pool_saturation_pct{pool_id}
+- bac_telemetry_staleness_ms{pool_id}
+
+Histograms:
+- bac_request_latency_ms{endpoint}
+
+Dashboards: see “Burst Capacity Dashboards” page.
+
+## Operational runbooks
+- Overload mitigation: adjust caps, engage circuit breaker, communicate with CS/Support
+  - See: Burst Pool Overload Mitigation Runbook
+- Denials higher than expected: validate tenant config, telemetry staleness, pool headroom
+- Explain endpoint usage: how to interpret reason codes and guardrail evaluation
+
+## Change management
+- Any change to denial codes or guardrail semantics requires:
+  - Review by Smart Routing (Mina Haddad / Ravi Menon)
+  - Review by SRE (Sean Gallagher)
+  - Update to customer-facing docs and Support playbook
+- Any change affecting billing/metering correlation requires Finance/Billing sign-off.
+
+## Appendix: Integration guidance for Router/Gateway
+Recommended caller behavior:
+- Only call BAC when baseline is exceeded or predicted to exceed within the request window.
+- Use a stable request_id for retries.
+- Respect retry_after_ms; jitter retries.
+- Surface reason_code to customer-visible reporting where safe.
+- For DENIED_POOL_SATURATED / DENIED_FLEET_SAFETY_CAP:
+  - Prefer backpressure (429) and/or queue with bounded waiting.
+  - Avoid uncontrolled retries.
+
+For customer comms:
+- “Burst is best-effort above baseline and subject to shared-pool availability and fleet safety; baseline SLAs remain protected.”

@@ -1,0 +1,167 @@
+VPC proxy traffic segmentation and KMS rotation playbook for private deployments
+
+Overview
+
+This playbook describes an operational design pattern and step-by-step runbooks for private (VPC and on-prem) Redwood Inference deployments that use an internal edge proxy to enforce traffic segmentation, customer-specific routing, and customer-managed KMS key rotation. The document targets platform engineers responsible for onboarding customers to Private, SREs handling day-2 operations, and security engineers reviewing key lifecycle controls.
+
+Goals
+
+- Provide a reproducible, low-risk pattern for integrating an internal proxy (Envoy-based) into VPC/private deployments for traffic segmentation and observability.
+- Define clear KMS rotation procedures (customer-managed and Redwood-managed) with rollback and verification steps.
+- Document day-2 checks, metrics, and troubleshooting guidance for proxy and KMS incidents.
+
+Scope and assumptions
+
+- Applies to Private (VPC and on-prem appliance) deployments where customer network controls inbound/outbound traffic.
+- Assumes customer provides one or more KMS endpoints (cloud KMS or HSM) and allows Redwood’s control plane to perform key-wrap operations when authorized.
+- Not a replacement for the full on-prem packaging guide; links to onprem packaging checklist are included.
+
+Architecture pattern summary
+
+1) Traffic flow (high level):
+   - Client -> Customer LB (optional) -> Internal edge proxy (Envoy) -> Redwood runtime control-plane proxies -> Model-serving pods
+   - Segmentation boundaries: admin/control plane vs. inference data plane.
+2) Proxy responsibilities:
+   - Per-customer routing (host header / SNI mapping)
+   - Path-based isolation for control plane endpoints (/admin/* vs /api/v1/generate)
+   - Token provenance and header-sanitization (strip internal headers, pass X-Redwood-Tenant-ID)
+   - Mutual TLS termination to upstream runtime nodes when required
+   - Metrics export (prometheus scrape endpoints), structured access logs to S3/Elasticsearch
+
+Design decisions and tradeoffs
+
+- Single internal proxy per cluster vs. multiple per-tenant: we recommend a single multi-tenant edge proxy with strict routing rules for most customer sizes to minimize resource footprint; per-tenant proxies recommended for high-compliance customers.
+- TLS termination at proxy improves observability but requires stronger key management. Where customers require E2E TLS, use TCP passthrough with SNI routing.
+
+Required configuration snippets
+
+- Example Envoy listener for per-tenant SNI (YAML snippet):
+
+```
+static_resources:
+  listeners:
+    - name: listener_https
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 443 }
+      filter_chains:
+        - filter_chain_match: { server_names: [ "tenant-a.example.internal" ] }
+          tls_context: { common_tls_context: { tls_certificates: [{ certificate_chain: { filename: "/etc/envoy/tenant-a.crt" }, private_key: { filename: "/etc/envoy/tenant-a.key" } }] } }
+          filters: [ ... ]
+```
+
+- Example KMS config (pseudo-JSON) used by the control plane for secrets encryption:
+
+```
+{
+  "kms_provider": "cloud-kms",
+  "endpoint": "kms.us-east-1.example.com",
+  "key_id": "projects/redwood/locations/us/keyRings/inference/cryptoKeys/tenant-a-key",
+  "auth_method": "assume-role"
+}
+```
+
+Operational runbook: KMS key rotation (Redwood-managed flow)
+
+1) Preparation (offline):
+   - Confirm rotation window with customer and apply maintenance window in console.
+   - Verify backup of encrypted secret blobs (S3 prefix) and current key id mapping.
+   - Ensure health of control-plane and proxy: all pods in Ready state, no alerts firing for >1h.
+
+2) Create new key:
+   - Using customer KMS (or Redwood proxy account), create a new key version and grant Redwood service principal wrap/unwrap permission.
+   - Note new key ARN/ID.
+
+3) Staged rewrap:
+   - Run rewrap tool in dry-run mode: rewrap --from-key old-key --to-key new-key --prefix s3://redwood-private/tenant-a/secrets --dry-run
+   - Verify checksums and object counts match expected (report produced).
+
+4) Cutover:
+   - Run rewrap without dry-run: rewrap --from-key old-key --to-key new-key --prefix ...
+   - Monitor rewrap job metrics (objects_processed, errors, time_per_object).
+   - Update control-plane configuration to point to new key id. Deploy config via canary (10% traffic) for 15 minutes, then scale to 100% if no errors.
+
+5) Post-rotation verification:
+   - Confirm API call path decrypts secrets (run integration test suite: key-rotation/integration/run.sh).
+   - Revoke old key wrap permission only after 24-hour observation window.
+
+Rollback path (if rewrap fails):
+
+- Stop any ongoing rewrap job.
+- Reapply control plane config to old key id.
+- Restore encrypted blobs from S3 backup prefix if partial rewrites occurred.
+- Open a P0 incident if >5% of secrets failed to decrypt; see Incident runbook below.
+
+Day-2 operations: metrics, alerts, and playbooks
+
+Minimum dashboards and alerts to configure for Private deployments:
+
+- Proxy health dashboard: listener_count, active_connections, upstream_5xx, envoy_cluster_unhealthy
+- KMS metrics: rewrap_jobs_running, rewrap_job_errors, kms_api_latency_ms95
+- SLOs: 99.9% inference-control-plane availability; 99.95% proxy listener availability (monthly)
+- Alerts (example thresholds):
+  - envoy_cluster_unhealthy >= 1 for 2m -> page oncall (severity P1)
+  - kms_api_latency_ms95 > 1000ms for 5m -> notify security and oncall (P2)
+  - rewrap_job_errors > 0 -> create ticket and assign to platform-eng
+
+Proxy troubleshooting quick checks
+
+1) If customers report 502/503s:
+   - Check Envoy admin /ready and /clusters endpoints.
+   - curl localhost:9901/stats?filter=cluster_
+   - Look for upstream connection failures and TLS handshake errors.
+
+2) If tokens rejected with auth errors:
+   - Confirm header-sanitization policy: X-Redwood-Auth present and not being stripped by intermediate LB.
+   - Verify token signer key is reachable and not rotated mid-request.
+
+3) If metrics missing:
+   - Confirm prometheus scrape config and service discovery for envoy admin port.
+
+Upgrade and canary rollout pattern (proxy + kms aware)
+
+- Stage 0: Preflight validations (schema + config linting)
+  - Run envoy-config-lint across all listener/filter-chain combos.
+  - Run kms-credential-check against each key id.
+- Stage 1: Deploy new proxy version to control plane nodes with readiness probes, 10% traffic for 20 minutes.
+- Stage 2: Gradually ramp to 50% for 30 minutes while monitoring 5xx and latency metrics.
+- Stage 3: If stable, roll to 100%; if not, rollback to previous proxy build and execute postmortem.
+
+Customer requirements checklist (network and infra)
+
+| Area | Minimum requirement | Rationale | Owner |
+|------|---------------------|-----------|-------|
+| Network | VPC route table allowing control-plane egress to Redwood control endpoint on TCP 443 | Control-plane needs to reach Redwood for license/telemetry when configured | Customer network |
+| KMS | KMS endpoint with policy granting wrap/unwrap to Redwood principal or allow remote HSM access | Required for key operations during rotation | Customer security |
+| Certificates | Customer or Redwood-provided certs for SNI per-tenant if TLS is terminated at proxy | Prevents TLS mismatch and improves client trust| Customer ops |
+
+(If the deployment is air-gapped, provide HSM firmware versions and offline rewrap tool instructions; see onprem packaging reference.)
+
+Incident runbook: Proxy TLS handshakes failing
+
+1) Triage: Identify scope (one tenant vs all tenants).
+2) Temporary mitigation: Switch listener to TCP passthrough for affected tenants.
+3) Root cause investigation: Check certificate chain validity, key permissions, and recent config changes.
+4) Restore: Redeploy corrected cert bundle and rotate connection pool.
+
+Appendix: useful commands and scripts
+
+- List Envoy listeners: kubectl exec -n redwood-support $POD -- curl -s http://127.0.0.1:9901/listeners
+- Rewrap dry-run: ./tools/rewrap --from old-key --to new-key --prefix s3://... --dry-run
+- Validate KMS access (example AWS): aws kms simulate-principal-policy --policy-input-list file://policy.json --principal-arn arn:aws:iam::123456789012:role/RedwoodService
+
+Related documents and reference links
+
+- Private deploy packaging checklist: eng-private-deployments/onprem-packaging/package-compatibility-license-audit-playbook-2026
+- Day-2 automation and upgrade playbook: eng-private-deployments/day-2-ops/onprem-vpc-day2-automation-and-upgrade-playbook-2025
+
+Ownership and contact
+
+- Primary owner: Platform Security (platform-security@redwood.example.com)
+- Secondary owner: Infra SRE (infra-sre@redwood.example.com)
+- Escalation: PagerDuty (redwood-private-oncall)
+
+Change history
+
+- 2025-11-12: Initial draft by Maya R. Solano
+- 2026-01-05: Added rewrap verification steps and dry-run guidance (reviewed by Leo Chen)
+- 2026-02-15: Published with canary rollout updates and incident playbook additions (reviewed by Priya Nair)

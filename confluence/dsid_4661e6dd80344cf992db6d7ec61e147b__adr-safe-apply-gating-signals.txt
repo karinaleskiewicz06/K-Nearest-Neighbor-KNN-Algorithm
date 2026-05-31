@@ -1,0 +1,226 @@
+ADR: Safe Apply Gating Signals for Optimization Config Rollouts
+
+## Status
+Published (effective for Hosted + Dedicated rollouts). Private deployments must implement equivalent metrics and can use the same thresholds as defaults.
+
+## Context
+Redwood Optimize allows high-impact runtime configuration changes (batching heuristics, caching toggles/knobs, and quantization profiles). Historically, config changes have caused:
+- Latency regressions (p95/p99 spikes) that were not detected during early rollout steps.
+- Elevated 5xx/timeout rates due to semantic misconfiguration or resource exhaustion.
+- "Silent" quality regressions with quantization profiles that only surfaced in downstream customer behavior.
+- Operational ambiguity during incidents (unclear whether to pause, continue, or rollback) due to inconsistent metrics and missing baselines.
+
+This ADR defines **the gating signals** used by the Safe Apply controller to determine whether a staged rollout can progress (canary → expand → promote), should pause, or should require operator intervention.
+
+## Decision
+We will gate Optimization Config rollouts using a **hybrid gating model**:
+1) **SLO Gates (hard gates):** error rate and latency must remain within defined thresholds.
+2) **Saturation Gates (hard/soft mix):** capacity and backpressure signals must not indicate imminent instability.
+3) **Quality Gates (hard gates for quantization changes):** quantization profile changes must pass eval harness checks before promotion.
+4) **Applicator Progress Gates (hard gates):** rollout must meet minimum propagation and convergence criteria (no mixed-version instability beyond a bounded time).
+
+Gates are evaluated at each rollout stage (e.g., 1% canary, 10% canary, 50%, 100% + promote) using a consistent evaluation window and baseline comparison.
+
+### What “gating” means
+- If a **hard gate** fails: the rollout controller **auto-pauses** the rollout and marks the stage as **FAILED**. Operator must decide to rollback or override with additional approvals.
+- If a **soft gate** fails: the rollout controller **auto-pauses** by default, but may be configured per tenant to **WARN-only** (requires explicit opt-in).
+- A stage can only be promoted when **all required gates** for that stage are green.
+
+### Change types and required gates
+- Batching and caching changes: SLO + saturation + applicator progress gates.
+- Quantization profile changes: SLO + saturation + applicator progress gates **plus quality gates**.
+
+## Gate Signals
+The system evaluates gates using time series metrics aggregated for the rollout’s scope (tenant/model/region/deployment) and the current stage’s traffic percentage.
+
+### Required metric tags (must be present on all gate metrics)
+All gate evaluations require the following dimensions:
+- tenant_id
+- model_id
+- region
+- deployment_mode (hosted | dedicated | private)
+- config_version (the version under evaluation)
+- rollout_id
+- stage (e.g., canary_1pct, canary_10pct, promote)
+
+Optional but recommended:
+- worker_pool / gpu_pool
+- runtime_build_id
+
+Missing tags are treated as a hard failure for the relevant gate (“INSUFFICIENT_SIGNAL”).
+
+## Evaluation windows and baselines
+### Windows
+Default per-stage evaluation:
+- Warmup: 5 minutes (no gating decisions; metrics stabilize after first traffic shift)
+- Evaluation: 15 minutes (gates computed continuously; must stay green for the full window)
+- For p99 latency-sensitive models or low-traffic tenants: controller may extend evaluation to 30 minutes automatically if request volume is insufficient.
+
+### Baseline
+We compute both:
+- **Absolute** thresholds (protect against catastrophic failures)
+- **Relative** regression compared to baseline (protect against slow drifts and tenant-specific norms)
+
+Baseline is the **previous active config version** for the same scope and time-of-day window where feasible. If baseline is unavailable (new tenant/model/region), we fall back to the most recent “known-good” version in that environment.
+
+## Gate definitions and default thresholds
+Thresholds below are defaults; per-tenant overrides are allowed but require explicit ownership sign-off (SRE + PM) for production.
+
+### 1) SLO Gates (Hard)
+These are the primary safety gates.
+
+A. HTTP 5xx rate
+- Signal: 5xx_rate = 5xx / total_requests
+- Thresholds (must satisfy both):
+  - Absolute: 5xx_rate <= 0.25%
+  - Relative: 5xx_rate_new <= max(5xx_rate_baseline + 0.10%, 2.0x * 5xx_rate_baseline)
+- Minimum volume: >= 5,000 requests in evaluation window; otherwise extend evaluation window up to 30 minutes. If still insufficient volume, require manual approval to proceed.
+
+B. Timeout rate
+- Signal: timeout_rate (gateway timeout + upstream deadline exceeded)
+- Thresholds:
+  - Absolute: timeout_rate <= 0.10%
+  - Relative: timeout_rate_new <= max(timeout_rate_baseline + 0.05%, 2.0x * timeout_rate_baseline)
+
+C. Latency p95 and p99
+- Signal: end_to_end_latency_ms_p95 and end_to_end_latency_ms_p99
+- Thresholds (must satisfy both):
+  - Absolute: p95 <= (SLO_p95 + 10%) and p99 <= (SLO_p99 + 15%) for the tenant/model tier
+  - Relative: p95_new <= 1.10x * p95_baseline AND p99_new <= 1.15x * p99_baseline
+
+Notes:
+- SLO_p95/SLO_p99 are defined per tier (Hosted standard vs Dedicated SLA) in the SRE SLO catalog.
+- For streaming endpoints, we gate on time_to_first_token (TTFT) p95 in addition to end-to-end latency:
+  - TTFT p95 absolute: <= baseline + 80ms OR <= 1.20x baseline (whichever is larger)
+
+### 2) Saturation / Backpressure Gates (Hard + Soft)
+These gates prevent rollouts from driving the system into unstable resource regimes where SLOs may degrade later.
+
+A. Queueing / scheduler delay (Hard)
+- Signal: queue_delay_ms_p95 (time spent queued before a worker starts compute)
+- Thresholds:
+  - Absolute: queue_delay_ms_p95 <= 50ms
+  - Relative: queue_delay_ms_p95_new <= 1.50x baseline
+
+B. GPU utilization and saturation (Soft by default; Hard for large blast radius)
+- Signals:
+  - gpu_compute_util_avg (rolling avg)
+  - gpu_memory_util_avg
+- Thresholds:
+  - Soft: gpu_compute_util_avg <= 90% AND gpu_memory_util_avg <= 92%
+  - Relative: neither may increase by > +8 percentage points vs baseline
+
+Policy:
+- For rollouts with blast radius >= 25% of a region’s traffic for a model, GPU saturation becomes a **hard gate**.
+
+C. OOM / CUDA errors (Hard)
+- Signal: oom_rate, cuda_error_rate
+- Thresholds:
+  - Absolute: oom_rate == 0 (no OOMs allowed)
+  - Absolute: cuda_error_rate <= 0.01%
+
+D. KV cache pressure (Soft; becomes Hard for caching-related changes)
+- Signals:
+  - kv_cache_evictions_rate
+  - kv_cache_hit_rate
+- Thresholds:
+  - For cache toggles/knobs: kv_cache_evictions_rate_new <= baseline + 0.5% AND kv_cache_hit_rate_new >= baseline - 5 pts
+
+### 3) Applicator Progress / Convergence Gates (Hard)
+These gates ensure the runtime has converged to the intended version and that mixed-version states are bounded.
+
+A. Version convergence
+- Signal: percent_workers_on_target_version
+- Threshold:
+  - Must reach >= 99% of eligible workers within 10 minutes of stage start.
+
+B. Mixed-state duration
+- Signal: mixed_version_workers_count over time
+- Threshold:
+  - Mixed-version state must not persist beyond 15 minutes for any shard/pool.
+
+C. Apply error budget
+- Signal: config_apply_error_rate (apply attempts failing due to semantic checks, transient fetch, or runtime rejection)
+- Threshold:
+  - Absolute: <= 0.1%
+
+If convergence gates fail, rollout is paused and the incident response path is to rollback to prior version.
+
+### 4) Quality Gates for Quantization Profile Changes (Hard)
+Quantization changes can pass latency/error gates yet degrade output quality. Therefore, quantization rollouts require quality gates before promotion beyond canary.
+
+We use two layers:
+
+A. Pre-promotion offline eval gate (required)
+- Trigger: before moving from initial canary (<=10%) to >=50% or "promote".
+- Mechanism: eval harness runs the candidate quant profile vs baseline profile on the defined prompt sets for the model family.
+- Default metrics (per model family, selected by Applied ML):
+  - Pairwise win-rate vs baseline (LLM-as-judge with calibration)
+  - Task-specific score (e.g., exact match / pass@k / rubric score)
+  - Safety regression checks (policy violation rate)
+
+Thresholds (default):
+- Win-rate: >= 49% with 95% CI lower bound >= 47% (i.e., no statistically meaningful regression)
+- Task score: >= baseline - 0.5% absolute (or model-family-defined delta)
+- Safety violations: must not increase by > 0.1% absolute
+
+Minimum sample sizes:
+- >= 500 examples for general chat models
+- >= 1,000 examples for high-variance tasks (e.g., long-context summarization)
+
+B. Online shadow/holdout gate (recommended; required for enterprise tiers)
+- Mechanism: run holdout traffic (e.g., 1–5%) comparing outcome proxies (rerank agreement, user-rated signals where available) and regression heuristics.
+- Thresholds:
+  - Quality proxy regression score must remain within baseline band (Applied ML-defined) for the evaluation window.
+
+Noisy signal handling:
+- If eval variance is high (wide CI), controller pauses and requires Applied ML approval to proceed.
+- Overrides must be recorded in the audit log with justification and reviewer.
+
+## Blast radius policy (how gates tighten as rollout expands)
+We apply stricter gating as blast radius increases:
+- <= 1% canary: standard thresholds
+- 1% → 10%: require all SLO hard gates + convergence gates; saturation gates still mostly soft
+- 10% → 50%: saturation gates become hard for GPU utilization and KV cache pressure where relevant
+- >= 50% / promote: all SLO + saturation + convergence gates hard; quantization requires offline eval gate passing within last 24h and tied to the exact config_version hash
+
+## Rollout controller behavior
+- Gates are evaluated continuously; any hard failure triggers an auto-pause within 60 seconds.
+- On pause, the controller:
+  1) Annotates dashboards with rollout_id/config_version
+  2) Emits an audit event: optimization_config.rollout.paused (includes failing_gate, metric snapshots, baseline)
+  3) Generates a “next action” recommendation (rollback vs investigate)
+
+The controller does not automatically rollback for general availability customers in v1 (separate product decision); internal and selected accounts may enable auto-rollback behind a feature flag.
+
+## Alternatives considered
+1) **SLO-only gating (errors/latency only):** Rejected. Saturation signals often predict impending incidents before SLOs breach, and help avoid false confidence during short evaluation windows.
+2) **Absolute thresholds only:** Rejected. Tenants differ materially; relative gating catches regressions that are meaningful even when absolute values are “under global limits.”
+3) **Relative thresholds only:** Rejected. Baselines can be poor during an ongoing incident; absolute thresholds provide a safety floor.
+4) **Quality gates based solely on online signals:** Rejected for v1. Online signals can be delayed, noisy, and customer-dependent. Offline eval is required for controlled quantization safety.
+
+## Consequences
+### Positive
+- Consistent, auditable criteria for progressing config rollouts.
+- Faster detection of regressions with fewer “mystery” incidents.
+- Clear contract between Control Plane, Runtime, SRE, and Applied ML on required metrics and tags.
+
+### Tradeoffs / Risks
+- Added rollout duration due to warmup/evaluation windows and offline eval runtime.
+- Potential false positives from metric noise on low-traffic tenants; mitigated via minimum volumes and adaptive window extension.
+- Increased complexity for Private deployments that must surface equivalent metrics; mitigated via documented metric spec and reference dashboards.
+
+## Implementation notes (non-normative)
+- Gate logic is implemented in the canary rollout controller (ENG-4824 / ENG-4827) using shared rule definitions from slo-toolkit.
+- Gate decisions must be deterministic from stored metric snapshots to support post-incident reconstruction.
+- All gate evaluations and overrides must produce audit events with rollout_id, config_version, and the evaluated scope.
+
+## Open questions
+- Do we need model-family specific latency gates for TTFT vs throughput-heavy endpoints (e.g., embeddings) beyond the defaults above?
+- For quantization: should we require a second eval run after “promote” to detect drift from different production prompt distributions?
+
+## Appendix: Default gate summary table
+SLO (Hard): 5xx_rate, timeout_rate, p95/p99 latency, TTFT p95 (streaming)
+Saturation (Hard/Soft): queue_delay p95 (Hard), GPU util/mem (Soft→Hard at high blast radius), OOM/CUDA errors (Hard), KV cache pressure (Soft→Hard for cache changes)
+Convergence (Hard): >=99% workers on target within 10m, mixed state <=15m, apply_error_rate <=0.1%
+Quality (Hard for quant): offline eval win-rate + task score + safety regression; online holdout recommended/required by tier

@@ -1,0 +1,396 @@
+Incident Bot Diagnostics v2 — Design
+
+## Summary
+Incident Bot Diagnostics v2 upgrades Redwood’s incident Slack bot to automatically attach standardized “first 5 minutes” context in #incidents and #eng-oncall. v2 adds three primary context areas:
+1) **Recent deploy context** (service/version/rollout phase/canary + linked PRs)
+2) **Customer/tenant-safe config diffs** (feature flags, routing policy, quotas, model pins) with redaction + audited access
+3) **Saturation signals** (GPU utilization, KV cache pressure, queue depth, scheduler/backpressure indicators, regional capacity) plus deep links to dashboards/traces
+
+This document covers goals, architecture, data sources, Slack UX, caching and rate limiting, failure modes, and rollout plan.
+
+---
+
+## Goals
+- Reduce **time-to-triage** and **time-to-mitigation** for common incident classes:
+  - Deploy regressions
+  - Misconfiguration (flags/routing/quotas/model pins)
+  - Regional capacity/saturation
+- Standardize incident context so responders start from consistent evidence instead of ad-hoc queries.
+- Improve graceful degradation decisions by surfacing routing/fallback configuration and capacity signals.
+
+### Success metrics (v2)
+- **MTTR reduction:** 15–25% for deploy/config/saturation-driven incidents (measured vs baseline by class).
+- **Context completeness score:** % of incident threads where deploy + config + saturation cards render successfully within SLA.
+- **Responder satisfaction:** on-call survey after beta rotation (qualitative + “card usefulness” rating).
+
+---
+
+## Non-goals
+- Replacing incident management workflows or pager tooling.
+- Building a long-term metrics warehouse or re-architecting telemetry storage.
+- Providing raw customer configuration data; v2 only provides **tenant-safe** summaries and redacted diffs.
+
+---
+
+## User experience (Slack)
+### Entry points
+- Automatic: bot posts v2 context when it detects an incident declaration pattern (e.g., `SEV1`, `SEV0`, `/incident declare`, or incident channel topic template).
+- Manual:
+  - `/incident context` (recompute and post)
+  - `/incident context --service <svc> --region <region> --tenant <tenant>` (advanced, gated)
+  - Button actions on cards: “Refresh”, “Expand”, “Open dashboard”, “Copy command”, “Request elevated access”
+
+### Context cards (threaded)
+Cards are posted as separate message blocks in the incident thread to support partial rendering and degraded behavior.
+
+1) **Recent deploys**
+- “What changed in the last N minutes that could explain this?”
+- Includes:
+  - Service + environment + region
+  - Last deploy timestamp(s)
+  - Image SHA / build ID
+  - Rollout phase (canary/partial/full) and canary health summary
+  - Links: rollout page in Console, GitHub PR(s), deploy timeline dashboard
+
+2) **Config changes (tenant-safe)**
+- “Did config/policy change?”
+- Includes:
+  - Config change window summary (last X mins)
+  - Redacted diff preview (allowlisted keys)
+  - Explicit redaction warnings (e.g., “3 fields redacted”)
+  - Links: Console config history view (scoped), audit event ID (internal), runbook
+
+3) **Saturation signals**
+- “Are we capacity constrained or backpressured?”
+- Includes:
+  - GPU utilization + GPU memory
+  - KV cache pressure indicator
+  - Queue depth and admission control/backpressure
+  - Regional capacity headroom summary
+  - Links: saturation overview dashboard, per-pool drill-down, traces/log correlation
+
+4) **SLO / error budget burn (optional but recommended)**
+- “How bad is it and where?”
+- Includes:
+  - Per-region burn link (latency, 5xx, streaming disconnects)
+  - Highlighted top offending routes/models if available
+
+### Rendering rules
+- Default time window: **last 60 minutes** (deploy/config) and **last 15 minutes** (saturation), configurable.
+- Truncation:
+  - Diff previews: 20 lines max in card; “Expand” opens modal with pagination.
+  - Signal lists: top 5 highest severity items; remainder behind “Expand” modal.
+- Each card displays:
+  - Computation timestamp
+  - Data source used
+  - “Degraded mode” indicator when data comes from cache or links-only fallback
+
+---
+
+## High-level architecture
+### Components
+- **incident-bot (Slack app)**
+  - Listens for incident triggers and slash commands.
+  - Renders cards and handles interactive actions (buttons/modals).
+  - Enforces Slack ack deadlines and idempotent retries.
+
+- **Diagnostics Aggregator (diag-agg)** (new internal service)
+  - Single orchestration endpoint for v2 context.
+  - Performs bounded fan-out queries to deploy/config/telemetry sources.
+  - Applies caching, request coalescing, timeouts, rate limits, and partial responses.
+
+- **Deploy Metadata Exporter** (owned by Release Eng / Infra)
+  - Provides recent deploy events in a bot-consumable format.
+
+- **Config Diff Service** (owned by Platform)
+  - Produces tenant-aware diffs with strict allowlists + redaction hooks.
+  - Enforces least privilege and emits audit events.
+
+- **Telemetry Query Service** (owned by Telemetry)
+  - Provides safe, bounded aggregations for saturation signals.
+  - Supports parameterized deep links to dashboards.
+
+- **Audit Logging** (Security)
+  - Captures bot access to privileged endpoints (config diffs, tenant-scoped telemetry).
+
+### Data flow (happy path)
+1. Incident triggers bot (`/incident declare` or pattern detection).
+2. Bot calls `diag-agg` with incident context (channel/thread, guessed service/region, optional tenant, timestamp).
+3. `diag-agg` fan-out:
+   - Deploys: recent deploys and rollout status
+   - Config: diff summary with redaction
+   - Telemetry: saturation summaries + recommended dashboards
+4. `diag-agg` returns a **partial-friendly** payload containing cards with status per card (ok/degraded/failed).
+5. Bot posts cards to the incident thread.
+6. On actions (Refresh / Expand): bot calls `diag-agg` action endpoints; `diag-agg` uses cached results and performs targeted re-queries.
+
+---
+
+## Data sources and contracts
+### 1) Deploy metadata
+**Source of truth:** deploy events emitted from CI/CD pipeline and rollout controller.
+
+**diag-agg input:** `{ service, env, region, time_window }`
+
+**Key fields needed**
+- `service_name` (canonical)
+- `deploy_id` / `rollout_id`
+- `image_sha` / `build_id`
+- `started_at`, `finished_at`
+- `rollout_phase` (canary | partial | full | rollback)
+- `canary_status` (pass | fail | running | unknown)
+- `related_prs` (URLs)
+
+**Notes**
+- When service mapping is unknown, card should still render with “Service unresolved” and include manual links to deploy timeline filtered by channel.
+
+### 2) Config diff retrieval (tenant-safe)
+**Source of truth:** platform config service (routing policies, feature flags, quotas, model pins).
+
+**Strict requirements**
+- Never post secrets or customer-sensitive values into Slack.
+- Provide safe diffs using:
+  - Allowlisted keys (safe-by-default)
+  - Pattern-based secret detection (e.g., tokens/keys/certs)
+  - Value redaction or hashing for sensitive-but-diff-relevant fields
+
+**Suggested allowlist categories (initial)**
+- Routing policy toggles (non-secret)
+- Feature flag names + boolean state
+- Quota/rate-limit numeric values (aggregated)
+- Model pin identifiers (public model IDs, internal version IDs)
+
+**Gating and access**
+- Default card: safe preview only.
+- “Expand diff” action:
+  - Requires responder to be in on-call role group (or break-glass for Sev0/Sev1).
+  - Always emits an audit event with incident channel/thread + actor.
+
+### 3) Telemetry / saturation signals
+**Source of truth:** metrics pipeline and scheduler/runtime instrumentation.
+
+**Signals (standardized)**
+- GPU utilization (avg/p95) by pool/region
+- GPU memory utilization (avg/p95)
+- KV cache pressure (ratio or eviction rate proxy)
+- Queue depth (p95) and queue time (p95)
+- Backpressure / admission control reject rate
+- Regional capacity headroom (available vs allocated)
+
+**Bounded queries**
+- Pre-aggregated metrics preferred.
+- Hard limits on label cardinality returned to the bot.
+- Default grouping: `{region, pool, service}`; tenant grouping only when explicitly requested and authorized.
+
+---
+
+## diag-agg API (v2)
+### Endpoints (internal)
+- `POST /v2/incident-context` — returns card payload for a thread
+- `POST /v2/incident-context/refresh` — recompute with stricter budgets and cache reuse
+- `POST /v2/incident-context/expand` — returns paginated detail for a single card (diff or signal list)
+
+### Card payload semantics
+- Each card includes:
+  - `card_id` (stable)
+  - `title`
+  - `status` (ok | degraded | failed)
+  - `summary` (human readable)
+  - `details_preview` (safe truncation)
+  - `actions` (Refresh, Expand, Open links)
+  - `links` (pre-parameterized)
+  - `debug` (source timestamps, cache status; internal-only)
+
+(Implementation note: the payload is versioned so Slack rendering can evolve without breaking older bot clients.)
+
+---
+
+## Caching, coalescing, and performance budgets
+### Performance targets
+- Bot posts initial cards within **45 seconds** total, with progressive rendering:
+  - First card within **10 seconds**
+  - Remaining cards streamed/posted as results arrive
+- 99p `diag-agg` latency target (non-degraded): **< 8s** for initial request with bounded fan-out.
+
+### Caching approach
+- **L1 (in-process):** short TTL (15–30s) to absorb Slack retries and “Refresh spam”.
+- **L2 (Redis or shared cache):** TTL by data type:
+  - Deploy context: 2 minutes
+  - Config diff summary: 2 minutes
+  - Saturation signals: 30–60 seconds
+  - Expanded diff pages: 5 minutes (content-addressed)
+
+**Cache keys** (conceptual)
+- `incident:{channel_id}:{thread_ts}:{service}:{region}:{tenant?}:{window}`
+
+### Request coalescing
+- Coalesce identical in-flight requests per cache key (singleflight).
+- Interactive actions should preferentially use cached data and only re-query the specific card.
+
+### Query budgets and guardrails
+- Hard caps per request:
+  - Max upstream calls: 10
+  - Max wall clock: 8s (initial) / 5s (refresh)
+  - Max response size per card preview: 6 KB
+- If budgets are exceeded, return **degraded** status with links-only fallback.
+
+---
+
+## Rate limiting and load shedding
+### Why
+During incidents, responders may trigger multiple refreshes, and the bot can unintentionally amplify load on telemetry/config systems (especially under partial outages).
+
+### Controls
+- **Per-thread limit:** 1 full recompute per 30 seconds; expanded views allowed but paginated.
+- **Per-user limit:** limit expand actions (config diffs) to prevent broad access and load.
+- **Global limit:** cap total `diag-agg` concurrency; queue with short deadline.
+- **Circuit breakers:** if an upstream dependency is failing or slow, open circuit and degrade to cached results + links.
+
+### Degraded mode behavior
+When degraded:
+- Prefer cached data (even if stale within max staleness bounds).
+- If no cache, post:
+  - A brief explanation (“Telemetry queries timing out; using dashboard links.”)
+  - Deep links with pre-filled filters (service/region/time window)
+  - A “Manual commands” snippet for on-call (see Runbooks section)
+
+---
+
+## Failure modes and expected behavior
+| Failure mode | Example | Bot behavior | Operator action |
+|---|---|---|---|
+| Deploy service unavailable | rollout controller down | Show deploy card as degraded; include deploy timeline link | Use Console deploy timeline; check release pipeline status |
+| Config diff denied (permissions) | missing scope; responder not on-call | Show safe summary only; show “Request elevated access” | Use break-glass if Sev0/1; file INT ticket if missing scope |
+| Telemetry query timeout | metrics backend slow | Show cached saturation; if none, links-only | Open saturation dashboard; check telemetry health |
+| High cardinality response | runaway label set | Truncate to top N and mark degraded; include warning | Use drill-down dashboards; adjust query groupings |
+| Slack ack deadline exceeded | Slack retries event | Idempotent handling; use request IDs and cache | None (transparent) |
+| Partial region outage | one region unreachable | Still render other region cards; isolate failure | Focus on affected region; consider failover |
+
+---
+
+## Security, permissions, and audit
+### Principle
+Least privilege for the bot; explicit escalation paths for privileged data; auditable access.
+
+### Identity model
+- Bot runs as service identity `svc-incident-bot`.
+- `diag-agg` runs as `svc-diag-agg` and assumes scoped access to downstream services.
+
+### Scopes (initial proposal)
+- Deploy metadata: read-only, non-tenant-specific.
+- Telemetry: read-only aggregations; tenant-scoped queries only with explicit scope `telemetry:tenant_agg_read`.
+- Config diffs:
+  - Summary access: `config:diff_summary_read`
+  - Expanded diff: `config:diff_expand_read` (gated)
+
+### Audit requirements
+- Emit audit events for:
+  - Any config diff retrieval (summary and expanded)
+  - Any tenant-scoped telemetry aggregation
+  - Break-glass activations (include incident severity + approver/actor)
+- Audit event fields include: timestamp, actor (human and service), incident channel/thread, tenant (if any), endpoint called, and result (allowed/denied).
+
+---
+
+## Observability for the bot
+### Key metrics
+- `incident_bot.context.latency_ms` (p50/p95/p99)
+- `incident_bot.context.card_status_count` by card/status
+- `incident_bot.context.cache_hit_rate` by card
+- `incident_bot.context.upstream_timeout_count` by dependency
+- `incident_bot.context.degraded_mode_count`
+- `incident_bot.slack.action_retry_count` (idempotency effectiveness)
+
+### Dashboards
+- Incident Bot Overview (SLOs, latency, errors)
+- Upstream Dependency Health (deploy/config/telemetry)
+- Cache + Rate Limit Effectiveness
+
+### Alerts
+- Page on:
+  - sustained failures to render core cards (deploy/config/saturation) > threshold
+  - excessive degraded mode occurrences (could indicate upstream outage)
+- Ticket on:
+  - rising p95 latency
+  - cache hit rate regression
+
+---
+
+## Runbooks and operator guidance
+- “First 5 minutes” usage is documented in: **Incident Bot Triage Playbook**.
+- Interpreting deploy context and config diffs:
+  - staged rollouts
+  - partial propagation
+  - rollback vs forward-fix indicators
+- Saturation triage:
+  - mapping GPU/queue/KV signals to likely causes and mitigations
+
+Bot card footers should include a “Runbook” link to the relevant section.
+
+---
+
+## Rollout plan
+### Phase 0: Discovery + baseline (Week 0–1)
+- Capture baseline MTTR by incident class.
+- Validate signal inventory and query costs.
+
+### Phase 1: Data-source plumbing (Week 1–3)
+- Deploy metadata export endpoint stable.
+- Config diff service with allowlists and redaction tests.
+- Standardize saturation metrics across pools and regions.
+
+### Phase 2: Slack UX + reliability hardening (Week 3–6)
+- Context cards, modals, pagination.
+- Idempotency, retries, caching, rate limiting.
+- Degraded-mode behavior and links-only fallback.
+
+### Phase 3: Beta rollout (Week 6–8)
+- Feature flag: `incident_bot.v2_diagnostics`
+- Cohort: SRE rotation + one platform on-call rotation
+- Regions: start with us-east + eu-west
+- Exit criteria:
+  - Context completeness score >= 85%
+  - No security/audit gaps
+  - No measurable telemetry load regressions
+
+### Phase 4: GA (Week 8–10)
+- Expand to all rotations and regions.
+- Update runbooks and onboarding docs.
+- Post GA retro; track follow-up tickets.
+
+### Rollback plan
+- Immediate: toggle feature flag off (returns to v1 behavior).
+- If `diag-agg` is unhealthy: bot switches to links-only mode (no fan-out) while keeping incident interactions operational.
+
+---
+
+## Open questions
+1) Tenant identification: best default heuristic in #incidents without risking misattribution (channel naming vs incident form fields)?
+2) How to represent multi-service incidents (e.g., control plane + inference runtime) without overloading responders?
+3) KV cache pressure: finalize the standardized metric and thresholds that are reliably actionable.
+4) Config diff granularity: do we need “effective config” (post-merge) vs “changed config” for certain incident classes?
+
+---
+
+## Appendix A: Example card content (illustrative)
+### Recent deploys (example)
+- Service: `hosted-api` | Region: `eu-west` | Env: `prod`
+- Last deploy: 12m ago | Rollout: `partial (30%)` | Canary: `PASS (p95 latency +4%)`
+- Commit: `a1b2c3d` | PRs: `#29104 Export deploy metadata`, `#29152 Improve rate limits`
+- Links: Console rollout • Deploy timeline dashboard • GitHub compare
+
+### Config diff (example)
+- Window: last 60m | Tenant: (not specified)
+- Changes (safe preview):
+  - `routing.fallback.enabled: false -> true`
+  - `quota.hosted_api.rps_limit: 1200 -> 900`
+  - `feature_flags.streaming_v2: true -> false`
+- Note: “2 fields redacted”
+- Actions: Expand diff (requires on-call role) • Open config history
+
+### Saturation (example)
+- GPU util (p95): 94% (threshold 90%) | GPU mem (p95): 88%
+- Queue depth (p95): 310 (threshold 200) | Admission rejects: 2.1%
+- KV cache pressure: elevated (evictions up 3.4x)
+- Suggested mitigations: enable batching cap, route overflow to fallback tier, consider regional failover
+- Links: Saturation overview • Scheduler backpressure • Traces/log correlation

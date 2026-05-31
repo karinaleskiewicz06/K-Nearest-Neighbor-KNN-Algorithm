@@ -1,0 +1,256 @@
+Cost Model API Observability (Dashboards + Alerts)
+
+## Purpose
+This page defines the required dashboards and alerting for the **Cost Model API** (internal service) used by Console and Optimize. The intent is to:
+- Keep Console hot paths reliable (bounded latency + bounded error rates).
+- Provide early warning on correctness issues (cost drift vs observed spend) and input data health (telemetry lag, schema/version mismatches).
+- Make schema adoption visible (distribution by schema_version and client build/version) to support safe deprecations.
+
+Non-goals:
+- This is not a billing/invoicing monitoring spec. Billing systems may reuse primitives, but Cost Model is not the system of record.
+
+## Service + ownership
+**Service name:** cost-model-service
+
+**Primary oncall/ownership:** Platform Control Plane (Ethan Park) 
+**Reliability partner:** SRE (Rafael Mendes)
+
+**Critical clients:**
+- Console backend (Chloe Martin / Jada Williams)
+- Optimize services (Aditya Rao / Jonas Weber)
+- Billing hooks integration (Cole Summers) (read-only validation + limited usage)
+
+## Data sources
+- **Request metrics:** emitted by cost-model-service (Prometheus), keyed by route + status class.
+- **Traces:** OpenTelemetry traces sampled on slow/error requests.
+- **Input health:** telemetry ingestion pipeline metrics (token metering + runtime cache/batching inputs).
+- **Drift job:** scheduled comparison job (predicted cost vs observed spend attribution) exported as time series.
+
+## Naming conventions (metrics + labels)
+All metrics below are presented with recommended names/labels. Existing names should be mapped in dashboard queries; do not block dashboard creation on naming perfection.
+
+Required common labels:
+- `env` (prod|staging)
+- `route` (e.g., /v1/estimate, /v1/breakdown, /v1/what-if)
+- `tenant_tier` (hosted|dedicated|private) (request context)
+- `deployment_mode` (hosted|dedicated|private)
+- `status_code` or `status_class` (2xx|4xx|5xx)
+- `schema_version` (e.g., scm.v1)
+- `client` (console|optimize|billing-hooks|other)
+- `region`
+
+Cardinality constraints:
+- Never label by raw `tenant_id`, `model_id`, or `org_id` in default service metrics.
+- When tenant-level debugging is required, rely on logs/traces with sampling and explicit access controls.
+
+## Dashboard: Overview (SLO + health)
+### Goals
+Provide an at-a-glance view for oncall and product teams:
+- Is the service up?
+- Is it fast enough for Console?
+- Are errors within budget?
+- Is drift or input quality regressing?
+
+### Panels (minimum)
+1) **Availability / success rate**
+- Metric: `http_server_requests_total{service="cost-model-service"}`
+- Query (PromQL sketch):
+  - Success rate: `sum(rate(http_server_requests_total{status_class=~"2.."}[5m])) / sum(rate(http_server_requests_total[5m]))`
+
+2) **Latency p50/p95/p99 by route**
+- Metric: `http_server_request_duration_seconds_bucket`
+- Query sketch:
+  - p95: `histogram_quantile(0.95, sum by (le, route) (rate(http_server_request_duration_seconds_bucket[5m])))`
+
+3) **Request volume (RPS) by route + client**
+- Identify spikes, client rollouts, and potential abuse.
+
+4) **Error rate by route + status class**
+- Include top 4xx causes (validation, bounds) vs 5xx (service issues).
+
+5) **Saturation signals**
+- CPU utilization, memory RSS, GC pause time (if applicable), threadpool/worker queue depth.
+- For compute-heavy paths: cache hit rate for internal memoization.
+
+6) **Dependency health**
+- Telemetry store query latency/error rate
+- Model catalog lookup latency/error rate
+
+### Recommended dashboard variables
+- `env`
+- `region`
+- `route`
+- `client`
+- `schema_version`
+
+## Dashboard: Latency deep dive (Console hot paths)
+### Scope
+Console uses estimate/breakdown endpoints in user-facing flows. This dashboard focuses on tail latency, regression detection, and bounding behavior.
+
+### Panels
+- p95/p99 latency by route and region
+- Latency heatmap (bucket distribution) for `/v1/breakdown` (most expensive)
+- Slow request breakdown (from tracing):
+  - time in dependency calls
+  - time in cost computation
+  - serialization time
+- Request bounds enforcement rate:
+  - count of requests rejected due to `CARDINALITY_LIMIT`, `TIME_RANGE_TOO_LARGE`, `TOO_MANY_GROUPS`
+
+### Target thresholds (guidance)
+Use the official SLO page for contractual SLOs. These thresholds are pragmatic guardrails for alerting/dashboards:
+- `/v1/estimate`: p95 < 150ms (prod)
+- `/v1/breakdown`: p95 < 350ms (prod)
+- `/v1/what-if`: p95 < 800ms (prod) (allowed to be slower; should not be on Console critical path)
+
+## Dashboard: Errors + error budget burn
+### Panel set
+- 5xx rate over time by route/region
+- Top error codes (application-level):
+  - `INVALID_ARGUMENT`
+  - `UNSUPPORTED_SCHEMA_VERSION`
+  - `INPUTS_INCOMPLETE`
+  - `DEPENDENCY_UNAVAILABLE`
+  - `COMPUTE_BUDGET_EXCEEDED`
+- Retries observed (client library) vs server-side timeouts
+- Error budget burn rate (multi-window)
+
+### Burn rate queries (example)
+If SLO is 99.9% (0.1% error budget), define an SLI for good requests:
+- Good events: 2xx responses (optionally include some 4xx if caller fault is excluded per SLO definition)
+- Example burn-rate approach:
+  - Short window (5m): `error_rate_5m / 0.001`
+  - Long window (1h): `error_rate_1h / 0.001`
+
+Alerting is specified below (multi-window is required).
+
+## Dashboard: Schema version adoption + compatibility
+### Why
+Schema version distribution is required for:
+- Safe deprecation of fields/endpoints
+- Understanding feature-flag rollouts across Console/Optimize
+- Correlating drift changes with schema changes
+
+### Panels
+- Requests by `schema_version` (stacked area) over 7d/30d
+- Requests by `client` x `schema_version`
+- Count of `UNSUPPORTED_SCHEMA_VERSION` errors
+- Client library versions (if emitted as `client_version` label *with low cardinality*)
+
+### Operational actions
+- If a schema deprecation is planned, adoption must show >95% traffic on the target version for 14 days (prod) before removal.
+- Any spike in unsupported-version errors during rollout requires rollback of the client feature flag (Console/Optimize) before server rollback.
+
+## Dashboard: Drift vs observed spend (correctness)
+### Definition
+**Drift** measures difference between:
+- Predicted cost totals produced by the standard cost model primitives, aggregated over a time window
+- Observed infrastructure spend attribution (GPU-hours/instance cost allocation) for the same scope
+
+Drift is expected to be non-zero. The objective is bounded and explainable drift with stable trends and quick detection of regressions.
+
+### Metrics (required)
+Exported by the scheduled drift monitoring job (hourly) with dimensions bounded to prevent cardinality blowups:
+- `cost_model_drift_ratio` (dimensionless): `(predicted_total - observed_total) / observed_total`
+- `cost_model_predicted_total_usd`
+- `cost_model_observed_total_usd`
+- `cost_model_drift_inputs_fresh` (0/1)
+- `cost_model_drift_scope` (global|by_region|by_deployment_mode|by_hardware_sku)
+
+Recommended dimensions (keep small):
+- `env`, `region` (optional), `deployment_mode`, `hardware_sku` (top 5 only), `schema_version`
+
+### Panels
+- Drift ratio over time (global) with alert thresholds overlaid
+- Drift ratio by deployment mode (hosted/dedicated/private)
+- Drift ratio by region
+- Coverage indicators:
+  - percent of traffic included in drift computation
+  - telemetry lag (p50/p95) of required inputs
+
+### Expected ranges (initial v1 guidance)
+These are operational guardrails (not customer commitments):
+- Global drift ratio absolute value should typically be < 5% day-over-day
+- Any sustained step change > 3% coincident with a deployment should be investigated
+
+### Known drivers of drift (for dashboard annotations)
+- Telemetry lag/backfills (token metering delay)
+- Runtime metric export changes (prefill/decode split, KV cache hits)
+- Overhead allocation policy updates (Finance)
+- Hardware price updates or capacity mix changes
+
+## Alerts (production)
+All paging alerts must be actionable and link to the incident runbook.
+
+### Paging alerts (P1/P2)
+1) **Availability / error budget burn (multi-window)**
+- Condition: 5xx (and other SLO-counted failures per SLO doc) burn rate
+- Trigger: burn > 14x for 5m AND > 2x for 1h (page)
+- Rationale: catches both fast outages and slow-burning regressions
+
+2) **Latency SLO burn (Console routes)**
+- Condition: p95 latency exceeds SLO threshold for `/v1/estimate` or `/v1/breakdown`
+- Trigger: burn > 10x for 10m AND > 2x for 2h (page)
+- Add separate alert for p99 spikes if correlated with timeouts
+
+3) **Dependency unavailability (telemetry store / model catalog)**
+- Trigger: dependency error rate > 2% for 10m OR p95 dependency latency > 2s for 10m (page if it impacts request success)
+
+4) **Drift regression (correctness)**
+- Trigger: `abs(cost_model_drift_ratio)` > 8% for 3 consecutive hourly evaluations AND `cost_model_drift_inputs_fresh==1`
+- If inputs not fresh, alert as non-paging (see below)
+
+### Non-paging alerts (ticket/Slack)
+5) **Telemetry lag threatens correctness**
+- Trigger: telemetry freshness SLI below threshold (e.g., p95 lag > 30m for 2h)
+- Action: notify Telemetry & Analytics channel; may require backfill
+
+6) **Schema mismatch / unsupported version**
+- Trigger: `UNSUPPORTED_SCHEMA_VERSION` > 0.1% of requests for 15m
+- Action: coordinate with client owners; rollback feature flag
+
+7) **Request bounding / cardinality pressure**
+- Trigger: `COMPUTE_BUDGET_EXCEEDED` or bounds rejections > 1% for 30m on any route
+- Action: evaluate new client usage pattern or abusive query shapes
+
+8) **What-if endpoint abuse**
+- Trigger: `/v1/what-if` RPS above expected envelope or sustained high compute time
+- Action: enforce rate limits; check guardrails
+
+## Alert routing
+- **Paging:** Platform Control Plane oncall; SRE secondary after 15 minutes if not acked.
+- **Non-paging:** #eng-platform (service) and #telemetry-analytics (input freshness), plus ticket creation in ENG queue.
+
+## Required runbook links
+All alert definitions in Grafana/Alertmanager must link to:
+- `cost-model-api-incident-runbook` (primary)
+- SLO page (definitions + what counts)
+
+## Dashboard layout + foldering
+Grafana folder: **Platform / Cost Model API**
+
+Dashboards (minimum set):
+1) Cost Model API — Overview
+2) Cost Model API — Latency (Console)
+3) Cost Model API — Errors + Burn
+4) Cost Model API — Schema Adoption
+5) Cost Model API — Drift vs Observed Spend
+
+## Rollout checklist (observability)
+Before enabling Console traffic by default:
+- [ ] Overview dashboard populated in prod and staging
+- [ ] Alerts created in staging; validated with controlled failure injection
+- [ ] Paging alerts created in prod but initially in “notify-only” for 48 hours (where appropriate)
+- [ ] Drift dashboard shows stable baseline for at least 7 days, with annotations for known changes
+- [ ] Schema version panel confirms expected client rollout distribution
+
+## Appendix: Example annotations to maintain
+Add Grafana annotations for:
+- cost-model-service deploys (commit SHA)
+- schema package releases (scm.v1.x)
+- telemetry pipeline changes impacting inputs (token metering, KV cache metrics)
+- overhead allocation policy updates (Finance)
+
+## Open questions (tracked separately)
+- Exact SLO thresholds and what errors count are defined in the SLO doc; keep this page aligned.
+- Whether we need a bounded, low-cardinality `model_family` label for drift breakdown (proposal: top 3 families only).

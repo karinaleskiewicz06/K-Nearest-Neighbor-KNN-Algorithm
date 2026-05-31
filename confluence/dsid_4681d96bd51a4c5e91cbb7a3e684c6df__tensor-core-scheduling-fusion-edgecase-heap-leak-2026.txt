@@ -1,0 +1,138 @@
+TensorCore fusion scheduling: intermittent heap growth and eviction inconsistency
+
+Summary
+-------
+This page documents a reproducible, intermittent heap growth and KV-cache eviction inconsistency observed when TensorCore fusion is enabled for certain transformer kernels on our heterogeneous GPU pool. The issue appears when fused kernels are scheduled across co-located model shards and when intra-request KV prefetch overlaps with eviction windows.
+
+Impact
+------
+- Scope: affects a subset (~2-3%) of heavy-generation requests on Dedicated and Private clusters using A100/NVIDIA Ampere families with TensorCore fusion enabled.
+- User-visible: transient increase in 95th-99.9th percentile latency, occasional OOMs on worker processes, and increased eviction churn leading to degraded per-token cost (up to +18% for affected requests).
+- Business: risk to SLOs (p95 latency SLO breaches when load spikes coincide with the bug).
+
+Observed signals
+----------------
+- Gradual heap growth on the worker process over a 5–30 minute window (process RSS increases in steps coincident with fused-kernel dispatch).
+- KV cache eviction rate spike (evictions/sec) with correlated increase in cold-start ratio for sessions.
+- Kernel execution traces show fused-kernel handoffs where a kernel fusion path returns before its allocated temporary buffer is reclaimed by the allocator.
+- GPU-side telemetry: extended SM busy durations, repeated kernel launches for identical shapes with slightly different scheduling metadata.
+
+Reproduction steps (conservative, reproducible in lab)
+-----------------------------------------------------
+1. Environment: A100 (80GB) instance or equivalent Ampere GPU; runtime build >= rtf-2026.02.
+2. Config: enable tensor_fusion=true, kernel_prefetch=adaptive, kv_cache_async_prefetch=true. Use multi-shard model variant (shard_count >= 2) with batch sizes that produce interleaved attention (sequence length ~1k).
+3. Traffic: replay a synthetic workload with a mix of long-generation and short completion requests; increase concurrency to saturate a single GPU slot (utilization ~70–80%).
+4. Monitor: capture process RSS, allocator free-list sizes, KV eviction counters, and per-kernel timestamps via the runtime’s compact trace.
+5. Expected: after ~5–20 minutes, worker process RSS climbs in discrete steps and eviction/sec rises; sporadic OOMs may be visible in stress runs.
+
+Root-cause hypothesis
+---------------------
+- The TensorCore fusion path introduces a small temporary buffer per fused dispatch that the CPU-side allocator treats as ephemeral. Under certain scheduling interleavings the fused dispatch completes on the GPU but the runtime’s completion callback is deferred (due to priority-driven scheduling and backpressure). While the callback is delayed the temporary buffer remains referenced by the dispatch record and is not returned to the free list. Repeated interleavings create a slow leak until a GC/eviction cycle recovers memory — but the recovery timing interacts badly with KV-cache eviction heuristics causing eviction storms and cold-hot thrash.
+- Binder: the issue manifests only when (a) fusion is enabled, (b) adaptive prefetch is used, and (c) priority inversion creates callback deferral windows.
+
+Detection and alerting (recommended signals)
+-------------------------------------------
+Create alerts that combine process-level, runtime, and kernel telemetry:
+
+- Alert: worker-heap-growth-sustained
+  - Condition: process_RSS growth > 150MiB in 10m AND heap_allocated_by_runtime/free_list_shrink_ratio > 0.15
+  - Severity: P2
+
+- Alert: kv-eviction-churn-spike
+  - Condition: evictions_per_sec > 20 for 5m AND cold_start_ratio > 0.12
+  - Severity: P2
+
+- Alert: fused-kernel-complete-defer
+  - Condition: fused_kernel_dispatch_time - completion_callback_time > 200ms for >100 samples in 5m
+  - Severity: P3
+
+Diagnostic trace snippet (compact trace JSON example)
+------------------------------------------------------
+Use the compact-trace capture to correlate kernel launches and completion callbacks. Example snippet (sanitized):
+
+{"kernel_launches": [{"id": "k1", "start_ns": 1000000, "end_ns": 1005000, "fusion": true, "temp_bytes": 8388608}, {"id": "k2", "start_ns": 1007000, "end_ns": 1012000, "fusion": true, "temp_bytes": 8388608}], "callbacks": [{"id": "cb1", "time_ns": 1005200, "kernel_id": "k1"}, {"id": "cb2", "time_ns": 1014000, "kernel_id": "k2"}]}
+
+Mitigations and workarounds (short-term)
+----------------------------------------
+If you observe the signals above in production, apply the following mitigations in order of increasing impact:
+
+1) Toggle runtime flags (non-disruptive to sessions):
+   - disabled: tensor_fusion=false
+   - If disabling fusion resolves the heap growth immediately, escalate to the runtime team for root-cause tracking.
+
+2) Soften prefetch: set kv_cache_async_prefetch=false or lower prefetch window from 128 tokens to 32 tokens.
+
+3) Reduce scheduling concurrency: temporarily lower per-GPU slot concurrency to reduce interleavings (slot_concurrency -> max(1, slot_concurrency - 1)).
+
+4) Eviction smoothing: increase the eviction hysteresis window to 60s to avoid cascade eviction. (config example below)
+
+Config snippet (runtime flags)
+------------------------------
+YAML example to apply via runtime-config API: 
+
+runtime_flags:
+  tensor_fusion: false
+  kv_cache_async_prefetch: false
+  eviction_hysteresis_sec: 60
+  slot_concurrency: 1
+
+Long-term fixes and plan (owner: kernel-scheduling team)
+--------------------------------------------------------
+- Short term (2 weeks): add defensive guard in fusion path to ensure temporary buffers are returned to the allocator synchronously on CPU-side completion callback. Add telemetry that increments a "fusion-buffer-held-ms" histogram for every fused dispatch.
+- Mid term (6 weeks): modify scheduler to avoid prioritizing out completion callbacks when fused dispatches are outstanding (priority inversion safeguards). Run canary on a single Dedicated cluster.
+- Long term (Q3/Q4): redesign fused-dispatch metadata to transfer ownership of temporaries to the GPU allocator stack so process-level lifetime aligns with actual GPU resource lifetime. This will require cross-team API change with allocator and tracing teams.
+
+Release & rollout plan
+----------------------
+1. Patch: micro-patch to force synchronous return of temporary buffer on callback (canary): release candidate rc-fusion-guard-2026.07.
+2. Canary: deploy to one Dedicated pool with internal traffic mirror; run 48h stress test with synthetic replay.
+3. Gradual rollout: 10% -> 50% -> 100% of Dedicated fleets over 7 days, monitor alerts and eviction/cold-start metrics at each step.
+4. Post-rollout: follow-up telemetry sweep and retrospective.
+
+Testing checklist
+-----------------
+- Unit: fused dispatch lifecycle unit tests that simulate delayed callbacks and assert buffer return.
+- Integration: stress replay with interleaved long and short generations.
+- Performance: ensure patch does not regress p50 latency by more than 5% on representative microbenchmarks.
+- Chaos: run the scheduler fuzz harness (see kernel-and-scheduling/scheduler-fuzz-resilience-lab-manual) with fusion enabled.
+
+Owner and escalation path
+-------------------------
+- Primary owner: kernel-scheduling (oncall: @kernel-scheduling on PagerDuty).
+- Secondary owner: runtime-memory and allocator team.
+- Escalation: if P95 latency or OOM rate increases by >20% post-mitigation, open an incident and page SRE and runtime leads.
+
+Operational runbook (quick steps)
+--------------------------------
+1. If alert worker-heap-growth-sustained fires: check process RSS trends and fused-kernel-complete-defer metric.
+2. Apply runtime_flags toggle (tensor_fusion=false) via the runtime-config control plane. Observe immediate memory delta within 60–120s.
+3. If immediate toggle not possible, reduce slot_concurrency and enable eviction_hysteresis.
+4. Collect compact trace for 30m and attach to issue with trace_id label: kernel-fusion-heap-XXXX.
+
+Follow-ups and audit items
+--------------------------
+- Add synthetic benchmark entry to microbenchmark-suite for fusion-heavy interleaving shapes (owner: benchmarking team).
+- Add acceptance gate to release pipeline that runs fused-path lifecycle checks.
+
+Appendix: sample commands and queries
+-------------------------------------
+- Capture compact trace for a worker (CLI):
+  ./rtctl trace capture --worker-id=worker-42 --duration=1800 --out=trace-worker-42.json
+
+- Query for eviction churn in Datadog (example):
+  avg(last_5m):sum:runtime.kv_evictions{cluster:dedicated,pool:pool-2} by {worker} > 20
+
+- Toggle runtime flags via API (curl):
+  curl -X POST https://controlplane.internal/api/v1/runtime-flags -H 'Authorization: Bearer $TOKEN' -d '{"tensor_fusion": false, "kv_cache_async_prefetch": false}'
+
+- Collect allocator free-list snapshot (GDB/heapwalk helper snippet):
+  python tools/heapwalk.py --pid 12345 --out=heap-12345.json
+
+Document history
+----------------
+- 2026-03-15: Issue triaged and initial lab repro recorded (Diego Alvarez).
+- 2026-04-02: Short-term mitigation (prefetch window tweak) verified in staging (Sophia Lin).
+- 2026-06-10: Patch candidate rc-fusion-guard prepared and integration tests green (Arjun Rao).
+- 2026-07-02: Canary deployment completed, metrics show reduction in heap-growth incidents; document published and owners assigned.
+
+If you have additional reproductions or telemetry, add them as comments on this page and label with "fusion-heap-sample".

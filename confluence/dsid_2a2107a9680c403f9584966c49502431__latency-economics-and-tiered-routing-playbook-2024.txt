@@ -1,0 +1,149 @@
+Latency economics and tiered routing playbook
+
+Overview
+
+Purpose
+This playbook defines the design, operational controls, and experiment/runbook procedures for latency-aware, cost-conscious tiered routing in the Redwood serving runtime. It connects SLO targets, per-tenant economics, and fallback policies so routing decisions preserve customer-facing latency SLOs while minimizing unit cost.
+
+Scope
+- Applies to multi-tenant hosted and Dedicated pools where requests may be routed across model variants, regions, and capacity tiers.
+- Not intended to replace per-customer contractual routing written in the control plane (those are higher-level policies implemented using these primitives).
+
+Goals and design constraints
+1) SLO preservation: prioritize meeting 99th percentile latency objectives for customer-facing routes.
+2) Cost sensitivity: route to lower-cost model variants or capacity tiers when doing so will not materially violate SLOs or degrade quality beyond tolerance.
+3) Safety: provide deterministic fallbacks and observability to avoid routing flaps and oscillation.
+4) Incremental deployability: new routing heuristics must be testable against shadow traffic and staged canaries.
+
+Key concepts and terminology
+- Tier: a logical grouping of capacity (e.g., premium-dedicated, shared-hosted, burst-spot).
+- Model variant: exact model artifact plus quantization/precision profile (e.g., gptx-1.2-int8-v2).
+- Fidelity: qualitative measure of expected output quality for a given variant.
+- Cost-per-token (CPT): estimated operator cost for serving a token on a given variant/tier.
+- Latency budget: per-request remaining time to meet the configured SLO.
+- Route policy: declarative rule combining selectors (tenant, route, weight) and decision predicates.
+
+Routing decision flow (high-level)
+1. Admission: validate request metadata, tenant allowances, and route-level constraints.
+2. Classification: tag request with workload profile (sequence-length estimate, sync/async, priority).
+3. Candidate generation: list compatible model variants and tiers.
+4. Scoring: compute score for each candidate: score = alpha * latency_score + beta * cost_score + gamma * fidelity_penalty.
+5. Selection and reservation: pick highest-scoring candidate that satisfies hard predicates (region affinity, contractual pinning). Reserve slot capacity (kernel admission).
+6. Execution and post-eval: if execution violates latency budget or quality regression, trigger fallback/rollback.
+
+SLO and economics math (practical formulae)
+- Expected latency per candidate L_c = median_kernel_latency(candidate, shape) + network_estimate(candidate.region). Use histogram-backed estimates.
+- Cost per request R_c = CPT(candidate) * expected_tokens(request). For batching, use amortized cost models (see amortized_cost_table below).
+- Composite utility U_c = (SLO_headroom(c)/SLO_target) - lambda * (R_c / R_ref) - mu * FidelityPenalty(c). We treat SLO_headroom as max(0, SLO_target - E[L_c]).
+- Decision threshold: pick candidate with max U_c subject to U_c > U_min else route to fallback (higher tier).
+
+Config table (example values)
+|| key || description || example || notes ||
+|| slo.target || target latency (ms) for route || 95 ms (P99) || route-level override ||
+|| lambda || cost weight in utility || 0.8 || tuned per product vertical ||
+|| mu || fidelity penalty weight || 1.2 || fidelity penalty normalized [0,1] ||
+|| U_min || minimal acceptable utility || -0.2 || prevents overly cheap but slow picks ||
+|| cost_ref || normalization constant for cost || $0.0005/token || updated by billing team weekly ||
+
+Operational rules and safety knobs
+- Circuit-breaker: if the selected candidate's observed P99 exceeds slo.target + 20% for 5 mins, route flow is temporarily pinned to next-safe tier and an alert is fired (severity P2).
+- Dampening window: do not switch routing preference for a tenant more than once per 60s to avoid oscillation.
+- Shadow testing: new candidate variants must be validated by 1 hour of 10% shadow traffic before being eligible for live routing.
+- Canary rollout: initial 1% of live traffic with metric-based escalation gates (latency, quality regression).
+
+Runbook: outage or mass-latency incident (step-by-step)
+1. Detect: Pager triggers from latency SLO alert (P99 exceeded for > 3m across a route).
+2. Triage: identify which candidate types account for majority of slow requests (use the routing decisions histogram - see observability queries section).
+3. Immediate mitigation (fast path): enable route-level override to force-route to premium-dedicated variant or raise U_min to deprioritize low-cost candidates. Command-line: 
+
+sh
+redwoodctl routes override set --route customer.chat --variant premium-gptx-1 --reason "p99-latency-spike"
+
+4. Validate: watch P99 and token drop rates for 10m. If steady, keep override while root cause investigation continues.
+5. Permanent remediation: revert to automated routing only after corrective changes (kernel patch, region failover, or cost recalibration) and a successful canary run.
+
+Telemetry & observability contract
+Minimum signals required for safe operation and postmortem:
+- per-route, per-variant P50/P95/P99 latency histograms (1s bucketing for 1m window)
+- per-route request counts and error counts by variant and tier
+- candidate selection reasons (why candidate selected: lowest cost / fidelity / pinned)
+- route decision churn metric (switches/min per tenant)
+- shadow validation pass/fail rates and quality regression counts
+- amortized cost per request and per-token CPI-like metric
+
+Example observability queries (PromQL-like pseudocode)
+- P99 latency for route "customer.chat":
+redwood_latency_seconds_bucket{route="customer.chat",job="runtime"} -> histogram_quantile(0.99, sum by (le) (rate(...)))
+- Fraction of requests routed to low-cost tier:
+sum(rate(requests_total{tier="shared"} [5m])) / sum(rate(requests_total[5m]))
+
+Quality safety and fidelity checks
+- Automatic prompt-level checks: for generation routes with fidelity-sensitive SLAs, run lightweight rerank/consistency checks in shadow before returning low-fidelity results live. If rerank confidence < threshold, fall back to higher-fidelity variant.
+- Regression window: if quality metric delta exceeds 1.5x baseline for 10m, pin variant and trigger remediation.
+
+Operational exercises and experiments (lab recipes)
+Each experiment below should be scheduled in the runtime lab environment and follow the experiment governance checklist (owned, hypothesis, rollback, telemetry).
+1. Cost-pressure response drill
+   - Hypothesis: under sustained increase in cost_ref by 25%, routing will shift to cheaper variants without violating P99.
+   - Steps: bump lambda to 1.6 for a test tenant, enable shadowing for new variants, monitor P99, fidelity.
+   - Success: no >10% increase in P99 and fidelity regression < threshold.
+2. Synthetic tail latency injection
+   - Hypothesis: the dampening window prevents oscillation when kernels degrade intermittently.
+   - Steps: inject 200 ms additional kernel tail for candidate A for 7m and observe routing churn.
+   - Success: churn < 0.5 switches/min and circuit-breaker triggers if needed.
+3. Canary for new quantized variant
+   - Steps: 10% shadow -> 1% live -> 5% live -> 20% live; at each stage validate latency, quality, cost.
+
+Rollout checklist for routing policy changes
+- Author a policy PR including: policy YAML, target routes, and experiment plan.
+- Run 1 hour of shadow validation on staging with traffic representative of production (latency and token shape).
+- Create a canary run for a pilot tenant for 24h with automatic rollback gates for P99 and quality.
+- Post-canonicalization: add telemetry enrichment and update billing/cost models if CPT adjustments required.
+
+Ownership and escalation
+- Policy author (owner): eng-serving-runtime/routing (primary)
+- Oncall escalation: runtime SRE -> runtime platform lead -> product owner for route
+- SLA incident owner: whoever owns the route in the Console product mapping table.
+
+Appendices
+A. Example policy YAML (simplified)
+
+---
+route: customer.chat
+slo:
+  p99_ms: 95
+  emergency_fallback_ms: 200
+policies:
+  - id: prefer_low_cost_with_headroom
+    selectors:
+      - tenant_tier: standard
+    scoring:
+      lambda: 0.8
+      mu: 1.2
+      alpha: 0.6
+    predicates:
+      - region_affinity: true
+      - fidelity_min: 0.85
+    safety:
+      shadow_validation: 1h
+      dampening_seconds: 60
+---
+
+B. Amortized cost note
+- When batching occurs, compute amortized CPT by dividing measured kernel execution cost by average batch size observed in the same time window. This prevents underestimating cost for low-latency but small-batch shapes.
+
+C. Related diagnostics (runbook quick commands)
+- Show recent routing decision histogram (last 15m):
+redwoodctl metrics query --name routing_decisions_histogram --route customer.chat --since 15m
+- Force a policy override:
+redwoodctl routes override set --route customer.chat --policy "pin-premium" --reason "p99-spike"
+
+D. Change log
+- 2024-05-12: Initial draft and validation experiments documented.
+- 2025-03-18: Added cost-normalization guidance and amortized-cost section.
+- 2025-11-03: Clarified circuit-breaker thresholds and added canary rollout gates.
+
+Contact and further reading
+- Owner: eng-serving-runtime/routing (Slack #runtime-routing)
+- Recommended follow-ups: delta-routing-and-cost-partitioning-architecture-2026, runtime-observability-self-heal-orchestration-manual-2026
+

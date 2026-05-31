@@ -1,0 +1,128 @@
+Runtime signal conciliation and latency cohorting
+
+Summary
+This page defines a single, operationally actionable taxonomy for runtime signals (conciliation) and a pragmatic approach to grouping traffic by latency cohorts (cohorting). The goal is to standardize how the runtime reconciles competing signals — SLOs, kernel pressure, KV cache warm state, and cost guidance — and how the scheduler harmonizes execution decisions across those cohorts to reduce tail latency while preserving throughput and cost targets.
+
+Intended audience
+- Runtime engineers (kernel, scheduler, dispatch)
+- SREs and oncall engineers owning latency SLOs
+- Performance and profiling owners
+
+Why this exists
+We observed repeated flapping between priority policies during mixed workloads: short chat requests bouncing against long generation jobs; KV cache warmup causing transient tail spikes; and adaptive batching oscillations that increase mean latency. Those issues trace back to inconsistent interpretation of telemetry signals across components. This doc prescribes: 1) a shared signal vocabulary, 2) cohorting rules, 3) a scheduler harmonization contract, and 4) an operational playbook for experiments and incidents.
+
+Key concepts
+- Signal conciliation: the deterministic process by which the runtime reduces multiple, possibly conflicting telemetry inputs into an ordered set of actions (e.g., throttle, preempt, hedging, fallback).
+- Latency cohort: a stable label assigned to a request (or request class) representing its expected latency distribution and tolerance (e.g., interactive-50ms, elastic-200ms, batch-1s). Cohorts are used to drive scheduling, admission, and caching policies.
+- Steering signals: canonical telemetry used for conciliation. See table below.
+
+Steering signals (canonical)
+- SLO_gap: (SLO_target_ms - observed_p95_ms) normalized by SLO_target_ms. Positive = healthy.
+- Queue_depth: per-queue pending requests count and age histogram (0-10ms, 10-100ms, >100ms).
+- Kernel_pressure_index (KPI): weighted sum of GPU occupancy, active kernels, enqueue latency, and memory stall rate. Range [0,100].
+- KV_warm_fraction: fraction of requests expected to hit prefix/KV cache (0-1).
+- Cost_signal: per-token cost estimate and priority cost budget remaining for the route/customer.
+- Error_rate: percent of responses that triggered fallback/retry in the last minute.
+
+Latency cohorts (recommended defaults)
+1) interactive-50ms: requests with strict p50/p95 targets (e.g., UI autocompletion).
+2) interactive-150ms: session chat turns that can tolerate modest tail but expect snappy median.
+3) elastic-400ms: longer generations where batching accelerates cost efficiency.
+4) background-batch-1s: large offline or low-priority requests eligible for queueing and high batching.
+
+Cohort assignment rules
+1. Assign cohort at ingress based on route metadata and model profile (explicit route overrides default).
+2. If request includes max_latency_ms or max_tokens, map to cohort using the mapping table in Appendix A.
+3. Dynamic reclassification: on warmstart/kvcache-warmup events, mark requests as "warming-elastic" for up to 2s to bias toward nodes with warm cache.
+
+Scheduler harmonization contract (short)
+- Purpose: give a deterministic algorithm for turning conciliated signals into actions across the admission-controller, slot allocator, and kernel dispatcher.
+- Input: steering signals + cohort label + route SLA tier + model-variant cost guidance.
+- Output: admission decision (accept/defer/redirect), slot allocation (slots, preemptible flag), kernel hints (preferred kernel ID, quantization path), and fallback instruction (model-variant or queue route).
+
+Decision precedence (ordered)
+1. Safety blocks (OOM, watchdog) — immediate reject/evict.
+2. SLO preservation for interactive cohorts when SLO_gap < 0.1 — apply hedging, reduce batch size, reserve non-preemptible slot.
+3. KPI escalation — if KPI > 80, favor elastic/background cohorts for eviction or delayed admission.
+4. Cost_controls — if cost budget is exhausted for a high-cost route, redirect to quantized variant or lower-fidelity model.
+5. KV_warm_fraction optimization — prefer nodes with warm fraction >= 0.7 for cohorts that benefit from cache; otherwise allow warmup cohort routing.
+
+Operational playbook (incident / experiment flow)
+1. Detection: Alert triggers if p95_interactive > SLO_target * 1.2 for 3 minutes OR KPI > 85 for 2 minutes.
+2. Triage rapid checks (2 min):
+   - Check SLO_gap, KPI, Queue_depth, KV_warm_fraction across affected nodes.
+   - Identify cohort skew (which cohorts show disproportionate latency).
+3. Rapid mitigation (5–15 min):
+   - If KPI high and elastic/background load is > 40% of active kernels, temporarily drain new batch routes and redirect to spare pool.
+   - If KV_warm_fraction low and interactive cohorts are affected, enable warm-prefetch for interactive routes and nominate warm nodes using routing tag warm-preferred=true.
+   - Apply emergency hedging for interactive cohorts: spawn second probe request on separate slot and cancel slower completion.
+4. Follow-up (post-mitigation):
+   - Run microbenchmark traffic shaped to reproduce cohort mix that triggered incident (see Benchmarking protocol section).
+   - Capture full traces for 30 minutes and export to profiling lab.
+
+Benchmarking protocol (cohort-aware replay)
+- Purpose: validate scheduler decisions under realistic mixed cohorts.
+- Core steps:
+  1. Build a traffic shape with 3 lanes: interactive-50ms (40% qps), interactive-150ms (30% qps), elastic-400ms (30% qps).
+  2. Run three scenarios: baseline (no harmonization), harmonization-lite (conciliation but no preemptive evict), harmonization-full (all rules enabled).
+  3. Measure: p50/p95/p99 per cohort, mean tokens/sec, kernel context-switches, KPI, KV hit delta, cost_per_1k_tokens.
+  4. Acceptance criteria: interactive-50ms p95 improvement >= 20% vs baseline and overall cost increase <= 8%.
+
+Profiling playbook (fast experiment loop)
+- Sampling: mark 1% of interactive requests and 0.5% of elastic as deep-sampled for full trace collection.
+- Instrumentation: include kernel_id, batch_size, slot_id, kv_hit, enqueue_time_ms, kernel_start_ms, kernel_end_ms, total_response_ms.
+- Replay: use the captured traces to run stepwise synthetic replays in the profiling lab with and without harmonization – compare kernel dispatch histograms.
+
+Configuration reference (examples)
+Table: Scheduler conciliation thresholds (human-readable)
+- interactive_reserve_slots: 20% (reserve always-available non-preemptible slots per node for interactive cohorts)
+- hedging_probe_delay_ms: 30 (time after which hedging probe is launched for interactive when queue_age > 10ms)
+- kpi_preempt_threshold: 80
+- warm_preferred_fraction_threshold: 0.7
+- cost_redirect_threshold_usd_per_1k: 2.50
+
+Example YAML snippet (route-level override)
+- route: /api/chat/fast
+  cohort: interactive-50ms
+  reserve_slots: 0.25
+  max_batch_size: 8
+  fallback_variant: model-lite-quantized-v2
+
+Runbook excerpt: latency spike play actions (cheat sheet)
+1. Acknowledge alert and post on #runtime-incidents.
+2. Run `runtime-cli get-signals --nodes affected` and snapshot KPI/queue/kv.
+3. If KPI > 85: scale out spare-pool by +10% and enable batch-drain on background pools.
+4. If interactive p95 > target*1.2 and KV_warm_fraction < 0.6: set routing tag warm-preferred=true for interactive routes and re-route 10% traffic to warm nodes.
+5. If no improvement in 10 minutes: failover to regional fallback model family (defined in Release Playbook).
+
+Dashboards and alerts (minimum)
+- Dashboards: cohort-latency-heatmap, KPI-over-time, kv-warm-fraction-by-node, admission-decision-by-cohort.
+- Alerts: High KPI, cohort p95 breach, sustained hedging rate > 5%, sudden KV_warm_fraction drop > 0.2 in 5m.
+
+Ownership and contacts
+- Runtime scheduler owner: Marcus Lee (pager: eng-runtime-scheduler)
+- Kernel infra owner: Elena García (pager: eng-kernel)
+- Profiling & benchmarks: Jordan Kim (profiling@redwood.ai)
+
+Appendix A — cohort mapping guidelines
+- max_latency_ms <= 50 -> interactive-50ms
+- 50 < max_latency_ms <= 200 -> interactive-150ms
+- 200 < max_latency_ms <= 600 -> elastic-400ms
+- max_latency_ms > 600 or large token budgets -> background-batch-1s
+
+Appendix B — experiment checklist for safe rollout
+1. Feature-flagged rollout (10% traffic) for 48h with continuous monitoring.
+2. Canary cluster with identical HW profile and KV warm snapshot.
+3. Compare p99 and error delta vs baseline; gate at 2% p99 regression or 0.5% error rate increase.
+
+Change log
+- 2025-09-14: Document created (Aisha Patel).
+- 2025-11-02: Added hedging parameters and KPI definition (Marcus Lee).
+- 2026-02-03: Tuned benchmark acceptance criteria and added warm-preferred routing guidance (Elena García).
+
+Related artifacts
+- Synthetic replay harness: repo: infra/perf/replay/cohort-replay
+- Profiling lab dashboard: dashboards/runtime/cohort-profiles
+
+Finally
+This doc is normative for any scheduling or admission change that touches cohorted traffic. If you propose a change that modifies the conciliation algorithm, update the decision precedence table and run the cohort-aware benchmark suite described above prior to rollout.

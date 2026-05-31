@@ -1,0 +1,117 @@
+Model warm-pool SLO sentinel and graceful demotion runbook
+
+Summary
+
+This runbook describes the SLO-linked operational controls we use to keep model-serving latency and availability within contract and product targets during bursty traffic, model rollouts, and partial capacity degradation. It defines the warm-pool sizing guidance, the SLO & error-budget mapping used to trigger automated and human remediation, step-by-step oncall playbook actions for safe graceful demotion (tiered degradation), and the telemetry/alerting requirements necessary for confident incident review.
+
+Scope & intent
+
+- Services covered: redwood-gen-api (text generation), redwood-embed-api (embeddings), and the model serving runtime (runtime-daemon).
+- Applies to Hosted and Dedicated runs where warm-pool provisioning and graceful demotion are in effect. Private deployments should consult the reference architecture for on-prem heuristics.
+- Goal: keep customer-facing SLOs within budget while minimizing cost and avoiding hard failures.
+
+Ownership
+
+- Primary owner: eng-sre (Capacity & Runtime subteam)
+- Runbook steward: Asha Patel (eng-sre)
+- Escalation: Service owner (product team) -> Runtime lead -> SRE oncall -> Infrastructure engineering manager
+
+SLOs and error-budget mapping
+
+- Availability SLO (synthetic + real traffic): 99.95% successful responses (2xx) per rolling 30d for production routes.
+- Latency SLOs (tail-sensitive): p95 < 250ms, p99 < 900ms for small generation (<512 tokens) routes; embeddings p95 < 150ms, p99 < 600ms.
+- Error budget policy: burn rate > 2x sustained for 1 hour triggers auto-safeguards; burn rate > 4x for 15 minutes escalates to oncall.
+- Warm-pool sentinel: a derived signal that measures the ratio of free warm slots to expected demand over a 10-minute prediction window. Thresholds:
+  - Green: > 1.5x expected demand (no action)
+  - Yellow: 0.8x–1.5x expected demand (preemptive warm-up / autoscale advisory)
+  - Red: < 0.8x expected demand (initiate graceful demotion plan & prioritized routing)
+
+Telemetry signals (minimum)
+
+- Telemetry stream (per-route, per-model): request_count, success_rate (2xx fraction), p50/p95/p99 latency, warm_pool_free_slots, warm_pool_fill_rate, kv_cache_hit_rate, queue_depth, gpu_utilization, queued_kv_mem_bytes.
+- Derived signals: expected_demand (EWMA 5m), warm_pool_sentinel_ratio, error_budget_burn_rate (rolling 1h / 30d baseline).
+- Retention: high-fidelity (1s/10s) for 1d, 1m aggregates for 30d.
+
+Warm pool sizing guidance (heuristic table)
+
+||Workload profile||Typical tokens/request||Target p95 latency||Warm pool base multiplier||Notes||
+|Burst-dominated, spiky onboarding flows|<256|p95 <250ms|2.5x expected baseline|Keep warm pools in hot-region; pre-warm on release windows|
+|Steady enterprise batch embedding|<1024|p95 <150ms|1.2x baseline|Smaller warm pools; prioritize KV cache persistence|
+|Chatty multi-turn context|>1024|p95 <400ms|3.0x baseline|Reserve extra slots for KV cache re-hydration|
+
+Sizing worked example
+
+- Measured steady requests/minute: 600 r/min for route /v1/generate-small. Average session length 20 tokens. Expected baseline concurrency: (600 r/min * 20 tokens) / 60s ≈ 200 active token pipelines. Warm pool multiplier 2.5x -> warm slots target = 500.
+
+Operational playbook (Runbook steps)
+
+1) Automated sentinel actions (no human action required for Green -> Yellow transitions):
+   - When warm_pool_sentinel_ratio enters Yellow for > 5m: trigger async pre-warm job that allocates ephemeral warm slots up to Yellow->Green target. Notify oncall channel (#sre-warm-pool-alerts) with summary.
+   - If autoscaler is healthy, suggest temporary scale-up (burst nodes) with conservative 10–15% CPU/GPU headroom.
+2) Oncall verification (Yellow -> Red or error budget burn triggers):
+   - Step 1: Acknowledge pager. Post the following to the incident channel: observed routes, p95/p99, warm_pool_free_slots, recent deploys.
+   - Step 2: Run quick health checks: `curl -sS https://prometheus.internal/api/v1/query?query=warm_pool_free_slots` and `redwoodctl runtime status --model <model-name>`. Capture outputs.
+   - Step 3: If warm_pool_free_slots < 0.8x expected AND error_budget_burn_rate > 2x, flip routing policy to priority-mode (see Routing & fallback below).
+   - Step 4: If GPU OOMs or memory errors appear, start model eviction for low-priority model variants following the eviction matrix (Appendix).
+3) Graceful demotion (Red state) — prioritized routing and degraded functionality:
+   - Shift non-critical routes to lower-cost model variants (embedding-lite, generate-small-quantized) using canary routing 10% -> 50% -> 100% with 5m observation windows.
+   - Start progressive token trimming policy: for long generation sessions, apply soft length cap and prompt pruning rules (see templates). Notify product teams.
+   - Enable reduced-quality caching mode: allow best-effort KV cache eviction to free memory but maintain prefix-serving for high-priority sessions.
+4) Recovery and scale-down:
+   - After sustained warm_pool_sentinel_ratio > 1.2x for 15 minutes AND error_budget_burn_rate < 1.2x for 30 minutes, reverse routing changes in the same stepwise window used to apply them.
+
+Routing & fallback policies
+
+- Priority-mode routing: tag tenants/routes into priority buckets (critical, business, experimental). In priority-mode, lower buckets receive degraded model variants or delayed scheduling.
+- Fallback order (default): primary model -> quantized variant -> small-variant -> queued with client-visible retry header.
+- Client-facing responses during demotion must include `X-Redwood-Demotion: <policy-id>` header and a clear `retry-after` when queued.
+
+Monitoring & alert definitions (examples)
+
+- Alert: SNTL-WARMPOOL-YELLOW: warm_pool_sentinel_ratio < 1.5 for 10m, severity: P3 (notify #sre-warm-pool-alerts).
+- Alert: SNTL-WARMPOOL-RED: warm_pool_sentinel_ratio < 0.8 for 5m OR warm_pool_free_slots trending down > 20%/5m, severity: P1 (pager).
+- Alert: SLO-BURN-ONCALL: error_budget_burn_rate > 4x sustained 15m, severity: P1 (pager + auto-routing).
+- Dashboard: per-tenant warm pool heatmap, model KV cache shadow hit rates, projected demand horizon.
+
+Incident review & postmortem signals
+
+When an event invoked graceful demotion or failed to prevent SLO breach, include the following in the incident review:
+- Evidence timeline: warm_pool_sentinel_ratio, autoscaler actions, deploy IDs, routing policy changes, oncall actions (with timestamps).
+- Hypotheses and reproduced checks: were warm pools under-provisioned, or were prediction windows miscalibrated? Include EWMA windows tried.
+- Cost impact: incremental pre-warm spend, avoided hard failures estimate, customer-facing outcomes (routes degraded, errors, latency delta).
+- Action items: at least one capacity tuning change, one observability improvement, and one test that prevents regression. Track in the SLO remediation board.
+
+Operational tooling & automation examples
+
+- redwoodctl warm-pool prewarm create --model gpt-small --slots 100 --ttl 30m
+- redwoodctl routing set-priority --route /v1/generate-small --priority critical
+- PromQL example for sentinel ratio: `sum(warm_pool_free_slots) / sum(expected_demand_5m)`
+
+Appendix A — Eviction matrix (priority order)
+
+1) Experimental models (all variants)
+2) Low-traffic training replicas (<=1r/min)
+3) Quantized small-variants used by non-critical tenants
+4) Business-critical variants (evict last, escalate to runtime lead)
+
+Appendix B — Prompt pruning template (for product teams)
+
+- Rule 1: Trim system prompt to 2 standard sentences when active demotion is in effect.
+- Rule 2: For multi-turn session, keep last N=6 messages prioritized by recency and role.
+- Rule 3: If trimmed prompt still exceeds token cap, apply semantic-summarization step using `redwood-summarize --budget 60` before generation.
+
+Verification & exercises
+
+- Quarterly table-top exercises: simulate warm-pool starvation by halting pre-warm jobs for 30m and validating graceful demotion sequence executes end-to-end.
+- Chaos test: run synthetic burst experiments that increase expected_demand by 3x for 10 minutes while exercising the routing and canary rollback.
+
+References & related documents
+
+- See capacity admission playbook and runtime OOM runbook for memory-specific escalations.
+- Link to routing policy governance: /confluence/eng-platform/dashboards-and-alerts/routing-policy-governance (internal).
+
+Change log
+
+- 2026-02-10: Initial draft (Asha Patel)
+- 2026-05-12: Added sentinel thresholds and warm-pool sizing worked example (reviewers: Daniel Kim)
+- 2026-08-18: Finalized demotion routing policies and alert thresholds (published)

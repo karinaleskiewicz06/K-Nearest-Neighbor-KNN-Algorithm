@@ -1,0 +1,156 @@
+Probe Dependency Graph and Orchestration Manifest
+
+Overview
+
+Purpose: Define the Probe Dependency Graph (PDG) concept, data model, orchestration manifest, and operational procedures for coordinating evaluation probes across shadowing, quantization migration, and regression triage. The PDG ensures probes run in dependency-aware order, minimizes redundant work, and encodes quality/latency constraints for mixed-SLO workloads.
+
+Scope: This doc covers the PDG schema, node/edge semantics, orchestration priority rules, example manifests, runtime integration points with the eval harness, and a step-by-step runbook for probe incidents and migrations. It applies to: evaluator teams, model-onboarding engineers, and the runtime/CI owners.
+
+Why a PDG?
+- Probes increasingly depend on the outputs of other probes (e.g., priming templates, cached KV artifacts, quant-safety classifiers). Without explicit dependency management, we see wasted compute, nondeterministic scheduling, and triage complexity during regressions.
+- PDG centralizes dependency metadata so the eval engine can reuse intermediate artifacts, schedule co-located runs, and generate clear blame paths for regressions.
+
+Key concepts
+
+1) Node types (table)
+| node_type | purpose | critical_fields | owner |
+| probe | Primary evaluation probe (prompt+seed+slice) | id, slice_id, cost_estimate, expected_latency_ms | evaluator |
+| transformer | Artifact producer (priming template generator, tokenizer shim) | id, image, cache_key | evaluator |
+| quant-job | Quantization candidate run (per-model/per-profile) | id, profile, quant_level | applied-ml |
+| kv-cache | Generated cache snapshot used by downstream probes | id, model_version, ttl_sec | infra |
+| aggregator | Combines probe outputs into metrics (e.g., coherence, fidelity) | id, metric_list, window_size | applied-ml |
+
+2) Edge semantics
+- depends_on: downstream node must wait for upstream to complete successfully.
+- uses_cache: downstream can reuse upstream artifacts; orchestration may skip run if cache is fresh.
+- optional_if_failed: if upstream fails, downstream can run a degraded flow (e.g., fallback prompt) but must be tagged in manifest.
+
+3) Contract rules
+- Each node declares SLO tags: latency_budget_ms, budget_tokens, fidelity_min (0-1).
+- Orchestrator enforces a soft-deadline; nodes that miss latency_budget_ms are flagged and the scheduler may deprioritize their dependents.
+- Cost_estimate is required (USD/minor_units) to support eval budgeting and probe eviction.
+
+PDG Manifest: YAML example\n# Example PDG manifest (annotated)
+version: v1
+manifest_id: pdg-example-card-promotion-2027
+description: PDG for card-promotion ranking probe set with quant shadowing
+nodes:
+  - id: tkn-priming-v1
+    type: transformer
+    image: gcr.io/redwood/primers/tkn-priming:202701
+    cache_key: primer/tkn-v1/sha256:abcd
+    owner: evaluator
+    outputs: [kv-cache:primer-tkn-v1]
+  - id: probe-ranking-a
+    type: probe
+    slice_id: ranking-promo-A
+    depends_on: [tkn-priming-v1]
+    expected_latency_ms: 120
+    cost_estimate: 0.003
+    fidelity_min: 0.85
+    owner: evaluator
+    optional_if_failed: true
+  - id: quant-shadow-low
+    type: quant-job
+    profile: int8-dynamic
+    depends_on: [probe-ranking-a]
+    owner: applied-ml
+    expected_latency_ms: 500
+    cost_estimate: 0.02
+edges:
+  - from: tkn-priming-v1
+    to: probe-ranking-a
+    relation: uses_cache
+  - from: probe-ranking-a
+    to: quant-shadow-low
+    relation: depends_on
+
+Integration points
+- Eval Orchestrator API: POST /eval/orchestrate with manifest_id and run_policy (immediate | scheduled | canary). The orchestrator returns run_id and a plan with task-level ETA estimates.
+- Cache registry: PDG nodes that declare outputs must register artifacts into the central cache service under the manifest namespace. The registry stores artifact provenance and TTL.
+- Telemetry hooks: each node emits standardized spans (pdg.node.start/stop) and a final pdg.node.result with fields: status, tokens_used, wall_ms, artifact_refs (if any).
+
+Scheduling and priority algorithm (high-level)
+1. Topological sort by depends_on edges. Nodes in the same rank are prioritized by a score: score = w1*(1-fidelity_min) + w2*(cost_estimate_norm) + w3*(latency_penalty) where weights are configured per-origination (default w1=0.6,w2=0.25,w3=0.15).
+2. If a node's cache_key exists and artifact is fresh (TTL not expired), skip the producer node and link the artifact ref into the plan.
+3. For mixed-SLO runs (some nodes with tight latency_budget_ms, others with high-fidelity), the scheduler builds two passes: a fast-pass (best-effort low-latency nodes) and a quality-pass (full fidelity).
+4. Canary policy: when running quant-shadow jobs, orchestrator schedules canary runs limited to 1% of traffic-mapped probes and pins a regression-watch window. Canary failures trigger an early abort and notify the regression triage channel.
+
+Operational runbook
+
+Trigger conditions:
+- PDG orchestrator reports node failures > 5% in 10-minute window for any manifest
+- Canary quant-shadow failure (quality drop > fidelity_min - 0.1)
+- Cache registry reports corrupted artifact checksum
+
+Immediate steps (1-5):
+1) Triage lead acknowledges the alert in PagerDuty and opens a PDG incident (link to incident template).
+2) Run "pdg-cli plan-status --manifest pdg-example-card-promotion-2027" to get live plan.
+3) If failures are isolated to a transformer/kv-cache node, mark dependent probes as degraded: run "pdg-cli rerun --node probe-ranking-a --degraded-template=ranking-fallback-v1".
+4) For quant canary failures, immediately set quant-shadow to suspend: "pdg-cli set-policy --manifest <id> --quant-shadow=paused" and notify applied-ml on Slack #applied-ml-quant.
+5) Collect artifact refs and attach to the incident: use the telemetry hook to download pdg.node.result spans and attach the first-failure logs.
+
+Post-incident analysis
+- Owner: evaluator team lead.
+- Deliverable within 3 business days: incident summary with root-cause hypothesis, affected slices, regressions scores, and a remediation plan (rollback, patch, or new probe).
+- If root cause relates to model changes, create a regression ticket and schedule a re-run of the PDG with the previous model version pinned.
+
+Rolling out PDG-driven workflows (checklist)
+1. Create manifest and validate with 'pdg-cli validate --manifest <file>'. Validation checks: circular dependencies, required SLO tags, cost estimates, and TTLs.
+2. Run locally in dry-mode: 'pdg-cli plan --manifest <file> --dry-run'. Confirm that topological order aligns with expectations.
+3. Canary schedule: tag manifest with 'canary: true' and define canary_target_percent. Start with 0.5%-1% and observe fidelity metrics for 48 hours.
+4. Promote to scheduled daily runs once stability metrics (fidelity variance < 0.02, failure rate < 0.5%) are met for 72 hours.
+5. Archive old manifests and ensure cache eviction policies are configured to avoid stale artifacts.
+
+SLOs and alert thresholds
+- Probe success rate: 99.5% per 24h window.
+- Artifact freshness (kv-cache TTL): default 6 hours, must be <= 24 hours.
+- Canary fidelity regression: alert if fidelity delta >= 0.05 over baseline.
+- Scheduling latency: 95th percentile plan-to-start <= 30s for immediate runs.
+
+Ownership and escalation
+- Manifest author: evaluator team (primary).
+- Orchestrator service owner: runtime infra (pager: infra-oncall).
+- Quant jobs: applied-ml (pager: applied-ml-oncall).
+- Incident triage: evaluator lead -> applied-ml lead -> runtime infra if artifact corruption suspected.
+
+Migration notes for model-onboarding and quantization teams
+- When onboarding a quant profile, attach a PDG manifest that includes both the production probe node and corresponding quant-shadow node. This guarantees an atomic relationship between the probe and its quant candidate.
+- Ensure quant-job nodes declare a backward-compatibility flag: 'fallback_to: {model_version}' so rollbacks are automated.
+
+Metrics dashboard (recommended widgets)
+- PDG run rate (daily) split by manifest owner.
+- Node-level failure heatmap (by node_type and slice).
+- Cache hit ratio for transformer nodes.
+- Canary fidelity delta timeseries per manifest.
+
+Examples and troubleshooting scenarios
+1) Scenario: Priming transformer runs unexpectedly slow during a spike.
+   - Symptoms: downstream probes show increased latency and partial timeouts.
+   - Quick fix: instruct orchestrator to skip transformer with 'pdg-cli override --skip tkn-priming-v1 --manifest <id>' and attach fallback primers.
+   - Longer fix: scale transformer horizontally and increase cache TTL for the high-traffic slice.
+
+2) Scenario: Quant canary passes locally but fails under shadow load.
+   - Action: pause global quant rollout, run targeted long-tail probes from the PDG (use 'pdg-cli replay --manifest <id> --slice longtail-99') and collect per-slice fidelity.
+
+Appendix A — PDG CLI quick reference
+- pdg-cli validate --manifest <file>
+- pdg-cli plan --manifest <file> [--dry-run]
+- pdg-cli orchestrate --manifest <file> --policy {immediate|scheduled|canary}
+- pdg-cli rerun --node <id> --manifest <id> [--degraded-template <id>]
+- pdg-cli set-policy --manifest <id> --quant-shadow {running|paused}
+
+Appendix B — Backwards compatibility and provenance
+- All artifacts registered by PDG nodes must contain an immutable provenance blob: producer_image, manifest_id, commit_sha, and timestamp. This enables deterministic replay for regression triage.
+
+Related pages and artifacts
+- See the PDG schema repo: git@github.com:redwood-inference/pdg-schema (link internal).
+- Integration tests: CI job 'eval/pdg-integration' must pass before manifest promotion.
+
+Contact
+- Doc owner: Aisha Kumar (aisha@redwood.com)
+- Evaluator contact: Marco Li (marco@redwood.com)
+- Applied-ML contact: Sofia Ramirez (sofia@redwood.com)
+
+Acknowledgements
+Thanks to the evaluator platform, runtime, and applied-ml teams for prototyping the PDG proofs-of-concept and providing early feedback.

@@ -1,0 +1,277 @@
+Hosted circuit breakers + load shedding (Reliability Program) — Overview
+
+## Summary
+Redwood Inference’s Hosted API experiences bursty, highly variable workloads (prompt-length variance, streaming, and customer traffic spikes). When capacity or dependencies saturate, overload can cascade into tail-latency blowups, elevated 5xx rates, and noisy-neighbor effects.
+
+This program adds explicit overload protection (circuit breakers + load shedding) to keep the platform within SLOs and degrade safely when the system is saturated.
+
+**Primary outcomes**
+- Reject or degrade traffic early and predictably to prevent overload cascades.
+- Provide customer-facing errors with stable semantics (status codes, error codes, retry guidance, correlation IDs).
+- Enable safe degradation modes (fallback routing, reduced features, queued admission) while preserving tenant isolation.
+- Reduce incident count/severity for capacity-related and dependency-related failure modes.
+- Improve operability: dashboards, alerts, runbooks, and consistent post-incident data capture.
+
+---
+
+## Why we’re doing this (motivation)
+### Observed platform risks
+- **Tail latency amplification:** When GPU scheduling queues grow, p95/p99 latency increases superlinearly; streaming endpoints are particularly sensitive to scheduler contention.
+- **Retry storms:** Ambiguous timeouts and generic 5xx can trigger aggressive client retries, compounding saturation.
+- **Noisy neighbor effects:** A small number of tenants with high concurrency or long prompts can dominate shared resources, especially during regional demand spikes.
+- **Dependency brownouts:** Partial degradation in downstream services (policy/config store, routing metadata, telemetry pipeline) can lead to increased request time and thread pool exhaustion.
+
+### Product and customer expectations
+- Enterprise and regulated customers require clear overload behavior and predictable guidance:
+  - Distinguish “rate limited” vs “temporarily overloaded”.
+  - Provide **Retry-After** consistently.
+  - Provide correlation IDs for support and incident triage.
+
+---
+
+## Scope
+### In scope
+- A hosted circuit breaker framework across the request path:
+  - **Gateway admission** (control plane/API gateway)
+  - **Routing fallback** integration (Smart Routing)
+  - **Runtime admission/backpressure** signals and bounded queueing behavior
+- Load-shedding policies based on real-time signals:
+  - GPU queue depth / scheduler backlog
+  - token/sec saturation
+  - memory pressure proxies / KV cache pressure
+  - regional capacity signals
+  - downstream dependency health
+- Tier-aware and tenant-aware policies (self-serve vs enterprise Hosted tiers; Dedicated contracts are out of the default shared policy path but may reuse components).
+- Customer-visible error taxonomy + payloads (HTTP mapping, stable error codes, Retry-After guidance, correlation IDs).
+- Optional graceful degradation modes:
+  - fallback to compatible model variants (when configured)
+  - feature reduction under duress (e.g., lower max_tokens, limit streaming concurrency, tool-calling constraints) behind policy flags
+- Rollout guardrails: dark launch metrics, canary by region, progressive enablement, fast rollback.
+
+### Out of scope (initial rollout)
+- Billing/credits policy changes (we only use existing usage enforcement hooks).
+- Cross-cloud multi-provider capacity brokering beyond current routing/failover primitives.
+- Major SDK API redesign (we will add additive error handling docs and helpers).
+
+---
+
+## Target failure modes (what we’re designing for)
+| Failure mode | Typical symptoms | Desired behavior (new) |
+|---|---|---|
+| GPU/runtime saturation | p99 latency spikes, timeouts, rising 5xx, queue depth growth | Shed early with 503 overload + Retry-After, preserve core SLOs for remaining admitted traffic |
+| Regional capacity dip | elevated queue depth + routing latency, uneven utilization | Prefer in-region admission control; optional fallback to compatible region/model per policy; bounded retries |
+| Noisy neighbor tenant | high concurrency + long prompts dominate scheduler | Tier/tenant-aware limits; fairness via per-tenant concurrency/token budgets |
+| Dependency brownout (config/policy/routing metadata) | increased gateway/routing latency, partial errors | Trip dependency breaker, return explicit error with correlation ID and retry guidance; avoid blocking critical threads |
+| Client retry storm | high request rate + repeated 5xx/timeouts | Stable 429 vs 503 semantics, consistent Retry-After; avoid ambiguous timeouts |
+
+---
+
+## High-level architecture
+### Design principles
+1. **Layered controls, single source of truth for policy.** Enforce at the earliest safe point (gateway) while still honoring runtime signals.
+2. **Fail safe and simple.** If policy evaluation is unavailable, degrade to safe defaults rather than allow unlimited admission.
+3. **Bounded queueing.** Prefer short, explicit queueing + early shedding over uncontrolled backlog.
+4. **Tenant isolation first.** Limits should protect shared pools without disproportionately harming small tenants.
+5. **Stable customer semantics.** Errors must be consistent across services and versions.
+
+### Components
+**1) API Gateway Admission (Control Plane / Edge)
+**- Enforces token buckets and concurrency caps (per-tenant, per-route, per-model where applicable).
+- Applies circuit breaker state when upstream saturation or dependency health indicates overload.
+- Emits normalized metrics:
+  - `gateway_overload_shed_total{reason,tier,region,route}`
+  - `gateway_breaker_state{breaker,region}`
+  - `gateway_admission_latency_ms{stage}`
+
+**2) Overload Policy Engine (shared)
+**- Stores tier defaults and tenant overrides.
+- Validates config and enforces guardrails (e.g., max caps, required Retry-After bounds).
+- Produces deterministic “admission decisions” and “degradation actions” for each request.
+
+**3) Smart Routing (fallback and constraints)
+**- On overload, routing may:
+  - attempt configured fallback model variant (same family/compatibility)
+  - attempt fallback region (subject to data residency and policy)
+- Loop prevention and bounded retries are mandatory.
+
+**4) Serving Runtime (signals + admission hooks)
+**- Exports saturation signals with bounded cardinality.
+- Provides runtime-side backpressure to prevent scheduler collapse.
+
+### Request flow (text diagram)
+1. **Client → Gateway**
+2. Gateway authenticates tenant, resolves route/model, collects fast signals (local concurrency, recent shed rate).
+3. **Policy evaluation** returns one of:
+   - Admit
+   - Shed (429/503 with code + Retry-After)
+   - Admit with degradation actions (feature caps, reduced tool-calling complexity)
+4. If admitted, request goes to routing; routing may apply **fallback policy** if upstream breaker open.
+5. Runtime accepts/queues within bounded limits; exports queue depth/saturation signals.
+6. Telemetry and SLO classification attach correlation IDs and overload classification.
+
+---
+
+## Customer-facing behavior (contract)
+### Status code semantics
+We standardize overload responses using ADR-014.
+- **429 Too Many Requests**
+  - Used for *tenant-scoped* admission limits (rate/concurrency) where retry is generally allowed after a short delay.
+- **503 Service Unavailable**
+  - Used for *system overload* or dependency/resource saturation where the platform is protecting itself.
+
+### Response payload requirements
+- Always include:
+  - `error.code` (stable overload code)
+  - `error.message` (customer-readable summary)
+  - `error.type` (e.g., `overload_error`)
+  - `request_id` and `correlation_id`
+  - `retry_after_ms` field (body) when Retry-After header is present
+- **Retry-After header** must be set consistently when we expect safe retries.
+
+### Retry guidance
+- Clients should implement exponential backoff with jitter.
+- Clients must respect Retry-After when provided.
+- SDKs will surface overload errors distinctly from generic transport errors.
+
+---
+
+## SLO and error budget alignment
+This program is explicitly tied to Hosted API SLO adherence and error budget protection.
+
+### Key policies
+- Overload-induced shedding is **preferable** to timeouts and uncontrolled 5xx cascades.
+- SLO reporting must:
+  - classify overload errors consistently
+  - separate “platform unhealthy” from “platform protecting capacity”
+  - avoid masking real regressions by overusing shedding
+
+### What we measure
+- Error budget burn rate during load tests and organic spikes.
+- Reduction in timeout rate and p99 latency during overload.
+- Correctness of error classification (overload vs internal error).
+
+See: *Hosted API SLO — Overload exceptions and budget policy* (related page).
+
+---
+
+## Success metrics (program-level)
+### Reliability metrics
+- **Incidents:** measurable reduction in saturation-related incidents and paging events (target: -30–50% QoQ after GA, adjusted for traffic growth).
+- **Tail latency under burst:** improved p95/p99 during controlled burst scenarios; avoid multi-minute brownouts.
+- **Timeouts and 5xx:** reduced ambiguous timeouts and generic 5xx during overload windows.
+
+### Overload protection quality metrics
+- **Shed rate correctness:** shedding increases only when saturation signals indicate; low false-positive rates.
+- **Breaker stability:** avoid rapid flapping; maintain predictable open/close behavior with hysteresis.
+- **Retry-storm resistance:** stable Retry-After semantics; reduced repeated requests per original user action.
+
+### Operability metrics
+- **MTTD/MTTR:** faster detection and quicker mitigation via dashboards/runbooks.
+- **Oncall confidence:** runbooks cover common overload scenarios; decision points are clear.
+
+---
+
+## Ownership and RACI (high level)
+### Program ownership
+- **Program Manager:** Talia Benson
+- **SRE Lead / Reliability owner:** Rafael Mendes
+
+### Component owners
+- **Gateway admission + enforcement hooks:** Ethan Park (lead), Amara Diallo, Cole Summers
+- **Policy engine + validation:** Benji Okafor, Jordan Lee
+- **Smart Routing fallback:** Mina Haddad (lead), Ravi Menon, Elena Popov, Peter Holtz
+- **Runtime saturation signals + backpressure:** Sofia Ivanova (lead), Lena Fischer, Omar El-Sayed
+- **Dashboards/alerts standards:** Aisha Bello, Allison Grant
+- **Docs and customer comms:** Elliot Price, Wei Chen, Dev Patel
+
+### Oncall escalation paths
+- Primary: #eng-oncall → SRE oncall
+- Secondary: #eng-platform-oncall (gateway/policy), #eng-routing-oncall, #eng-runtime-oncall
+- Support escalation: Support → Owen Phillips (incident liaison)
+
+---
+
+## Rollout plan (phased)
+### Phase 0 (Weeks 1–2): Requirements + error taxonomy
+**Deliverables**
+- Finalize overload SLO objectives and guardrails.
+- Publish ADR-014 (error taxonomy) and ADR-015 (layering).
+- Align with Support/Docs on customer guidance.
+
+**Exit criteria**
+- Signed-off error payload + status code mapping.
+- Initial thresholds and signals chosen for dark launch.
+
+### Phase 1 (Weeks 3–6): Implementation + dark launch
+**Deliverables**
+- Gateway admission middleware wired to policy engine.
+- Runtime saturation signals exported with bounded cardinality.
+- Routing hooks for fallback (disabled by default).
+- Dashboards + baseline alerts (non-paging initially).
+
+**Exit criteria**
+- Dark launch metrics show breaker decisions correlate to saturation.
+- No elevated customer errors due to false positives.
+
+### Phase 2 (Weeks 7–9): Canary + progressive enablement
+**Approach**
+- Canary in a single region (typically us-east) for a subset of tenants.
+- Gradually enable:
+  1) gateway shedding for extreme overload
+  2) tier-aware admission limits
+  3) limited fallback routing for configured tenants
+
+**Exit criteria**
+- Improved latency/timeout behavior during burst tests.
+- Stable breaker behavior (no flapping) and consistent Retry-After.
+
+### Phase 3 (Weeks 10–12): GA + operationalization
+**Deliverables**
+- Paging alerts enabled with tuned thresholds.
+- Runbooks finalized and linked from dashboards.
+- Support readiness complete (known issues + escalation guidelines).
+- Post-launch review with incident simulations and action items.
+
+**Exit criteria**
+- SLO toolkit classification aligned and verified.
+- Support can triage overload errors using correlation IDs and dashboards.
+
+---
+
+## Operational readiness checklist (GA gates)
+- Dashboards available in all regions with consistent metric names.
+- Alert thresholds reviewed and tested against historical traffic replays.
+- Runbooks:
+  - Hosted overload circuit breaker runbook (oncall)
+  - Runtime overload mitigation runbook
+- Incident-bot announces breaker state transitions in #incidents/#eng-oncall.
+- Support enablement:
+  - canonical explanation for 429 vs 503 overload responses
+  - sample customer reply templates
+- Rollback:
+  - feature flags for breaker evaluation and enforcement
+  - safe default policy when config/policy store is unhealthy
+
+---
+
+## Known risks and mitigations
+- **False positives (over-shedding):**
+  - Mitigation: dark launch + canary; hysteresis; per-region tuning; clear dashboards.
+- **Feedback loops between layers:**
+  - Mitigation: ADR-015 layering; avoid using shed rate as the sole signal; bounded retries in routing.
+- **Metric cardinality blowups:**
+  - Mitigation: bounded labels; aggregation at source; avoid per-request IDs in metrics.
+- **Customer confusion around new errors:**
+  - Mitigation: stable codes; docs updates; SDK examples; Support playbooks.
+
+---
+
+## References
+- ADR-014: Hosted overload error taxonomy (status codes, payloads, Retry-After)
+- ADR-015: Admission control layering (gateway vs routing vs runtime)
+- Overload policy engine integration
+- Overload protection dashboards
+- Runtime backpressure and saturation signals
+- Hosted API SLO policy (overload classification and error budget treatment)
+- Hosted overload circuit breaker runbook
+- Support: overload errors and retry guidance

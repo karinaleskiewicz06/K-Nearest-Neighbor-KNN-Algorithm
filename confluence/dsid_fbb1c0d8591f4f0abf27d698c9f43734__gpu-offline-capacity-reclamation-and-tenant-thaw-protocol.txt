@@ -1,0 +1,147 @@
+GPU offline capacity reclamation and tenant thaw protocol
+
+Summary
+This runbook describes the end-to-end process for reclaiming GPU capacity that has been declared offline (hardware fault, maintenance, prolonged preemption or lost heartbeats), and the controlled "thaw" procedure for returning tenants/workloads to that reclaimed capacity. The goal is to minimize customer impact, preserve SLOs, keep billing/credits consistent, and ensure Terraform/IaC and CI/CD artifacts remain the source of truth.
+
+When to use this doc
+- A node or GPU is marked OFFLINE by fleet telemetry for > 5 minutes and is not automatically rejoining.
+- Eviction/maintenance window has completed but the node failed health checks.
+- A region-level cold-power recovery or rack maintenance requires manual reclamation.
+
+Owner and escalation
+- Primary owner: GPU Fleet Capacity team (oncall: gpu-capacity@pagerduty)
+- Secondary owner: Cloud Accounts & Networking (for VPC/egress issues)
+- Escalation path: oncall -> eng-infra lead -> infra SRE -> CTO ops
+
+SLO context and impact windows
+- Tenant interactive SLO (p50 latency): 120ms target; we consider mitigation if expected 15-minute impact > 5% of tenant traffic.
+- Throughput SLOs for reserved Dedicated capacity: maintain >= 96% of committed tps over rolling 1h window.
+- Billing/credits: tenants on soft-reserve (warm pool credits) should not lose credit buckets during automated reconciliation; hard-reserve tenants may be moved with billing-notify.
+
+Pre-flight checks (automated + manual)
+1) Confirm telemetry signals: fleet-telemetry query for node_id shows offline_reason != "scheduled-drain" AND offline_duration > 300s.
+2) Check KV-cache state: verify token prefix warm cache snapshot exists for affected tenant(s).
+3) Validate network reachability: run egress and private-link checks to control plane.
+4) Identify tenant impact: run the tenant-impact tool: ./bin/tenant-impact --node NODE_ID --window 15m
+
+Immediate automated remediation (0–10 min)
+- If offline_reason == "transient-preempt" and offline_duration < 600s: let autoscaler keep warm pool and do no-op.
+- Otherwise trigger the reclaim pipeline: /ops/reclaim/run --node NODE_ID --mode dry-run and collect the output.
+
+Manual reclamation and verification (10–45 min)
+Step 1 — Coordinate:
+- Announce to #infra-notifications with subject: "[GPU RECLAIM] NODE <NODE_ID> region:<REGION>" and tag affected tenant teams.
+- Open a short incident channel if tenant impact > 5% or SLO risk exists.
+
+Step 2 — Non-destructive snapshot and metadata freeze:
+- Run: fleetctl snapshot create --node NODE_ID --reason "reclaim-manual-<YYYYMMDD>"
+- Freeze billing/credit delta for tenants on this node: billingctl freeze --node NODE_ID --until 1h
+
+Step 3 — Diagnostic probes (run in sequence):
+1. hardware self-test: hwdiag run --node NODE_ID --run quick
+2. kernel logs: journalctl -u gpu-driver -o short-iso --since "15 minutes ago" | sed -n '1,200p'
+3. nvml state: /opt/tools/nvml-dump --node NODE_ID --json > /tmp/nvml-NODE_ID.json
+4. network: socat test to control-plane and tenant endpoints (examples below)
+
+Example commands and snippets:
+- Check control plane reachability:
+  curl -s -f https://control.redwood.internal/v1/health || echo "control plane unreachable"
+- Validate service-level egress to tenant backend:
+  ip netns exec infra-probe curl -sS http://10.10.0.22:8080/health || echo "tenant backend fail"
+
+Decision matrix (reclaim vs escalate)
+- If hardware test fails or NVML reports persistent ECC errors: escalate to hardware team and mark node for decommissioning.
+- If network is flaky but node hardware OK: attempt soft-reconfigure (see Network remediation).
+- If node can be rejoined after reboot and tests pass: perform controlled join and prepare tenant-thaw plan.
+
+Network remediation (if applicable)
+- Reapply VPC attachments: terraform apply -target=module.gpu_vpc_attachment --auto-approve
+- Restart egress sidecar on node: kubectl -n infra rollout restart daemonset/egress-proxy --field-selector spec.nodeName=NODE_NAME
+- If NAT gateway ip exhaustion is suspected, switch to alternate egress pool: egressctl swap-pool --node NODE_ID --pool alt-egress-pool
+
+Reclaim action (if node will not return within 1h)
+1) Mark node state: fleetctl node set --node NODE_ID --state RECLAIMED --owner gpu-capacity
+2) Drain tenant allocations: allocatorctl drain --node NODE_ID --grace-period 120 --preserve-credits
+3) Create IAM/service-account rebinds for affected tenant workloads (automated via terraform module change, example below)
+
+Terraform/IaC pattern (maintain source of truth)
+- We never do permanent capacity reassignments out-of-band. All changes must be represented in Terraform. The reclaim-controller writes a tfvars patch which must be reviewed and merged.
+- Typical tfvars patch example (terraform variables file):
+| variable | old_value | new_value | comment |
+| gpu_node_pool.size | 24 | 23 | reclaim NODE_ID-xyz |
+
+CLI: create patch bundle
+  ./tools/tf-patch --pool gpu-node-pool/region-1 --dec -1 --reason "reclaim NODE_ID-xyz" --out tfpatch/reclaim-NODE_ID.patch
+
+Merge process (manual safe path)
+1. Create PR with tfpatch and automated plan artifact. CI will run plan validation including simulation of placement.
+2. Wait for at least one reviewer from gpu-fleet and one from cloud-accounts.
+3. Merge during a non-peak window unless SLO risk requires immediate merge (document exception in PR description).
+
+Tenant thaw process (controlled reallocation)
+- Preconditions: reclaimed node repaired and marked Joinable OR replacement node provisioned and tf plan applied. KV-caches warmed or snapshot restore available.
+
+Thaw stages (per-tenant)
+1) Thaw scheduling: allocate a small pilot percentage of traffic (5–10%) to reclaimed capacity for 15 minutes.
+2) Monitor: use the tenant-thaw dashboard; key metrics: p50/p95 latency, error rate, KV cache hit ratio, token billing delta.
+3) Ramp: if pilot stable, increase allocation in doubling increments: 10% -> 25% -> 50% -> 100% with 10–30 minute observation windows.
+4) Full reattach: once at 100% for at least 30 minutes with no regressions, remove draining markers and unfreeze billing.
+
+Tenant thaw CLI example:
+  allocatorctl attach --tenant TENANT_ID --target-node NODE_ID --percentage 10 --pilot --preserve-credits
+  # wait 15m, run monitors
+  allocatorctl scale-increment --tenant TENANT_ID --node NODE_ID --factor 2
+
+Safety and rollback criteria
+- Abort and rollback thaw if:
+  - p95 latency increases > 30% from baseline for two consecutive windows;
+  - error rate increases from 0.2% to > 1%;
+  - KV cache hit ratio drops > 15% and cannot be recovered by cache warmup within 20 minutes.
+- Rollback steps: run allocatorctl detach --tenant TENANT_ID --node NODE_ID --immediate and route traffic back to previous pool. Create incident with tags: gpu-thaw-rollback.
+
+Post-reclaim auditing and reconciliation (within 24h)
+- Reconcile Terraform changes: ensure PRs merged and state applied. Run terraform state list and ensure no dangling references to NODE_ID.
+- Financial reconciliation: billingctl unfreeze --node NODE_ID and run credits-audit --node NODE_ID --window 24h; file any adjustments with Finance (ticket in Jira: FIN-GPU-ADJ).
+- Telemetry audit: run fleet-telemetry audit --node NODE_ID --since 48h and attach to incident.
+
+CI/CD and runbook integration points
+- All reclaim controller changes must have unit tests for simulated preemption and egress failures.
+- CI job: gpu-reclaim-integration is required to pass before merging allocator controller or tf-patch tooling.
+- Canary pattern: when reclaim logic is changed, deploy to blue sandbox with synthetic tenants using the warm-pool test harness.
+
+Operational tips and gotchas
+- Do not assume warm caches persist across physical node replacement. Always rely on a cache snapshot restore when moving tenant allocations.
+- For tenants using private VPC endpoints, verify route table propagation and security group bindings after any terraform apply that touches attachments.
+- Avoid full-scale thaw during global traffic peaks (US business hours 09:30–16:30 PT) unless there is a critical dependency.
+
+Diagnostics cheat sheet (quick commands)
+- Show node health: fleetctl node show NODE_ID
+- List affected tenants: allocatorctl list-allocations --node NODE_ID
+- Create reclaim tf-patch: ./tools/tf-patch --pool <POOL> --dec 1 --reason "reclaim" --out ./tfpatch
+- Inspect NVML: nvidia-smi -i 0 -q | egrep "(ECC|Pending ECC)"
+
+Templates and docs
+- Incident title template: [GPU RECLAIM] <NODE_ID> <REGION> — <short reason>
+- PR description checklist: include impact analysis, simulated plan output, rollout window, rollback plan, reviewer list.
+
+Appendix: sample incident timeline (example)
+- 00:00: Telemetry marks node offline (heartbeat loss)
+- 00:04: Automated reclaim dry-run executed; stats show 3 tenants affected (cumulative 7% traffic)
+- 00:10: Manual diagnostics: NVML errors observed -> hardware flagged; node marked RECLAIMED 00:22
+- 00:25: TF patch created and PR opened; CI integration run (gpu-reclaim-integration) starts
+- 01:10: PR merged during low-window; terraform apply reduces pool by 1 and provisions replacement node
+- 03:00: Replacement joins; KV cache restore for tenant A begins
+- 03:20: Tenant A pilot thaw 10% -> stable
+- 04:30: Tenant A full thaw complete; billing unfrozen; incident closed after 24h audit
+
+Contact list
+- GPU Fleet Capacity oncall: gpu-capacity@pagerduty
+- Hardware team: hw-support@redwood.internal
+- Cloud Accounts: cloud-accounts@redwood.internal
+
+Document history
+- 2024-10-15: Created by Priya Natarajan
+- 2024-11-02: Added terraform patch workflow (Ethan Park)
+- 2025-02-01: Revised thaw ramp policy and rollout windows (Lina Martinez)
+
+End of document

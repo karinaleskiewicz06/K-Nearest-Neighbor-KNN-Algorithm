@@ -1,0 +1,158 @@
+Headroom Squint and Proactive Eviction Runbook
+
+Summary:
+This runbook describes the proactive headroom assessment ('Headroom Squint') and the controlled tenant eviction / backfill sequence used when hosted inference capacity is constrained. It blends SLO-aware decisioning, error-budget signal fusion, and an automated-but-supervised eviction flow intended to preserve critical SLOs while minimizing customer impact.
+
+Scope and intent:
+- Applies to: multi-tenant model-serving clusters (hosted, dedicated-overflow pools).
+- Goal: detect impending SLO degradation early, reclaim capacity predictably, and restore headroom without broad throughput throttles.
+- Out of scope: long-term capacity planning (see capacity-planning team playbooks), billing adjustments, and customer SLAs outside Redwood standard tenancy.
+
+Owners and on-call responsibilities:
+- Runbook owner: eng-sre capacity squad (primary: Priya Anand).
+- Escalation: SRE on-call -> Capacity lead -> Runtime service owner.
+- Communication: #sre-capacity Slack channel + incident bridge if escalation required.
+
+Key definitions and SLO mapping:
+1) Production SLOs (examples):
+   - api.p95_latency_text_generate <= 1200ms (SLO: 99.5% p95)
+   - api.p99_latency_text_generate <= 3000ms (SLO: 99.0% p99)
+   - availability.request_success_rate >= 99.9% (monthly)
+   - embedding.qps_per_tenant <= provisioned_headroom (soft limit)
+
+2) Error budget windows used by this runbook:
+   - Short window: 1 hour burn rate observed (alerting level).
+   - Mid window: 24 hour rolling burn (decisioning level).
+   - Long window: 30 day consumption (deprioritization/contracting signal).
+
+Signals and thresholds (headroom squint):
+- Alerts to consider a 'squint' (early assessment):
+  1. SLO short-window burn > 20% of budget in 1 hour AND p99 latency > SLO threshold for > 5 minutes.
+  2. Cluster headroom < 15% (available GPU memory / reserved capacity) for > 10 minutes.
+  3. Sustained queuing latency over 200ms at the router layer (per-route).
+  4. Error categories: OOMs or model hotstart failures exceeding 5 per 10 minutes.
+
+- Escalation thresholds (when to run eviction):
+  - Immediate: error budget burn > 50% in 1 hour OR p99 > 150% of SLO for > 2 minutes.
+  - Controlled eviction: headroom < 7% AND predicted demand forecast shows > 12% growth in next 30 minutes (see forecasting query below).
+
+Observability queries and examples:
+- PromQL: 1h SLO burn rate (example for p99 latency SLO):
+  (sum(rate(latency_p99_exceedance_total[1h])) / sum(rate(request_total[1h]))) * 100
+
+- PromQL: cluster free headroom (fraction of reserved GPU memory free):
+  (sum(node_gpu_memory_free_bytes) / sum(node_gpu_memory_total_bytes)) * 100
+
+- Router queuing latency (99th):
+  histogram_quantile(0.99, sum(rate(router_request_duration_seconds_bucket[5m])) by (le))
+
+- Short forecast (10m momentum):
+  increase(request_total[10m]) / increase(request_total[60m]) > 0.12
+
+Decision matrix (quick):
+1) If short-window burn > 50% OR p99 >> SLO: trigger incident bridge and start mitigation sequence A (immediate throttles and model fallback).
+2) Else if headroom < 15% and short-window burn between 20–50%: run Headroom Squint and prepare controlled eviction (sequence B).
+3) Else if headroom < 7% with forecasted growth: schedule proactive eviction and contact customer success for tiered communications.
+
+Run sequences (step-by-step):
+- Sequence A (Immediate mitigation - emergency):
+  1. Notify incident bridge and mark severity P1.
+  2. Execute emergency route-level throttles for best-effort tenants: 
+     - curl -X POST $ROUTER_API/throttle -d '{"policy":"emergency","percent":50,"targets":["noncritical-tenants"]}'
+  3. Activate model fallback policies (route -> cheaper quantized model) for compatible routes.
+  4. If no improvement in 5 minutes, escalate to full cluster-level admission control (drop new requests).
+
+- Sequence B (Controlled eviction - recommended flow):
+  1. Run Headroom Squint (automated script described below) to produce a ranked eviction candidate list.
+  2. Announce on Slack: short explanation + expected impact window.
+  3. Throttle low-priority tenants incrementally by 10% every 3 minutes while observing p99.
+  4. If p99 drops below SLO target and headroom > 20%: stop throttles and rollback further eviction.
+  5. If throttles do not recover SLO: evict the top-ranked non-critical tenants using graceful preemption.
+  6. Backfill freed capacity to critical tenants and run validation canaries for 2 minutes.
+
+Headroom Squint algorithm (practical description):
+- Inputs: tenant priority, recent token QPS, model memory footprint, active KV cache size, historical SLO sensitivity score, contract tier.
+- Score = weighted sum: 0.35*priority_score + 0.25*QPS_norm + 0.2*model_mem_norm + 0.1*kv_cache_frac + 0.1*slo_sensitivity.
+- Sort ascending (lowest impact eviction first).
+- Exported artifact: CSV with columns [tenant_id, priority, qps_10m, model_mem_mb, slo_sensitivity, eviction_score, suggested_action].
+
+Automated tools and CLI snippets:
+- Generate candidate CSV (k8s job):
+  kubectl -n infratools run headroom-squint --image=registry/redwood/headroom-squint:stable -- /bin/squint --out /tmp/candidates.csv
+
+- Apply graceful eviction (example):
+  /opt/redwood/bin/tenant-evict --tenant $TENANT_ID --mode graceful --drain-time 180 --notify true
+
+- Emergency immediate kill (only after approval):
+  /opt/redwood/bin/tenant-evict --tenant $TENANT_ID --mode immediate --notify false
+
+Dashboard and runbook pages to inspect:
+- Dashboards to open: 
+  - Cluster Capacity Overview (dash id: DB-cc-overview)
+  - Per-tenant SLO burn (dash id: DB-tenant-slo-burn)
+  - Router Queuing Heatmap (dash id: DB-router-queue)
+
+Alert playbook (templates):
+- Alert: SLO_SHORT_BURN_HIGH
+  - Trigger: short-window burn > 20%
+  - Pager: SRE on-call
+  - Play: run Headroom Squint -> notify capacity squad
+
+- Alert: CLUSTER_HEADROOM_LOW
+  - Trigger: headroom < 10% for 10 minutes
+  - Pager: SRE on-call + capacity lead
+  - Play: immediate assessment + sequence B if sustained
+
+Post-action checks after eviction completed:
+- Verify per-route p95/p99 back within targets for at least 30 minutes.
+- Check customer-facing errors rate decreased and no new OOM events.
+- Validate resource reclamation (expect headroom increase >= 20% after top-3 evictions).
+- Collect evidence: upload squint CSV, slack timeline, and graphs to the incident review ticket.
+
+Incident review and artifacts required (minimum):
+1. Timeline of alerts, squint output, eviction commands executed, and metrics before/after.
+2. Post-incident root cause hypothesis and recommended mitigations (capacity vs model-level).
+3. Action items: e.g., increase reserved pool by X GPUs, introduce stricter tenant ingress throttles, add per-tenant warm pools.
+
+Operational tooling integrations and improvements backlog (examples):
+- Automate squint run when SLO_SHORT_BURN_HIGH fires and pre-seed eviction candidates in a read-only place (S3 or DB).
+- Add a dry-run mode for tenant-evict CLI that simulates impact on headroom and SLOs.
+- Improve dashboard to show predicted headroom trajectory for next 30 minutes.
+
+Testing and exercises:
+- Quarterly table-top: run a simulated headroom incident using recorded traffic and validate runbook timings.
+- Monthly canary: run the squint script in dry-run mode during low-traffic window and verify candidate outputs.
+- Game day: inject a fake surge into a staging cluster to validate throttling cadence and eviction automation.
+
+Runbook maintenance and review cadence:
+- Owner reviews the runbook after every P1 incident that used eviction in production.
+- Formal review by reviewers list quarterly (add notes to page).
+
+Appendices:
+A. Eviction CSV example (tabular; one line per tenant):
+tenant_123, low, 450 qps, 12000 MB, 0.12, 0.34, throttle-20%
+tenant_456, medium, 1200 qps, 28000 MB, 0.55, 0.72, evict-graceful
+
+B. Incident template to attach:
+- Summary: short description string
+- Alerts triggered: list
+- Actions taken: chronological list
+- Impact: tenants affected + estimated % traffic impacted
+- Metrics evidence: links to charts (DB ids)
+- Postmortem owner: name
+
+C. Safety checks and guardrails:
+- Never evict tenants in 'enterprise-sla' tier without approval from customer success + legal.
+- For private deployments, follow customer-specific eviction and isolation rules in eng-private-deployments docs.
+- All evictions must be logged with operator identity; automated evictions must include an allowlist and an audit webhook.
+
+Contact and escalation list:
+- On-call SRE: rotation in PagerDuty -> see schedule link
+- Capacity lead: Marta Gómez (marta@redwood.ai)
+- Runtime owner: Noah Kim (noah@redwood.ai)
+
+Change log:
+- 2025-11-12 (Priya Anand): Initial draft and circulation to capacity squad.
+- 2026-02-08 (Priya Anand): Formalized thresholds, added squint CSV format and PromQL examples.
+
+End of runbook.

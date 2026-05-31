@@ -1,0 +1,177 @@
+GPU bin-packing policy, IaC templates, and canary migration runbook
+
+Summary
+-------
+This document defines a GPU bin-packing policy optimized for mixed-priority LLM inference workloads, provides reference Terraform/IaC module examples for policy-enforced placement, and describes a step-by-step canary migration and rollback runbook for switching pools with minimal customer impact. It targets infra teams operating Redwood's shared and dedicated GPU pools (services: gpu-scheduler, gpu-provisioner, spot-fallback-autoscaler).
+
+Motivation
+----------
+- We run diverse workloads: latency-sensitive API traffic, batch eval jobs, nightly model-tuning pipelines, and CI evals. Existing first-fit strategies cause noisy-neighbor latencies and fragmented capacity.
+- Goal: reduce tail latency variance for high-priority customers while increasing overall GPU utilization by ~8–12%.
+
+Scope and constraints
+---------------------
+- Applies to k8s-backed GPU pools managed by gpu-provisioner and the centralized gpu-scheduler service.
+- Supports both preemptible (spot) and dedicated instances.
+- Must integrate with existing billing tags and tenant isolation IAM policies.
+- Non-goal: replacement of existing autoscaling algorithms; this is a placement policy + IaC deployment pattern.
+
+Design overview
+---------------
+1. Policy primitives
+   - bin_type: {"latency-reserved", "balanced", "batch-optimized"} (see variable table below).
+   - tenant_priority: integer 0..100 (higher = more reserved resources).
+   - affinity_score: runtime-measured metric combining model sequence-length percentiles and historical p95 token latency.
+   - frag_threshold: fraction (0.0–1.0) indicating acceptable remaining GPU memory fragmentation before triggering compaction.
+
+2. Placement algorithm (high-level)
+   - Step A: classify incoming allocation request by bin_type and tenant_priority.
+   - Step B: calculate affinity_score from tenant tags and recent telemetry (default window: 15 minutes).
+   - Step C: prefer nodes where (available_memory >= request_gpu_mem) and (fragmentation < frag_threshold) and (tenant_priority delta within 10 points), ordered by affinity_score desc.
+   - Step D: if no fit in preferred bins, fall back to cross-bin placement respecting tenant anti-affinity labels unless override=true.
+   - Step E: if placement on preemptible nodes, attach preemptible_metadata and set eviction_policy to 'graceful-drain-60s'.
+
+Operational SLOs and thresholds
+-------------------------------
+- p95 API latency regression budget for latency-reserved tenants: +2% allowed during rollout.
+- Node packing compaction window: once per 6 hours; compaction must not exceed 20% of node GPU time (measured by kernel activity).
+- Fragmentation alert: when >15% of nodes report frag_threshold exceeded for >30 minutes, page infra-oncall.
+- Canary success criteria: no p99 latency regressions, no increase in error rate >0.1% for latency-reserved tenants over a 1-hour window.
+
+IaC modules and templates
+------------------------
+The following is a concise Terraform snippet (HCL) reference for the placement-policy module and a k8s ConfigMap that the gpu-scheduler consumes. Replace variables and provider blocks per account.
+
+Terraform reference (gpu-placement-policy module)
+```hcl
+module "gpu_placement_policy" {
+  source = "git::ssh://git@github.com/redwood-inference/iac-modules.git//gpu-placement-policy?ref=v1.4.0"
+
+  name            = "default-binpack-policy"
+  frag_threshold  = 0.18
+  compaction_hour = "*/6"
+  bin_types       = ["latency-reserved", "balanced", "batch-optimized"]
+  owner_team      = "eng-infra"
+  tags            = { cost_center = "infra-gpu" }
+}
+```
+
+ConfigMap consumed by gpu-scheduler (k8s)
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-placement-config
+  namespace: infra-system
+data:
+  bin_policy.json: |
+    {
+      "bin_types": ["latency-reserved","balanced","batch-optimized"],
+      "frag_threshold": 0.18,
+      "compaction_window_minutes": 360,
+      "default_eviction": "graceful-drain-60s"
+    }
+```
+
+Variables table (recommended defaults)
+- bin_type.default: "balanced"
+- frag_threshold.default: "0.18"
+- compaction_window_minutes.default: "360"
+- preemptible_eviction.default: "graceful-drain-60s"
+
+Canary migration and rollout runbook
+----------------------------------
+Purpose: incrementally move tenants from the legacy first-fit placement to the new bin-packing policy with automated verification and safe rollback.
+
+Prerequisites
+1. kubecontext to infra-cluster and infra-prom-query access.
+2. Canary tenant group created: label canary=true on tenant namespace(s).
+3. Infra oncall and owners notified.
+
+Step-by-step procedure
+1) Deploy placement policy module to staging (terraform apply)
+   - Command: terraform -chdir=./modules/gpu-placement-policy init && terraform -chdir=./modules/gpu-placement-policy apply -auto-approve
+2) Apply configmap to staging cluster
+   - kubectl apply -f staging/gpu-placement-config.yaml --context infra-staging
+3) Enable canary mode in gpu-scheduler (flag: --placement-canary=on) in staging and wait 10 minutes for metrics to settle.
+4) Run verification checks (automated):
+   - Query p95 latency for canary tenants: promql: rate(redwood_api_latency_seconds_bucket{tenant_group="canary"}[5m]) and ensure p95 remains within baseline ±1%.
+   - Check packing efficiency: custom metric gpu_node_fragmentation_ratio < 0.2 across 95% of nodes.
+5) Promote to limited production (5% weight):
+   - Toggle routing rule in gpu-scheduler: 95% legacy, 5% new-policy for low-priority tenants.
+   - Watch: p50/p95/p99 and error rates for 30 minutes.
+6) Incremental ramp: 5% -> 20% -> 50% -> 100% over successive windows of 30–60 minutes assuming criteria pass.
+
+Rollback criteria and steps
+- Trigger conditions: p99 increase >5%, errors >0.5%, fragmentation alerts triggered in >10% of nodes for 60+ minutes.
+- Immediate rollback: set gpu-scheduler --placement-canary=off, revert ConfigMap to previous version, and terraform apply with previous module version.
+- Post-rollback: open severity-2 incident and capture diagnostics (see Diagnostics checklist).
+
+Diagnostics checklist (collect before/after rollback)
+- pod logs from gpu-scheduler and gpu-provisioner (last 2 hours)
+- prom queries for redwood_api_latency_seconds, gpu_node_fragmentation_ratio, gpu_packing_compactions_total
+- node-level nvidia-smi snapshots and dmesg for preemption events
+- terraform plan state diff and module versions
+
+Monitoring and alerting changes
+--------------------------------
+- New alert: GPU Fragmentation High
+  - Query: avg_over_time(gpu_node_fragmentation_ratio[15m]) > 0.18
+  - Severity: page (infra-oncall)
+  - Runbook: follow compaction playbook, verify eviction metrics, escalate to runtime team.
+
+- New dashboard panels (recommended):
+  - Node fragmentation heatmap (by AZ and pool)
+  - Canaries: p50/p95/p99 comparison for canary vs baseline tenants
+  - Compactions scheduled vs completed (6h windows)
+
+Ownership and rollout timeline
+-----------------------------
+- Owner: Maya Chen (eng-infra)
+- Runtime owner: Arjun Patel (serving-runtime)
+- Expected rollout: staggered 8-week rollout; week 1–2 staging verification, week 3 limited prod, week 4–6 ramp, week 7–8 stabilization and retrospective.
+
+Security and IAM notes
+----------------------
+- Module must attach IAM tag: iam:role=infra-gpu-placement to controller service account.
+- All Terraform state operations must run in the shared state bucket with kms_key = projects/redwood-kms/keys/infra-gpu.
+- When deploying to customer-dedicated accounts, ensure placement policy module is deployed under a restricted service account following onboarding checklist.
+
+Appendix A — Example Terraform variables file (vars.tfvars)
+---------------------------------------------------------
+# vars.tfvars
+frag_threshold = 0.18
+bin_types = ["latency-reserved","balanced","batch-optimized"]
+owner_team = "eng-infra"
+compaction_hour = "*/6"
+# account scoping
+account_id = "123456789012"
+region = "us-west-2"
+
+Appendix B — Troubleshooting snippets
+------------------------------------
+1) How to surface recent fragmentation metrics:
+   kubectl -n infra-system port-forward deployment/gpu-metrics 9090:9090 &
+   curl -G http://localhost:9090/api/v1/query --data-urlencode 'query=avg_over_time(gpu_node_fragmentation_ratio[15m])'
+
+2) Force a compaction run (admin-only):
+   curl -X POST \\n    -H 'Authorization: Bearer $ADMIN_TOKEN' \\n    https://gpu-provisioner.internal/api/v1/compaction/run?force=true
+
+3) Revert ConfigMap to previous revision:
+   kubectl -n infra-system rollout history configmap/gpu-placement-config
+   kubectl -n infra-system apply -f <previous-revision.yaml>
+
+Changelog
+---------
+- 2024-03-11: Initial draft and design proposal by Maya Chen.
+- 2024-05-04: Added Terraform module reference and variable defaults (review: Arjun).
+- 2025-01-22: Published with canary runbook and SLO thresholds; updated IAM notes (review: Samira).
+
+Related reading
+---------------
+- See: /confluence/eng-infra/gpu-fleet-and-capacity/gpu-demand-forecasting-and-ml-backed-scaling-playbook for demand inputs.
+- See: /confluence/eng-infra/terraform-and-iac/gpu-tenant-quotas-and-fair-share-patterns for quota interactions.
+
+Contact
+-------
+- Questions or execution assistance: @maya.chen (Slack) or create ticket in infra-sev channel.

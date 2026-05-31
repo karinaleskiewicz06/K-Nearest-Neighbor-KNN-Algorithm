@@ -1,0 +1,135 @@
+Dispatcher memory leak and connection-window exhaustion — investigation & mitigation
+
+Summary
+-------
+This page documents a recurring failure class observed in the dispatcher service where long-running connection windows and an unbounded buffer growth lead to pod memory exhaustion and partial request loss. The doc covers: detection signals, short-term mitigations, permanent fixes planned, rollout steps, post-incident verification, and ownership.
+
+Context and scope
+------------------
+- Affected service: dispatcher-service (grpc frontend + connection multiplexer)
+- Secondary impact: kernel-manager and grpc-proxy pods observed elevated tail latency due to request drops and retries.
+- Customer-visible symptoms: increased 5xx rates on hosted API routes, transient model swap failures, and elevated p99 latency.
+- Root hypothesis summary: under sustained backpressure (long KV cache fetches / slow kernel warmstarts), the dispatcher accumulates connection windows and request buffers that are not compacted, causing memory pressure and eventual OOM/kube eviction.
+
+Why this matters
+------------------
+- SLO impact: incidents breached the 99.9% availability SLO for several customer routes for 4–17 minutes in observed incidents.
+- Cost/operational: repeated restarts mask the underlying problem and create downstream load spikes (thundering herd) when services recover.
+
+Detection and alerting
+----------------------
+Create or verify these signals in Grafana / Prometheus: 
+1) Memory growth slope alert (dispatcher pod level):
+- PromQL (example):
+  increase(container_memory_working_set_bytes{job="dispatcher-service"}[15m]) > 150e6
+- Alert intent: signal sustained memory growth > 150MB over 15 minutes.
+
+2) Connection-window count spike:
+- Instrumentation metric: dispatcher_connection_windows_total (gauge of active per-client windows)
+- PromQL: sum(dispatcher_connection_windows_total) by(cluster_zone) > 5000
+
+3) Request buffer backlog:
+- Metric: dispatcher_request_buffer_depth (histogram buckets or gauge). Alert when avg > 400 per pod for 10m.
+
+4) Error surface correlation: correlate 500s spike with buffer metrics using dashboards. Create a combined panel that shows: 5xx_rate, dispatcher_memory_working_set, request_buffer_depth
+
+Investigation checklist (fast triage)
+------------------------------------
+1) Identify affected pods: kubectl -n inference get pods -l app=dispatcher-service --field-selector status.phase!=Running
+2) Check last OOM reason: kubectl describe pod <pod> | grep -i oom
+3) Check top memory consumers inside the pod: kubectl exec -it <pod> -- pmap /proc/1/maps || ps aux --sort=-rss | head -n 20
+4) Query metrics: use the PromQL alerts above to identify trend and onset time windows.
+5) Grab heap profile (if enabled): curl -sS http://<pod-ip>:6060/debug/pprof/heap > heap-<pod>.pb.gz
+6) Correlate with kernel-manager traces: tracer id / request ids in logs. Use the trace-id header to find full request timeline.
+
+Immediate mitigations (stop-gap, low-risk)
+------------------------------------------
+Apply these in order to reduce customer-visible impact while preserving diagnostics: 
+1) Scale horizontally: kubectl scale --replicas=+2 deploy/dispatcher-service (add pods to lower per-pod backlog).
+2) Enable admission backpressure: set config dispatcher.max_inflight_per_client to 50 (from default 200) via config map and rolling restart. This limits per-client window growth.
+3) TTL/Compaction: reduce dispatcher.window_idle_ttl from 10m to 90s to force faster window tear-down.
+4) Controlled rolling restart: restart the pods with highest memory slope first, one at a time, with 3m drain between restarts. Use the readiness probe to ensure no traffic is sent to the pod during restart.
+5) Route heavy customers to Dedicated capacity or lower-priority model variants temporarily (use routing policy to steer by customer tag).
+
+Permanent remediation plan (engineering work items)
+--------------------------------------------------
+Priority and owner: platform/runtime team (owner: Maya Singh)
+Planned tasks and rationale: 
+- Task A (P0): Fix buffer compaction logic — when downstream kernels take long to accept data, dispatcher should compact or spill oldest requests to disk-backed buffer with explicit backpressure. (PR: #5482)
+- Task B (P1): Add bounded request queue per-client with adaptive eviction policies (evict smallest/least-progressing items).
+- Task C (P1): Improve heap visibility — enable continuous heap sampling and add an automated heap-diff alert with sample retention for 72 hours.
+- Task D (P2): Add a new telemetry label to trace all requests carrying dispatcher_window_id for easier cross-service correlation.
+- Task E (P2): Scheduler change — enforce admission controls earlier in edge proxies to stop untrusted clients from opening many logical windows.
+Estimated timeline: P0 in 3 weeks (hotfix + canary), P1/P2 in 6–10 weeks with review cycles and integration tests.
+
+Patch / hotfix notes
+--------------------
+- Hotfix branches: hotfix/dispatcher/buffer-compact-2026-06 (contains limited compaction and conservative defaults).
+- Canary plan: deploy to canary zone (us-west-canary) with 5% traffic shadowing for 48 hours and run the playback suite from benchmarking repo (endpoint: /health-playback).
+- PR references: #5482 (compaction), #5510 (window-id telemetry).
+
+Rollout checklist (post-PR merge)
+--------------------------------
+1) Deploy hotfix to staging and run the synthetic backlog test from benchmarking suite: benchmarks/runtime/dispatcher-backlog-sim (expected max memory < 1.2x baseline).
+2) Canary deploy to us-west-canary with traffic-split=5% and monitor alerts for 24–48 hours.
+3) If no regressions, lift to 25% traffic for another 24 hours.
+4) Gradually roll to remaining regions with guardrails: watch for memory-slope alert, request_buffer_depth, and 5xx_rate.
+5) Complete rollout and mark release in release-tracker: release-id: rdr-runtime-2026-06-compact.
+
+Rollback plan
+-------------
+- If memory slope increases by > 50% vs baseline or 5xx rate increases > 1% absolute during canary: rollback to previous deploy using kubectl rollout undo deployment/dispatcher-service --to-revision=<rev> and revert config changes (max_inflight_per_client, window_idle_ttl).
+- For severe regressions, scale down the hotfix replicas and revert config through the operator to restore previous behavior.
+
+Post-incident verification and monitoring additions
+--------------------------------------------------
+- Add a derived metric: dispatcher_active_window_memory_ratio = dispatcher_memory_used_by_windows / container_memory_working_set_bytes. Alert if > 0.6 for 10m.
+- Add an automated dashboard row in the dispatcher incident dashboard: memory slope, buffer depth, active windows, 5xx rate, kernel-manager inflight.
+- Add unit and integration tests in the runtime bench suite that simulate slow kernel acceptance and verify compaction does not exceed memory targets.
+
+Ownership and escalation
+------------------------
+- Primary owner: Runtime Platform (oncall rotation: runtime-platform-oncall).
+- Secondary owner: Serving Runtime SRE.
+- Pager escalation: runtime-platform-oncall -> platform-lead -> eng-sre-lead.
+- Slack channels: #runtime-ops, #serving-incident-escalations
+
+Postmortem and follow-ups
+-------------------------
+1) Run a two-week incident review with stakeholders: runtime, SRE, kernel-team, customer-success for any impacted customers.
+2) Deliver a short RCA doc that enumerates timeline, root causes, and action items with target dates.
+3) Close or convert any temporary mitigations (shorter TTLs, stricter admission) into configuration toggles that default to safe values.
+
+Appendices
+---------
+A) Example PromQL snippets
+- Memory slope (per pod): increase(container_memory_working_set_bytes{pod=~"dispatcher-service-.*"}[10m])
+- Buffer depth agg: avg_over_time(dispatcher_request_buffer_depth[5m])
+- Combined alert rule sample:
+  - name: DispatcherMemorySlope
+    expr: increase(container_memory_working_set_bytes{job="dispatcher-service"}[15m]) > 150e6
+    for: 10m
+
+B) Diagnostic commands
+1) pod list and memory usage: kubectl top pod -n inference | grep dispatcher-service\2) fetch heap profile: kubectl exec -n inference -c dispatcher <pod> -- curl -sS localhost:6060/debug/pprof/heap > /tmp/heap.pb.gz\3) extract top alloc sites from heap: go tool pprof -top /tmp/heap.pb.gz\\n
+C) Impact table (sample from incident 2026-06-18)
+| Region | Duration | Peak affected pods | Customer routes impacted | Notes |
+| us-west-2 | 00:17 | 3 | /v1/generate, /v1/chat | sustained KV fetch failure from remote cache |
+| eu-central-1 | 00:04 | 1 | /v1/embed | transient kernel warmstart stutter |
+
+Related pages
+-------------
+- /confluence/eng-serving-runtime/runbooks/runtime-deployment-circuit-breakers-and-sla-fallback-playbook-2026 (for fallback policies)
+- /confluence/eng-serving-runtime/profiling-playbook/gpu-memory-fragmentation-diagnostics-playbook-2026 (for GPU memory correlation)
+- /confluence/eng-serving-runtime/benchmarking-and-perf-suite/runtime-deployment-sanity-and-benchmark-suite-acceptance-2026 (benchmarks to run)
+
+Contact and next steps
+----------------------
+If you are paged, follow the Investigation checklist, apply Immediate mitigations as needed, and notify runtime-platform-oncall. For changes to telemetry or alerting, open an RFC in the runtime-team repo and tag reviewers: @EthanB, @LeahM.
+
+Document history
+----------------
+- 2026-02-12: created by Maya Singh
+- 2026-06-19: hotfix branch created and canary started (notes added)
+- 2026-07-03: permanent remediation plan and rollout checklist added
+

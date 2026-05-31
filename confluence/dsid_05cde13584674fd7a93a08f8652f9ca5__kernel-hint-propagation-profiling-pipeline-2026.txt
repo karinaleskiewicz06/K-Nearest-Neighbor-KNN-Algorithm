@@ -1,0 +1,164 @@
+Kernel Hint Propagation Profiling Pipeline
+
+Summary:
+
+This document specifies the Kernel Hint Propagation Profiling Pipeline (KHPPP) — an end-to-end process used by the serving runtime team to capture, synthesize, and propagate lightweight kernel hints from production traces to the kernel selection and scheduler subsystems. The pipeline is optimized for low-overhead sampling, deterministic replay for hypothesis testing, and safe automated rollout of hint-driven kernel recommendations to the runtime.
+
+Goals:
+- Reduce unexpected kernel regressions by surfacing causal correlations between request shape and kernel latency.
+- Provide repeatable profiling artifacts usable by scheduler and kernel teams for autotune jobs.
+- Automate a canary rollout path for kernel hint changes with observable safety gates.
+
+Scope and non-goals:
+- Scope: inference request-level sampling -> trace enrichment -> hint extraction -> validation replay -> recommendation artifact -> canary rollout.
+- Non-goals: full-model-level retraining or kernel code changes (those are handled by kernel engineering RFCs).
+
+Owner and runbook contact:
+- Primary owner: eng-serving-runtime / Kernel Signals team (oncall: @kernel-signals).
+- Secondary: eng-platform / Scheduler (oncall: @scheduler-op).
+- On-call escalation ladder: pager -> lead kernel engineer -> runtime SRE.
+
+Architecture overview:
+1) In-proxy lightweight sampler (service: trace-sampler): attaches to request ingress and emits a sampled event with the following fields: request_id, model_id, route, token_len, prefix_hash, routing_decision, upstream_kernel_hint (if present). Sampling rate is configurable per-service (default 0.1%).
+
+2) Enrichment & correlation (service: hint-enricher): enriches sampled events with kernel telemetry pulled from kernel-telemetry-store (per-GPU kernel latency percentiles, occupancy, kernel version). Correlation computes the candidate hint map for (model_id, sequence_bucket, route).
+
+3) Hint extractor (service: hint-extractor): runs a lightweight causal check (Granger-inspired) to output a candidate hint: {hint_id, model_family, sequence_bucket, suggested_kernel_profile, confidence_score, sample_count, top_covariates}. Output written to artifact-store as a JSONL stream with TTL 90 days.
+
+4) Replay & validation (service: hint-replay): replays a bounded subset of the original sampled traces in the internal replay lab (sandbox runtime) to validate latency delta, regression rate, and resource delta. Replay uses the same scheduler and kernel loader versions as production canary.
+
+5) Recommendation and canary (service: hint-orchestrator): packages validated hints into a signed recommendation manifest and drives a staged canary rollout through the runtime configuration service (route-level config).
+
+SLOs and thresholds (applies to the pipeline):
+- End-to-end artifact availability: 99% within 15 minutes of sample capture.
+- False-positive detection: target false-positive rate for deployed hints <= 2% measured over 7-day window.
+- Canary safety: any canary that increases p99 latency for a route by > 3% or absolute +40ms must auto-abort.
+- Resource delta: kernel profile must not increase GPU memory usage by > 6% without manual signoff.
+
+Sampling configuration table (example):
+
+| service | default-sampling | max-sampling | notes |
+|---------|------------------:|-------------:|-------|
+| public-api | 0.1% | 1% | Route override by SLA tier |
+| internal-batch | 0.05% | 0.5% | High-throughput, low-latency sensitivity |
+| dedicated-gpu | 0.2% | 2% | More signal for deterministic workloads |
+
+Data retention and PII notes:
+- Sampled traces omit prompt payloads by default. The pipeline stores prompt hashes and token counts only. Full payload capture is gated behind an explicit customer opt-in and legal review.
+
+Trace enrichment schema (sample line):
+
+{
+  "request_id": "r_123abc",
+  "model_id": "open-llama-13b",
+  "route": "/v1/chat/completions",
+  "sequence_bucket": "0-64",
+  "kernel_versions": ["kv1.3.2"],
+  "observed_p50_ms": "12.4",
+  "observed_p99_ms": "73.1"
+}
+
+(Above is an example logged by hint-enricher; fields are stored as strings in artifact JSONL to simplify downstream joins.)
+
+Validation replay checks (ordered step-by-step):
+1) Replay subset selection: choose top 500 traces per candidate hint (or all if sample_count < 500).
+2) Run replay with baseline kernel profile and with suggested kernel profile.
+3) Capture metrics: p50/p95/p99 latency, GPU memory, kernel occupancy, and error rate.
+4) Apply decision rules (see decision matrix).
+
+Decision matrix (simplified):
+- Accept if: p99 improves by >= 4% AND resource delta <= 3% AND confidence_score >= 0.75.
+- Tentative if: p99 improves 1–4% AND resource delta <= 6% -> schedule extended evaluation (72h).
+- Reject if: p99 regresses > 0% OR error_rate increases > 0.1% OR resource delta > 10%.
+
+Canary rollout procedure (operational checklist):
+1) Create signed manifest via hint-orchestrator, include: hint_id, target_routes, advisory_notes, rollback_conditions.
+2) Deploy to 1% of traffic in canary region (region: us-west2 by default).
+3) Monitor canary dashboard for 30 minutes baseline, then 6-hour extended observation window.
+4) Automated gates: if p99 delta > 3% or error_count delta > 0.05% -> immediate rollback. If any kernel panics or GPU OOMs -> immediate rollback and page oncall.
+5) If canary passes extended window, increase to 10% for 24 hours, then 50% for 6 hours, then global rollout.
+
+CLI and artifact examples:
+- Inspect recent candidate hints:
+```
+$ rlctl hints list --since 2026-02-01 --filter model_family=open-llama-13b --min-confidence 0.6
+ID        MODEL       SEQ_BUCKET  CONF  SAMPLES  STATUS
+ht-8a2c   open-llama  0-64        0.78  1,240    validated
+```
+
+- Manifest sample (YAML):
+```
+hint_id: ht-8a2c
+model_family: open-llama
+sequence_bucket: 0-64
+suggested_kernel_profile: wave-compact-v2
+confidence_score: 0.78
+validation:
+  p99_delta_pct: -6.1
+  resource_delta_pct: 1.8
+  replay_samples: 500
+canary_policy:
+  initial_traffic_pct: 1
+  region: us-west2
+  abort_conditions:
+    p99_delta_pct_gt: 3
+    error_rate_delta_pct_gt: 0.05
+```
+
+Observability and dashboards:
+- Dashboard: KHPPP / Candidate Hints Overview (service: grafana-khppp) shows candidate hint throughput, validation pass/fail rate, avg confidence, and top failing routes.
+- Alerting rules:
+  - khppp-artifact-delay-high: fires if >1% of artifacts are older than 15 minutes (SEV3).
+  - khppp-canary-p99-abort: fires if any canary violates p99 delta > 3% (SEV2).
+  - khppp-replay-failure-spike: fires if hint-replay job failure rate > 0.5% over 10m (SEV2).
+
+Developer guidelines for writing kernel hints:
+- Keep hints scoped: prefer sequence_bucket granularity (0-64, 65-256, 257-1024).
+- Annotate top_covariates (e.g., prefix_hash, prompt_type) to help scheduler isolation policies.
+- Provide a manual test plan in the artifact when confidence_score < 0.8.
+
+Safety and rollback patterns:
+- All manifests carry a 24h automatic rollback window if no explicit promotion is run.
+- Rollbacks must be recorded in the audit log with cause and mitigation notes.
+- For routes with strict SLOs (enterprise-tier), the pipeline is opt-in; hints will not be applied unless the customer has agreed to canary policy.
+
+Troubleshooting playbook (quick steps):
+1) Missing artifacts: check trace-sampler logs -> hint-enricher -> artifact-store. Rehydrate by running: `rlctl hints backfill --from 2026-02-10 --to 2026-02-11 --service public-api`
+2) Replay failures: check sandbox runtime container logs (service: hint-replay) and kernel-telemetry-store ACLs. Common causes: missing kernel image or incompatible kernel loader.
+3) Unexpected p99 regression in canary: immediate rollback via `rlctl canary abort --manifest-id <id>` and run `rlctl hints debug --id <hint_id>` to fetch top failing traces.
+
+Runbook: immediate incident steps for kernel hint-induced outage:
+1) Page kernel-signals and scheduler-op.
+2) Abort running canaries and set global kernel manifest to baseline.
+3) Capture traces for affected time window, escalate to kernel engineering.
+4) Open postmortem and tag hint as rejected with root-cause.
+
+Metric catalog (important signals):
+- khppp.candidate.count (counter)
+- khppp.validation.pass_rate (gauge, %)
+- khppp.replay.latency_ms.p95
+- khppp.canary.p99_delta_pct
+- khppp.artifact.queue_time_seconds.p90
+
+Related pages:
+- /confluence/eng-serving-runtime/runtime-architecture/execution-stitching-and-fallback-orchestration-2026
+- /confluence/eng-serving-runtime/kernel-and-scheduling/scheduler-observability-contract-and-simulated-injector-2026
+- /confluence/eng-serving-runtime/runbooks/runtime-deployment-circuit-breakers-and-sla-fallback-playbook-2026
+
+Appendix: example decision rule JSON (flattened for automation):
+```
+{"rule_id":"dr-2026-11","min_confidence":"0.75","p99_improve_pct":"4","max_resource_delta_pct":"3","action":"promote"}
+```
+
+Notes and future work:
+- Integrate KV-cache prefix signals to make hints prefix-aware rather than only sequence-length aware.
+- Add a privacy-preserving differential sampling mode for regulated customers.
+- Expose an internal UI for kernel engineers to triage top_covariates and request ad-hoc replays.
+
+References:
+- artifact-store schema: s3://redwood-artifacts/khppp/schema-v1.md
+- scheduler contracts: /confluence/eng-serving-runtime/kernel-and-scheduling/scheduler-observability-contract-and-simulated-injector-2026
+
+Owner signoff:
+- Jordan Patel (Kernel Signals)
+- Priya Rao (Runtime SRE)

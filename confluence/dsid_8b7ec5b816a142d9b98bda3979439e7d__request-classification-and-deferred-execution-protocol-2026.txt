@@ -1,0 +1,148 @@
+Request classification and deferred execution protocol
+
+Summary
+-------
+This decision record defines a standardized Request Classification and Deferred Execution Protocol (RCDEP) for Redwood Inference. The goal is to provide a concise, operationally-safe contract for:
+
+- Classifying incoming inference requests into deterministic handling classes.
+- Allowing best-effort deferred execution for low-priority work while preserving higher-tier SLOs.
+- Providing clear fallback semantics and audit trail for deferred or dropped requests.
+
+Scope
+-----
+Applies to all external-facing request ingress paths and edge proxies that hand off to the serving runtime (hosted API, Dedicated ingress, and Private runtime sidecars). Does NOT change model output semantics; it only affects scheduling, admission, and fallback behavior.
+
+Motivation
+----------
+Redwood serves mixed workloads with widely varying latency and cost requirements. Without a consistent classification and deferred execution contract, teams implement ad-hoc timeouts and retries causing SLO violations, duplicate work, and billing surprise. RCDEP centralizes the policy so runtime, edge, and SDKs behave consistently.
+
+Design principles
+-----------------
+- Predictability: high-tier requests must observe bounded tail latency (P99) targets.
+- Observability: every decision (defer, accept, reject, drop) is recorded with reason codes.
+- Minimal semantic change: application-visible outputs remain unchanged except when a request is intentionally degraded (see Failure modes).
+- Pluggable policy: teams may adopt preset policies (strict, balanced, opportunistic) per tenant.
+
+Request classification taxonomy
+-------------------------------
+All incoming requests MUST include a Classification header (x-rw-class) set by client SDKs or edge proxies. Allowed values: HIGH, MEDIUM, LOW, BATCH, BACKGROUND. If missing, default to MEDIUM.
+
+Table: handling profile per class
+| Class | SLO priority | Accept window | Defer allowed | Typical use cases |
+|---|---:|---:|:---:|---|
+| HIGH | critical | 0–200 ms | no | interactive chat, synchronous user actions |
+| MEDIUM | standard | 0–800 ms | conditional | API endpoints with relaxed P99 |
+| LOW | best-effort | 0–2000 ms | yes | analytics, optional enrichments |
+| BATCH | throughput | asynchronous | yes | large embedding batches, offline re-runs |
+| BACKGROUND | non-urgent | hours | yes | periodic maintenance tasks |
+
+Admission and deferred execution protocol (RCDEP v1)
+---------------------------------------------------
+1. Ingress validation: proxy authenticates and canonicalizes request, extracts x-rw-class and x-rw-deadline-ms (client-specified deadline in ms).
+2. Admission decision: the ingress consults local capacity and policy. Possible decisions: ACCEPT_IMMEDIATE, DEFER_WITH_HANDLE, REJECT (hard), QUEUE (bounded), or ACCEPT_DEGRADED (fallback model).
+3. If DEFER_WITH_HANDLE: ingress returns 202 Accepted with Location header /deferred/{id} and an estimated start ETA. The request is persisted to the tenant-scoped deferred queue with metadata and reason code.
+4. Deferred worker picks up requests from the deferred queue respecting tenant fairness, quotas and per-class throughput caps. Workers must read x-rw-mutability (see below) before execution.
+5. On execution, service posts an event to the Audit bus and notifies the client via webhook or poll endpoint. 2xx responses include metadata: execution_time_ms, reason_code, and used_model_variant.
+
+Mutability and side-effect signals
+---------------------------------
+- Requests with side effects (billing operations, transactional writes) MUST set x-rw-mutability: "immutable" or "idempotent".
+- Deferred execution is only allowed for requests marked idempotent or immutable="false" with explicit client consent. The serving runtime will reject deferral for requests marked "has-side-effects" unless configured as "allow-deferred-writes" at tenant-level.
+
+Failure modes and fallbacks
+---------------------------
+- If deferred queue growth > 2x normal, RCDEP transitions LOW/BATCH/BACKGROUND classes to REJECT with reason_code=queue_overrun.
+- If worker capacity is exhausted, MEDIUM requests MAY be downgraded to ACCEPT_DEGRADED using a smaller model variant (model-quantized or fast fallback) following model-variant-compatibility matrix.
+- HIGH requests must never be downgraded or deferred except under explicit emergency override by SRE. Emergency actions are written to the incident log.
+
+Telemetry and observability
+--------------------------
+Mandatory telemetry emitted for every request:
+- rw.request.class (string)
+- rw.admission.decision (ACCEPT_IMMEDIATE | DEFER_WITH_HANDLE | REJECT | ACCEPT_DEGRADED | QUEUE)
+- rw.reason_code (string)
+- rw.defer.handle_id (present for deferred requests)
+- rw.enqueue_latency_ms, rw.start_latency_ms, rw.exec_duration_ms
+- rw.model.variant (string)
+
+SLO impact and metrics guidance
+-------------------------------
+- HIGH: P99 latency <= 200 ms, error budget 0.1%/month.
+- MEDIUM: P99 <= 800 ms, error budget 1%/month.
+- LOW/BATCH: throughput budgeted, tail latency not guaranteed.
+
+Operational runbook (high level)
+-------------------------------
+1. Detect: Alert on rw.defer.queue_size > threshold (tenant-scoped) or sustained growth for 10m.
+2. Triage: Check reason codes (queue_overrun, capacity_surge).
+3. Mitigate: Apply temporary tenant throttles, enable temporary burst capacity, or enforce automatic rejection for LOW classes.
+4. Restore: Increase worker pool, rebalance deferred shards, and run backfill jobs for lost deferred items.
+
+Rollout plan
+------------
+- Phase 0 (canary): Implement on a single non-critical region with MEDIUM default and defer disabled. 2 weeks.
+- Phase 1: Enable DEFER_WITH_HANDLE for LOW/BATCH on a small set of tenants; observe telemetry for 4 weeks.
+- Phase 2: Gradual rollout to all regions; default policies: balanced.
+- Phase 3: SDK updates to attach x-rw-class and x-rw-deadline-ms by default.
+
+Example policy config (tenant YAML)
+| key | type | description | default |
+|---|---|---|---|
+| default_class | string | fallback class for untagged requests | MEDIUM |
+| allow_deferred_writes | bool | permit deferral of write-like requests | false |
+| deferred_queue_max_size | int | per-tenant limit for deferred queue | 10000 |
+
+Example request/response (edge)<br>Request headers:
+```
+POST /v1/generate HTTP/1.1
+Host: api.redwood.ai
+Authorization: Bearer <token>
+x-rw-class: LOW
+x-rw-deadline-ms: 120000
+Content-Type: application/json
+```
+Ingress response when deferred:
+```
+HTTP/1.1 202 Accepted
+Location: /deferred/ef97a2b4
+Content-Type: application/json
+{
+  "handle_id": "ef97a2b4",
+  "eta_seconds": 38,
+  "reason_code": "capacity_surge_low_class"
+}
+```
+Deferred execution event (audit bus payload):
+```
+{ "handle_id": "ef97a2b4", "tenant": "acme-corp", "class": "LOW", "used_model": "rw-llm-7b-quant-v2", "start_ts": "2026-03-10T12:03:45Z", "duration_ms": 412 }
+```
+
+Security and compliance notes
+-----------------------------
+- Tenant-level deferred queues must be encrypted at rest using customer or platform-managed KMS keys.
+- Requests containing PHI/PII MUST be tagged with x-rw-sensitive=true and are ineligible for deferred execution unless tenant policy explicitly allows.
+
+Ownership and contacts
+----------------------
+- Product owner: Asha Patel
+- Primary SRE contact: Ethan Liu
+- Runtime owner: María Gómez
+
+Open questions and future work
+-----------------------------
+- Should the ingress return estimated cost delta when returning ACCEPT_DEGRADED? (action: Product)
+- Reconciliation guarantees for deferred durable queues: at-least-once vs exactly-once semantics (action: eng-serving-runtime).
+
+Appendix: short checklist for implementers
+-----------------------------------------
+- [ ] Ingress sets and validates x-rw-class and x-rw-deadline-ms.
+- [ ] Admission emits rw.admission.decision and rw.reason_code.
+- [ ] Deferred queue items include idempotency token and mutability flag.
+- [ ] Audit bus records execution events for every deferred job.
+- [ ] SDKs upgraded to set default classification by Q3 2026.
+
+References
+----------
+- Related playbook: /confluence/architecture-and-standards/api-standards/request-priority-and-hinting-protocol-playbook-2026
+- Observability SLI guidance: /confluence/architecture-and-standards/observability-standards/telemetry-ingestion-and-retention-guidelines-2025
+

@@ -1,0 +1,168 @@
+PRD: Predictive Retry and Regional Failover for Cross-Region Inference
+
+Summary and purpose
+
+This PRD describes a product-level feature to introduce a predictive retry and regional failover system for cross-region inference traffic. The goal is to reduce user-visible errors and tail latency during transient failures or capacity pressure in a single region, while preserving unit economics and SLOs. This is a product-scoped requirement that coordinates runtime, routing-service, billing, and console UX changes.
+
+Key goals (what success looks like)
+
+- Reduce customer-visible 5xx error rate due to regional capacity failures by >= 80% for affected tenants during incidents.
+- Maintain end-to-end P95 latency within 1.25x of baseline for retried requests under normal operating conditions. Target: p95 <= 250ms for standard gen routes after retry policy applied in steady state.
+- Keep additional token cost from retries under control: amortized additional token cost <= 3% on average across tenants using automatic failover.
+- Provide visibility and control in Console: per-tenant toggle, per-route policy, audit logs for retry/failover events.
+
+User problems addressed
+
+- Customers experience transient 5xx or increased latency when a single region's Dedicated/Hosted capacity is saturated.
+- Customers lack an automated, safe mechanism to fail over in-region requests to another region or model variant when brief outages happen.
+- Engineering teams resort to client-side retry logic which is inconsistent and can amplify load.
+
+Non-goals
+
+- This PRD does not cover cross-cloud failover or migration of long-running private deployments.
+- Not a replacement for long-term capacity planning; SRE and capacity orchestration must continue separately.
+
+Scope and constraints
+
+- Scope: Redwood-hosted inference surface (hosted API + dedicated pools). Private on-prem and VPC customers are out of scope for this automated feature by default; we will provide an opt-in config and documentation for Private deployments in a follow-up.
+- Constraint: Routing changes must keep request semantics (cookie, headers, API key context) and respect data-residency flags. Requests flagged as "region-locked" (customer policy) must not be failed over.
+
+High-level design requirements (must-haves)
+
+1) Predictive detection engine
+- Detect region degradation using aggregated signals: internal 5xx rate, manifest capacity exhaustion, queue length, scheduler backpressure, instance eviction events.
+- Scoring window: 30s rolling window with exponential smoothing.
+- Output: per-region severity score (0.0-1.0) and predicted probability of continued degradation for next 60s.
+
+2) Policy-driven routing decisions
+- A routing-policy DSL exposes policies per-tenant and per-route. Required policy knobs: enable_retry (boolean), max_retries (0..2), backoff_strategy (fixed|exponential), prefer_local_latency (boolean), failover_region_list (ordered list), cost_guardrail (percent).
+- Default policy for hosted customers: enable_retry=true, max_retries=1, backoff_strategy=fixed(150ms), failover_region_list=[nearest-other-region], cost_guardrail=3%.
+
+3) Safe retry semantics
+- Retries should be idempotent at the platform level. For non-idempotent semantics (e.g., streaming with partial outputs), platform will return immediate failure; caller must retry.
+- Retry behavior: first attempt -> if predictive engine score for region > threshold (0.65) or 5xx observed -> retry to next region using preserved request context.
+- Retries must carry an X-Redwood-Retry header with metadata: attempts, original-region, score.
+
+4) Cost and token accounting
+- Billing must attribute tokens consumed by retries to the tenant, but Console should show a breakdown: primary_token_cost, retry_token_cost.
+- Implement a per-tenant daily "retry-credit" budget that is configurable by account admins (default: 3% of daily token spend or 5000 tokens, whichever is higher).
+
+5) Observability and console UX
+- Console: new Failover Insights dashboard (per-tenant) showing: retry rate, retry success rate, coast-to-coast latency delta, token cost from retries, and active policies.
+- Tracing: each retried request should have a single trace id with child spans indicating routing and region transition.
+- Alerts: SRE and tenant admins receive alerts when retry_rate > 5% sustained for 10m or when retry_cost > configured budget.
+
+6) Auditing and compliance
+- All failovers must be recorded in audit logs: timestamp, tenant, route, original_region, target_region, reason_code, token_delta.
+- For customers with data-residency flags, policy must disallow failover (see constraints).
+
+Operational safety and SLO considerations
+
+- Safety gates: only enable predictive retries when target region health score <= 0.5 and predictive engine indicates < 30% chance of cascading failure.
+- Rate limiting: platform-level circuit breaker to ensure retries do not cause fan-out amplification. Circuit breaker triggers when routing-service observes > 2x normal inter-region traffic to a given target region within 60s.
+- SLO mapping: retries are considered part of the platform reliability SLA; however, we will not count retry-induced latency as violations for customers if retry policy was opted-in and retry succeeded within configured max_retries. This must be reflected in per-route SLO accounting.
+
+Detailed configuration table (for Console and API)
+
+| Config key | Type | Default | Description |
+|------------|------|---------|-------------|
+| enable_retry | boolean | true | Master toggle for automatic retries for the tenant |
+| max_retries | integer | 1 | Maximum number of cross-region retry attempts |
+| backoff_strategy | string | fixed(150ms) | Backoff used between retry attempts |
+| failover_regions | array | [nearest-other-region] | Ordered list of regions to attempt failover to |
+| cost_guardrail_pct | integer | 3 | Percent of daily spend allowed for retries before stop |
+| region_lock | boolean | false | If true, prevents any cross-region failover for customer's requests |
+
+APIs and surface changes
+
+- New Admin API: POST /v1/admin/tenants/{tenant_id}/failover-policy accepts a JSON body with keys above.
+- SDK/Console: Add per-route preview and quick-toggle to test failover simulation against synthetic requests.
+- Logs API: GET /v1/tenants/{tenant_id}/failover-events?start=...&end=...
+
+Example policy JSON
+
+{
+  "enable_retry": true,
+  "max_retries": 1,
+  "backoff_strategy": "fixed(150ms)",
+  "failover_regions": ["us-west-2", "us-east-1"],
+  "cost_guardrail_pct": 3,
+  "region_lock": false
+}
+
+Operational playbook (high level steps)
+
+1) Enable feature (canary)
+   - Phase A (internal): enable for internal test tenants and SDK test accounts. Monitor trace continuity and token accounting for 7 days.
+   - Phase B (pilot customers): 5 strategic customers on Hosted/Dedicated with non-strict region lock. Collect feedback for 14 days.
+   - Phase C (general availability): enable as default for new tenants and offer toggle upgrade for existing tenants.
+
+2) Incident handling (if retry causes cascading load)
+   - Step 1: SRE to flip global routing-service circuit breaker for inter-region failover to OFF.
+   - Step 2: Notify product and customer-success with affected tenant list and rollback window.
+   - Step 3: Re-run post-incident analysis: adjust predictive-engine thresholds, update training data for detector, and revise default policy if needed.
+
+3) Monitoring and metrics to triage regressions
+   - Per-region health score (0..1), 1s granularity.
+   - Retry_count per tenant, retry_success_rate, retry_token_cost, p95_latency_primary_vs_failover.
+   - Circuit-breaker triggers and counts.
+
+Security and privacy considerations
+
+- Respect data-residency and compliance flags. Explicit denials: GDPR/contractual region-lock must be honored.
+- Audit logs must be immutable and stored per existing retention policy (default 90 days).
+- Ensure cross-region traffic is encrypted in transit and signed with platform-level attestation to prevent replay or tampering.
+
+Rollout plan and milestones
+
+- Q4 2025 (proto): implement predictive engine proof-of-concept and basic routing hooks. Demo internal tenant behaviour.
+- Q1 2026 (pilot): API + Console controls, pilot with up to 5 customers.
+- Q2 2026 (GA): full rollout for Hosted; Dedicated rollout with tenant opt-in for first 90 days.
+
+Ownership and stakeholders
+
+- Product owner: Aisha Raman (Product)
+- Engineering leads: Elina Cho (routing-service), Marcus Patel (runtime), Priya Singh (billing)
+- SRE: Evan Brooks
+- Console & Observability: Daniel Kim
+- Customer Success: Olivia Grant
+
+Open questions (to resolve during design phase)
+
+1) How to surface simulated token cost for failover decisions in the routing step without invoking full execution? (design/engineering)
+2) Should retries be considered for streaming endpoints where partial output can be consumed by callers? Proposed: default to no automatic retry for non-idempotent streaming; expose a per-route override.
+3) How to bind retry accounting to budgeted credits vs straightforward token billing for enterprise contracts? (billing/legal)
+
+Appendices
+
+A. Example trace flow (text diagram)
+   - Request(id=R1) -> routing-service(us-east-1) -> predictive-engine(score=0.78) -> routing-service decides failover -> routing-service forwards to runtime(us-west-2) -> runtime executes -> response returned -> trace shows R1 -> forward_span -> remote_exec_span -> response_span.
+
+B. Failure mode matrix
+
+| Trigger | Platform reaction | Customer-visible outcome |
+|--------|-------------------|-------------------------|
+| Regional scheduler queue overflow | predictive-engine raises region score -> failover to next region | Successful response with slightly higher latency (p95 increase ~40ms) |
+| Target region overloaded due to sudden fan-out | circuit-breaker prevents further failovers -> primary region errors | Customer sees 5xx until manual mitigation; SRE alerted |
+
+C. CLI commands (example)
+
+# Preview simulated failover for tenant
+redwood admin simulate-failover --tenant-id t123 --route /v1/complete --target-region us-west-2 --count 100
+
+D. Implementation notes (for engineering)
+- Predictive engine model should be lightweight (rule + ML hybrid) and run in routing-service with fallback to central probe.
+- Routing changes must be feature-flagged per-room for rapid rollback.
+
+Purposeful exclusions and tradeoffs
+
+- We do not attempt to fully hide cross-region latency delta; we surface the delta in Console and allow customers to opt-out.
+- To keep complexity manageable we cap max_retries at 2 for initial rollout.
+
+Next steps
+
+- Kickoff design review with routing-service, runtime, billing, SRE, and Console teams (target: 2025-10-06).
+- Prioritize detection signals and define acceptance criteria for pilot.
+- Finalize API contract and Console mockups.
+
+# End of document

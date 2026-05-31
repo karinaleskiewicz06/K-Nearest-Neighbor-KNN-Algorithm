@@ -1,0 +1,147 @@
+Scheduler Shadowplay and Telemetry Convergence Playbook
+
+Summary
+This playbook defines the 'Scheduler Shadowplay' experiment pattern and a telemetry convergence protocol for validating scheduler and kernel-scheduling changes against production-like traffic. It combines parallel (shadow) scheduling runs, targeted profiling, and a gated quality checklist so teams can iterate on scheduling policies without risking customer SLAs.
+
+Why this exists
+- Scheduler changes (admission, preemption, kernel hints) can introduce subtle latency and fidelity regressions that are hard to detect with unit tests or synthetic microbenchmarks.
+- Shadowing real traffic through a non-authoritative (shadow) scheduler lets us compare end-to-end observables while keeping live traffic untouched.
+- Telemetry convergence defines statistical checks and gating rules so rollouts proceed only when measurable signals align with safety thresholds.
+
+Scope and assumptions
+- Applies to changes in: scheduler policy DSL, kernel selection heuristics, priority mapping, preemption thresholds, and admission controllers.
+- Assumes: shadow scheduler can be run in parallel to production pods (no write-side-effects), tracing headers are propagated (trace-id/kvcache-hash), and a profiling instrumentation sidecar is available.
+
+Owners and contacts
+- Playbook owner: eng-serving-runtime Scheduling Guild (primary: Maya Chen)
+- On-call escalation: runtime-sre team (pager: #runtime-sre)
+- Reviewers: listed in metadata above
+
+High-level pattern
+1) Prepare shadow environment
+   - Deploy a shadow scheduler instance that consumes mirrored decision requests. Shadow scheduler MUST NOT affect traffic (read-only decision path).
+   - Ensure shadow pods have the same kernel build (or explicitly labeled if testing kernel changes).
+2) Collect baseline
+   - Run shadowplay with baseline scheduler to establish reference telemetry for 48h (recommended) or one production peak cycle.
+3) Deploy candidate scheduler
+   - Switch shadow cluster to candidate scheduler and run for an identical period.
+4) Telemetry convergence checks and gating
+   - Compute delta metrics (candidate vs baseline) and run statistical tests.
+5) Profiling and targeted instrumentation
+   - On any significant divergence, run focused profiler sessions using the profiling sidecar.
+6) Decision and rollout
+   - If all gates pass, proceed to canary with controlled traffic. If not, collect diagnostics and iterate.
+
+Metric and signal catalog
+- Latency: p50/p90/p95/p99 for request end-to-end (ms). Primary gating metric: p95.
+- Errors: 4xx/5xx within runtime, kernel faults, NVLink reprobes.
+- Kernel switch count: average kernel flips per request (should not increase >10%).
+- KVCache hit ratio: prefix/KV cache hit % (should not degrade >1.5ppt for high-fidelity cohorts).
+- Token throughput: tokens/sec aggregated per shard.
+- Resource signals: GPU SM occupancy, memory allocs/sec, swap activity (on-host), CPU steal.
+- Cost proxy: normalized per-token GPU utilization estimate.
+
+Gating thresholds (default)
+- p95 latency: candidate <= baseline + 10 ms OR no statistically-significant increase (p-value > 0.05 for Mann-Whitney U test)
+- Error rate: candidate <= baseline + 0.1% (absolute)
+- KVCache hit: no decrease greater than 1.5 percentage points for workloads with >10% cacheable prefixes
+- Throughput: candidate >= 95% of baseline under matched load
+- Cost delta: normalized per-token cost increase <= 8% (ops must approve >8%)
+- Stability: no kernel panics, watchdog resets, or GPU timeout events during the shadow period
+
+Statistical procedures
+- Use paired comparisons where possible: align requests by trace-id to compute per-request deltas and run a Wilcoxon signed-rank test for latency deltas.
+- For non-paired aggregated signals, use bootstrap confidence intervals (95%) to judge convergence.
+- Require at least N=10k matched requests for meaningful p95 comparisons; otherwise extend the shadow window.
+
+Data sources and dashboards
+- Primary time-series: runtime.metrics.{latency,end_to_end}_p95, runtime.errors.count, runtime.kvcache.hit_ratio, kernel.switch_rate, gpu.utilization_pct
+- Traces: trace.span.runtime_request -> annotate with scheduler.variant and kernel.hints (tag names: scheduler.variant, kernel.tag, shadow.play_id)
+- Dedicated dashboards: "Scheduler Shadowplay Convergence" (Grafana) and "Scheduler Shadowplay Diff" (Heatmap). Ensure diff dashboard shows per-cohort comparisons.
+
+Runbook: immediate remediation flow (if candidate fails during shadow)
+1) Abort: stop candidate shadow traffic and revert shadow scheduler to baseline.
+2) Snapshot: capture a 10-minute high-fidelity profile (pprof + GPU traces) and save a trace sample set with trace-ids.
+3) Notify: post summary to #runtime-ops including key deltas and linking the snapshot.
+4) Triage: schedule a focused investigation within 4 business hours with scheduling, kernel, and SRE.
+5) Rollback plan: candidate must remain off the production decision path until the issue is resolved and a new shadow run passes gates.
+
+Profiling playbook (when divergence detected)
+- Step 1: Reproduce in controlled shadow window with load-sculpting tool (load-sculptor-cli).
+  Example: load-sculptor-cli replay --corpus=samples/peak-1H --concurrency=120 --trace-ids=./trace-seed.json
+- Step 2: Enable sidecar collection: set env SHADOW_PROFILING=enabled and increase trace sampling to 100% for 5 minutes.
+- Step 3: Capture: GPU traces (nsys), kernel timeline (ktrace), and runtime CPU flamegraphs.
+- Step 4: Annotate: tag traces with reason tags (e.g., preemption-regression, kernel-selection) and add kernel hint dumps.
+- Step 5: Analyze: correlate p95 latency spikes with kernel switch counts and NVLink activity. Use causality checklist below.
+
+Causality checklist (common root causes)
+- Kernel hint mismatch: candidate suggested a heavier kernel path for mid-length sequences.
+- Increased kernel churn: frequent kernel switches per request due to sequence length fragmentation.
+- Admission backpressure: new admission thresholds caused head-of-line blocking at dispatcher.
+- KV cache coldspots: candidate ordering increases cold-start requests for popular prefixes.
+- Resource contention: increased SM occupancy leading to longer kernel enqueue latencies.
+
+Example scheduler policy snippet (YAML)
+- name: test-candidate-policy
+  admission:
+    max_slots_per_shard: 48
+    queue_timeout_ms: 120
+  preemption:
+    enabled: true
+    debt_threshold_ms: 5
+  kernel_hints:
+    prefer_quantized: true
+    max_kernel_switches_per_request: 2
+  priority_synthesis:
+    economic_weight: 0.7
+    fidelity_weight: 0.3
+
+CLI example: start a shadow run (ops)
+1) Create play:
+   rwd ctl shadow create --name=scheduler-shadow-2026-06 --source=mirror-prod --target=shadow-cluster-03 --duration=48h --note="candidate kernel: v2-opt-hint"
+2) Switch policy:
+   rwd ctl shadow set-policy --play=scheduler-shadow-2026-06 --policy-file=policies/test-candidate-policy.yaml
+3) Watch progress:
+   rwd ctl shadow status --play=scheduler-shadow-2026-06 --format=wide
+
+Acceptance checklist before promoting candidate to canary
+- All gating thresholds satisfied for target cohorts for a minimum of 48 hours (or one peak cycle).
+- Telemetry pipelines show <5% missing trace propagation during the shadow window.
+- No kernel-level faults or GPU watchdog events recorded.
+- Profiling artifacts and a short investigation note uploaded to the shadowplay artifact bucket: s3://redwood-shadowplay/artifacts/{play_id}/
+- Approval from runtime-sre and Scheduling Guild leads.
+
+Rollout matrix (recommended)
+- Shadow -> Canary 1 (5% traffic, 4h) -> Canary 2 (20% traffic, 12h) -> Gradual ramp to 100% over 72h if no regressions.
+- If canary shows divergence, follow rollback immediate remediation flow above.
+
+Operational tips and anti-patterns
+- Tip: Align shadow windows to production peak hours for more representative load.
+- Tip: Use cohort labels (e.g., small-seq, long-seq, embeddings-heavy) to avoid signal dilution.
+- Anti-pattern: Short (15–30 minute) shadow runs; these often miss tail behaviour.
+- Anti-pattern: Ignoring KV cache observables; many scheduler changes shift ordering and indirectly alter cache hit rates.
+
+Appendix A — Example diff report fields
+- total_matched_requests
+- p95_baseline_ms, p95_candidate_ms, p95_delta_ms, p95_pvalue
+- errors_baseline, errors_candidate, errors_delta_pct
+- kvcache_hit_baseline_pct, kvcache_hit_candidate_pct, kvcache_delta_pp
+- gpu_util_baseline, gpu_util_candidate, util_delta_pp
+- artifact_link (S3)
+
+Appendix B — Troubleshooting quick hits
+- If p95 increases but kernel switch count unchanged: look for NVLink queueing or host CPU starvation.
+- If KV hits drop: verify request ordering and any implicit batching changes.
+- If errors spike with no latency change: prioritize investigating kernel-level assertions and runtime error wrapping.
+
+References and related docs
+- Runtime decision graph and observed behaviour catalog (link in metadata)
+- Profiling: causal latency attribution playbook (link in metadata)
+- Runtime runbooks: eviction, warmstart, and graceful degradation playbooks
+
+Change log
+- 2026-01-15: Initial draft (Maya Chen)
+- 2026-03-22: Added statistical procedure guidance and default gating thresholds (reviewers: Priya Nair)
+- 2026-06-30: Expanded profiling playbook and added CLI examples; set publication status to published
+
+End of document

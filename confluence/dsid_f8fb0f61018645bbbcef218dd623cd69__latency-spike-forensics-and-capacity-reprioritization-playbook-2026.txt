@@ -1,0 +1,191 @@
+Latency spike forensics and capacity reprioritization playbook
+
+Overview
+--------
+
+This playbook defines a repeatable, time-boxed process for diagnosing sudden latency spikes in model inference paths and for executing short-term capacity reprioritization actions that preserve customer-visible SLOs while minimizing cost and blast radius. It focuses on production-facing inference services (hosted API, dedicated pools, and private gateways) and integrates SLO/error-budget signals with capacity controls and routing fallbacks.
+
+Scope
+-----
+
+- Applies to service classes: inference-gateway, request-router, model-worker, kv-cache, and edge-proxy.
+- Triggering signal: sustained P95/P99 latency regression that violates SLO or a rapid error-budget burn in a single region/cluster.
+- Out-of-scope: planned capacity maintenance, long-term perf regressions requiring code changes (those follow the Performance Engineering workflow).
+
+Key goals
+---------
+
+1. Rapidly identify whether latency is caused by load, model-serving regressions, hardware degradation, or dependency cascades.
+2. Contain customer impact with low-risk capacity/routing changes and temporary quality-preserving fallbacks.
+3. Produce evidence suitable for a post-incident review (timelines, queries, artifact links).
+
+Preconditions & RBAC
+--------------------
+
+- Oncall SRE must have access to: Grafana dashboards, Prometheus queries, Kibana/Elasticsearch for logs, internal tracing UI, the routing control plane (traffic-router CLI/API), and the capacity controller (autoscaler and pool-manager).
+- Runbook assume two-person handoff for any capacity preemption affecting dedicated tenants.
+
+Detection and initial triage (first 10 minutes)
+----------------------------------------------
+
+1. Confirm alert: validate Grafana alert and correlate with Prometheus series. Check:
+   - Alert name(s): "inference_p99_latency_alert", "model_worker_error_budget_burn"
+   - Time window: last 5m and last 30m
+2. Snapshot immediate telemetry:
+   - Query P99/P95/P50 for the inference-gateway and model-worker:
+     - Prometheus: 
+       - model_serving_request_duration_seconds_bucket{job="inference-gateway",quantile!=""} (or histogram summary series)
+       - model_worker_inflight_requests_total
+       - model_worker_kvcache_hit_ratio
+     - Traces: search for span latency > 95th percentile in tracing UI for the timeframe.
+3. Determine blast radius: which customers, routes, regions, models are impacted.
+   - Use token-level tracing to slice by route and model_name. Example query: 
+     - logs: "model_name:\"*\" request_id:*" | json | stats p99(latency_ms) by model_name, route
+4. Decide initial response tier:
+   - Tier 1 (isolated tenant or non-critical route): use tenant-level throttles and cache warmers.
+   - Tier 2 (multiple tenants, significant P99/regression): escalate and consider cross-region routing or model variant fallback.
+   - Tier 3 (platform-wide P99 regression / SLA risk): trigger incident and follow Major Incident playbook.
+
+Forensics checklist (10–45 minutes)
+-----------------------------------
+
+Collect the following artifacts and attach to the incident timeline:
+
+- Time-bounded traces (5m/30m/2h) for representative requests.
+- Prometheus query snapshots (include series names and raw result CSV).
+- Representative logs for model-worker pods and the gateway (correlate by request_id).
+- Kernel and GPU metrics if model-workers show hardware stress (nvidia-smi, DCGM, dstat).
+
+Essential queries and commands (examples)
+----------------------------------------
+
+- Prometheus (example P99 over 10m):
+  - avg_over_time(histogram_quantile(0.99, sum(rate(model_serving_request_duration_seconds_bucket[10m])) by (le, route, model_name)), 10m)
+- Active inflight by worker: rate(model_worker_inflight_requests_total[2m]) by (worker_pool)
+- Cache hit ratio: increase(model_worker_kvcache_hits_total[10m]) / increase(model_worker_kvcache_lookups_total[10m])
+- Check pod restarts and OOMs: kubectl -n redwood get pods -l app=model-worker -o wide; kubectl describe pod <pod>
+- Collect GPU utilization and memory errors: ssh to node -> nvidia-smi --query-gpu=utilization.gpu,utilization.memory,memory.used --format=csv -l
+
+Rapid hypothesis checklist (do in parallel)
+------------------------------------------
+
+- Hypothesis A — Load surge: increased requests per second (RPS) with matching increase in inflight requests and queueing.
+- Hypothesis B — Model regression: a recent model rollout introduced slower ops or larger KV cache misses.
+- Hypothesis C — Hardware degradation: GPU throttling, overheating, or host-level I/O causing stalls.
+- Hypothesis D — Downstream dependency: database, embedding service, or external API experiencing latency.
+
+For each hypothesis, capture one quick metric that supports/refutes it within 10 minutes. Attach screenshots/CSV.
+
+Containment and low-risk mitigations (first 15–60 minutes)
+--------------------------------------------------------
+
+Use the capacity reprioritization matrix below to select mitigations. Actions are ordered by least-impactful first. Always coordinate with pool-owner if you will preempt dedicated pools.
+
+Capacity reprioritization matrix (decision support)
+--------------------------------------------------
+
+Patterns and recommended actions:
+
+- If cause == Load surge and affected == best-effort routes:
+  1) Apply route-level rate limit: traffic-router apply-rate-limit --route <route> --rps <value>
+  2) Enable burst-absorber policy on gateway for 5–15 minutes (automated knob).
+  3) Warm or pin model warm-pool for hot models: pool-manager scale --pool hot-warmers --replicas +2
+
+- If cause == Model regression and fallback available:
+  1) Initiate model-variant fallback: router set-model-variant --route <route> --variant <vX-compat> --weight 100 --ttl 900
+  2) Ramp down canary traffic: rollout-controller pause-canary --deploy <deploy_id>
+
+- If cause == Hardware degradation on subset of nodes:
+  1) Drain affected nodes and shift traffic: kubectl drain <node> --ignore-daemonsets --delete-local-data
+  2) Move critical tenants to healthy pools: pool-manager migrate-tenant --tenant <id> --to-pool healthy-pool
+
+- If cause == Downstream dependency latency:
+  1) Increase local caching TTLs for embeddings or configuration where safe.
+  2) Rate-limit and shed non-essential background jobs consuming shared dependency.
+
+Immediate mitigation play examples (scripts and templates)
+--------------------------------------------------------
+
+- Route throttling template (safe defaults):
+  - target window: 60s
+  - default emergency rps: 50 for non-critical routes, 200 for enterprise tenant routes (subject to SLA)
+  - CLI example: traffic-router apply-rate-limit --route /v1/generate --rps 200 --burst 100 --reason "emergency-latency-mitigation"
+
+- Model fallback example: router set-model-variant --route /chat --variant open-compat-small --weight 100 --notify-team sres@redwood.com
+
+Escalation to capacity preemption (policy and approval)
+----------------------------------------------------
+
+- Only trigger preemption when:
+  - P99 latency is > SLO threshold for 30m and containment actions above have not restored SLO, OR
+  - Error budget burn rate > 10x sustained for 1h in a tenant-critical service.
+- Approval path: oncall SRE -> SRE lead -> Pool owner (explicit ack in incident timeline). Store approvals in incident doc.
+- Preemption actions: reduce soft-qos for low-priority tenants, evict stateless best-effort pods from crowded nodes, or borrow capacity from a staging pool.
+
+Communication and customer-impact handling
+----------------------------------------
+
+- If an enterprise tenant is impacted, notify Customer Success immediately with the incident link and expected timeline. Use the templated message in the incident communication toolkit.
+- Public-facing status: update status page only when impact affects multiple customers or base SLA. Leave internal status updates in the incident doc for isolated tenant events.
+
+When to trigger Major Incident and oncall shift
+-----------------------------------------------
+
+- Trigger Major Incident if any of the following are true:
+  - Platform-wide P99 breach for > 15 minutes across regions.
+  - Any customer-facing SLA is at immediate risk (legal/compliance).
+  - Capacity preemption would affect > 5 enterprise customers.
+
+Post-incident evidence collection (within 24 hours)
+--------------------------------------------------
+
+1. Produce timeline with: detection time, mitigations applied (commands + timestamps), owner for each action, and the final remediation.
+2. Export the following to the incident annex: Prometheus snapshots, trace bundles (zip), node-level metrics, and the pool-manager audit log.
+3. Classify the incident root cause into one of the following buckets: load, regression, hardware, dependency, or mixed.
+
+Remediation and SRE follow-up (72 hours)
+--------------------------------------
+
+- Short-term remediation (owner: oncall team): revert rollout or extend cache TTLs; update canary gating rules to be stricter.
+- Medium-term remediation (owner: runtime team): create a perf regression ticket, schedule model profiling run, and add regression test to the eval harness.
+- Capacity adjustments (owner: capacity planning): if load surges are recurrent, add headroom or convert some pools to reserved dedicated capacity.
+
+Postmortem & Continuous improvement
+----------------------------------
+
+- Postmortem should be completed within 5 business days and include: incident summary, timeline, root cause analysis, contributing factors, impact metrics, action items with owners and dates.
+- Run a tabletop within 30 days for incidents classified as Tier 2 or 3.
+- Feed relevant findings into:
+  - SLO and error-budget reviews for weight/threshold tuning.
+  - Model-onboarding checklist for rollout gating.
+  - Observability standards for better telemetry coverage.
+
+Appendix: diagnostic queries and useful dashboards
+------------------------------------------------
+
+- Key dashboards: inference-p99-overview, model-worker-hot-pods, region-capacity-hedge, kvcache-miss-heatmap.
+- Prometheus snippets: histogram_quantile(0.99, sum(rate(model_serving_request_duration_seconds_bucket[5m])) by (le, route))
+- Trace search: span.operation: "infer.request" AND span.duration_ms > 1000
+
+Ownership and contacts
+----------------------
+
+- Primary owner: eng-sre oncall (rotation list in PagerDuty)
+- Secondary owner: runtime-platform (paging policy in runbook)
+- Capacity owner: capacity-planning@redwood.com
+- Customer contact: customer-success@redwood.com
+
+Revision history
+----------------
+
+- 2025-09-18: Created by Maya Chen (published).
+- 2025-12-02: Added GPU diagnostic steps and expanded preemption policy (reviewers: Diego Alvarez).
+- 2026-01-15: Clarified escalation thresholds and added decision matrix templates (reviewers: Priya Patel, Jonas Berg).
+
+Related artifacts and templates
+------------------------------
+
+- Incident template: /confluence/eng-sre/incident-review/incident-postmortem-template-2024
+- Traffic-router CLI docs: /confluence/eng-platform/systems-and-services/traffic-router-cli
+- Pool-manager runbook: /confluence/eng-infra/gpu-fleet-and-capacity/pool-manager-ops
+

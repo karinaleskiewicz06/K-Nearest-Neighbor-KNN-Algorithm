@@ -1,0 +1,190 @@
+ADR-014: Hosted overload error taxonomy (customer-facing)
+
+## Summary
+This ADR defines the **customer-facing error taxonomy** for overload protection in the Redwood Hosted API, including:
+- Stable **error codes** and their semantics
+- HTTP **status mapping** (primarily 429 vs 503)
+- Standard JSON **response payload shape** (additive and backwards compatible)
+- **Retry-After** header semantics and client retry guidance
+
+This taxonomy is used by the API Gateway admission layer, Smart Routing, and serving runtime admission points.
+
+## Context / Problem
+The Hosted API experiences bursty workloads. During saturation, failures have historically presented as ambiguous timeouts and generic 5xx errors, causing:
+- Retry storms and further overload
+- Confusing customer experience (unclear whether to retry, when, and how)
+- Difficult incident triage due to inconsistent error signatures across services
+
+We need **stable, explicit overload errors** so:
+- The platform can shed load early and predictably
+- Customers can implement safe retry/backoff
+- Support/SRE can quickly classify and mitigate overload scenarios
+
+## Goals
+1. Provide a stable, documented set of **error codes** for overload and rate limiting.
+2. Ensure errors are **machine-actionable** (retryable vs non-retryable, suggested delay).
+3. Avoid client breakage: payload changes must be **JSON-compatible and additive**.
+4. Standardize headers and IDs for correlation across gateway, routing, runtime, and support.
+
+## Non-goals
+- Redefining billing/credit quota semantics (usage/billing errors remain separate).
+- Introducing new SDK API surface beyond parsing and exposing these fields.
+
+## Decision
+### 1) Error envelope (JSON payload shape)
+All overload/rate limit responses from Hosted API MUST use the following top-level envelope:
+
+- Top-level object contains **"error"**.
+- Required fields inside `error` are `type`, `code`, `message`, `request_id`.
+- Additional fields are additive and optional.
+
+**Canonical schema (conceptual):**
+- `error.type` (string): broad category; see below
+- `error.code` (string): stable machine-readable code; see taxonomy table
+- `error.message` (string): human-readable; safe to show in logs/UI
+- `error.request_id` (string): Redwood request identifier (also returned via header)
+- `error.correlation_id` (string, optional): consistent across internal hops where available
+- `error.retryable` (boolean, optional): whether retry is recommended
+- `error.retry_after_ms` (integer, optional): suggested wait time (mirrors Retry-After when possible)
+- `error.param` (string, optional): request field most related to error (e.g., `model`)
+- `error.region` (string, optional): region that handled the request (e.g., `us-east`)
+- `error.details` (object, optional): reserved for future use; MUST remain bounded and non-sensitive
+
+**Example (503 overload):**
+```json
+{
+  "error": {
+    "type": "overload_error",
+    "code": "overload_circuit_open",
+    "message": "Service is temporarily overloaded. Please retry after a short delay.",
+    "request_id": "req_01JDR6P3Q9G2V2H2QY9X2S8A1B",
+    "correlation_id": "corr_01JDR6P3R1K9J8YJ9A0ZQ4TQG2",
+    "retryable": true,
+    "retry_after_ms": 2000
+  }
+}
+```
+
+**Backwards compatibility note:** Some existing clients rely on the presence of `error.message` and may ignore unknown fields. We will keep the `error` envelope and `message` semantics consistent. New fields are additive.
+
+### 2) Required headers
+For all overload/rate limit errors:
+- `Content-Type: application/json`
+- `X-Request-ID: <req_...>` (MUST match `error.request_id`)
+- `X-Redwood-Error-Code: <error.code>` (best-effort; for quick grep)
+
+For retryable overload/rate limit errors:
+- `Retry-After: <seconds>` (see section below)
+
+Optional headers (best-effort, may be omitted to control cardinality / privacy):
+- `X-Redwood-Region: <region>`
+- `X-Redwood-Model: <model>`
+
+### 3) Taxonomy: types, codes, and HTTP mapping
+We standardize on a small set of stable codes. Internal components may have more granular reasons, but they MUST map into this public taxonomy.
+
+#### 3.1 `error.type` values
+- `overload_error`: capacity-related refusal or dependency brownout handling (generally HTTP 503)
+- `rate_limit_error`: tenant- or route-scoped admission control limits (generally HTTP 429)
+
+#### 3.2 Public error codes
+| HTTP | error.type | error.code | When returned | Retry guidance |
+|---:|---|---|---|---|
+| 503 | overload_error | overload_circuit_open | A circuit breaker is open at the gateway/routing/runtime admission point due to sustained saturation or dependency brownout. | Retryable. Respect Retry-After; use exponential backoff + jitter. |
+| 503 | overload_error | overload_shed | Request was intentionally load-shed due to real-time saturation signals (queue depth, token/sec saturation, memory pressure proxies, regional capacity). | Retryable. Respect Retry-After; avoid immediate fan-out retries. |
+| 503 | overload_error | overload_queue_full | Runtime admission rejected because per-model/per-pool queue is at a hard cap to protect latency SLOs. | Retryable. Retry-After is usually short (e.g., 1–5s). |
+| 503 | overload_error | overload_dependency_unavailable | A required downstream dependency is degraded/unavailable (e.g., routing policy service, authz, internal model registry) and continuing would amplify impact. | Retryable unless specified otherwise; Retry-After may be longer (e.g., 10–60s). |
+| 429 | rate_limit_error | rate_limit_exceeded | Tenant/route/model rate limit exceeded (token bucket / QPS). | Retryable. Retry-After provided when possible; otherwise back off conservatively. |
+| 429 | rate_limit_error | concurrency_limit_exceeded | Tenant concurrency cap exceeded (especially relevant for streaming requests). | Retryable. Retry-After typically short; also reduce parallelism. |
+
+Notes:
+- We intentionally map overload conditions to **503** (Service Unavailable) rather than 500 to communicate that the service is healthy enough to reject safely.
+- We intentionally use **429** for tenant/route admission controls where a customer can often mitigate by reducing call rate/concurrency.
+
+### 4) Retry-After semantics
+#### 4.1 Format
+- `Retry-After` MUST be an **integer number of seconds**.
+- We do not emit HTTP-date format.
+
+Examples:
+- `Retry-After: 2`
+- `Retry-After: 15`
+
+#### 4.2 When Retry-After is required
+- For `503` with codes: `overload_circuit_open`, `overload_shed`, `overload_queue_full`, `overload_dependency_unavailable` where `retryable=true`: **MUST** include `Retry-After`.
+- For `429` with codes: `rate_limit_exceeded`, `concurrency_limit_exceeded`: **SHOULD** include `Retry-After`.
+
+If we cannot safely recommend a retry window, omit `Retry-After` and set `error.retryable=false`.
+
+#### 4.3 Relationship to payload
+- When `Retry-After` is present, the payload SHOULD include `error.retry_after_ms` equal to the header value in milliseconds.
+- When streaming has already begun and headers cannot be modified, include `error.retry_after_ms` in the terminal error event (see streaming section).
+
+#### 4.4 Client retry contract (documented guidance)
+Clients SHOULD:
+1. Respect `Retry-After` when provided.
+2. Apply exponential backoff with jitter for additional attempts.
+3. Cap retries (e.g., 2–5 attempts) and avoid unbounded retry loops.
+4. Reduce concurrency when receiving `concurrency_limit_exceeded`.
+5. Prefer idempotent patterns on retry (see below).
+
+### 5) Correlation and supportability
+- `request_id` is required for every error response and is the primary support handle.
+- `correlation_id` is optional but recommended when a request traverses multiple internal hops (gateway → routing → runtime). If present, it must be safe to share with customers.
+
+### 6) Streaming behavior
+For streaming responses (SSE / chunked):
+- If overload is detected **before any bytes are sent**, return the normal HTTP error response (429/503) with headers.
+- If overload is detected **after streaming has started**, emit a terminal SSE error event with the same JSON `error` envelope and then close the stream.
+
+**Example (SSE terminal error event):**
+```
+event: error
+data: {"error":{"type":"overload_error","code":"overload_shed","message":"Stream interrupted due to temporary overload. Please retry.","request_id":"req_...","retryable":true,"retry_after_ms":2000}}
+
+```
+
+### 7) Idempotency and safe retries
+- For non-streaming write-like operations (where relevant), clients SHOULD use `Idempotency-Key` to prevent duplicate work when retrying after 429/503.
+- For completion/generation requests, retries can produce different outputs even if idempotent at the HTTP level; this is expected. The goal is to avoid duplicate billing/work where applicable and to keep retries controlled.
+
+## Alternatives considered
+1. **Use generic 503 without codes**
+   - Rejected: ambiguous, hard for clients and support; does not prevent retry storms.
+
+2. **Use 500 for overload to count as “server error”**
+   - Rejected: overload is not an unexpected crash; 503 communicates controlled shedding and allows explicit retry guidance.
+
+3. **Expose internal granular reasons directly**
+   - Rejected: would create stability burden and potentially leak sensitive capacity/dependency details. We instead map internal reasons to a stable public set.
+
+## Consequences / Follow-ups
+### Implementation requirements
+- Gateway, routing, and runtime must map local refusal reasons to the public taxonomy above.
+- SDKs must surface `error.code`, `error.type`, `request_id`, and parse `Retry-After`.
+- Observability should key dashboards/alerts off `error.code` and HTTP status rather than ad-hoc strings.
+
+### Documentation and support enablement
+- Developer docs: add a section “Overload and retry guidance” with examples for each code.
+- Support playbooks: include quick explanation of each code and what data to request from customers (request_id, timestamp, region/model if known).
+
+### Compatibility guarantees
+We commit to:
+- Keep `error.code` values stable once published.
+- Only add new codes with documentation and release notes.
+- Only add new fields (no breaking schema changes) under the `error` object.
+
+## Appendix A: Message templates (customer-facing)
+These are suggested `error.message` strings; services may vary wording slightly but should preserve meaning.
+- `overload_circuit_open`: “Service is temporarily overloaded. Please retry after a short delay.”
+- `overload_shed`: “Request could not be served due to temporary capacity constraints. Please retry.”
+- `overload_queue_full`: “Service is busy. Please retry shortly.”
+- `overload_dependency_unavailable`: “A downstream dependency is temporarily unavailable. Please retry later.”
+- `rate_limit_exceeded`: “Rate limit exceeded. Please retry after the indicated delay.”
+- `concurrency_limit_exceeded`: “Too many concurrent requests. Please reduce parallel requests and retry.”
+
+## Appendix B: Quick reference (copy/paste)
+- Use **429** for rate/concurrency admission controls.
+- Use **503** for overload/circuit breaker/load shedding.
+- Always include `X-Request-ID` and `X-Redwood-Error-Code`.
+- Include `Retry-After` whenever `retryable=true` and we can safely recommend a delay.

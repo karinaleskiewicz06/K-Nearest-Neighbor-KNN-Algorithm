@@ -1,0 +1,372 @@
+Debugging kernel selection and launch config (profiling playbook)
+
+## Purpose
+This page is the standard playbook for debugging **kernel selection** (v1 and v2) and **GPU launch configuration** in Redwood Serving Runtime.
+
+It covers:
+- Capturing kernel selection traces (telemetry + local dumps)
+- Reproducing a mis-selection locally with the same inputs
+- Comparing candidate kernels apples-to-apples
+- Interpreting common GPU/perf counters for prefill vs decode
+- Recognizing common failure signatures and the fastest mitigations
+
+**Non-goals:** deep kernel implementation details or architectural rationale (see the design + ADR).
+
+---
+
+## When to use this playbook
+Use this when you see any of the following:
+- p95/p99 latency regression after enabling Kernel Auto-Selection v2
+- Throughput instability on mixed workloads (short + long prompts)
+- Unexpected fallback to a slower “generic” kernel
+- GPU-SKU-specific regressions (A100 vs H100 vs L40S, MIG vs non-MIG)
+- Suspected nondeterminism (same request → different kernel choice)
+
+---
+
+## Glossary (runtime terms)
+- **Prefill:** processing the prompt/context (usually GEMM-heavy; long-context sensitive)
+- **Decode:** token-by-token generation (latency sensitive; typically attention-heavy)
+- **Seq bucket:** selector’s coarse regime classification (prefill/decode characteristics + token ranges)
+- **Candidate kernels:** kernel implementations compatible with the request + model + GPU SKU
+- **Launch config:** CUDA kernel launch parameters and runtime execution path configuration (e.g., split-K, CTA shape, persistent kernels, etc.)
+
+---
+
+## Quick-start triage checklist (10–15 minutes)
+1) Identify **what changed**
+   - Runtime version (e.g., 1.21 canary)
+   - Selector version (v1 vs v2)
+   - Driver/CUDA version
+   - GPU SKU (including MIG)
+   - Model version / quantization profile
+
+2) Pull a single representative **trace**
+   - Capture selection telemetry for the request(s)
+   - Confirm chosen kernel, seq bucket, and fallback reason (if any)
+
+3) Sanity check feature extraction
+   - model_family correct?
+   - prefill_tokens/decode_tokens estimates correct?
+   - gpu_sku normalized correctly?
+
+4) Compare with a forced kernel baseline
+   - Force “known-good” kernel on same GPU SKU
+   - Check prefill vs decode deltas; confirm regression is in the suspected phase
+
+5) If customer-impacting
+   - Apply runbook mitigation (disable v2 by model/GPU/region or pin kernel)
+   - Then continue root-cause analysis offline
+
+---
+
+## Data you should collect (minimum)
+For any debugging thread / ticket, include:
+- **Model**: name + version hash (or Redwood model revision)
+- **GPU**: sku (normalized), MIG mode (if present), driver + CUDA
+- **Workload**: prompt tokens, max output tokens, streaming on/off, typical concurrency
+- **Selector**: v1/v2 enabled, allowlist/denylist state, forced kernel overrides
+- **Evidence**: 1–3 trace IDs and a short time window to query dashboards
+
+Recommended extras:
+- Nsight Systems (.nsys-rep) for one request
+- Nsight Compute report for the dominant kernel (prefill or decode)
+
+---
+
+## Capturing kernel selection traces
+
+### A) Using production telemetry (preferred)
+Kernel selection emits a per-request event (sampled) when telemetry is enabled.
+
+What to look for in the event payload:
+- selector_version (v1 or v2)
+- model, model_family
+- gpu_sku, driver_version, cuda_version
+- prefill_tokens, decode_tokens_est
+- seq_bucket
+- candidates (compact list)
+- chosen_kernel
+- fallback_reason (if any)
+- decision_hash / determinism_fingerprint
+
+**Recommended query pattern (Hosted/Dedicated):**
+- Filter by model + gpu_sku + seq_bucket
+- Compare selection distribution before/after the regression window
+- Correlate with p95/p99 latency by the same dimensions
+
+Sampling note:
+- Sampling is intentionally low by default to control overhead and cardinality.
+- If you need more coverage during a canary, coordinate with SRE/Observability to temporarily increase sampling for a narrow allowlist (model + region).
+
+### B) Local dump (repro and deep debugging)
+Use the runtime CLI flags to dump the selector’s decision record.
+
+**Common flags (runtime 1.21+):**
+- `--kernel-select.v2=0|1` (enable/disable v2)
+- `--kernel-select.dump=/path/selector_dump.jsonl` (writes JSONL)
+- `--kernel-select.sample-rate=0.0..1.0` (local only; do not use 1.0 in prod)
+- `--kernel.force=<kernel_id>` (force a kernel; bypass selection)
+- `--kernel-select.dump-candidates=1` (include candidate set; larger output)
+- `--kernel-select.determinism-check=1` (assert stable decision_hash for repeated runs)
+
+**Example: dump selection for a single run**
+1. Start runtime locally with dumping enabled:
+   - `rw-runtime serve --model llama-3.1-70b --kernel-select.v2=1 --kernel-select.dump=/tmp/sel.jsonl --kernel-select.sample-rate=1.0`
+2. Send one request (use your normal client or `curl`).
+3. Inspect `/tmp/sel.jsonl` and verify:
+   - seq_bucket matches expectations
+   - chosen_kernel is in candidates
+   - fallback_reason is empty
+
+**Expected dump line (shape, example fields):**
+- `timestamp`
+- `request_id`
+- `model`
+- `model_family`
+- `gpu_sku`
+- `driver_version`
+- `cuda_version`
+- `prefill_tokens`
+- `decode_tokens_est`
+- `seq_bucket`
+- `candidates`
+- `chosen_kernel`
+- `fallback_reason`
+- `selector_version`
+- `decision_hash`
+
+(Exact field names can change; treat this as the conceptual contract.)
+
+---
+
+## Reproducing a mis-selection locally
+Goal: reproduce the same decision with the same inputs, then iterate quickly.
+
+### Step 1: Pin the environment
+To avoid false leads, match:
+- GPU SKU (and MIG mode)
+- Driver + CUDA
+- Runtime build (commit hash)
+- Model revision and quantization settings
+
+If you cannot match GPU SKU exactly:
+- Prefer the same architecture (e.g., H100 SXM vs H100 PCIe still differs; document it)
+- Do not draw firm conclusions from cross-SKU comparisons without a controlled benchmark
+
+### Step 2: Replay the request
+Recommended approach:
+- Use the request payload captured in logs/traces (prompt, params, max_tokens, sampling settings)
+- Ensure tokenization is identical (same tokenizer/model revision)
+
+Practical tips:
+- Disable unrelated variability (temperature=0, top_p=1) when isolating perf/selection
+- Warm the model (at least 10–20 requests) before measuring
+
+### Step 3: Verify determinism
+Run the same request N times (N=20 is usually sufficient) with:
+- `--kernel-select.determinism-check=1`
+
+If the decision_hash changes across runs, skip ahead to **Failure signatures → Nondeterministic selection**.
+
+---
+
+## Comparing kernels (A/B) correctly
+Selection regressions are often “real” but can be misattributed due to measurement mistakes.
+
+### Baseline method
+1) Choose a workload profile
+- Short: prefill ~256–1k tokens, decode ~64–256
+- Long-context: prefill 8k–32k tokens, decode small/medium
+- Mixed: alternating short and long requests (to stress cache/batching)
+
+2) Compare two conditions on the same host/GPU
+- Condition A: selector v2 normal
+- Condition B: `--kernel.force=<known_good>` OR selector v1
+
+3) Measure:
+- End-to-end latency (p50/p95/p99)
+- Prefill time and decode time (if you have phase breakdown)
+- Throughput (tokens/sec) at a fixed concurrency
+
+### Guardrails
+- Keep concurrency and batcher settings fixed.
+- Ensure compilation/warmup is not included (or include it consistently in both conditions).
+- Watch for “silent” changes: different quantization path, different attention backend, different KV cache policy.
+
+### Identifying kernel switch overhead
+If you suspect selector overhead or frequent kernel switches:
+- Use the selector dump to confirm how often the chosen kernel changes for similar requests.
+- Measure CPU-side selector time (if exposed) and confirm it is not on the critical path.
+
+---
+
+## Interpreting perf counters (what matters for kernel selection)
+
+### Tools
+- **Nsight Systems (nsys):** timeline, kernel launch frequency, CPU/GPU overlap
+- **Nsight Compute (ncu):** kernel-level metrics (occupancy, memory throughput, tensor core utilization)
+
+### Prefill regressions (common with long context)
+Typical indicators:
+- Memory bandwidth saturation + poor L2 hit rate
+- Excessive attention-related workspace allocations
+- Reduced tensor core utilization (e.g., due to shape mismatch or fallback kernel)
+
+What to check:
+- Are we using the expected “long-context prefill” kernel variant?
+- Did we accidentally select a kernel optimized for decode (small seq) for a large prefill?
+- Is the launch config appropriate for the sequence length and head dimension?
+
+### Decode regressions (common with small prompts, high QPS)
+Typical indicators:
+- Increased kernel launch count (too many small kernels)
+- Lower occupancy due to small problem sizes or poor scheduling
+- Higher CPU overhead per token (scheduling/selector/telemetry)
+
+What to check:
+- Are we selecting a decode-optimized kernel for short seq?
+- Is continuous batching behavior consistent (same batch sizes)?
+- Any sign that telemetry sampling is too high (CPU spikes)?
+
+---
+
+## Common failure signatures and fixes
+
+### 1) Long-context p99 spikes after enabling v2
+Symptoms:
+- p50 unchanged, p99 worse
+- Only affects large prefill (8k+ tokens)
+- Selection traces show a “short/mid” seq bucket for long prompts or an unexpected kernel
+
+Likely causes:
+- Seq bucket misclassification at bucket boundaries
+- Incorrect prefill token estimation (tokenizer mismatch, truncation, or streaming config)
+- Missing long-context kernel for the GPU SKU → fallback to generic
+
+Actions:
+1) Confirm `prefill_tokens` and `seq_bucket` in the trace.
+2) Force the known-good long-context kernel; verify p99 recovers.
+3) If confirmed: add a temporary denylist rule for (model_family, gpu_sku, seq_bucket) and follow the rollback runbook.
+
+### 2) GPU SKU mapping confusion (A100 variants, MIG)
+Symptoms:
+- Same instance type shows different sku strings across environments
+- Selection differs unexpectedly between “same” GPU hosts
+- Fallback_reason mentions “no compatible kernel for SKU”
+
+Likely causes:
+- SKU normalization mismatch (cloud naming vs PCI IDs)
+- MIG partitions reported as distinct SKUs without mapping
+
+Actions:
+1) Capture raw GPU identifiers (from runtime startup logs).
+2) Confirm normalized `gpu_sku` in selection traces.
+3) If normalization is wrong, stop: comparisons are invalid until normalized.
+4) Workaround: pin kernel or disable v2 on that SKU until mapping is corrected.
+
+### 3) Unexpected fallback to generic kernel
+Symptoms:
+- chosen_kernel is a generic or “safe” kernel
+- fallback_reason indicates denylist hit or missing kernel
+
+Likely causes:
+- Known-bad kernel/SKU combo is denied
+- Kernel not built/registered for this runtime build + CUDA
+- Driver/CUDA guardrail disables a kernel path
+
+Actions:
+1) Read fallback_reason; do not guess.
+2) Check known-issues page for that SKU/driver.
+3) Validate the kernel registry for the runtime build.
+4) If it’s a new driver combo: treat as unsafe until validated; keep fallback.
+
+### 4) Nondeterministic selection (same input, different kernel)
+Symptoms:
+- decision_hash changes across repeated runs
+- kernel choice flips between two candidates without config changes
+
+Likely causes:
+- Unordered candidate iteration (map/set ordering)
+- Floating-point scoring instability (if any scoring exists)
+- Hidden dynamic inputs (e.g., scheduler hint updates mid-run)
+
+Actions:
+1) Enable determinism check flag locally.
+2) Ensure scheduler hints are fixed for the test (or disable hints input).
+3) Capture dumps for multiple runs and diff `candidates` ordering.
+4) If confirmed: block rollout for the affected path; determinism is a hard requirement.
+
+### 5) Telemetry/cardinality-induced overhead
+Symptoms:
+- CPU usage increases, minor but broad latency regressions
+- Metrics ingestion/backends show increased series counts
+- Alerts fire for “metric cardinality” changes
+
+Likely causes:
+- Sampling too high
+- Candidate sets emitted too verbosely
+- High-cardinality tags (e.g., request_id) accidentally included
+
+Actions:
+1) Reduce sampling immediately; keep only the dimensions required by the standard.
+2) Confirm dashboards still work with reduced detail.
+3) Coordinate with Observability for query/panel updates.
+
+---
+
+## Recommended debugging workflow (end-to-end)
+1) **Validate** the regression is real
+   - Same GPU SKU, same model rev, same concurrency
+
+2) **Get a trace**
+   - Confirm chosen kernel, candidates, seq bucket, fallback reason
+
+3) **Reproduce locally**
+   - Dump selector decisions and verify determinism
+
+4) **A/B**
+   - Selector v2 vs forced known-good kernel (or v1)
+
+5) **Profile**
+   - nsys: timeline and kernel launch patterns
+   - ncu: dominant kernel metrics
+
+6) **Mitigate** (if needed)
+   - Disable v2 for (model/GPU/region) or pin kernel via runbook
+
+7) **Close the loop**
+   - Add/update known issue entry
+   - If a rule threshold changes, add a regression test case (long-context boundary)
+
+---
+
+## Escalation and ownership
+- If regression impacts Hosted canary or Dedicated pools: page **Runtime Oncall** and coordinate with **SRE** for rollback authority.
+- Kernel selection logic issues: **Yuki Sato** (owner), **Hiro Tanaka** (kernels lead)
+- Tail latency / observability issues: **Omar El-Sayed**, **Allison Grant**
+- Perf suite additions / reproductions: **Marcus Reed**, **Claire Dubois**, **Sahana Iyer**
+
+---
+
+## Appendix: What “good” looks like
+- For a fixed (model, gpu_sku, seq_bucket), chosen_kernel distribution is stable over time.
+- p95/p99 deltas are within rollout budgets, with no long-context outliers.
+- decision_hash is stable (deterministic) given identical inputs.
+- Telemetry provides enough context to explain every fallback without additional logging.
+
+---
+
+## Appendix: Template for reporting a kernel selection bug
+Copy/paste into a ticket:
+- Runtime version / commit:
+- Environment (Hosted/Dedicated/Private):
+- Model + revision:
+- GPU SKU + MIG + driver/CUDA:
+- Selector: v1/v2, allowlist/denylist state, forced kernel?
+- Workload: prefill tokens, decode tokens, concurrency, streaming:
+- Trace IDs (1–3):
+- Observed: (p95/p99 change, throughput change)
+- Expected:
+- Selection details: chosen_kernel, candidates, seq_bucket, fallback_reason:
+- Mitigation applied (if any):

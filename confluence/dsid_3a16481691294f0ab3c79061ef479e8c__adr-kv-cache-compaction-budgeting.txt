@@ -1,0 +1,180 @@
+ADR: KV cache compaction budgeting (time/bytes moved) and enforcement points
+
+# ADR: KV cache compaction budgeting (time/bytes moved) and enforcement points
+
+## Summary
+We will make KV cache compaction **strictly budgeted** and **scheduler-aware**.
+
+**Budgeting dimensions**
+- **Time budget (wall-clock):** maximum microseconds of compaction work allowed per scheduling tick.
+- **Bytes moved budget:** maximum bytes of KV pages/blocks relocated per scheduling tick.
+
+**Where budgeting is enforced**
+- Primary enforcement is in the **scheduler loop** at defined boundaries (end of prefill, end of decode micro-batch, and/or “idle” windows).
+- A **background compaction worker** may run opportunistically, but it is **subordinate** to scheduler budgets and can be preempted/cancelled when the scheduler signals load/latency risk.
+
+This decision is intended to reduce burst-driven tail latency (p95/p99) while still converging fragmentation downward over time.
+
+## Status
+**Accepted** (runtime-1.22).
+
+## Context and problem statement
+KV cache compaction moves existing KV allocations (pages/blocks) to reduce fragmentation in the KV arena.
+
+While compaction improves long-run allocator health and reduces allocation/defrag overhead, it introduces two categories of risk:
+1. **Latency spikes from unbounded work:** copying/packing KV blocks can consume GPU bandwidth and/or CPU coordination time. If executed without limits, compaction can steal time from decode and create visible p95/p99 regressions.
+2. **Scheduler interference:** compaction done at the wrong time (mid-decode, during a burst) can amplify tail latency or trigger backpressure/evictions at the worst moment.
+
+Production traffic characteristics that make this acute:
+- Mixed prompt lengths + sustained decode workloads.
+- High churn (cancellations, short sessions) interleaved with long-lived sessions.
+- Bursty arrivals where “catch-up” work tends to occur exactly when we can least afford it.
+
+We need compaction to be:
+- **Predictable:** bounded overhead per unit time.
+- **Cooperative:** aware of serving phases and backpressure.
+- **Configurable:** tier/model/profile differences (Hosted vs Dedicated; different SLOs).
+- **Observable:** measurable and attributable when it impacts latency.
+
+## Decision drivers
+- Protect tail latency SLOs for Hosted API; Dedicated has more headroom but still needs predictable behavior.
+- Avoid “stop-the-world” defrag patterns.
+- Ensure progress under steady load without requiring large idle windows.
+- Allow a kill-switch and safe rollback path.
+
+## Decision
+### 1) Compaction must be budgeted (both time and bytes moved)
+Compaction work will be performed in **small incremental steps**, each step consuming budget and then yielding back to the scheduler.
+
+**Why two budgets (time + bytes)?**
+- Bytes moved alone does not bound coordination overhead (metadata updates, synchronization, kernel launches) and can still cause latency spikes.
+- Time alone can be unpredictable across models/hardware and can lead to too much data movement when the system is “fast,” increasing interference.
+- Dual budgets allow stable behavior across heterogeneous GPUs and model shapes.
+
+**Invariants**
+- Compaction must never exceed the configured per-tick budget.
+- If compaction cannot finish a relocation within the current budget, it must either (a) stop before starting the relocation, or (b) complete a relocation only if it can do so atomically and within a bounded worst-case (implementation-specific safety rule).
+
+### 2) Primary enforcement point: the scheduler loop
+Budgeting will be enforced in the scheduler because it is the only component with full context on:
+- Current phase (prefill vs decode)
+- Active queue depth and load shedding/backpressure status
+- Expected work for the next tick (e.g., decode micro-batches)
+- Tail-latency guardrails
+
+**Allowed compaction windows (configurable per tier/profile):**
+- End of prefill batch
+- End of decode micro-batch
+- “Idle” windows when there are no runnable decode tokens and no pending prefill
+
+**Default policy (initial rollout):**
+- Hosted: compaction only at decode micro-batch boundaries and idle windows.
+- Dedicated: compaction allowed at prefill boundaries as well, with larger budgets.
+
+### 3) Secondary mechanism: background compaction worker (opportunistic)
+A background worker can improve convergence under sustained load by using small slices of budget during low-risk windows.
+
+Constraints:
+- The worker must be **cooperative**: it checks scheduler signals and immediately yields when the scheduler marks the system as “latency sensitive” or “overloaded.”
+- The worker is not allowed to run if the scheduler indicates: backpressure active, p99 elevated, or compaction/eviction rates above thresholds.
+- Budget is still enforced as “per time period” (e.g., max X µs/sec and max Y bytes/sec), and the scheduler can clamp it to zero.
+
+Rationale: a pure background thread without scheduler integration tends to either (a) do too little and never converge, or (b) run at exactly the wrong time.
+
+## Detailed design notes (what this ADR constrains)
+This ADR intentionally constrains *how much* work compaction can do and *when* it can run. It does not dictate the exact memory layout or relocation primitive (see the design doc).
+
+### Budget definitions
+Budgets are expressed as:
+- **budget_us_per_tick**: hard cap on wall-clock time spent in compaction per scheduler tick.
+- **budget_bytes_per_tick**: hard cap on bytes relocated per scheduler tick.
+
+Additional guardrails:
+- **max_moves_per_tick**: cap number of relocation operations.
+- **min_free_ratio_target / fragmentation_trigger**: compaction should run only when fragmentation exceeds a threshold and stop early once below target.
+- **priority clamp**: if the scheduler detects overload, budgets are reduced (potentially to zero).
+
+### Proposed configuration keys (internal runtime config)
+Names may evolve, but the following shape is the target:
+- `kv_compaction.enabled` (bool)
+- `kv_compaction.trigger_fragmentation_ratio` (float, e.g., 0.18)
+- `kv_compaction.target_fragmentation_ratio` (float, e.g., 0.10)
+- `kv_compaction.budget_us_per_tick` (int, µs; tier dependent)
+- `kv_compaction.budget_bytes_per_tick` (int; tier dependent)
+- `kv_compaction.max_moves_per_tick` (int)
+- `kv_compaction.allowed_phases` (enum set: `DECODE_BOUNDARY`, `PREFILL_BOUNDARY`, `IDLE_ONLY`)
+- `kv_compaction.background.enabled` (bool)
+- `kv_compaction.background.max_us_per_sec` (int, µs)
+- `kv_compaction.background.max_bytes_per_sec` (int)
+- `kv_compaction.kill_switch` (bool; emergency disable)
+
+### Enforcement mechanics
+- Scheduler calls `compaction_step(budget)` only at allowed boundaries.
+- `compaction_step()` returns a summary: bytes moved, time used, moved-block count, and a “did_work” boolean.
+- Background worker can request work but must obtain a budget token from the scheduler; if none, it sleeps.
+
+## Alternatives considered
+### A) Unbounded compaction (run-to-completion defrag)
+**Rejected.** Strong risk of p95/p99 spikes during bursts. Hard to reason about worst-case behavior; encourages “catch-up” behavior exactly when capacity is constrained.
+
+### B) Bytes-moved-only budgeting
+**Rejected.** Does not bound coordination overhead, kernel launch overhead, and metadata work; can still create unpredictable stalls depending on fragmentation patterns.
+
+### C) Time-only budgeting
+**Rejected.** Can lead to excessive memory movement when copy is fast, increasing interference with decode. Also makes progress variable across GPUs and models.
+
+### D) Background-only compaction (no scheduler integration)
+**Rejected.** In practice, either starves (never enough idle time) or fights with decode at the worst moments. Harder to clamp quickly in incidents.
+
+### E) Compaction only on allocation failure / OOM proximity
+**Rejected.** Too late; turns compaction into a “panic” path with high variance and poor tail-latency behavior. Also creates correctness/complexity risks when running under severe memory pressure.
+
+### F) Periodic full arena rebuild (evacuate everything)
+**Rejected (initial release).** Operationally risky, large copy spikes, and complicated interaction with long-lived sessions/pinned sequences. May be revisited for offline maintenance modes.
+
+## Consequences
+### Positive
+- Predictable overhead and better tail-latency protection.
+- Clear operational controls: budgets can be tuned per tier and clamped during incidents.
+- Easier to attribute impact using metrics (bytes moved/time used vs p99).
+
+### Negative / costs
+- Compaction convergence is slower; fragmentation may persist longer under sustained high load.
+- Increased implementation complexity: scheduler hooks + cooperative worker semantics.
+- Tuning burden: budgets must be validated per model/hardware class.
+
+## Operational and observability requirements
+This ADR requires the following signals to exist (see metrics standard for names):
+- Fragmentation ratio (and optionally distribution/percentiles across arenas)
+- Compaction time used (per tick, aggregated)
+- Bytes moved (per tick and per second)
+- Moves/relocations count
+- “Compaction skipped” reasons (phase not allowed, under load clamp, below trigger threshold)
+- Correlation hooks to tail latency (trace spans with compaction annotations)
+
+Dashboards must make it possible to answer:
+- Did p99 rise because compaction ran more, or because fragmentation worsened and allocator overhead increased?
+
+## Rollout guidance (constraints)
+- Default budgets should start conservative in Hosted, then expand after perf-canary validation.
+- Budgets must be feature-flagged and remotely adjustable.
+- Any sustained p99 regression above guardrail thresholds should clamp budgets to zero (or disable compaction) until triage.
+
+## Open questions
+- Whether “bytes moved” should count logical KV bytes, physical page bytes, or GPU copy bytes (incl. padding/alignment). We will standardize on what is easiest to measure reliably and correlate with GPU bandwidth.
+- Whether budgets should be scaled dynamically by measured decode utilization (e.g., proportional control) rather than fixed tier defaults.
+
+## Appendix: initial tier defaults (proposal; subject to canary)
+These are starting points used for canary/testing; do not treat as contractual.
+
+- Hosted (latency-sensitive):
+  - `budget_us_per_tick`: 150–300 µs
+  - `budget_bytes_per_tick`: 2–8 MiB
+  - allowed phases: `DECODE_BOUNDARY`, `IDLE_ONLY`
+
+- Dedicated (throughput/predictability):
+  - `budget_us_per_tick`: 300–800 µs
+  - `budget_bytes_per_tick`: 8–32 MiB
+  - allowed phases: `DECODE_BOUNDARY`, `PREFILL_BOUNDARY`, `IDLE_ONLY`
+
+All defaults require perf-canary validation on representative GPUs and mixed-length burst scenarios.

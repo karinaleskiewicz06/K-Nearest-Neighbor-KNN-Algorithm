@@ -1,0 +1,315 @@
+Region Health Service (RHS) — Aggregated Region Health for Routing and Failover
+
+## Overview
+The Region Health Service (RHS) provides a single, consistent, low-latency view of per-region health for Redwood’s multi-region routing and failover automation. RHS aggregates multiple signals (reachability, error/latency burn, capacity/headroom, and control-plane dependencies) into a normalized region status with explainability ("why we think a region is unhealthy").
+
+RHS is designed to:
+- Reduce failover trigger noise by requiring corroboration and applying dampening/hold-down logic upstream of policy changes.
+- Provide deterministic inputs for the routing policy engine and the failover controller.
+- Provide an auditable “evidence bundle” to support on-call investigation and post-incident reviews.
+
+**Primary consumers**
+- Smart Routing / Policy Engine (real-time routing decisions)
+- Failover Controller (automation decisioning + execution)
+- Observability dashboards/alerts (operators)
+
+---
+
+## Service ownership
+- **Service owner:** Control Plane Engineering (Ethan Park)
+- **Routing integration owners:** Smart Routing (Mina Haddad), Routing Policy (Ravi Menon)
+- **Signal pipeline + SLO alerts:** SRE (Rafael Mendes), Observability (Allison Grant)
+- **Network/reachability signal owners:** Network (Victor Alvarez)
+
+Slack: #eng-platform, #eng-sre (escalate via on-call)
+
+---
+
+## Terminology
+- **Region:** A Redwood deploy region (e.g., us-east, eu-west) that can independently serve Hosted API and/or Dedicated traffic.
+- **Signal:** A time-series or probe-derived health indicator (reachability, 5xx burn, p95 latency burn, capacity, etc.).
+- **Region status:** RHS-computed classification used by routing and automation.
+- **Hold-down:** Minimum duration a region must remain in a state before transitioning again (anti-flap).
+
+---
+
+## Region status model
+RHS emits both a *summary state* and *per-signal evidence*.
+
+**Summary `region_state` values**
+- `HEALTHY` — no active impairment indicated.
+- `DEGRADED` — impairment suspected/confirmed; routing may shift partially depending on policy.
+- `UNHEALTHY` — region should not receive new traffic (except explicitly pinned traffic with overrides).
+- `UNKNOWN` — insufficient signal coverage; routing should apply conservative defaults (see Failure modes).
+
+**Design principles**
+- Reachability is authoritative when corroborated (see ADR-042).
+- Error burn and tail latency burn are strong signals but must be protected against localized client-side retry storms.
+- Capacity is treated as a *gating* signal (prevents failing *into* a region with insufficient headroom).
+- RHS prioritizes “safe to fail over” outcomes over “fast to fail over” when signals disagree.
+
+---
+
+## Inputs (signals)
+RHS ingests signals via a small set of adapters. Each adapter produces a normalized `SignalReading` with:
+- `signal_type` (enum)
+- `value` (numeric or boolean)
+- `confidence` (0.0–1.0)
+- `as_of` (timestamp)
+- `source` (system identifier)
+- `notes` (human-readable)
+
+### Core signal types
+1) **Cross-region reachability probes** (authoritative)
+- Source: perf-canary cross-region probes
+- Meaning: Can clients (or Redwood edge) reach the region’s API ingress and complete TLS + minimal request?
+- Key dimensions (normalized internally, not exposed as high-cardinality labels): probe origin, target region, protocol
+
+2) **5xx burn-rate (Hosted API and Dedicated)**
+- Source: gateway metrics and serving error counters
+- Meaning: Sustained elevated 5xx relative to SLO target
+- RHS uses burn-rate windows aligned with multi-region SLO definitions (see SLO page)
+
+3) **Tail latency burn-rate**
+- Source: gateway + serving latency histograms
+- Meaning: Sustained p95/p99 latency relative to target
+- RHS prefers latency burn corroborated by reachability or errors before escalating to `UNHEALTHY`
+
+4) **Capacity/headroom**
+- Source: fleet capacity service
+- Meaning: whether the region can safely accept incremental load during failover
+- Used as: (a) a trigger for `DEGRADED` when capacity exhaustion is severe, and (b) a gate to prevent routing into an overloaded region
+
+5) **Control plane dependency health**
+- Source: control plane health checks (policy config distribution, auth/session dependencies)
+- Meaning: region may be serving but unable to safely change policy, or unable to accept certain traffic classes
+
+6) **Network edge symptoms** (supporting)
+- Source: network telemetry (BGP anomalies, packet loss indicators, provider status ingestion)
+- Meaning: supporting evidence; never solely escalates to `UNHEALTHY` without reachability/probe corroboration
+
+### Signal freshness and staleness
+Each signal type has an expected freshness budget (see Defaults). If readings are stale, RHS may downgrade confidence or move `region_state` to `UNKNOWN` depending on coverage.
+
+---
+
+## Aggregation and evaluation logic (high level)
+RHS performs a deterministic evaluation per region on a fixed cadence (default: every 2s) and serves cached results.
+
+**Evaluation steps (simplified)**
+1. Fetch latest normalized readings for required signals.
+2. Apply staleness rules and confidence downgrades.
+3. Compute per-signal `signal_status`: `OK`, `WARN`, `FAIL`, or `MISSING`.
+4. Apply signal hierarchy (ADR-042) to propose `candidate_state` and `candidate_reason`.
+5. Apply dampening/hold-down and anti-flap constraints.
+6. Emit:
+   - Region summary (`region_state`, `reason`, `confidence`)
+   - Evidence bundle (top contributing signals + key values)
+
+**Hierarchy (summary)**
+- Reachability FAIL (corroborated) → `UNHEALTHY`
+- 5xx burn FAIL (corroborated) → `UNHEALTHY` or `DEGRADED` depending on magnitude
+- Tail latency burn FAIL (corroborated) → `DEGRADED`
+- Capacity exhaustion FAIL → `DEGRADED` and sets `admission_gate=false`
+- Missing signals beyond tolerance → `UNKNOWN`
+
+Note: Exact thresholds and timers are maintained in configuration and documented in ADR-042. RHS must remain deterministic for a given set of readings + config.
+
+---
+
+## APIs
+RHS is an internal service used by the routing control plane and automation controller.
+
+### 1) GetRegionHealth (single region)
+**HTTP**: `GET /v1/region-health/{region}`
+
+**Response fields (stable contract)**
+- `region` — region identifier
+- `region_state` — HEALTHY|DEGRADED|UNHEALTHY|UNKNOWN
+- `confidence` — 0.0–1.0
+- `reason_code` — stable enum (e.g., REACHABILITY_FAIL, ERROR_BURN, LATENCY_BURN, CAPACITY_EXHAUSTION, SIGNAL_STALE)
+- `as_of` — timestamp
+- `hold_down_until` — timestamp (if applicable)
+- `admission_gate` — true/false (safe to route additional load)
+- `evidence` — compact, human-readable summary string
+
+**Notes**
+- Evidence is intentionally compact for low-latency callers. Full evidence is available via the debug endpoint (restricted).
+
+### 2) ListRegionHealth (all regions)
+**HTTP**: `GET /v1/region-health`
+
+Used by routing/policy evaluation to compute candidate targets and by dashboards to show a world view.
+
+### 3) DebugRegionHealth (restricted)
+**HTTP**: `GET /v1/debug/region-health/{region}`
+
+Returns verbose per-signal readings and intermediate evaluation steps.
+
+**Access control**
+- Restricted to on-call tooling, incident-bot, and authorized internal users.
+- Do not expose to customer-facing surfaces.
+
+### 4) Health check
+**HTTP**: `GET /healthz`
+- Returns 200 if RHS can serve cached outputs and its internal store is reachable.
+
+---
+
+## Caching and TTL
+RHS is built to be resilient to downstream signal-store stalls and to avoid thundering herds during incidents.
+
+### Output caching
+- RHS caches computed region results in-memory.
+- Default output TTL: **2s**
+- Jitter: **±250ms** to spread load across consumers.
+
+### Input caching (signal reads)
+- Signal adapter reads are cached per signal type and region.
+- Default adapter cache TTLs:
+
+| Signal type | Adapter cache TTL | Stale after | Notes |
+|---|---:|---:|---|
+| Reachability probes | 2s | 10s | Prefer near-real-time; stale implies UNKNOWN risk |
+| 5xx burn | 5s | 30s | Burn windows are slower-moving; tolerate short gaps |
+| Tail latency burn | 5s | 30s | Corroborate before escalation |
+| Capacity/headroom | 3s | 15s | Used as admission gate; stale treated as conservative |
+| Control plane deps | 5s | 30s | Impacts ability to safely automate |
+
+### Stampede protection
+- RHS uses single-flight deduplication per `(region, signal_type)` to prevent concurrent recomputation spikes.
+- On adapter timeouts, RHS serves last known good values within the stale budget (if any), and records `reason_code=SIGNAL_STALE` when staleness impacts evaluation.
+
+---
+
+## Configuration
+RHS configuration is distributed via the control plane config system and is versioned.
+
+**Key config blocks**
+- Signal thresholds (burn-rate limits, probe failure ratios)
+- Corroboration requirements (which signals must agree)
+- Dampening / hold-down timers
+- Safety limits for state transitions (max flips per window)
+
+**Example (illustrative, not copy/paste authoritative)**
+- Reachability: `FAIL` if >60% probe failures for 30s from >=2 origins
+- Error burn: `FAIL` if 5xx burn-rate exceeds 14x for 5m or 6x for 30m (aligned to SLO tooling)
+- Hold-down: 5m after transition to UNHEALTHY; 10m after rollback from UNHEALTHY to DEGRADED
+
+For authoritative rules, see ADR-042 and the current config in the control plane repo.
+
+---
+
+## Integration points
+### Routing / Policy engine
+- Policy engine calls `ListRegionHealth` at a fixed cadence and uses `region_state` + `admission_gate` as first-class predicates.
+- Determinism requirement: Given the same RHS output and the same policy config, the policy engine must evaluate identically across instances.
+
+### Failover controller
+- The failover controller consumes RHS to decide whether to recommend or execute routing policy flips.
+- RHS provides:
+  - `reason_code` for audit logs
+  - `hold_down_until` to prevent oscillation
+  - `admission_gate` to ensure we do not fail into capacity exhaustion
+
+### Observability
+- Dashboards should use RHS outputs for “operator truth” (state + reason), while raw signals remain available for diagnosis.
+- Incident-bot uses RHS `reason_code` and evidence to post concise summaries when transitions occur.
+
+### Dedicated pool drain / evacuation
+- Dedicated drain workflows should consult RHS to ensure target region is `HEALTHY` and `admission_gate=true` before draining significant load.
+
+---
+
+## Failure modes and expected behavior
+RHS is explicitly designed to fail conservatively.
+
+### 1) Missing or stale signals
+**Symptoms**: adapters time out, metrics pipeline delays, probe outages
+
+**Behavior**
+- If critical signals (reachability + error burn) are missing beyond tolerance: `region_state=UNKNOWN`.
+- `UNKNOWN` should be treated by routing as “do not increase load” unless explicitly overridden by a policy.
+
+**Operator guidance**
+- Check probe pipeline status and metrics ingestion lag.
+- Prefer manual verification before forcing failover based only on partial data.
+
+### 2) False positives / noisy triggers
+**Symptoms**: temporary client retry storms, localized POP issues, single-origin probe failures
+
+**Behavior**
+- Corroboration rules prevent immediate escalation based on a single weak signal.
+- Hold-down timers prevent rapid flip-flopping.
+
+**Operator guidance**
+- Use DebugRegionHealth to verify corroboration and staleness.
+- Validate that the impairment is regional (not a single service/route).
+
+### 3) RHS internal overload
+**Symptoms**: increased RHS latency, elevated 5xx on RHS endpoints
+
+**Behavior**
+- Consumers should use short timeouts (<=250ms) and accept cached results.
+- If RHS is unavailable, routing falls back to last known good cached health view (in the consumer) for a limited time window, then reverts to conservative routing defaults.
+
+### 4) Partial regional degradation
+**Symptoms**: only some routes/models failing; Dedicated-only impact; control plane healthy but data plane impaired
+
+**Behavior**
+- RHS supports route-class scoping internally (Hosted vs Dedicated signals).
+- Summary state reflects the “worst applicable state” for the requested traffic class; consumers must specify context where supported.
+
+---
+
+## SLO / performance targets (internal)
+RHS is a control-plane dependency; it must be fast and predictable.
+
+- **Availability**: 99.95% monthly (internal)
+- **Latency**: p99 <= 150ms for `GET /v1/region-health` from within a region
+- **Freshness**: typical end-to-end signal-to-output update within 5–10s during normal operation; reachability-driven updates may be faster when probes fail consistently
+
+---
+
+## Security and privacy considerations
+- RHS aggregates operational telemetry only; it must not include customer prompts, outputs, or tenant identifiers in outputs.
+- Debug endpoint is restricted. Evidence strings must avoid embedding high-cardinality identifiers.
+- Auditability is handled by downstream consumers (failover controller) which record RHS `reason_code` and `as_of`.
+
+For data residency boundaries and cross-region routing constraints, see: Failover and Security Boundaries (Security & Compliance space).
+
+---
+
+## Operational notes
+### Deployments
+- RHS is deployed per region with a global-consistent config.
+- Consumers should query the local region RHS endpoint (lowest latency) unless explicitly evaluating global state.
+
+### On-call playbook
+- If RHS outputs appear wrong: validate raw signals first, then compare with DebugRegionHealth evaluation steps.
+- If RHS is down: follow the failover controller runbook; consider disabling automation approvals only with SRE lead approval.
+
+---
+
+## Change management
+- Threshold changes require review by SRE + Routing (due to impact on automation and customer-visible behavior).
+- Any changes that affect state transitions (hierarchy, hold-down) must be documented in an ADR update or follow-on ADR.
+
+---
+
+## Appendix: Reason codes (stable)
+- `REACHABILITY_FAIL`
+- `ERROR_BURN`
+- `LATENCY_BURN`
+- `CAPACITY_EXHAUSTION`
+- `CONTROL_PLANE_DEP_UNHEALTHY`
+- `SIGNAL_STALE`
+- `INSUFFICIENT_CORROBORATION`
+
+---
+
+## Appendix: Consumer timeouts and retries
+Recommended consumer settings:
+- Timeout: 250ms (single attempt)
+- Retry: none (RHS already caches; retries amplify load during incidents)
+- Use last known good for up to 30s if RHS request fails; beyond that, treat as `UNKNOWN` and apply conservative routing policies

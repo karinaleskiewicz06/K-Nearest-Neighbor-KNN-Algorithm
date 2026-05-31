@@ -1,0 +1,143 @@
+Runbook (2026): Streaming timeouts caused by large request headers + proxy buffering (ALB/API Gateway)
+
+## Purpose
+This runbook covers diagnosing and mitigating intermittent streaming inference failures (typically 502/504) that occur during long-lived streaming completions (40–180s), most commonly when request headers are large and/or change frequently (e.g., rotating Cookie headers) and the edge tier buffers streaming responses.
+
+This pattern was confirmed in customer production (Lexicraft AI, dedicated, us-east-1) under SUP-90147 and has recurred historically under similar conditions.
+
+## Symptoms (what you will see)
+- Client reports: streaming stalls mid-response; connection closes with 504 (ALB) or 502 (API Gateway).
+- ALB access logs: entries with HTTPCode_ELB=504 and/or error_reason like "Target timed out".
+- API Gateway logs: intermittent 502 with messages consistent with upstream connection close / timeout.
+- Serving runtime logs: typically clean (no worker crash/OOM). Token generation may still be happening server-side, but the client does not receive chunks.
+- Failure rate: often low single digits (e.g., 1–10%), increases during bursts or when customers rotate auth/session cookies frequently.
+
+## Primary causes (current understanding as of 2026-03-20)
+1) Large request headers (most often Cookie + tracing headers) increase edge/proxy processing and can trigger buffering/translation behaviors.
+2) Proxy buffering on streaming routes (API Gateway or intermediate proxies) can prevent timely flush of chunks, creating apparent “idle” periods at the ALB connection.
+3) ALB idle timeout too low for long streams when downstream buffering delays chunk delivery, leading to ALB-initiated connection resets and 504s.
+
+Notes:
+- Header size alone is not always sufficient; the problematic cases frequently involve a combination of (a) large headers and (b) long-lived connections with intermittent chunk delivery.
+- In SUP-90147, correlation was strongest when total request header size exceeded ~8–12 KB and the Cookie header changed during sessions (auth refresh / rotation).
+
+## Scope / where this applies
+- Environments: most commonly production dedicated clusters behind ALB -> API Gateway -> mesh -> serving runtime.
+- Protocols: observed with HTTP/1.1 chunked streaming; translation from HTTP/2 at the edge can exacerbate buffering behavior depending on gateway config.
+
+## Decision tree (fast triage)
+1) Are failures 502/504 and clustered on long streaming requests (>60s)?
+   - If yes: continue.
+2) Do failing requests have large headers (Cookie, x-client-trace, x-trace-cookie, large Authorization/JWT)?
+   - If yes: continue.
+3) Is proxy buffering enabled on the streaming route/stage?
+   - If yes: disable buffering (see Mitigation A).
+4) Is ALB idle timeout < expected worst-case stream duration + buffering jitter?
+   - If yes: increase idle timeout for the streaming target group (see Mitigation B).
+
+## Data to collect (before changes)
+Collect these artifacts for the incident/ticket:
+- 5–10 failing request IDs with timestamps and target group name.
+- ALB access log lines for failing requests (include request_processing_time, target_processing_time, response_processing_time, target_status_code, elb_status_code).
+- API Gateway request/response logs for the same request IDs.
+- Approximate header sizes from gateway logs (or request samples) with focus on:
+  - Cookie
+  - Authorization
+  - x-client-trace / x-trace-cookie / baggage / traceparent
+- Serving runtime metrics: token throughput, worker restarts (confirm “no” for crash loops).
+
+## How to confirm header-size correlation
+Indicators:
+- Failures disproportionately occur on requests with large Cookie/tracing headers.
+- Replaying the same prompt with reduced headers reduces or eliminates failures.
+
+Practical methods:
+- Ask customer to temporarily disable cookie rotation (or reduce cookie payload) for a controlled window.
+- Replay a failing request in staging with:
+  - Original headers
+  - Minimized headers
+  Compare stream stability and TTFB.
+
+## How to confirm proxy buffering
+Indicators:
+- Upstream (runtime) is emitting chunks, but the client sees delayed/accumulated output (large TTFB, then burst output, or no output until timeout).
+- Gateway configuration shows buffering enabled for the streaming route.
+
+## Mitigations
+### Mitigation A (preferred): Disable proxy buffering for streaming endpoints
+Goal: ensure chunks are flushed as they are generated.
+
+Actions (implementation depends on gateway/proxy stack):
+- API Gateway stage/route config: ensure streaming mode is enabled and response buffering is disabled for the streaming completion routes.
+- Confirm any intermediate proxy does not buffer (e.g., equivalent of "proxy_buffering off" / "X-Accel-Buffering: no" behavior where applicable).
+
+Validation:
+- After change, confirm client receives tokens continuously (no long silent gaps) on a test stream lasting >120s.
+- ALB target_response_time should no longer cluster near idle timeout.
+
+Rollback:
+- Revert stage/route config to previous version.
+
+### Mitigation B: Increase ALB idle timeout for streaming target groups
+Goal: avoid ALB closing long streams during occasional delivery pauses.
+
+Recommended settings (current):
+- Streaming target groups: 180s idle timeout (minimum), with consideration for 300s on high-latency workloads.
+- Non-streaming target groups: keep defaults unless otherwise required.
+
+Notes:
+- Increasing idle timeout treats symptoms if buffering still exists; it should be paired with Mitigation A when possible.
+
+Validation:
+- Confirm 504s drop immediately on streams that previously timed out around 60–120s.
+
+### Mitigation C (customer-side): Reduce header size and header churn
+When our edge changes cannot be applied immediately or customer headers exceed safe limits.
+
+Recommended guidance to customers:
+- Keep total request headers under 8 KB (soft limit); investigate aggressively above 12 KB.
+- Avoid rotating large Cookie values during a single long-lived streaming request.
+- Prefer compact auth tokens; avoid embedding large JSON blobs in cookies.
+- Keep tracing baggage minimal; avoid duplicative trace headers.
+
+## Permanent remediation (platform defaults)
+As of 2026-03-20, the platform remediation direction is:
+- Default: streaming routes MUST have buffering disabled.
+- Add header-size telemetry at the gateway and emit per-request metrics (p50/p95/p99 header bytes).
+- Add guardrails:
+  - Warnings at >8 KB header bytes.
+  - Investigation threshold at >12 KB.
+  - Optional enforcement policy (by org/cluster) if chronic.
+- Update docs and support playbooks to include “header size + buffering” as first-line checks for streaming 502/504.
+
+## Operational checks (after mitigation)
+Monitor for at least 24–72 hours:
+- ALB 5xx rate on the affected target group.
+- API Gateway 5xx rate on streaming routes.
+- P95/P99 stream duration and disconnect rate.
+- Customer-reported completion success rate.
+
+Success criteria:
+- 504s attributable to idle timeouts drop to near zero on the affected workload.
+- Streaming output shows steady chunk delivery (reduced long silent intervals).
+
+## Communication template (support-facing)
+We believe your intermittent streaming timeouts are correlated with large and frequently changing request headers (notably Cookie/tracing) interacting with edge buffering/timeouts. We can mitigate on our side by disabling proxy buffering for streaming routes and increasing the load balancer idle timeout for long-lived streams. In parallel, we recommend keeping total request headers below ~8 KB and avoiding rotating large cookies during long streaming requests.
+
+## Appendix: What to look for in logs
+ALB access logs (common patterns):
+- elb_status_code=504 with error_reason containing "Target timed out"
+- target_response_time clustering near the configured idle timeout
+- higher request_processing_time for large-header requests
+
+API Gateway logs (common patterns):
+- 502 with upstream connection closed / timed out
+- Evidence of buffering/aggregation behavior (no incremental flush events if such logs exist)
+
+## Ownership
+- Primary: SRE On-Call (edge/networking)
+- Secondary: API Gateway team, Serving Runtime team
+
+## Change history
+- 2026-03-14: Initial runbook created from SUP-90147 mitigation steps.
+- 2026-03-20: Updated guidance: thresholds (8–12 KB), recommended ALB idle timeout (>=180s), and platform-default direction (buffering disabled by default).

@@ -1,0 +1,135 @@
+Operator surge handling for large-model swap and SLA preservation
+
+Summary:
+This playbook describes operator procedures, automated mitigations, and safety patterns to handle sudden request surges that coincide with a large-model swap (for example, replacing a 13B float model with a 70B quantized variant). It focuses on preserving customer SLOs (p95 latency, availability) and avoiding cascading resource exhaustion (GPU memory, KV-cache thrash, global rate-limits).
+
+Goals:
+- Protect customer-visible SLOs (p95 <= configured SLO, availability >= 99.9%).
+- Perform model swaps with bounded disruption, minimal traffic loss, and clear rollback paths.
+- Ensure operators have a concise, ordered checklist plus automated guard rails.
+
+Scope and assumptions:
+- Applies to Private deployments (VPC and on‑prem) running Redwood runtime with per-tenant traffic shaping and KV caching.
+- Assumes model artifacts are staged in the artifact store and image manifests are validated via the operator CI.
+- Not applicable for emergency hotfixes unrelated to model selection (see separate incident runbook).
+
+Owner and escalation:
+- Primary: Runtime ops (team: eng-private-deployments).
+- Secondary: Serving runtime oncall.
+- Escalate to SRE Director for multi-region SLA impact.
+
+SLOs impacted and thresholds (example):
+| Metric | Warning threshold | Critical threshold | Immediate operator action |
+| p95 latency (tenant) | > 1.5x baseline | > 2.5x baseline | Throttle non-critical tenants; enable degraded model fallback |
+| Error rate (5m) | > 1% | > 3% | Pause rollout; route to safe fallback model |
+| GPU mem pressure | 75% sustained | 90% sustained | Reject new model loads; cold-evict caches |
+| Request queue depth | 200 per-node | 500 per-node | Scale down or shed low-priority traffic |
+
+Pre-swap checklist (must be green before initiating swap):
+1) Artifact verification: check sha256 and attestation signatures. Example: 
+```
+$ rcli artifacts verify --model my-model-70b --sha256 "abc123..."
+```
+2) Canaries prepared: at least two Canary shards with synthetic workload and telemetry hooks.
+3) KV cache warm-up plan defined (see KV cache section).
+4) Autoscaler settings reviewed: max burst nodes, pre-warm policy, startup-time target <= 60s for large models.
+5) Rollback image available and smoke-tested in staging.
+6) Operator contact rota and alerting rule owners notified.
+
+Automated protections enabled by default:
+- Progressive admission controller: rejects requests beyond configured tenant concurrency when memory pressure > 80%.
+- Priority-based queueing: premium tenants retain a higher concurrency share.
+- Model fallback map: routes to a smaller compatible model automatically when load or memory exceeds thresholds.
+
+Surge detection signals (recommended):
+- sudden increase (>3x in 1 minute) in token generation rate for a tenant
+- growing KV cache miss rate concurrent with rising p95
+- GPU OOM or repeated kernel failures during model init
+- ingress RTT increase + elevated request queue depth
+
+Operator playbook (ordered steps) – when a surge is detected during or immediately after a model swap:
+1) Confirm: validate telemetry (Grafana, traces): p95, queue depth, gpu_free_mem, kv_cache_miss_rate.
+2) Snapshot state: capture runtime state bundle for forensics: 
+```
+$ rcli ops snapshot --tenant TID --include=kv-cache,gpu-state,model-manifests --out /tmp/TID-snapshot.tar.gz
+```
+3) Pause new rollouts and canary promotions.
+4) Trigger automated throttles: reduce global admission by 30% and enable low-priority tenant shedding.
+5) Initiate rapid warmup for target model on a small set of spare nodes: preload embeddings, load initial KV segments, run 50 short prompts to populate caches.
+6) If memory pressure remains high: perform controlled KV-cache eviction for tenants that have stale access patterns (operators: identify candidates via last-access timestamp). Use the eviction command: 
+```
+$ rcli kvcache evict --tenant LOW_PRIORITY_TID --age 72h --percent 40
+```
+7) If errors persist or p95 remains above critical: switch affected tenants to fallback model variant (automated fallback if configured). Example routing change (one-line): 
+```
+$ rcli routing set --tenant TID --route-to model:my-model-13b-fp --priority emergency --duration 30m
+```
+8) If fallback is not acceptable for the customer and SLA is at risk: initiate throttled traffic drain for the tenant and open an immediate customer notification per customer communication templates (see related_pages).
+
+Model swap-specific sequence (safe path):
+1) Staged pull: push model artifact to 3 pre-defined warm nodes in each zone.
+2) Warm initialization: start runtime with model in warm-only mode (no traffic) and validate key kernel paths.
+3) KV cache pre-seed: replay recent traffic (anonymized synthetic prompts) to pre-fill KV segments for frequently seen prefixes.
+4) Canary traffic: send at 1% of total TID traffic for 10 minutes and validate latencies and correctness.
+5) Progressive ramp: 1% -> 5% -> 25% -> 60% -> 100% with 5–10 minute observation windows. Abort on any critical threshold.
+
+KV cache handling guidance:
+- Maintain conservative per-tenant cache quota when swapping to a larger model; larger models have larger KV entries.
+- For swaps expected to increase KV footprint by >1.8x, proactively shrink per-tenant quota by 25% before swap and run pre-seed to avoid sudden OOMs.
+- Use tiered eviction: first evict cached prompts older than 48h, then evict low-score embeddings.
+
+Traffic shaping and priority policies (examples):
+- Premium tenants: guaranteed min concurrency = 0.25 * node_concurrency (configurable).
+- Best-effort tenants: subject to proportional fair sharing and last-resort shedding.
+- Example admission controller config snippet (YAML):
+```
+admission_controller:
+  default_concurrency: 100
+  premium_multiplier: 2.5
+  memory_pressure_thresholds:
+    warn: 0.75
+    critical: 0.9
+  low_priority_shed_percent: 0.4
+```
+
+Rollback and rollforward procedures:
+- Immediate rollback (fast backout):
+  1. Pause route promotions.
+  2. Re-route traffic to previous model image (safe rollback image must be staged): 
+```
+$ rcli routing set --tenant TID --route-to model:previous-image --priority rollback --reason "auto-backout"
+```
+  3. Drain in-flight requests by enabling soft-timeout extension and letting requests complete on their original nodes.
+  4. Validate metrics for 5m; if stable, proceed to gradual teardown of failed model's nodes.
+- Orchestrated rollforward (if rollback not chosen):
+  1. Reduce concurrency and run another warm-init wave with augmented pre-seed.
+  2. Run extended canary (30m) with trace-level logging enabled and operator presence.
+  3. Promote carefully with the same progressive ramp.
+
+Operator CLI and API quick references:
+- Snapshot state: rcli ops snapshot --tenant <TID> --include=...
+- Evict KV: rcli kvcache evict --tenant <TID> --age <hours> --percent <n>
+- Route set: rcli routing set --tenant <TID> --route-to model:<id> --priority <label> --duration <m>
+- Check GPU usage: rcli node metrics --node <id> --fields "gpu_mem_free,gpu_util" --last 5m
+
+Post-incident and reporting:
+- Required artifacts to attach to incident: ops snapshot, canary traffic logs, routing changes, model artifact attestations, and a list of tenants affected.
+- Postmortem template: include timeline, root cause hypothesis, detection latency, mitigation steps, and next-action owner with deadlines.
+
+Testing and validation recommendations:
+- Maintain a synthetic workload suite that mirrors the top-10 tenants by traffic pattern; run full model-swap rehearsals quarterly.
+- Continuously measure cache footprint delta for any new model and add a perf-test that measures per-token memory and init time.
+
+Appendix: quick decision matrix
+- If p95 crosses critical and GPU mem > 90% -> immediate rollback to previous model image.
+- If p95 moderately degraded and KV miss rate high -> run aggressive pre-seed + targeted evictions.
+- If only a single tenant affected and they accept fallback -> trigger tenant-scoped fallback and notify customer success.
+
+Related pages and templates:
+- Customer notification templates: see related_pages link 1.
+- Canary automation repo: internal git path: git@internal:redwood/canary-scripts.git (operators have read access).
+
+Contact and handoff:
+- After any operator-led rollback/rollback-attempt, open a handoff ticket with runtime ops and account management for scheduled follow-up with customer.
+
+This document is intended to be a condensed, actionable playbook. For runbook automation recipes, refer to the operator automation library in the related_pages links.

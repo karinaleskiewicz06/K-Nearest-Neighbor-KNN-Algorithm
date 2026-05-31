@@ -1,0 +1,132 @@
+SLO Provisioning and Backfill Orchestration Runbook
+
+Summary:
+This runbook describes the standardized procedure for provisioning SLO-backed capacity and executing controlled backfill when headroom exists or when emergency soft-preemption is required. It ties SLO tiers and error-budget signals to concrete capacity decisions, operational tooling flows, incident evidence requirements, and postmortem actions. The goal is predictable, auditable capacity decisions that preserve customer-facing SLOs while minimizing wasted resources.
+
+Scope and applicability:
+- Applies to all model-serving runtime services and front-end routing layers: inference-router, batcher, kvcache-service, and the multi-tenant scheduling plane.
+- Relevant when: onboarding new tenants, model rollouts, emergency capacity recovery, scheduled maintenance, and demand spikes where controlled backfill or soft-preemption is permitted.
+- Not intended for wholesale cluster evictions; use the cluster-eviction playbook for zone-level failures.
+
+Key concepts and definitions:
+- SLO tiering: 
+  - Tier-1 (Critical production): 99.95% p99.9 latency SLO (30d rolling), 99.99% availability SLO for API surface. Error budget: 0.05% availability.
+  - Tier-2 (High): 99.9% p99 latency SLO (30d), 99.95% availability.
+  - Tier-3 (Best-effort / non-critical): 99% p95 latency SLO, no contractual SLA.
+- Error budget (EB): Allowed budget for SLO violations over the rolling window.
+- Burn rate: EB consumption per unit time. Thresholds used here: 
+  - Normal: burn_rate < 1.0
+  - Elevated: 1.0 <= burn_rate < 3.0
+  - Critical: burn_rate >= 3.0 (requires emergency measures)
+- Backfill: placing lower-priority workloads into otherwise-idle headroom without reducing effective capacity for higher tiers.
+- Soft-preemption: reversible demotion of non-critical work to protect Tier-1 SLOs.
+
+Observability and tooling prerequisites (must be available before executing procedures):
+- SLO dashboard: per-service SLO dashboard with rolling 30d window and 1h/6h/24h burn-rate panels.
+- Token-level telemetry: tracing/metrics with tenant attribution (api_token_id, customer_id).
+- Capacity allocator service: "capacity-orch" API with endpoints: /query-headroom, /reserve-backfill, /preempt-lease, /release-lease.
+- Canary harness: synthetic traffic generator in svc:canary-runner.
+- Audit log: automated entry created for every capacity-orch transaction (immutable event id).
+
+Runbook: SLO-compliant backfill provisioning (normal path)
+1) Preconditions (operator or automation must verify):
+   a) Confirm service SLOs for the target cluster from SLO dashboard.
+   b) Verify current burn_rate for Tier-1 is < 1.0 for the past 6h.
+   c) Run: curl -s -H 'Authorization: Bearer $OP_KEY' https://capacity-orch.internal/query-headroom?cluster=$CLUSTER to get headroom estimate (tokens/sec and GPU-hours).
+   d) Check for active maintenance windows or ongoing incidents: https://status.internal/latest. If anything tagged incident=yes, abort.
+2) Reservation:
+   a) Use capacity-orch to create a short-lived reservation: POST /reserve-backfill {
+      "cluster": "$CLUSTER", "tenant": "$TENANT", "type": "best-effort", "duration_minutes": 60, "max_gpu_frac": 0.15
+   }
+   b) Record the returned reservation_id in the audit log and ticket (link to QBR ticket if applicable).
+3) Soft admission and verification:
+   a) Deploy best-effort tasks under reservation namespace (k8s label: backfill-resv=$reservation_id).
+   b) Monitor SLO dashboard and burn rate for 15 minutes. If Tier-1 burn_rate rises above 1.0, immediately release reservation and evict: POST /release-lease {"reservation_id": "$reservation_id"}.
+   c) If burn_rate remains stable, gradually scale to the target allocation (ramp policy: +10% every 5 minutes).
+4) Expiration and cleanup:
+   a) Reservation auto-expires after duration_minutes. On expiry, automation must drain tasks (kubectl cordon + drain changes) within 5m, or issue preempt command.
+   b) Ensure reservation is released: POST /release-lease.
+   c) If the reservation was used for scheduled work, attach usage summary to the reservation audit record.
+
+Runbook: Emergency soft-preemption (critical burn or incident)
+Trigger: Any Tier-1 service reports burn_rate >= 3.0 OR incident with impact to availability.
+1) Immediate steps (within 2 minutes):
+   a) Toggle SLO-protect mode in capacity-orch: POST /preempt-lease {"policy": "slo-protect", "cluster": "$CLUSTER"}. This marks all non-tier-1 pods with label backfill-resv for immediate demotion.
+   b) Alert SRE on-call and the impacted service owner(s) via PagerDuty and #sre-urgent channel.
+2) Controlled eviction order:
+   - Step 1: Suspend best-effort batch jobs (label batch=best-effort).
+   - Step 2: Reduce kvcache warm-pool sizes by 30% (kvcache-controller API).
+   - Step 3: Reclaim ephemeral GPU slices allocated to dedicated test environments (identifier pattern: test-evict-*).
+3) Verification and rollback:
+   a) Confirm Tier-1 burn_rate drops below 1.5 within 10 minutes. If not, escalate to on-call senior SRE to consider cross-region failover.
+   b) Once burn_rate stabilized, gradually re-admit capacity following the normal path with a 30-minute hold at each step.
+
+Incident review and evidence capture standards (minimum required for any SLO-driven capacity action):
+- For any preempt or backfill release action taken due to SLOs, capture and attach the following to the incident ticket:
+  - reservation_id or lease_id and immutable event id from capacity-orch.
+  - SLO dashboard snapshot (PNG) for 1h/6h/24h windows centered on action.
+  - A list of affected tenants (api_token_id, customer_id) and the exact timeframe.
+  - Commands run and their timestamps (CLI history snippet).
+  - Root cause hypothesis (short) and immediate mitigation steps taken.
+- Review timeline template (to be used in postmortem):
+  1) Detection time (NTP)
+  2) Initial burn analysis and decision (who, why)
+  3) Actions executed (commands + reservation_ids)
+  4) Verification and re-admit time
+  5) Post-incident remediation tasks and owners
+
+SLO change and rollout checklist (when changing SLOs or admission policies):
+- Author PR in eng-sre/slo-registry with rationale, owner, and metrics showing prior 90d stability.
+- Run traffic shadowing for 72h with new admission rules in staging.
+- Notify affected teams (2-week notice for non-emergency) and update console docs and SDK guidance.
+- Schedule a rollback window in case of regression.
+
+Operational tooling integrations and scripts (examples)
+- capacity-orch (internal): Go microservice with REST API and Event log written to kafka topic capacity.events.
+- canary-runner: path/to/canary-runner --target inference-router --qps 5 --window 15m
+- sample curl to reserve headroom:
+  curl -s -X POST -H 'Authorization: Bearer $OP_KEY' -H 'Content-Type: application/json' https://capacity-orch.internal/reserve-backfill -d '{"cluster":"us-west-2-main","tenant":"example-tenant","type":"best-effort","duration_minutes":60,"max_gpu_frac":0.10}'
+- automation: katana-scripts/backfill-orchestrator (jenkins job) reads capacity.events and auto-triggers reservation expiration checks.
+
+Threshold table (quick reference):
+- Tier-1 burn_rate >= 3.0 => immediate soft-preempt (execute emergency path).
+- Tier-1 burn_rate 1.0-3.0 => pause new backfill reservations; allow in-flight reservations to drain at +0% scaling.
+- Tier-1 burn_rate < 1.0 => safe to consider new backfill reservations up to 15% cluster GPU capacity.
+- Headroom estimate accuracy target: error < 12% for 95% of queries.
+
+Post-incident remediation examples:
+- If an emergency preempt affected paying customers, create remediation tasks: refund estimator + customer communication draft + priority follow-up. Owner: customer-success.
+- For repeated burn spikes tied to a tenant, recommend tenant plan migration or traffic shaping (owner: platform-eng + account team).
+
+Ownership and escalation matrix:
+- First responder: cluster-sre on-call (pagerduty: SRE_CLUSTER).
+- Secondary: runtime-performance (pagerduty: RUNTIME_PM).
+- Policy owner: SLO Governance (team lead: Arjun Patel).
+- Business-impact owner: assigned product manager for impacted model catalog entry.
+
+Audit and compliance notes:
+- All reservations and preempt actions must create an immutable audit event. Retention: 2 years.
+- For customer-impacting preempts, tag incident as restricted in the ticketing system and follow security-and-compliance disclosure guidance.
+
+Appendix A — Example reservation JSON (for capacity-orch):
+{
+  "cluster": "us-west-2-main",
+  "tenant": "logging-service-42",
+  "type": "best-effort",
+  "duration_minutes": 60,
+  "max_gpu_frac": 0.10
+}
+
+Appendix B — Quick rollback commands:
+- Release reservation: curl -X POST -H 'Authorization: Bearer $OP_KEY' https://capacity-orch.internal/release-lease -d '{"reservation_id":"$reservation_id"}'
+- Force demote pods with label: kubectl -n $NS get pods -l backfill-resv=$reservation_id -o name | xargs -r kubectl delete --grace-period=30
+
+Related documents and references:
+- eng-sre/capacity-planning/service-onboarding-runway-and-slo-admission-playbook-2026
+- eng-sre/operational-tooling/capacity-evidence-playbook-and-retro-matrix-2024
+- eng-serving-runtime/runbooks/model-warm-pool-slo-sentinel-and-graceful-demotion-runbook-2026
+
+Revision history:
+- 2025-03-12 (Maya Chen) initial draft
+- 2025-10-02 (Maya Chen) added emergency soft-preempt flow and audit requirements
+- 2026-11-08 (Maya Chen) clarified thresholds and added ownership matrix

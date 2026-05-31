@@ -1,0 +1,153 @@
+Latency fingerprinting and kernel-sensitivity index: measurement and runbook
+
+Overview
+--------
+This page documents the Latency Fingerprinting methodology and the Kernel-Sensitivity Index (KSI) used by the serving runtime team to:
+- Quantify per-kernel impact on P50/P95/P99 for representative text-generation workloads.
+- Rank kernels by sensitivity so scheduling and preemption policies can be tuned without risking regressions.
+- Provide a reproducible investigation runbook for tail-latency incidents attributed to kernel scheduling or kernel-level regressions.
+
+Audience
+--------
+Primary: runtime engineers, SREs, performance QA, and release engineers. Secondary: product managers and infra owners who need a traceable cost/latency signal when evaluating kernel rollouts or quantization changes.
+
+Why this matters
+-----------------
+We observe intermittent tail spikes that correlate with kernel version rollouts and heterogeneous job mixes. High-level SLOs are: P95 < 250ms, P99 < 800ms for short-sequence interactive routes; P50 < 30ms for control-plane fast-paths. Without a per-kernel sensitivity metric, rollouts rely on opaque aggregate telemetry and longer canary windows. KSI accelerates detection and points to a minimal remediation surface.
+
+Definitions
+-----------
+- Latency fingerprint: a compact profile (histogram summary + contextual tags) describing how a specific workload shape (sequence length distribution, prompt tokenization class, decoding mode) maps to the latency curve observed on a given kernel build.
+- Kernel-Sensitivity Index (KSI): a scalar in [-1.0, +1.0] representing the normalized change in tail latency attributable to a kernel compared with a baseline kernel. Positive KSI means the kernel increases latency.
+- Workload shape: a tuple of {model_variant, avg_sequence_length, decoding_mode, batch_size_distribution}.
+
+Measurement approach (high level)
+--------------------------------
+1) Select representative workload shapes from the operational workload catalog (see runtime-sandboxing lab manual). Each shape must include a seed prompt set (N=512) sampled from production anonymized traffic.
+2) Run A/B microbenchmarks with deterministic seeds: baseline kernel (K0) vs candidate kernel (K1). Use traffic replay harness with request timing jitter to reflect production concurrency.
+3) Collect per-request timing, kernel-name tag, compile flags, GPU occupancy, kernel queue depth, and full trace ids.
+4) Compute the latency fingerprint (histogram quantiles plus conditional breakdowns) and the KSI per-shape.
+5) Validate significance with bootstrap sampling (95% CI).
+
+Detailed measurement protocol
+-----------------------------
+Prerequisites:
+- Access to performance lab fleet with matching GPU family and driver version.
+- Canary traffic replay harness (repo: infra/rl-replay) checked out at commit referenced in related_pages.
+- Profiling agent v2.3+ installed (service: runtime-profiler).
+
+Commands (example)
+1) Install profiling agent and start harness:
+
+$ git clone https://repo.internal/redwood/infra/rl-replay.git
+$ cd rl-replay && ./setup.sh --gpu-family ampere --driver 555.40
+$ ./replay --prompts seed_prompts_512.json --concurrency 128 --pacing jittered --profile --out /tmp/replay-output.json
+
+2) Run candidate vs baseline pair with pinned kernel metadata:
+
+$ ./replay --kernel-tag K0 --prompts seed_prompts_512.json --run-id baseline-2026-02-01 --profile --out baseline.json
+$ ./replay --kernel-tag K1 --prompts seed_prompts_512.json --run-id candidate-2026-02-01 --profile --out candidate.json
+
+3) Compute latency fingerprint and KSI (python tool):
+
+$ pytools/latency_fingerprint/compute_ksi.py --baseline baseline.json --candidate candidate.json --out ksi_report.json
+
+What the KSI output looks like
+----------------------------
+- ksi_report.json (example fields, abbreviated):
+  - work_shape: "gpt-7b,avg_seq=64,topk=40"
+  - ksi_value: "0.23"
+  - p95_baseline: "312ms"
+  - p95_candidate: "384ms"
+  - p99_baseline: "820ms"
+  - p99_candidate: "1102ms"
+  - bootstrap_ci: "[0.18, 0.29]"
+  - significant: "true"
+
+Interpreting KSI
+----------------
+- KSI > +0.1: kernel is considered high-risk for the shape (investigate and block wide rollouts).
+- +0.02 <= KSI <= +0.1: caution — prefer canary gating and extended sampling windows.
+- -0.02 <= KSI <= +0.02: neutral — no action required beyond normal canary.
+- KSI < -0.02: improvement — note in release notes and consider prioritized rollout.
+
+Kernel-sensitivity matrix (example ASCII table)
+------------------------------------------------
+Each row is a workload shape; each column is a kernel candidate. Values are KSI (rounded).
+
+| workload \t| kernel_K0 \t| kernel_K1 \t| kernel_K2 \t|
+| short-chat \t| 0.00 \t| 0.23 \t| -0.04 \t|
+| long-summarize \t| 0.00 \t| 0.07 \t| 0.12 \t|
+| embeddings-batch \t| 0.00 \t| -0.02 \t| 0.01 \t|
+
+This matrix is stored in the performance dashboard under: dashboards/ksi/matrix-latest (grafana).
+
+Runbook: Investigate a kernel-attributed tail-latency incident
+-------------------------------------------------------------
+If an alert fires that correlates to a kernel rollout (alert name: kernel-sensitivity-p99-spike):
+1) Triage: capture alert context, affected routes, and kernel-tag from the release event.
+   - Owner: oncall-runtime (pager duty: runtime-team)
+   - Initial data: timeframe, route(s), kernel-tag, % of traffic using kernel-tag.
+2) Pull latency fingerprints for the top 3 affected shapes from the last 24h (dashboard query).
+3) Run a quick A/B with the exact baseline and candidate on a staging replica using the seed prompts for the affected routes (10 minutes).
+4) If KSI > +0.1 and bootstrap CI excludes 0: escalate to Kernel Rollout WG and block rollout. Create an issue: infra/kernel-rollout-blocker with the KSI report attached.
+5) If KSI in (+0.02, +0.1): set temporary rate limit on the candidate kernel in the scheduler (see command below) and increase sampling to 4x for next 4 hours.
+6) If neutral: continue monitoring and annotate release notes with the verification run id.
+7) Record mitigations and postmortem if incident SLI impact exceeds threshold (sla-impact > 1 hour or customer-facing SLO breaches).
+
+Commands to throttle candidate kernel in scheduler (example)
+----------------------------------------------------------
+- CLI (schedulerctl) to reduce slot weight for kernel-tag K1:
+
+$ schedulerctl set-weight --kernel K1 --weight 0.2 --reason "ksi-quick-mitigation-2026-02-01"
+
+- Revert:
+$ schedulerctl set-weight --kernel K1 --weight 1.0 --reason "revert-ksi-mitigation"
+
+Telemetry and observability contract
+-----------------------------------
+Every replay and production request must carry these trace tags:
+- runtime.kernel_tag
+- runtime.kernel_build_id
+- runtime.kernel_variant (e.g., fp16-quant, int8-sym)
+- runtime.kv_hit (true|false)
+- runtime.queue_depth (integer)
+
+Dashboards and alerts to check
+-----------------------------
+- dashboards/ksi/summary: KSI trend per kernel and workload shape.
+- dashboards/latency/route-breakdown: per-route P50/P95/P99.
+- alerting/kernel-sensitivity-p99-spike: triggers when KSI-based p99 delta > 150ms and traffic fraction > 5%.
+- alerting/kernel-regression-ci-failure: flags if canary KSI exceeds +0.05 over three successive daily runs.
+
+Guidance for release engineers
+------------------------------
+- Add KSI reports to the kernel candidate artifact in the release bundle under /artifacts/ksi/*.json.
+- Require a KSI sign-off (responsible: perf-lead) for kernels with KSI > +0.02 on any production shape before global rollout.
+- Use staged rollouts with weight 10% -> 25% -> 50% -> 100% with KSI checks at each gate.
+
+Limitations and known caveats
+----------------------------
+- Small sample sizes for rare workload shapes inflate CI; prefer combining shapes with the same kernel hotpath.
+- KSI attribution is sensitive to queueing effects; ensure queue depth tags are stable across A/B runs.
+- Driver or compiler-level nondeterminism (JIT variability) can create noise — repeat runs and follow up with kernel-level deterministic tracing.
+
+Maintenance and ownership
+-------------------------
+- Owner team: serving-runtime/perf (primary), eng-sre (secondary).
+- Dashboard owner: telemetry-team.
+- Review cadence: quarterly. Update this doc when the profiling agent or replay harness changes major versions (major semver).
+
+Appendix: Quick checks and YAML example for CI gating
+-----------------------------------------------------
+YAML snippet (put into kernel-candidate CI job):
+
+pipeline:
+  steps:
+    - name: run-ksi-smoke
+      image: redwood/perf-tools:stable
+      commands:
+        - pytools/latency_fingerprint/compute_ksi.py --baseline baseline.json --candidate candidate.json --out ksi_report.json
+        - if [ $(jq .ksi_value ksi_report.json) \u003e 0.02 ]; then echo "KSI exceeded"; exit 1; fi
+
+If you have questions or need a dedicated pairing session to walk through the replay harness, ping the perf channel (#perf-runtime) or reach out to the doc reviewers listed above.

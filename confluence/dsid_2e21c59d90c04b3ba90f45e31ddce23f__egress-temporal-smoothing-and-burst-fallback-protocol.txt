@@ -1,0 +1,172 @@
+Egress temporal smoothing and burst fallback protocol
+
+Summary
+
+This document defines the egress temporal-smoothing strategy and the end-to-end burst-fallback protocol used by Redwood’s tenant egress pipeline. It covers the design, operational playbook, Terraform configuration snippets, alerting rules, and post-incident checks used when tenants hit short-lived egress spikes that could otherwise lead to cross-tenant impact or billing anomalies.
+
+Goals
+
+- Protect shared outbound bandwidth and NAT resources from short-lived tenant spikes.
+- Provide graceful degradation and predictable latency for active inference requests.
+- Ensure automated fallback to burst capacity with safe accounting and recoverable state.
+- Make the mechanism auditable and reversible via IaC and telemetry.
+
+Scope
+
+Includes: tenant-level egress credit ledger, local smoothing (token bucket + leaky window), global burst pool, redispatching to alternate regions, and the operational runbook for incidents.
+Excludes: long-lived tenant policy changes (handled by quota service), cross-region legal/GDPR routing.
+
+Terminology
+
+- egress-credit-balance: numeric accounting of a tenant’s remaining burstable bytes.
+- smoothing-window: a short window (default 30s) that averages egress rate to avoid immediate drops.
+- burst-orchestrator: service that provides temporary egress capacity from the global pool.
+- tenant-sidecar-proxy: per-tenant proxy that applies token-bucket smoothing and reports telemetry.
+
+High-level architecture (text diagram)
+
+Client -> tenant-sidecar-proxy -> local egress-shaper -> egress-allocator -> (normal NAT path OR burst-orchestrator) -> internet
+
+Key services and ownership
+
+- tenant-sidecar-proxy (service-tenant-proxy) — owner: eng-infra/networking
+- egress-allocator (service-egress-allocator) — owner: eng-infra/cloud-accounts-and-networking
+- burst-orchestrator (service-burst-orchestrator) — owner: eng-fleet/capacity
+- billing-ledger (service-credit-ledger) — owner: finance-legal (integration maintained by eng-infra)
+
+SLOs and thresholds
+
+- Normal egress latency (measured at sidecar): p95 <= 120ms
+- Degradation tolerance during burst fallback: p95 <= 500ms (target)
+- Egress credit low watermark: 20% of tenant's configured burst allowance (alert)
+- Global burst pool reserve: 10% of total pool must be reserved for emergency SLA-preserving operations
+
+Config table (defaults)
+
+| Parameter | Default | Notes |
+|---|---:|---|
+| smoothing_window | 30s | Rolling window for leaky averaging |
+| token_bucket_size | 10MB | Max instantaneous allowance before smoothing applies |
+| token_fill_rate | 1MB/s | Sustained replenishment rate for standard tenants |
+| burst_pool_size | 2TB | Global burst capacity available for all tenants |
+| burst_max_per_tenant | 200MB | Max concurrent burst allocation per tenant |
+| preemptive_reclaim_delay | 60s | Wait before reclaiming burst capacity from low-priority tenants |
+
+Terraform / IaC snippet (usage pattern)
+
+Below is an example Terraform variable block used by the burst-orchestrator module. It is intentionally simplified for clarity: 
+
+```
+variable "egress_burst_profile" {
+  description = "Per-tenant burst profile: size (bytes), refill_rate (bytes/s), priority"
+  type = map(object({
+    size        = number
+    refill_rate = number
+    priority    = string
+  }))
+  default = {
+    "default-tenant" = { size = 209715200, refill_rate = 1048576, priority = "standard" }
+  }
+}
+
+module "burst_orchestrator" {
+  source = "git::ssh://git@github.com/redwood-inference/infra-modules//burst-orchestrator"
+  global_pool_size = 2199023255552  # 2 TB in bytes
+  profiles         = var.egress_burst_profile
+}
+```
+
+Prometheus alert examples
+
+- Alert: EgressCreditLow
+  - expr: egress_credit_balance_bytes{job="service-credit-ledger"} < (tenant_burst_allowance_bytes * 0.2)
+  - for: 5m
+  - labels: severity=warning, team=infra-networking
+  - annotations: runbook=/confluence/eng-infra/cloud-accounts-and-networking/egress-temporal-smoothing-and-burst-fallback-protocol.json
+
+- Alert: BurstPoolDepletion
+  - expr: sum(burst_pool_free_bytes{job="service-burst-orchestrator"}) / sum(burst_pool_total_bytes{job="service-burst-orchestrator"}) < 0.10
+  - for: 1m
+  - labels: severity=critical, team=infra-sre
+  - annotations: pagerduty=infra-oncall
+
+Operational runbook: tenant spike detected
+
+1) Detection (automated):
+   - Pager triggers: EgressCreditLow OR tenant-sidecar-proxy reports sustained egress_bytes/s > (token_fill_rate * 3) for > 20s.
+2) Automated smoothing:
+   - tenant-sidecar-proxy engages smoothing-window and applies token-bucket enforcement. The client sees backpressure (HTTP 429 with Retry-After header) if immediate rate > token_bucket_size.
+3) Automated fallback:
+   - egress-allocator requests burst from burst-orchestrator (gRPC: AllocateBurst(tenant_id, requested_bytes)).
+   - If allocation successful, apply NAT path binding to the tenant’s burst pool subnet and update billing-ledger via /api/v1/credits/alloc.
+4) If allocation fails (insufficient pool):
+   - Policy order: a) try alternate region with spare burst capacity (redispatch), b) gracefully queue requests locally for up to 10s, c) apply tenant-priority preemptive reclaim signals.
+5) Human escalation (if automated measures fail):
+   - Notify infra-oncall (pagerduty) with tag: "egress-burst-fallback-failed".
+   - Runbook owner: eng-infra/cloud-accounts-and-networking oncall.
+
+Manual mitigation commands (kubectl / CLI)
+
+- Force an allocation snapshot and inspect allocations: 
+  kubectl -n infra logs deploy/service-burst-orchestrator --tail=200 | grep "AllocationSnapshot"
+
+- Revoke a tenant allocation (immediate reclaim): 
+  curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" https://burst-orchestrator.internal/api/v1/revoke -d '{"tenant_id":"TENANT_ID","bytes":104857600}'
+
+- Move a tenant to alternate egress pool (redispatch): 
+  terraform apply -var='tenant_egress_pool=eu-west-redispatch' -target=module.tenant_onboarding
+
+Post-incident checklist
+
+- Confirm billing-ledger allocations matched actual egress usage (finance reconciliation).
+- Increase smoothing_window or token_fill_rate for tenants with repeated short spikes, or create a custom burst profile.
+- Run a capacity simulation (see section "Simulation and testing") to validate pool sizing and preemptive reclaim tuning.
+- Add retrospective notes with timeline and affected tenants.
+
+Simulation and testing
+
+- Use the egress-load-generator harness located in infra-eval repo: scripts/egress-flood-test.py.
+- Test cases: short spike (60s), multi-tenant coordinated spike (10 tenants, 30s), region failover path (simulate eu->us redispatch).
+- Success criteria: no tenant p95 > 2x normal latency after fallback, burst_pool_free_bytes never goes below reserve.
+
+Telemetry and dashboards
+
+Recommended dashboard panels:
+- global: burst_pool_total_bytes, burst_pool_free_bytes, burst_allocations_by_tenant (top 20)
+- per-tenant: egress_credit_balance_bytes, egress_bytes_per_second, sidecar_backpressure_rate (429/s)
+- system health: allocator_error_rate, orchestrator_alloc_latency_p95
+
+Audit and compliance notes
+
+- All allocations are recorded in the billing-ledger with a unique allocation_id and TTL. Retention: 1 year.
+- For private deployments, the burst-orchestrator module ships a PII-safe mode that masks tenant identifiers in telemetry.
+
+Risks and trade-offs
+
+- Aggressive smoothing increases tail latency for short-running inference requests. Balance with business needs.
+- Large global burst pools can mask tenant anti-patterns; use periodic reviews and quota guardrails.
+
+Future improvements
+
+- Adaptive smoothing windows driven by per-tenant workload classification.
+- Machine-learned prefetching into burst pool based on historical spike likelihood.
+- Expose a self-serve tenant UI in Redwood Console for temporary burst purchase with auto-reconcile.
+
+Appendix: quick incident timeline template
+
+1. Detected: <timestamp> — alert fired (EgressCreditLow/BurstPoolDepletion)
+2. Automated actions: <timestamp> — smoothing applied, burst allocate attempted
+3. Allocation result: <timestamp> — success/failure and allocation_id
+4. Manual actions: <timestamp> — oncall actions and commands run
+5. Resolved: <timestamp> — final state and SLA impact
+
+Appendix: contact matrix
+
+- infra-oncall: #pagerduty-infra (primary)
+- network-eng: network-eng@redwood.com
+- finance-ops: billing-ops@redwood.com
+
+Document history
+
+- 2024-11-12: Created by Maya Chen
+- 2025-02-20: Tested and updated runbook steps; added Terraform examples (Priya Natarajan)

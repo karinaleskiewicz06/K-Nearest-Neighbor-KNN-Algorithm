@@ -1,0 +1,118 @@
+Live Traffic Probe Escrow and Decisioning Runbook
+
+Overview
+
+Purpose: This runbook describes the Live Traffic Probe Escrow pattern and the decisioning matrix used to gate rollouts, trigger automatic fallbacks, and escalate regression triage when production-quality deltas are detected. The escrow pattern minimises risk from noisy short-term signals by holding a deterministic sample of traffic and its probes in an immutable store before they can influence automated rollouts.
+
+Scope
+- Applies to: Redwood-hosted models (public API routes), Dedicated model pools, and Private deployments that integrate the probe SDK.
+- Not covered: offline batch evals, manual A/B experiments run entirely outside the Redwood serving runtime.
+
+Quick summary
+- Probe escrow holds (N) raw request+response records for 72 hours in s3://escrow-prod-probes/{model}/{date}.
+- Gate checks run on escrowed data every 15m and produce a pass/fail decision with a confidence score.
+- Failures trigger staged rollback: (1) local quant-fallback, (2) canary shrink to 0.1% traffic, (3) full rollback to prior model version if unresolved for 30m.
+
+Owners and contacts
+- Runbook owner: Model Reliability (model-reliability@redwood.com) — primary: Aisha Kapoor
+- Oncall escalation: ML-runtime SRE (pager: #ml-runtime-oncall)
+- Product owner for rollout policy: Priya Das (product)
+
+Signals and telemetry contract
+- Required metrics produced by the escrow pipeline (every probe emits these keys):
+  - probe_id (string)
+  - tenant_id (string)
+  - model_version (string)
+  - route (string)
+  - timestamp_utc (ISO8601)
+  - input_token_count (int)
+  - output_token_count (int)
+  - latency_ms (p95/p50 per-probe aggregated)
+  - coherence_score (float, 0–1) — evaluator micro-metric scoring intent preservation
+  - semantic_change_score (float, 0–1) — measured against baseline embedding similarity
+  - safety_violations (int) — count of sentinel hits (see sentinel catalog)
+  - quant_fallback_flag (bool)
+
+Thresholds and SLOs (defaults)
+- Latency tail: p99 latency increase > 35% relative to baseline (last 24h) -> alert candidate
+- Coherence regression: median coherence_score drops by >= 6 percentage points on escrow samples -> fail gate
+- Semantic drift: mean semantic_change_score decrement >= 0.12 over 1h window -> fail gate
+- Safety violations: any increase of +5 violations / 1000 probes vs baseline -> immediate fail and page SRE
+- Confidence requirement: decisions must meet min_confidence >= 0.7 (see Decision Confidence section)
+
+Probe Escrow workflow (step-by-step)
+1. Traffic sampling: router applies deterministic 1-in-K sampling keyed by tenant_id + route to ensure reproducibility.
+2. Probe synthesis: each sampled request is wrapped with a probe signature and shadowed to the probe SDK.
+3. Escrow write: SDK writes serialized record to escrow S3 path with encryption and manifest entry.
+4. Preflight enrichment: enrichment lambda augments records with embeddings, baseline similarity, and micro-eval hooks.
+5. Gate evaluation: gate runner pulls manifest in 15m batches, computes delta metrics against baseline and emits a gate_decision JSON to the decision topic.
+6. Decision action: decision consumer applies action policy (no-op, notify, throttled-fallback, rollback).
+
+Decision Confidence
+- We compute a composite confidence score using three factors (weighted): sample stability (40%), signal-to-noise (30%), and historical sensitivity (30%).
+- Minimum pass threshold: 0.70. Between 0.55–0.70 -> triage flag (human review). Below 0.55 -> automatic rollback for safety-flagged failures.
+
+Decision matrix (summary table)
+- Pass & high confidence: continue rollout, post to /release-events, no action.
+- Fail & high confidence: trigger rollback step 1 (local quant-fallback) and page ML-runtime oncall.
+- Fail & medium confidence: reduce canary traffic to 0.1% and create a triage ticket with attached escrow sample (5 examples).
+- Safety violation (any confidence): immediate full rollback to previous pinned model and create SEV ticket.
+
+Operational run commands and examples
+- Manually re-run gate for a date range (CLI):
+  rwn-escrowctl evaluate --model redwood-v2 --from 2025-01-05T00:00Z --to 2025-01-05T01:00Z --batch-size 5000
+
+- Example gate_decision JSON (published to kafka topic decision.gates):
+  {
+    "model_version": "redwood-v2.17",
+    "window_start": "2025-01-05T00:00:00Z",
+    "window_end": "2025-01-05T00:15:00Z",
+    "metrics": {"coherence_delta": -0.07, "semantic_delta": -0.13},
+    "confidence": 0.82,
+    "decision": "rollback-step-1"
+  }
+
+Telemetry retention and privacy
+- Escrowed probe payloads are retained for 72 hours by default, then moved to a 365-day restricted archive only if tagged for regulatory review.
+- Sensitive fields (PII) must be redacted at the SDK before escrow write. The SDK supports deterministic redaction rules and a redaction log.
+
+Canary orchestration and rollback sequence
+1. Local quant-fallback: switch the canary to run quantized variant with the same model name (fast fallback, < 30s config apply).
+2. Canary shrink: reduce canary to 0.1% traffic for verification window (30m).
+3. Hot swap: if failures persist, route canary traffic to previous model_version and mark current model as quarantined.
+4. Full rollback: automated full-traffic revert after 30 minutes of unresolved fail state OR immediately if safety violation.
+
+Debugging and triage playbook (for oncall)
+1. Confirm artifact: verify model_version, commit hash, and build manifest (rwn-manifest show --model <model_version>).
+2. Pull escrow sample: escrowctl fetch --model <model_version> --window <window_start>-<window_end> --limit 50 
+3. Run local evaluator: docker run redwood/eval:latest --input sample.json --metric coherence --seed 42
+4. Compare embeddings: use the baseline embedding snapshot (s3://baseline-embeds/{model}/snapshot-YYYYMMDD) and run: embed-diff --left escrow-embeds.json --right baseline.json --threshold 0.12
+5. If service-level failure, escalate to ML-runtime SRE and attach gate_decision and top 10 escrow samples.
+
+Post-incident activities
+- Within 24h: owner files an incident summary and updates the triage ticket with root cause hypotheses.
+- Within 72h: if RCA indicates model quality regression, schedule a model regression test in the eval harness and a targeted retrain or prompt-fix patch.
+- Within 7 days: update the baseline snapshot if the new behavior is accepted, or deprecate model version and document mitigation steps.
+
+Safety and audit notes
+- All escrow writes are logged with write-id and stored under kms-encrypted S3 buckets.
+- Access to escrow manifests is restricted to model-reliability and ML-runtime-SRE roles.
+
+Appendix: example escrow schema (newline-delimited JSON)
+- One line per probe record, minimal fields shown:
+  {"probe_id":"p-abc123", "tenant_id":"t-45", "model_version":"redwood-v2.17", "route":"/chat/v1", "input":"<redacted>", "output":"<redacted>", "metrics":{"latency_ms":320,"coherence_score":0.71}}
+
+Related pages and references
+- Probe catalog: /applied-ml-and-evals/prompt-sets-and-benchmarks/probe-curation-stewardship-and-annotation-charter-2026
+- Quant shadow guide: /applied-ml-and-evals/quantization-profiles/quant-shadow-cohort-strategy-and-rollback-playbook-2026
+
+Change history
+- 2024-11-12: Created by Aisha Kapoor
+- 2025-01-09: Clarified confidence thresholds and added CLI examples (reviewers: Liam Chen, Sofia Martinez)
+
+Operational checklist (one-line)
+- Is escrow enabled for this deployment? (yes/no)
+- Are redaction rules applied? (yes/no)
+- Has baseline snapshot been refreshed in the last 7 days? (yes/no)
+
+End of runbook

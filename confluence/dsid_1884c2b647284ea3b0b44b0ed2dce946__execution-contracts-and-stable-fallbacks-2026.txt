@@ -1,0 +1,149 @@
+Execution contracts and stable fallbacks — runtime handbook
+
+Summary
+-------
+This document defines the execution contracts between serving runtime components and the recommended, tested fallback/degradation modes to preserve customer-facing SLOs during resource contention or partial failure. It is intended for runtime engineers, SREs, and product owners who need clear invariants when changing the scheduler, kernel selection logic, or deployment topology.
+
+Scope
+-----
+- Applies to: runtime-proxy, gpu-dispatcher, kernel-mapper, kvcache-svc, execution-allocator, and canary routing.
+- Environments: hosted API, dedicated capacity, and private deployments.
+- Goals: maintain 99th percentile latency SLOs for interactive endpoints while maximizing throughput and minimizing silent correctness regressions.
+
+Key execution contracts (high level)
+----------------------------------
+1) Latency envelope contract
+   - "Interactive" requests (priority band P0) must target p99 <= 250 ms for generation-only requests up to 512 tokens when in steady state.
+   - "Background" requests (P2) may be queued or batched; expected p95 <= 3s; no hard p99 requirement.
+
+2) Preemption and kernel semantics
+   - Kernels must expose a preemption token: preemptible=true/false. The kernel-mapper will not assign non-preemptible kernels to capacity that services P0 unless explicit reservation exists.
+   - Preemption must preserve partial KV cache state on eviction and provide a best-effort resume hook.
+
+3) KV cache consistency
+   - KV entries are considered ephemeral per session. Strong consistency is not required across model swaps, but the runtime will attempt in-place migration of compatible KV formats.
+   - If model swap occurs and KV migration fails, the contract requires the session be downgraded to a new cold-start path with a documented telemetry event (kvcache.migration_failed).
+
+4) Model swap contract
+   - Model swaps triggered by routing or autoscaler must be atomic per request: either the request completes on the original model or is routed and restarted on a compatible variant (not partially executed).
+
+5) Observable control plane signals
+   - The allocator exposes: free_slots, reserved_slots, preemptions_pending, eviction_pressure. These MUST be present in the allocator/metrics endpoint.
+
+Degradation modes (ordered by preference)
+----------------------------------------
+- Transparent fallback to compatible model variant (same tokenizer / comparable LM family).
+- Partial output with structured disclaimer: return earliest stable token and a field: "partial=true" and a reason code. Use only for low-safety internal endpoints.
+- Throttling with HTTP 429 and Retry-After header; prefer this for non-critical background tasks.
+- Canary redirect to Dedicated or Alternate region when capacity or NVLink issues detected.
+- Soft-failure to an n-best cached response if prefix match > 95% and data residency/compliance permits.
+
+Kernel scheduling interactions (detailed)
+----------------------------------------
+- Priority bands: P0 (interactive), P1 (nearline), P2 (batch). Each band's scheduler policy includes concurrency cap, slot weight, and eviction tolerance.
+- Kernel hints provided by model onboarding: {preferred_kernel:list, min_batch_size:int, max_latency_ms:int, memory_safety_margin_percent:int}. The kernel-mapper uses these hints to select kernel and decide whether to co-locate competing kernels.
+- Cooperative preemption handshake:
+  1) Allocator sets preempt_request=true for target slot.
+  2) Kernel runtime receives SIG_PREEMPT and replies with remaining_work_estimate.
+  3) If remaining_work_estimate <= preemption_cutoff_ms, kernel completes; otherwise kernel checkpoints and releases slot.
+
+Example scheduler policy (YAML)
+------------------------------
+# declarative policy snippet consumed by allocator and verifier
+policy_version: v1
+priority_bands:
+  - name: interactive
+    id: P0
+    concurrency_cap: 8
+    slot_weight: 100
+    eviction_tolerance_ms: 50
+  - name: nearline
+    id: P1
+    concurrency_cap: 16
+    slot_weight: 50
+    eviction_tolerance_ms: 300
+  - name: batch
+    id: P2
+    concurrency_cap: 64
+    slot_weight: 10
+    eviction_tolerance_ms: 5000
+
+Operational observability and telemetry (must-haves)
+---------------------------------------------------
+- Core metrics (per deployment and per model variant):
+  - runtime.request_latency_p50/p95/p99
+  - runtime.request_error_rate
+  - allocator.free_slots, allocator.reserved_slots
+  - kernel.preemptions_total, kernel.preemption_success_rate
+  - kvcache.hits, kvcache.misses, kvcache.migration_failed
+  - slot.eviction_pressure
+- Tracing: span names should follow: runtime:[proxy|allocator|kernel|dispatcher].<operation>. Include tags: request_id, session_id, model_variant, priority_band, kernel_hint.
+- Logs: structured JSON with level, component, event_code, human_message, and stable fields: request_id and shard_id. Example event_code: KERNEL_CHECKPOINT_FAILED.
+
+Incident triage playbook (step-by-step)
+--------------------------------------
+1) Detect: alert on p99 latency breach for interactive endpoints for >5 minutes or error_rate > 0.1% over 10 minutes.
+2) Correlate: check allocator.free_slots, preemptions_pending, nvlink.error_rate, and recent kernel.rollouts.
+3) Quick containment (first 10 minutes):
+   - If allocator.free_slots < 10% and eviction_pressure high: enable conservative-mode via feature-flag (allocator.conservative_mode=true) which reduces concurrency caps per band by 40%.
+   - If preemption failures are the cause: temporarily disable non-preemptible kernels on P0 and drain affected nodes.
+4) Stabilize (10–60 minutes):
+   - Shift traffic to canary region or Dedicated pool if policy allows. Use the routing API: curl -X POST https://controlplane/api/v1/routing/shift -d '{"from":"us-west-2","to":"us-east-1","percent":30}'.
+   - Roll back recent kernel or kernel mapper changes using the kernel-deploy rollback CLI: ./kernel-deploy rollback --release <tag> --confirm
+5) Post-incident: create incident summary, attach timeline with span-level traces and allocation snapshots. Run the regression test matrix (see Benchmark checklist).
+
+Runbook commands and useful CLIs
+-------------------------------
+- Inspect allocator state:
+  curl -s http://allocator.internal/metrics | jq '.free_slots, .reserved_slots, .preemptions_pending'
+- Force-safe-mode on allocator:
+  kubectl exec -n runtime deploy/allocator -- /bin/allocatorctl set-safe-mode true
+- Trigger model-variant fallback for a session (debug-only):
+  curl -X POST http://runtime-proxy/internal/debug/fallback -d '{"session_id":"<sid>","variant":"gptx-1-quant"}'
+
+Benchmark checklist (for change validation)
+-----------------------------------------
+- Baseline capture: record p50/p95/p99 for 5k live-sampled requests and a synthetic mix: 40% short (<=64 tokens), 50% medium (65–512), 10% long (>512).
+- Kernel upgrade: run synthetic microbenchmarks for each kernel hint permutation (min_batch_size x sequence_length x concurrency).
+- Eviction and preemption test: emulate heavy P2 batch contamination and assert P0 p99 remains <=250ms under 95% of runs.
+- KV migration test: trigger model swap and assert kvcache.migration_failed rate < 0.1%.
+- Chaos profile: NVLink degradation (packet loss emulation) for 3 minutes and assert routing fallback succeeds without request duplication over 99.9% of requests.
+
+Rollout and canary guidance
+---------------------------
+- Any scheduler or kernel-mapper change must follow the four-step rollout: dev -> staging -> canary(1%) -> canary(10%) -> gradual (50%) -> full.
+- Canary health gates: runtime.request_error_rate delta < 0.02% and p99 delta < +20ms relative to baseline.
+- If kvcache.migration_failed events appear >0.5% in canary, abort and rollback.
+
+Ownership and escalation
+------------------------
+- Primary owner: runtime-platform team (oncall: runtime-platform-primary).
+- Kernel-mapper owner: serving-runtime-kernels team.
+- SRE escalation: use PagerDuty escalation path "runtime-slo-pager" for P0 SLO breaches.
+
+Appendix A: sample trace annotation schema
+-----------------------------------------
+All traces must include these attributes as tags: request_id, session_id, start_token_count, end_token_count, model_variant, kernel_name, priority_band, allocator_slot_id, kvcache_hit_ratio. Example (textual):
+Span: runtime:kernel.execute
+Tags: {"request_id":"r-123", "model_variant":"gptx-1-quant", "kernel_name":"attn_fused_v3", "priority_band":"P0"}
+
+Appendix B: compatibility table for fallback decisions
+----------------------------------------------------
+- Fallback allowed if: tokenizer_compat=true AND (model_family == model_family OR embedding_compat=true).
+- Disallowed fallback if preserves privacy/residency restrictions or if model variant differs by >2B parameters and no regression test exists.
+
+Change log
+----------
+- 2025-07-15: Initial draft by Priya Nandakumar.
+- 2025-11-02: Added cooperative preemption handshake (Jin Park).
+- 2026-01-30: Clarified telemetry keys and added canary health gates (Ethan Morales).
+
+Related documents
+-----------------
+- Runtime upgrade validation and canary matrix (internal).
+- Scheduler policy language (declarative profiles).
+- Runtime observability data model and tracebook.
+
+Contact
+-------
+For questions or proposed changes, open a PR against confluence source and tag @runtime-platform or email runtime-platform@redwood.ai.

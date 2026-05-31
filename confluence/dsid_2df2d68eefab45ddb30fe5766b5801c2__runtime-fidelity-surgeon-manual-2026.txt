@@ -1,0 +1,162 @@
+Runtime fidelity surgeon manual
+
+Summary
+-------
+This manual describes the end-to-end process and operational discipline we use to change inference fidelity inside the runtime: any deliberate change that affects numeric precision, kernel selection, batching policy, KV-cache warmup, model variant selection, or routing heuristics that we expect to change latency/cost/quality tradeoffs. The document combines architecture rationale, kernel scheduling implications, profiling playbook steps, benchmarking commands, an acceptance gate checklist, and example release-note scaffolding.
+
+Scope
+-----
+- Applies to hosted, dedicated, and private deployments for production traffic.
+- Covers automated changes (autotune controller), manual operator interventions, and canary rollouts.
+- Excludes model training changes, prompt-level A/B experiments, and customer-visible prompt edits.
+
+When to perform fidelity surgery
+-----------------------------
+Perform a fidelity change only when one or more of the following are true: 
+1) measurable unit-cost savings (>5% projected) with acceptable quality risk;
+2) latency SLO headroom is low and a fidelity change is required to meet tail SLOs;
+3) a hardware constraint (GPU memory, thermal ceiling) necessitates an alternate execution path;
+4) quality regressions are explicitly tolerated for degraded tiers (e.g., fallback fast path).
+
+Before you start (preflight checklist)
+------------------------------------
+- Ownership: confirm an owner from runtime-ops and an owner from applied-ml (names and PagerDuty rotation).
+- Ticketing: create a ticket with hypothesis, target metric delta, and rollback conditions.
+- Canary targets: identify traffic cohorts and snapshot corresponding request surfaces.
+- Baseline captures: collect 1 hour of traces for the target cohort including kernel traces, KV-cache hit rates, per-token cost, and example outputs (min 100 sessions).
+- Evaluation prompts: select at least 200 prompt/test pairs from the eval harness tagged for quality regressions.
+
+Architecture considerations that inform changes
+----------------------------------------------
+- Kernel selection is orthogonal to model architecture; the runtime maps model ops to kernel families at dispatch time. Changes in kernel hints may increase occupancy and change preemption behavior.
+- Prefetch and KV-cache warmup interact with quantized execution: warmup patterns that assume FP16 cache layouts may be less effective for int8 kernels.
+- Priority-driven scheduler treats fidelity-change traffic as "deferred candidate" until canary passes; this prevents accidental priority inversion.
+
+Operator runbook: step-by-step
+-----------------------------
+1) Prepare canary image/config: increment feature flag and attach a unique trace tag (fidelity-surgeon-<ticket-id>).
+2) Dry-run locally: use the shadow harness to replay captured traces against the new kernel/code path with shadow traffic enabled (no live responses).
+   - Command: 
+     ./bin/shadow-replay --trace-file=baseline-traces.tar.gz --kernel-hint=int8-micro --concurrency=20 --output=shadow-report.json
+3) Run microbenchmarks on the intended hardware slice (3 runs):
+   - Per-token latency (p50/p95/p99)
+   - Kernel invocation time distribution (collect CUDA/NVTX traces)
+   - Memory high-water mark and fragmentation sample
+4) Canary rollout: begin with 0.5% traffic to a stable pool with increased logging and a non-blocking guard. Monitor for 30 minutes.
+5) Expand canary: if health signals remain green, expand to 5% for 2 hours, then to 25% for 12 hours.
+6) Full rollout: gradually promote to 100% using the rollout matrix in the Acceptance section.
+
+Key monitoring signals (must be green during canary)
+---------------------------------------------------
+- SLOs: request p99 latency relative delta <= 10% and absolute p99 inside SLA target.
+- Errors: request error rate increase <= 0.01% absolute; business-critical routes require 0 increase.
+- Quality: BLEU/ROUGE/embedding-sim metrics on eval prompts must be within the regression gate (default: < 1.5% quality loss).
+- Cost: per-token CPU/GPU time reduction >= projected threshold.
+- Kernel health: no new kernel OOMs, kernel launch errors, or NVML thermal spikes.
+
+Profiling playbook excerpts
+--------------------------
+- Sampling plan: stratified sampling across short/medium/long sequences, chat vs. single-call, and top-ten customer tenants.
+- Tools and commands:
+  - nvprof/Nsight: capture GPU kernel timelines for the benchmark trial. Example: 
+    nsight-sys profile --output=nsys-report.nsys --trace=cuda,nvtx --duration=120 ./serve-bench --profile-target=canary-pool
+  - Kernel traces: ensure kernel names are mapped to canonical IDs using the kernel-mapper utility: 
+    python tools/kernel-mapper.py --input nsys-report.nsys --output kernel-latency.csv
+  - Per-request trace: use the trace-correlator to stitch system-level traces to request IDs: 
+    ./trace-correlator --trace-dir traces/ --tag fidelity-surgeon-1234 --out stitched.json
+
+Benchmarking suite: what to run and why
+--------------------------------------
+- Microbenchmarks: single-batch synthetic runs to measure kernel latency and occupancy at fixed sequence lengths.
+- Replay benchmarks: replay captured production traffic with preserved inter-arrival timing. This shows end-to-end behavior (queueing, batching).
+- Shadow A/B: run new path in shadow mode with sampling of produced outputs for offline quality scoring.
+- Cost simulation: feed kernel-level latencies into the cost model to project monthly delta.
+
+Example bench commands
+----------------------
+- Synthetic micro: 
+  ./bench/micro --model rwind-7b --batch-size 1 --seq-len 256 --kernel-profile > micro-256.log
+- Replay: 
+  ./bench/replay --trace traces/capture-20261001.tar.gz --scale 1.0 --inject-tag fidelity-surgeon-5678 --out replay-report.json
+
+Kernel scheduling knobs and notes
+--------------------------------
+- Admission window: reduce admission window for int8 kernels to avoid long head-of-line blocking with high-occupancy kernels. Typical knob: runtime.scheduler.admission_ms (default 3ms) -> 1.5ms for micro-kernel heavy workloads.
+- Priority decay: lower priority decay to bias warmup cohorts into prefetch success for cache-sensitive flows.
+- Cooperative preemption: enable for high-mix pools when deploying new kernels to help prevent starvation. Flag: runtime.scheduler.coop_preempt=true.
+- Kernel crediting: track kernel cost units per-request and enforce soft quotas to limit noisy-neighbor impact.
+
+Acceptance criteria (canary gates)
+---------------------------------
+Table: acceptance thresholds (must be strings per JSON schema but presented in a table-like block)
+
+- SLO_p99: "<= baseline_p99 * 1.10"
+- Error_rate_delta: "<= 0.0001 (absolute)"
+- Eval_quality_pass: ">= 98.5% of baseline score on eval set (configurable)"
+- Cost_delta: ">= projected_savings OR documented justification for cost-neutral change"
+- Kernel_stability: "0 kernel OOMs, 0 new kernel launch errors in canary window"
+
+Rollback plan
+-------------
+- Immediate rollback triggers: any of the following should trigger an automated rollback and pager:
+  1) p99 latency > acceptance threshold for 3 consecutive measurement windows (5-minute windows).
+  2) quality regression detected above tolerance on sampled outputs.
+  3) kernel crash, OOM, or interconnect fault.
+- Rollback procedure:
+  1) Flip feature flag to previous image using the rollout controller: 
+     ./rolloutctl promote --target previous --tag fidelity-surgeon-1234 --reason "auto-rollback"
+  2) Confirm system converges and monitor the same signals for 30 minutes.
+  3) Create incident ticket and attach all artifacts (nsys report, stitched traces, shadow-report.json).
+
+Known issues and mitigation notes
+--------------------------------
+- Int8 microkernels show sporadic latency spikes at p99 on sequence length > 1024 due to tensor-slice alignment. Mitigation: apply kernel alignment patch (K-alignment-v2) or restrict int8 to seq<=1024.
+- KV-cache warmup mismatch: quantized kernels may interpret KV padding differently; run the kv-warmup-mapper job during canary.
+- Scheduler hysteresis: rapid fidelity flips can cause scheduler thrashing; enforce a 30-minute minimum cool-down on pool-level knob changes.
+- Observability gaps: early int8 rollouts may not tag kernel names correctly in legacy telemetry; ensure kernel-mapper version >= 2.12.
+
+Release note template (for product/release notes)
+------------------------------------------------
+Summary: "Runtime: deploy int8 microkernel path for rwind-7b on production pools. Expected improvements: ~7% unit GPU cost reduction at p50 latency parity. Rollout: staged canary with automated rollback."
+Impact: "Lower per-token cost; potential small quality drift in edge cases (long sequences)."
+Rollout: "0.5% -> 5% -> 25% -> 100% over 48 hours if gates pass."
+Monitoring: "SLOs: request p99, kernel health, eval-quality snapshot for top 20 customers."
+Known limitations: "Do not enable for on-prem clusters with older cuDNN versions (see compatibility table)."
+
+Compatibility table (text)
+- cuDNN >= 9.0: supported
+- CUDA >= 12.2: recommended
+- kernel-mapper >= 2.12: required for accurate telemetry
+
+Operational ownership and contacts
+----------------------------------
+- Primary owner: runtime-ops (team alias: runtime-ops@redwood.com)
+- Applied ML owner: applied-ml-evals@redwood.com
+- PagerDuty escalation: runtime-pager (P1)
+
+Postmortem and retrospective triggers
+-------------------------------------
+If a rollout hits an automated rollback or an unexpected quality regression, initiate a 72-hour postmortem with the following deliverables:
+- Timeline of events (minute-level)
+- Traces and profiles (NSYS, kernel-latency.csv)
+- Hypothesis and test plan for next patch
+- Action items and owners
+
+Appendix: useful commands and scripts
+------------------------------------
+- Shadow replay harness: ./bin/shadow-replay --help
+- Kernel mapper: python tools/kernel-mapper.py --help
+- Rollout controller: ./rolloutctl status --tag fidelity-surgeon-1234
+- Cost delta estimator: python tools/cost-sim.py --input replay-report.json --output cost-estimate.csv
+
+References
+----------
+- Runtime scheduler decision fabric (internal): /confluence/eng-serving-runtime/kernel-and-scheduling/scheduler-decision-fabric-and-telemetry-playbook-2024
+- Profiling playbooks: /confluence/eng-serving-runtime/profiling-playbook/telemetry-feedback-kernel-autotune-playbook-2026
+- Benchmarking suite docs: /confluence/eng-serving-runtime/benchmarking-and-perf-suite/runtime-deployment-sanity-and-benchmark-suite-acceptance-2026
+
+Document history
+----------------
+- 2026-02-15: created by Alexandra M. Rivera
+- 2026-04-12: added KV-cache warmup notes (Priya Kaur review)
+- 2026-10-03: clarified acceptance thresholds and added rollback automation steps (Daniel S. Cho review)

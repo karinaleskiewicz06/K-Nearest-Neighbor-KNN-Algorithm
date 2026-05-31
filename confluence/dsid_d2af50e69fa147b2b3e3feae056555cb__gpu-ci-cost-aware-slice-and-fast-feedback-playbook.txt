@@ -1,0 +1,123 @@
+GPU CI: cost-aware slicing and fast-feedback playbook
+
+Summary
+-------
+This playbook documents a pragmatic CI/CD pattern for running GPU-backed tests and evaluation workloads with aggressive cost controls and fast developer feedback. It is intended for the infra, evaluation, and eng-eval CI owners who operate ephemeral GPU pools, Terraform modules, and egress/burst networking for multi-tenant evaluation traffic.
+
+Goals
+- Keep median CI iteration time under 12 minutes for quick feedback on model/kernel changes.
+- Limit monthly CI GPU spend to a predictable budget with automated throttles and cost-slicing.
+- Avoid noisy-neighbour interference with production inference pools.
+- Provide safe canary promotion path for kernel and iac changes that affect runtime performance.
+
+Scope and audience
+- Applies to CI pipelines that run GPU-backed unit/integration/eval workloads (ephemeral or reserved).
+- Not for long-running training jobs or customer production inference pools.
+- Owners: ci-gpu-team, infra-provisioning, runtime-kernels.
+
+Principles
+1. Cost-shaping at the CI layer: shape test parallelism based on token-equivalent budget rather than only node count.
+2. Fast-fail first: prioritize small, fast tests to provide early feedback; run expensive flakes in lower-priority windows.
+3. Isolation by lane: separate "canary-iac/kernel" lanes from the default smoke lanes; canaries get limited warm pools.
+4. Declarative safety: all infrastructure changes must go through small Terraform modules with explicit budget variables and feature flags.
+
+High-level architecture
+- CI orchestration (Buildkite/GH Actions) triggers test workload definitions stored next to code.
+- gpu-provisioner service (internal) creates ephemeral pools via Terraform module gpu-ephemeral-pool-module.
+- burst-orchestrator manages egress credits and routes traffic through egress-shim for billing isolation.
+- telemetry exporter tags all traces/metrics with ci.run_id and cost.slice_id for billing.
+
+Pipeline stages (recommended)
+1. preflight (0-4m): lint, small CPU-only unit tests.
+2. warmup (2-6m parallel): request ephemeral pool reservation (small size) and run tokenizer & model-load smoke tests.
+3. fast-slice tests (4-10m): many small GPU tests confined to 1 token-equivalent budget slice.
+4. expensive-slice tests (10-40m, scheduled): longer evals scheduled in time-windowed slot or queued to lower-priority cluster.
+5. canary promotion (manual/auto): run a canary pipeline that deploys new kernel/iac to a dedicated mini-pool and runs perf regressions.
+
+Cost-slicing model (concept)
+- Define a unit: token-equivalent (TE) where 1 TE ≈ 1k tokens on a standard model benchmark.
+- Each test declares a TE budget: e.g., smoke=0.1 TE, embedding-eval=2.5 TE.
+- The gpu-provisioner maps TE budgets to pool sizes and runs using runtime-cost-profile.
+- Global monthly CI TE quota enforces throttling when project-level spend thresholds are hit.
+
+Terraform modules and interface (table)
+| Module name | Purpose | Key vars (required) | Outputs |
+| gpu-ephemeral-pool-module | Create ephemeral pool + node group scoped to pipeline | team (string), te_budget (number), max_nodes (int), egress_policy (string) | pool_id, k8s_cluster, billing_tag |
+| burst-credit-orchestrator | Allocate egress credits and priority lanes | project_id, monthly_te_quota, emergency_backstop | credit_id, remaining_te |
+| iac-canary-guard | Feature flag + canary rollout wrapper for kernel/IaC | canary_enabled (bool), canary_window_minutes (int) | canary_run_id |
+
+Operational runbook: failed reservation
+1. Detect: pipeline step "warmup" fails with "pool-not-ready" within 6m.
+2. Quick mitigation (automated): retry reservation with exponential backoff (30s, 60s, 2m) up to 3 attempts.
+3. If still failing: escalate to infra-provisioning oncall via PagerDuty (severity: P2) and attach ci.run_id and last 3 terraform logs.
+4. Manual recovery: run `./scripts/ci/force-release-pool --pool <pool_id>` then requeue.
+5. Post-incident: owner files a short postmortem, run a 30-day quota audit for the offending project.
+
+Monitoring, alerts, and SLOs
+- SLO: 95th percentile warmup completion < 6 minutes. Alert when 5% of warmup steps in a 1h window exceed 6 minutes.
+- Cost SLO: Monthly CI TE spend must remain within 5% of forecast. Alert on projected to exceed threshold with 72h runway.
+- Noisy neighbor SLI: CPU/GPU steal > 3% for any node during CI windows triggers immediate eviction of that test and a remediation ticket.
+
+Alerting thresholds (recommended)
+- warmup_latency_p95 > 6m -> PagerDuty P3 to infra-provisioning
+- ci_te_month_projection > budget * 1.05 -> Slack alert (#infra-finops) + runbook kickoff
+- gpu_steal_rate > 3% for >10m -> automated test kill + P2 alert
+
+Canary and rollout procedure for kernel or IaC changes
+1. Open small CL with cloud-only/infra changes and include `canary: true` in PR description.
+2. CI triggers canary lane: provisions a bounded mini-pool (max_nodes=2, te_budget=5) in non-prod region.
+3. Run perf suite: throughput, latency, kv-cache-hit-rate, token-efficiency. Minimum checks:
+   - median latency delta < +10% vs baseline
+   - throughput diff within -15% to +10%
+   - kv-cache hit-rate >= baseline - 2ppt
+4. If checks pass for 3 consecutive runs, promote to staging canary with larger pool. Automatic rollback if any metric crosses hard-fail thresholds.
+
+Terraform/IaC safety checklist (pre-merge)
+1. All modules version-pinned and have unit tests (terraform-compliance).
+2. Changes that alter `egress_policy` require explicit reviewer from networking team.
+3. New variables must come with sane defaults and budget max caps.
+4. Run `make tf-plan-ci` that executes plan against a dry-run backend with `ci=true` tags.
+
+Sample CI snippet (Buildkite-like)
+```
+steps:
+  - label: ":thermometer: warmup"
+    command: ./ci/warmup.sh --te-budget ${TE_BUDGET}
+    agents:
+      queue: gpu-warmup
+    timeout_in_minutes: 12
+  - wait
+  - label: ":rocket: fast-slice"
+    command: ./ci/fast_slice_runner.sh --slice_id ${SLICED_ID}
+    parallelism: 6
+```
+
+Developer guidance and best practices
+- Prefer tests that declare TE budget and explicit timeout. Avoid opaque test suites that spin up long-eval runs by default.
+- Use local cpu-mock mode for rapid iteration when possible (see `./tools/local-eval-mock`).
+- Annotate any PR that affects `gpu-ephemeral-pool-module` with the `infra-impact` label to trigger extra CI checks.
+
+Ownership and escalation
+- Primary owner: ci-gpu-team
+- Secondary owner: infra-provisioning
+- On-call routing: infra-provisioning -> runtime-kernel -> networking
+- Postmortem: triggered for any P1/P2 affecting > 10% of CI runs in 24h or cost overshoot > 10% monthly.
+
+Appendix A: Commands and snippets
+- Force release pool: `./scripts/ci/force-release-pool --pool $(cat /tmp/ci_pool_id)`
+- Query TE usage: `r-infra-cli te query --project ${PROJECT} --window 30d --format json`
+- Dry-run terraform for CI: `make tf-plan-ci TF_VAR_ci=true TF_VAR_team=${TEAM}`
+
+Appendix B: Known limitations (2026-01)
+- Per-slice TE accounting has ±5% inaccuracy for heterogenous kernels; we use a smoothing window to avoid frequent throttles.
+- Egress-shim does not yet support per-tenant TLS term; networking team is tracking in a separate RFC.
+
+Related reading
+- See module reference: gpu-ephemeral-pool-module README and burst-credit-orchestrator API spec (internal).
+- Cross-team playbooks: `gpu-tenant-eviction-predictor` and `egress-fallback-fabric` for advanced fallback patterns.
+
+Document history
+- 2025-09-15: initial draft (Avery Chen)
+- 2025-11-02: added cost-slicing model & Terraform checklist (Samir Patel)
+- 2026-01-10: updated canary thresholds and monitoring SLO (Jordan Lee)
+

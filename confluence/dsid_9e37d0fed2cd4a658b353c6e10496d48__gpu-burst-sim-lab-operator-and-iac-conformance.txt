@@ -1,0 +1,184 @@
+Burst Fabric Simulation Lab Operator & IaC Conformance
+
+Summary
+
+This doc describes the design and operational runbook for the GPU Burst Fabric Simulation Lab (BurstLab) operator and the accompanying Terraform/IaC conformance checklist. BurstLab is a self-service sandbox for validating multi-region/burst workloads, preemption-fallback logic, and IaC safety gates before changes are promoted to production GPU pools. The goal is to reduce rollout risk for autoscalers, burst-orchestrators, and tenant-facing network egress policies.
+
+Key outcomes
+- Automated simulation of burst scenarios (sudden large allocations, spot preemption waves, egress saturation).
+- IaC conformance checks that validate topology, routing, and egress-burst constraints.
+- CI gating: safe promotion only when simulations and telemetry assertions pass.
+- Clear incident playbook for common failure modes discovered by lab runs.
+
+Scope and boundaries
+- Scope: GPU allocation, warm-pool handoff, egress routing under burst, cross-region replica fallbacks, and Terraform module compatibility.
+- Out of scope: customer-facing billing reconciliation (handled elsewhere), model-level token accounting instrumentation.
+
+Owners and contacts
+- Primary owner: eng-infra: capacity-team (oncall: @capacity-oncall)
+- Secondary owner: eng-infra: cloud-networking
+- CI/CD owner: eng-infra: ci-team
+- Emergency contact: Pager duty for infra SRE (page policy: Severity 1)
+
+Architecture overview (text diagram)
+
+BurstLab operator sits in a staging AWS/GCP account and orchestrates ephemeral multi-region test clusters. Text diagram:
+
+[BurstLab controller] -> creates -> [test GPU pool A (us-west1)] -> attaches -> [burst-orchestrator]
+                              \-> creates -> [test GPU pool B (europe-west1)] -> attaches -> [warm-pool replicator]
+
+A traffic generator submits synthetic inference traffic via a tenant-proxy that exercises: batching, KV cache hit/miss patterns, long-tail sequence lengths. The operator can inject failures: simulated spot preemption, egress NAT exhaustion, and TC/iptables route blackhole.
+
+Prerequisites
+- Burstable staging accounts with isolated VPCs and ephemeral IAM roles (see Terraform module: burstlab/account-module).
+- Access to test image registry: gcr/redwood-infra-burstlab and a signed image promotion flow.
+
+Terraform/IaC conformance checklist (table-style bullets)
+- Module version pinning: terraform >= 1.4, modules pinned to a release tag.
+- Network CIDR safety: test-subnets must be /22 or larger and annotated with purpose=burstlab.
+- Egress guardrail: nat-gateway count >= expected-burst-egress/64MBps.
+- IAM least privilege: ephemeral role sasl/burstlab-runner limited to create:test-* prefixed resources.
+- KMS & secrets: all test artifacts must use customer-managed test KMS key with key policy: allow principals from burstlab account.
+- CI token scoping: GHA runner tokens expire in < 1h and are restricted to project:test only.
+
+Terraform snippet (example)
+
+```hcl
+module "burstlab_account" {
+  source = "git::ssh://git@github.com/redwood-infra/terraform-modules.git//burstlab-account?ref=v0.12.0"
+
+  account_name = "burstlab-staging-usw1"
+  region       = "us-west1"
+  vpc_cidr     = "10.40.0.0/16"
+  tags = {
+    purpose = "burstlab"
+  }
+}
+```
+
+CI/CD gating and pipeline example (GitHub Actions snippet)
+
+- Pipeline phases: plan -> apply-test -> simulate -> assert -> destroy
+- Gate rule: PR cannot be merged unless simulation assertions pass in the last successful workflow run.
+
+GHA snippet:
+
+```yaml
+name: BurstLab Conformance
+on: [pull_request]
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v2
+      - run: terraform init
+      - run: terraform plan -out=plan.tfplan
+
+  apply-test:
+    needs: plan
+    runs-on: ubuntu-latest
+    steps:
+      - run: terraform apply -auto-approve plan.tfplan
+      - run: ./scripts/launch-burstlab.sh --profile ${{ secrets.BURSTLAB_ROLE }}
+
+  simulate:
+    needs: apply-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - run: ./scripts/run-burst-scenarios.sh --scenarios all
+
+  assert:
+    needs: simulate
+    runs-on: ubuntu-latest
+    steps:
+      - run: ./scripts/check-telemetry-assertions.sh --ci
+
+  destroy:
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: terraform destroy -auto-approve
+```
+
+Simulation scenarios (examples)
+1) Rapid tenant spike: 10k concurrent small inference requests over 30s to test autoscaler reaction and KV cache miss storm.
+2) Spot wave: terminate 40% of nodes in us-west1 in a coordinated window to validate warm-pool seeding and cross-region fallback.
+3) Egress saturation: flood NAT gateway to exceed allocated throughput to test egress-sharding logic and tenant backpressure.
+4) Kernel update ripple: deploy quantized kernel change and assert latency regression < 5% p95.
+
+Telemetry assertions (pass/fail criteria)
+- Allocation success rate: >= 99.5% across the 5m window post-spike.
+- Eviction cascade depth: <= 2 (no more than 2 handoff hops).
+- Tenant request p95 latency regression: < 10% vs baseline.
+- Token billing hook verified: synthetic tokens recorded in staging billing sink.
+
+SLOs used by this lab (for gating)
+- Simulation pass rate required: 100% of defined assertions for critical PRs.
+- Allowed transient flakiness: no more than 1 non-critical assertion failure per week for the ci:burstlab job.
+
+Runbook: failure modes & remediation
+
+Mode A: Plan/apply fails due to module pin mismatch
+- Symptom: terraform plan errors with provider version mismatch.
+- Triage steps:
+  1. Check workflow logs for exact provider requirement.
+  2. Confirm tfenv/terraform setup in GHA matches pipeline version.
+  3. If module requires provider bump, open a follow-up PR to update module references and add a changelog entry.
+
+Mode B: Allocation success < SLO after spike
+- Symptom: allocation success 93% in 5m window.
+- Immediate steps:
+  1. Page capacity-oncall.
+  2. Run `./scripts/collect-cluster-state.sh --since 10m` and attach to the page.
+  3. Check warm-pool sizes: `kubectl -n burstlab get hpa,warmpool` and confirm desired replicas.
+  4. If warm-pool not seeding, manually increase warm-pool to target and re-run scenario.
+
+Mode C: Egress NAT saturation causing cross-account fallout
+- Symptom: persistent SNAT exhaustion, TCP resets for external storage replication.
+- Immediate steps:
+  1. Switch burstlab test VPC to backup egress (egress-fabric-fallback) via console toggle.
+  2. Throttle synthetic traffic generator: `kill -SIGTERM $(cat /tmp/burstlab-gen.pid)` and backoff.
+  3. Patch Terraform nat-gateway count and reapply with a canary target.
+
+Investigation checklist
+- Gather: terraform state, kube events, node-level dmesg, cloud provider event feed (preemptions), and NAT gateway metrics.
+- Telemetry queries: preemption_count_by_zone, kv_cache_miss_rate, nat_snat_errors, allocation_failure_reasons.
+
+Safety & cost controls
+- Each run is limited by default budget tags and an automatic destroy step. Runs exceeding $2000 estimated cost abort and notify finance.
+- Test accounts are flagged so billing export streams are separated from prod.
+
+Promote-to-prod criteria
+1. Module and network changes must pass BurstLab simulation with zero critical assertions failing in 3 consecutive runs.
+2. A performance benchmark (p95 latency delta) must be within the accepted regression window (< 5% for non-quant kernel changes; < 10% for large kernel experiments).
+3. Runbook steps documented and reviewed by at least two reviewers.
+
+Operational play: how to run a manual ad-hoc simulation
+1. Checkout repo: `git clone git@github.com:redwood-infra/burstlab-operator.git`
+2. Create ephemeral workspace: `make workspace && export TF_WORKSPACE=pr-<id>`
+3. Apply with test role: `terraform apply -var-file=tests/pr-<id>.tfvars -auto-approve`
+4. Launch scenario: `./scripts/launch-scenario.sh spike --concurrency 10000 --duration 30s`
+5. Record run id and attach logs to PR.
+
+Postmortem requirements for failed gates
+- If a PR fails the gate, author must: attach failing run id, telemetry dashboards, and a short failure summary in PR description.
+- If failure causes production impact, open a full incident with Sev classification and link to burstlab run ids that reproduce the issue.
+
+Appendix: diagnostic commands
+- Collect node telemetry: `for n in $(kubectl get nodes -o name); do kubectl logs -n kube-system $n || true; done`
+- Check NAT metrics (GCP example): `gcloud compute routers get-status <router> --region=us-west1`
+- Retrieve preemption feed: `aws ec2 describe-spot-instance-requests --filters Name=state,Values=active,closed`
+
+References
+- See Terraform module catalog: /confluence/eng-infra/terraform-and-iac/module-stability-testing-and-rollback-catalog.json
+- Burst orchestrator design notes: /confluence/eng-infra/gpu-fleet-and-capacity/gpu-burst-fairshare-lattice-allocator-playbook.json
+
+Notes and future work
+- Plan to integrate an experimental cost-simulator that estimates token-level chargebacks across burst scenarios.
+- Add a synthetic tenant harness that mirrors top-10 customer traffic patterns for more realistic regressions.
+
+Document history
+- Created 2024-09-03 by Maya Patel
+- Major update 2025-01-18: added CI gating snippet and stricter telemetry assertions

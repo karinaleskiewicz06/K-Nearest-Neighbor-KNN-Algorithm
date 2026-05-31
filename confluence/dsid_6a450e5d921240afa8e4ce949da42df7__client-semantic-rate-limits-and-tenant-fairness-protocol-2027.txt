@@ -1,0 +1,155 @@
+client-semantic-rate-limits-and-tenant-fairness-protocol-2027
+
+Summary
+=======
+This document defines the Client Semantic Rate Limits (CSRL) protocol and a Tenant Fairness enforcement policy for Redwood inference endpoints. CSRL augments token- and request-level throttles with semantic quotas (by model, route, and customer intent) and a runtime fairness allocator so multi-tenant capacity is shared predictably during contention.
+
+Goals
+- Provide a clear API-facing contract for clients about what will be counted against quotas and when requests may be delayed or rejected.
+- Ensure no tenant can monopolize shared serving capacity during bursts while preserving latency for high-SLO traffic.
+- Allow operators to express weighted fairness, emergency overrides, and per-route cost signals.
+
+Motivation
+----------
+Traditional rate limits (requests/sec, tokens/min) are necessary but insufficient for inference products because:
+- Different request shapes have different cost/latency (short chat vs. long-generation).
+- Customers need predictable degradation semantics for business-critical routes.
+- Simple static quotas do not capture intent: e.g., many short low-cost requests should not be blocked by a few long heavy ones.
+
+Scope
+-----
+Applies to: Redwood hosted inference endpoints and the shared Dedicated pools where multi-tenant scheduling is enabled. Not in scope: private on-prem deployments where customers control their own throttling (we provide the specification for interoperability).
+
+Definitions
+-----------
+- semantic-unit: A normalized usage unit that expresses cost intent. By default: 1 request = 1 sem-unit for short calls; long generations translate to >1 sem-unit based on tokens and model profile.
+- route: Logical API route (e.g., /v1/generate-chat, /v1/embed).
+- tenant: Customer account namespace.
+- weight: Configured numeric factor that biases fairness allocation (higher weight -> larger share under contention).
+
+Protocol: how client semantics are communicated
+-------------------------------------------
+1) Client Hints (optional headers / body fields)
+   - X-Redwood-Intent: "interactive" | "background" | "batch" (helps classify latency tolerance)
+   - X-Redwood-Priority: numeric 0..10 (higher is more important; optional, used only if tenant permits)
+   - model_hint: model id or model class (in request body) so router can apply model profiles
+
+2) Server-side semantic costing
+   - Cost computation: cost = ceil(max(1, (estimated_output_tokens + estimated_input_tokens) * model_cost_factor))
+   - model_cost_factor is derived from the model capability manifest and per-variant profiler.
+   - Example: short chat (est. 20 tokens, factor 0.2) -> cost = ceil(max(1, (20)*0.2)) = 4 sem-units.
+
+3) Quotas and quotas buckets
+   - Each tenant has: burst_bucket (tokens), sustained_window (quota per minute), route_caps (optional overrides), reserved_capacity (for Dedicated customers).
+   - Semantic quotas are charged against the sustained_window and burst_bucket.
+
+Fairness allocator (runtime behavior under contention)
+----------------------------------------------------
+1) Allocation inputs
+   - available_capacity_sem_units (real-time view of runnable capacity)
+   - active_tenants and their current queued demand (sem-units)
+   - tenant_weights (configurable) and tenant_reserved_capacity
+   - route_priority_modifiers (per-route SLOs)
+
+2) Algorithm (high-level)
+   - Compute fair_share = tenant_weight / sum(weights of active tenants) * available_capacity
+   - Soft-saturate share for tenants whose queued demand is small: give them min(demand, fair_share)
+   - If any tenant has reserved_capacity, subtract it from available_capacity before fair shares
+   - Enforce per-tenant max concurrency and per-route SLO-preserving floor (e.g., preserve up to 10% of capacity for high-SLO routes)
+
+3) Admission outcomes
+   - admitted_immediately: enough capacity in fair share and burst_bucket
+   - delayed_with_handover: request enqueued with an ETA and client receives Retry-After + queue token
+   - rejected_quota_exceeded: 429 with reason and suggested mitigation (reduce tokens, switch model)
+
+Enforcement points and contract messages
+---------------------------------------
+- Edge Gateway: lightweight pre-checks for basic token and sustained_window allowance; returns immediate 429s for obvious quota violations.
+- Router/Admission Coordinator: authoritative semantic-cost computation, fairness allocation, queue tokens.
+- Runtime Executor: final admission, precise local eviction when kernel preemption occurs.
+
+Client-visible response headers and bodies
+- X-Redwood-Semantic-Cost: integer sem-units charged
+- X-Redwood-Quota-Remaining: sem-units remaining in sustained_window
+- Retry-After: seconds if delayed
+- body: {"error": "quota_exceeded", "suggestions": ["reduce_max_tokens", "use-compact-model"]} 
+
+Configuration examples (table)
+----------------------------
+| tenant_tier | sustained_quota_per_min | burst_bucket | default_weight | reserved_capacity |
+| enterprise  | 10000                   | 5000         | 10             | 30%               |
+| startup     | 2000                    | 500          | 2              | 0%                |
+| free        | 200                     | 50           | 1              | 0%                |
+
+Example JSON quota policy (declarative)
+```
+{
+  "tenant": "acme-corp",
+  "sustained_quota_per_min": "5000",
+  "burst_bucket": "1200",
+  "default_weight": "5",
+  "route_overrides": {
+    "/v1/generate-chat": {"weight": "8", "floor_capacity_pct": "10"}
+  }
+}
+```
+
+Operational guidance and observability
+-------------------------------------
+- Metrics to emit (per-tenant and cluster-aggregated):
+  - csrl.request_cost (count sem-units charged)
+  - csrl.queue_length (requests queued)
+  - csrl.admissions.{immediate,delayed,rejected} (counts)
+  - csrl.fair_share_fraction (ratio of allocated to theoretical fair share)
+- Dashboards: per-tenant heatmap (sustained_quota vs consumption), global contention tracer, and top-10 route-actions causing the most semantic cost.
+- Alerts:
+  - P1 if global utilization > 92% and queued requests for >5 minutes
+  - P2 if any enterprise tenant sees >2% rejected rate for >30m
+
+SLOs (example baselines)
+- Admission latency for interactive intent: 95th percentile < 120ms when cluster utilization < 80%
+- Queue ETA accuracy: median error < 200ms
+
+Rollout and migration plan
+-------------------------
+1) Canary (2 weeks): enable semantic costing and allocator in read-only mode for 5% of traffic (emit metrics but do not enforce).
+2) Soft-enforce (4 weeks): activate enforcement for low-risk tenants (internal, dev, free tier) with advisory 429s (include mitigation suggestions).
+3) Enforce-by-default: enable strict enforcement for shared pools with full observability and automated incident escalation.
+
+- Migration checklist:
+  1. Populate model_cost_factor from profiling jobs (eng-serving-runtime).
+  2. Backfill tenant weights from billing / contract data (billing team).
+  3. Add client-gradual-notice emails and SDK warnings (devx).
+
+Safety and overrides
+-------------------
+- Emergency throttle: SRE can mark a tenant as emergency_exempt for X minutes (audited action).
+- Graceful degradation: if capacity drops, the allocator reduces batch sizes and preserves high-SLO route floors before reducing interactive allocations.
+
+Tracing and auditability
+-----------------------
+- Every admission decision must attach a trace id and a reason: {"admit":true, "reason":"fair_share"}. This is stored in short-term audit logs for 7 days and long-term cost accounting for 90 days.
+
+Ownership and review cadence
+---------------------------
+- Owner: eng-platform (oncall: inference-routing-team)
+- Reviewers: capacity-planning, billing, devx, security
+- Review cadence: quarterly for config defaults, immediate review for any changes to weight or reserved_capacity affecting enterprise tiers.
+
+Appendix A: Client SDK best practices
+------------------------------------
+1) Surface X-Redwood-Intent via SDK helpers; prefer enum values rather than free text.
+2) On 429 with "quota_exceeded" prefer: exponential backoff with jitter, optionally switch to a smaller model.
+3) Include optional estimate fields in request to help server cost estimation: {"estimated_output_tokens": 64}.
+
+Appendix B: Sample observability query (pseudo):
+- sum by (tenant) (rate(csrl.request_cost[5m])) / sum(rate(csrl.admissions.immediate[5m]))
+
+References
+- api-rate-tiering-and-contract-versioning-playbook-2026 (internal)
+- prompt-telemetry-response-lineage-spec-2026 (internal)
+
+Change log
+- 2026-12-07: Document created (Priya N.)
+- 2027-01-12: Added queue token semantics and Retry-After guidance (Marcus C.)
+- 2027-02-09: Clarified admission tracing requirements and SLO baselines (Linnea W.)

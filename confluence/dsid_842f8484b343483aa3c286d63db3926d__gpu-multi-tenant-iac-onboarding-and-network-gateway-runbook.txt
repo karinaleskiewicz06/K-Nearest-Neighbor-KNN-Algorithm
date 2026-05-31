@@ -1,0 +1,163 @@
+GPU multi-tenant IaC onboarding and network gateway runbook
+
+Summary
+========
+This runbook documents the recommended pattern for onboarding new tenants to Redwood's multi-tenant GPU fleet using an IaC Gateway pattern. It ties together Terraform modules, privileged deployment gateway controls, per-tenant network boundaries, egress shaping, and CI/CD promotion for GPU node images. The goal is a reproducible, auditable path that reduces blast radius while keeping developer experience self-serve.
+
+Goals
+-----
+- Provide a guarded IaC Gateway flow that enforces security and networking policy for tenant GPU onboarding.
+- Ensure capacity & quota checks run before any resource creation to avoid overcommit.
+- Standardize Terraform module inputs and preflight validations for per-tenant VPCs, subnets, NAT, and firewall rules.
+- Integrate GPU image promotion and node pool lifecycle with CI/CD canaries and automated rollback.
+- Document incident mitigation and rollback procedures for network or capacity failures during onboarding.
+
+Scope and Non-Goals
+-------------------
+Scope: tenant VPC provisioning, subnet allocation, GPU node pool creation, IAM/service-account scoping, egress/NAT configuration, Terraform and CI/CD interactions, capacity gating.
+Non-goals: per-application deployment manifests, billing account creation, legal/compliance approvals (these live in separate flows).
+
+Ownership
+---------
+- Primary: infra (cloud platform) team (onboarding and IaC Gateway operator).
+- Secondary: GPU fleet team (capacity APIs), networking team (hub VPC & transit), security (IAM review).
+- Escalation: Pager duty — infra-oncall -> platform-engineering -> networking leads.
+
+Key Concepts and Patterns
+-------------------------
+1. IaC Gateway: a centrally-run pipeline with least-privilege credentials that performs Terraform plan/apply on behalf of tenant owners. Tenants submit a parametrized request (gitops PR or web form) and the Gateway performs validation, policy checks, and the apply.
+2. Preflight capacity gating: a set of API checks that validate GPU quota, host-type availability in region, and expected unit-cost before provisioning. Fails fast if capacity cannot be guaranteed.
+3. Per-tenant network boundary: each tenant gets a dedicated VPC or a logically isolated segment within a shared VPC (shared-vpc pattern) depending on security profile. Network controls include egress policies (NAT gateway or egress proxy), subnet allocation table entries, and firewall tag scoping.
+4. Image promotion tie-in: GPU node images are promoted through a CD pipeline. Onboarding includes selecting an image channel (stable/canary) and includes an option to bootstrap with canary nodes before promoting to full pool.
+
+Prerequisites (checks the Gateway performs)
+------------------------------------------
+- Tenant account exists in org and has billing linked.
+- Owner SSO group mapped to tenant namespace in RBAC.
+- GPU quota available in requested region: call GET /capacity/gpu-quota?region=...
+- Node image channel valid (stable, canary, nightlies).
+- IP CIDR range check: non-overlapping with central infra and other tenants (CIDR allocator service).
+- Approved network egress policy per tenant classification.
+
+Terraform Module Inputs (required/typical)
+-----------------------------------------
+| variable | description | example | required |
+|-----------|-------------|---------|----------|
+| tenant_id | Unique tenant identifier | tenant-acme | yes |
+| vpc_cidr  | CIDR allocated to tenant VPC | 10.40.0.0/16 | yes |
+| region    | Cloud region for resources | us-west1 | yes |
+| gpu_node_count | initial GPU node count | 2 | yes |
+| gpu_instance_type | GPU SKU | nvidia-a100-80gb | yes |
+| node_image_channel | stable/canary | canary | yes |
+| egress_mode | nat/proxy/none | proxy | no |
+| billing_code | internal cost center | prod-search | no |
+
+Recommended Terraform module outputs (used by downstream automation)
+- vm_pool_id
+- node_pool_autoscaler_policy
+- tenant_vpc_id
+- subnet_ids (control plane/data)
+
+CI/CD pipeline (IaC Gateway) — overview
+-------------------------------------
+This pipeline runs in a central control account with a short-lived credential broker and contains the following stages:
+1. Validate: lint Terraform, run tflint, check module version pins.
+2. Policy Engine: run OPA/Conftest policies (CIDR rules, IAM least privilege, egress requirements).
+3. Preflight Capacity Check: query GPU capacity API and pricing estimator.
+4. Plan: terraform plan with a gravity-limited workspace and output planfile.
+5. Human Approval Gate: for first-time tenant provisioning or if capacity thresholds are >80% in region.
+6. Apply (canary): apply with node_image_channel=canary and gpu_node_count=1-2. Run smoke tests.
+7. Promote: if canary succeeds, apply with requested gpu_node_count and image channel.
+8. Post-check: run networking verification (connectivity to control-plane endpoints, egress test), IAM checks, and registration into the tenant inventory.
+
+Sample pipeline fragment (pseudo-yaml)
+------------------------------------
+- name: preflight-checks
+  run: |
+    ./scripts/check_quota.sh --region ${REGION} --gpus ${GPU_COUNT}
+    ./scripts/check_cidr_collision.sh --cidr ${VPC_CIDR}
+- name: terraform-plan
+  run: |
+    terraform init -backend-config="bucket=${STATE_BUCKET}"
+    terraform plan -out=plan.tfplan
+
+- name: apply-canary
+  when: approvals.ok
+  run: terraform apply -auto-approve plan.tfplan -var='node_image_channel=canary' -var='gpu_node_count=2'
+
+Capacity Gating Details
+-----------------------
+- Quota API calls must succeed and return available_units >= requested_gpu_count. If available_units < requested_gpu_count, the request is rejected and owner notified with recommended regions or a quota request link.
+- If regional utilization > 85% for the requested GPU SKU, pipeline inserts an automatic delay and notifies platform schedulers for manual review.
+
+Network Gateway (design notes)
+------------------------------
+- Hub-and-spoke architecture. Tenant VPC as spoke. Central hub VPC hosts: egress proxies, NAT gateways, shared services (KMS, logging sinks).
+- Use Private Google Access / AWS PrivateLink equivalents for control-plane endpoints.
+- Egress shaping options: 
+  - NAT Gateway per-tenant (default for high-isolation tenants).
+  - Centralized egress proxy (squid/istio) for monitoring and TLS inspection where permitted.
+- Firewall rules: deny by default, explicitly allow tenant-managed bastion and control-plane egress.
+- IP addressing: automated allocator ensures /24 minimum for node pools; blocklists applied for known bad CIDRs.
+
+Bootstrap smoke tests (post-apply)
+--------------------------------
+1. SSH to one GPU node via jump host (or SSM) and run: nvidia-smi, docker run --gpus all nvidia/cuda:11.8-base nvidia-smi
+2. Validate kubelet registration and taints/labels: kubectl get nodes -l tenant=${TENANT_ID}
+3. Egress test: curl -s --resolve hub.redwood.internal:443:10.1.2.1 https://hub.redwood.internal/health | grep OK
+4. Cost tagging: ensure resources have cost center tags.
+
+Rollback and Incident Steps
+--------------------------
+- If canary nodes fail smoke tests: destroy canary node pool, mark image channel as quarantined, notify image owners, create incident ticket and attach logs.
+- If Terraform apply fails mid-way: run terraform state list and terraform refresh. If partial resource creation occurred, run a destroy in the Gateway workspace then open a manual remediation ticket.
+- Network connectivity failures: validate route table and firewall rules, check NAT gateway health, verify shared-hub VPC peering status. If widespread, failover to backup NAT in another AZ and initiate cross-region mitigation.
+
+Troubleshooting cheatsheet
+-------------------------
+- "Quota denied" -> confirm billing account + request quota increase via self-service link; if urgent, escalate to capacity team.
+- "CIDR overlap" -> query CIDR allocator for conflicting allocation; request re-allocation or choose a different block.
+- "Node image bootloop" -> check cloud-init and serial console logs; revert to previous stable image and mark image as failing in registry.
+- "Nodes stuck in Pending" -> check subnet IP exhaustion and security groups; increase subnet size or enable IP masquerade.
+
+SLOs and Metrics to watch (onboarding flow)
+-------------------------------------------
+- Time-to-provision (goal): < 45 minutes for non-manual approvals.
+- Canaries failing rate: target < 2% per quarter.
+- Preflight false-positives (blocked but actually possible): < 1%
+- Metric sources: onboarding_pipeline.duration, capacity_api.available_units, terraform.apply_failure_rate
+
+Audit and Logging
+-----------------
+- All Gateway runs produce an auditable planfile and signed apply record stored in central bucket for 90 days.
+- IAM changes recorded in cloud audit logs and mirrored to the SIEM.
+- Network flows for initial 24 hours of a tenant are captured and stored for troubleshooting (packet sampling).
+
+Change History
+--------------
+- 2024-08-12: Initial draft authored by Aisha Chen.
+- 2024-10-09: Added capacity gating thresholds and canary promotion steps (reviewers: Marco Rivera).
+- 2025-02-10: Updated network gateway options and rollback steps; clarified SLOs (reviewers: Priya Kannan, Jamal Osei).
+
+Related materials and links
+-------------------------
+- Tenant GPU quotas and fair-share patterns (internal)
+- GPU shared VPC egress and IP management (internal)
+- GPU image promotion canary CD playbook (internal)
+
+Contact and escalation
+----------------------
+- Onboarding owner: infra-onboarding@redwood.ai
+- Platform pager: #infra-pager
+- Security review: security-reviews@redwood.ai
+
+Appendix: useful commands and snippets
+-------------------------------------
+- Check quota (example):
+  curl -sS -H "Authorization: Bearer ${TOKEN}" \\n    "https://capacity-api.redwood.internal/v1/gpus?region=${REGION}&sku=${SKU}"
+- Terraform init in Gateway workspace:
+  terraform init -backend-config="bucket=${STATE_BUCKET}" -reconfigure
+- Destroy canary node pool if failing:
+  terraform destroy -target=module.gpu_pool.resource.google_container_node_pool -auto-approve
+
+End of runbook

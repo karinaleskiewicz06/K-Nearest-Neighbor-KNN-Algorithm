@@ -1,0 +1,436 @@
+Optimize Quality Gates: Eval-Harness Integration Contracts (v1)
+
+## Summary
+This page defines the interface contract between **Optimize** (producer of proposed serving config diffs) and the **Eval Harness** (runner of offline quality evaluations) for **quality guardrails gating**.
+
+The contract covers:
+- Inputs required to run a gate (config diff, baseline, tier, prompt sets, model/runtime metadata)
+- Output schema (per-suite scores, deltas vs baseline, confidence/variance metadata, artifact pointers)
+- State machine + polling semantics
+- SLAs (latency, availability), retry/idempotency rules, and cancellation
+- Versioning and backwards compatibility expectations
+
+This contract is for **Hosted API** gating (initial rollout). Dedicated/Private extensions should follow the same shapes but may use different auth and artifact backends.
+
+---
+
+## Glossary
+- **Gate run**: An eval-harness execution comparing a *candidate* configuration to a *baseline* configuration.
+- **Candidate**: The proposed config (post-Optimize recommendation) to be applied to a route.
+- **Baseline**: The current production config or an explicit historical baseline (e.g., last-known-good gate run).
+- **Tier**: Gate strictness level.
+  - **SMOKE**: fast subset to catch obvious regressions; bounded runtime.
+  - **FULL**: broader coverage + stricter statistical requirements.
+- **Suite**: A named eval bundle (prompt set + metric computation). Suites are the unit of reporting.
+
+---
+
+## Ownership and on-call
+- **Optimize integration owner:** Yara Haddad
+- **Eval Harness integration owner:** Olivia Grant
+- **Evals methodology:** Jonas Weber / Selene Huang
+- **SLO / operational readiness:** Sean Gallagher (SRE), Connor O’Brien (Release Eng)
+
+Support channel: `#eng-ml` (primary), `#eng-sre` (for SLA/availability issues)
+
+---
+
+## High-level flow
+1. Optimize produces a proposed **config diff** for a route/model.
+2. Optimize selects a **baseline** (either explicit baseline snapshot or “current production snapshot”).
+3. Optimize calls Eval Harness to **create** a gate run.
+4. Eval Harness transitions state: `PENDING → RUNNING → (PASSED|FAILED|CANCELED|ERROR)`.
+5. Optimize **polls** for completion and persists the results (and surfaces them in Console).
+6. If passed, Optimize/rollout-controller may proceed with canary enablement; if failed, apply is blocked unless overridden (handled outside this contract).
+
+---
+
+## Environments
+| Environment | Base URL | Notes |
+|---|---|---|
+| Staging | `https://eval-harness.staging.redwood.internal` | Non-customer data; smaller prompt sets; relaxed quotas |
+| Production | `https://eval-harness.prod.redwood.internal` | Customer gating; SLO-backed |
+
+> The service is reachable only from Redwood control-plane networks. External access is not supported.
+
+---
+
+## Authentication and authorization
+- **Auth:** mTLS (service identity) + bearer token (short-lived service token).
+- **Required header:** `Authorization: Bearer <token>`
+- **Service identity allowlist:** `optimize-service`, `rollout-controller` (read-only on results)
+
+Authorization constraints:
+- Optimize may only create gate runs for routes/accounts it is authorized to operate on.
+- Read access to artifacts is via **signed URLs** (time-limited) or via an internal artifact proxy.
+
+---
+
+## API versioning
+### Endpoint versioning
+- All endpoints are namespaced: `/v1/...`
+- Backwards-incompatible changes require a new major version: `/v2/...`
+
+### Schema versioning
+Requests and responses include:
+- `X-Redwood-Schema-Version: 1.3` (semver string)
+- `X-Redwood-EvalHarness-Version: <git_sha>` (for debugging)
+
+Rules:
+- Eval Harness **must** accept requests with the current `1.x` schema version.
+- Eval Harness **may** accept a limited set of older `1.x` minors during rollouts.
+- New fields are additive; clients must ignore unknown fields.
+
+---
+
+## Gate run state machine
+| State | Meaning | Terminal | Notes |
+|---|---:|---:|---|
+| `PENDING` | Accepted but not scheduled | No | Usually short; may be longer during GPU scarcity |
+| `RUNNING` | Currently executing suites | No | Partial progress may be available |
+| `PASSED` | All required suites passed thresholds | Yes | Includes tier-specific details |
+| `FAILED` | At least one required suite failed | Yes | Includes failure reasons |
+| `CANCELED` | Canceled by client or system | Yes | Used for superseded diffs |
+| `ERROR` | System error prevented completion | Yes | Retry behavior depends on error type |
+
+---
+
+## Contract: Create gate run
+### Endpoint
+`POST /v1/gates/runs`
+
+### Idempotency
+- Optimize **must** include `Idempotency-Key` header.
+- Eval Harness will deduplicate for **24 hours** based on `(caller_identity, Idempotency-Key)`.
+- If a duplicate is received, Eval Harness returns the original gate run.
+
+Header:
+- `Idempotency-Key: <uuid>`
+
+### Request body (JSON)
+The request is defined here in descriptive form; field types are normative.
+
+**Top-level fields**
+- `request_id` (string, required): Caller-generated UUID for tracing.
+- `gate_policy_id` (string, required): Policy identifier from Optimize (e.g., `hosted-default-v1`, `enterprise-strict-v1`).
+- `tier` (string enum, required): `SMOKE` | `FULL`.
+- `priority` (string enum, optional): `LOW` | `NORMAL` | `HIGH` (default `NORMAL`).
+- `route` (object, required): Route identity.
+- `model` (object, required): Model identity and serving parameters.
+- `baseline` (object, required): Baseline selection info.
+- `candidate` (object, required): Candidate configuration, expressed as a **config diff**.
+- `suites` (array, required): Suites to run (prompt sets + metric bundle).
+- `constraints` (object, optional): Hard bounds for runtime/cost.
+- `metadata` (object, optional): Debug and attribution tags.
+
+**Route object**
+- `route_id` (string, required): Internal route identifier.
+- `account_id` (string, required): Customer/account identifier.
+- `project_id` (string, optional): Optional project grouping.
+- `region` (string, required): Region where runtime knobs apply (e.g., `us-east`, `eu-west`).
+
+**Model object**
+- `model_id` (string, required): e.g., `rw-llama-3.1-70b-instruct`.
+- `model_family` (string, required): e.g., `llama3.1`.
+- `model_version` (string, required): e.g., `2026-01-18`.
+- `tokenizer_version` (string, optional)
+- `serving_sku` (string, required): Hardware/runtime SKU, e.g., `h100-sxm-80gb`.
+
+**Baseline object**
+Exactly one of:
+- `baseline_snapshot_id` (string): A pinned snapshot of production config.
+- `baseline_gate_run_id` (string): A prior gate run to compare against.
+- `baseline_tag` (string): e.g., `current-production` (resolved by Optimize before calling, preferred for v1).
+
+Baseline requirements:
+- Baseline must match `model_id` + `serving_sku`.
+- If baseline cannot be resolved, Optimize should not call Eval Harness (treat as pre-gate validation failure in Optimize).
+
+**Candidate object**
+- `config_diff` (object, required): Typed diff produced by Optimize.
+- `config_diff_schema_version` (string, required): Version of diff schema, e.g., `1.0`.
+
+Supported diff change types (v1 scope):
+- Batching policy updates
+- Prefix/KV caching settings
+- Quantization profile changes
+
+Eval Harness treats `config_diff` as opaque except for logging and reproducibility; semantics are owned by Optimize/runtime. (Eval Harness only needs it to record what was tested.)
+
+**Suites array**
+Each suite item:
+- `suite_id` (string, required): e.g., `optimize-gate-core-chat-v1`.
+- `prompt_set_id` (string, required): e.g., `ps_chat_core_2026q1`.
+- `metric_bundle_id` (string, required): e.g., `mb_task_success_rubric_v1`.
+- `required` (boolean, required): If `true`, suite failure fails the gate.
+- `min_samples` (integer, optional): Overrides defaults for this run.
+
+**Constraints object**
+- `max_wall_clock_seconds` (integer, optional): Hard timeout.
+- `max_cost_usd` (number-as-string, optional): Soft cap; if exceeded, run transitions to `ERROR` with reason `COST_LIMIT_EXCEEDED`.
+
+**Metadata object**
+- `optimize_recommendation_id` (string, required): The recommendation being gated.
+- `change_set_id` (string, required): Stable identifier for the config change set.
+- `initiator` (string, required): `auto-apply` | `one-click` | `api`.
+- `git_sha_optimize` (string, optional)
+- `trace_id` (string, optional)
+
+### Response (JSON)
+- `gate_run_id` (string): Primary identifier.
+- `state` (string): Usually `PENDING`.
+- `created_at` (RFC3339 string)
+- `poll_after_seconds` (integer)
+- `links` (object): URLs for status/results (clients must treat as opaque).
+
+### Example (Create)
+Request:
+- `POST /v1/gates/runs`
+- `Idempotency-Key: 7c3b4f83-4cf4-4e60-8c93-0f7d13c9a7e2`
+
+Body (illustrative):
+- `tier: FULL`
+- `route.region: eu-west`
+- `baseline_snapshot_id: bsnap_01HRK...`
+- `candidate.config_diff_schema_version: 1.0`
+- `suites: [optimize-gate-core-chat-v1, optimize-gate-retrieval-v1]`
+
+---
+
+## Contract: Get gate run status
+### Endpoint
+`GET /v1/gates/runs/{gate_run_id}`
+
+### Response fields (JSON)
+- `gate_run_id` (string)
+- `state` (string)
+- `tier` (string)
+- `progress` (string): Human-readable progress (e.g., `2/5 suites complete`).
+- `started_at` (RFC3339 string, nullable)
+- `finished_at` (RFC3339 string, nullable)
+- `poll_after_seconds` (integer)
+- `latest_heartbeat_at` (RFC3339 string, nullable)
+- `failure_summary` (string, nullable): Present for `FAILED`/`ERROR`.
+
+Notes:
+- Clients should respect `poll_after_seconds` to avoid thundering herds.
+- `latest_heartbeat_at` is used for stuck-run detection by SRE.
+
+---
+
+## Contract: Get gate run results (final or partial)
+### Endpoint
+`GET /v1/gates/runs/{gate_run_id}/results`
+
+### Response fields (JSON)
+Top-level:
+- `gate_run_id` (string)
+- `state` (string)
+- `tier` (string)
+- `baseline_reference` (string): Echo of baseline selection used.
+- `candidate_reference` (string): Echo of candidate change id.
+- `overall` (object): Gate decision summary.
+- `suites` (array): Per-suite metrics and deltas.
+- `artifacts` (array): Artifact pointers for reproduction.
+- `statistics` (object): Aggregation + flake/variance signals.
+
+**Overall object**
+- `decision` (string): `PASSED` | `FAILED` | `ERROR` | `CANCELED`
+- `reason_codes` (array of strings): e.g., `QUALITY_REGRESSION`, `INSUFFICIENT_SAMPLES`, `FLAKY_SUITE_QUARANTINED`.
+- `human_summary` (string): 1–3 sentence summary for Console.
+
+**Suites array item**
+- `suite_id` (string)
+- `required` (boolean)
+- `status` (string): `PASSED` | `FAILED` | `SKIPPED` | `ERROR`
+- `baseline_scores` (string): Human-readable compact form (for v1; numeric schema tracked in eval-harness). Example: `task_success=0.842; rubric_mean=3.71`.
+- `candidate_scores` (string)
+- `delta` (string): Human-readable compact form. Example: `task_success=-0.018; rubric_mean=-0.07`.
+- `confidence` (string): Human-readable CI or significance note. Example: `95% CI task_success [-0.030, -0.006]`.
+- `sample_size` (string): Example: `n=120`.
+- `thresholds_applied` (string): Example: `task_success_delta >= -0.01 (FULL)`.
+- `failure_details` (string, nullable): Short reason if failed.
+
+**Artifacts array item**
+- `artifact_type` (string): `RUN_MANIFEST` | `PER_PROMPT_RESULTS` | `AGGREGATE_REPORT` | `RAW_MODEL_OUTPUTS` | `ERROR_LOGS`.
+- `artifact_id` (string)
+- `uri` (string): Signed URL or internal URI.
+- `expires_at` (RFC3339 string)
+- `sha256` (string, optional)
+
+**Statistics object**
+- `flake_score` (string): `0.00-1.00` encoded as string; higher is flakier.
+- `reruns_performed` (string): e.g., `1`.
+- `rerun_policy` (string): e.g., `auto_rerun_on_borderline_or_infra_error_v1`.
+- `variance_notes` (string, optional): e.g., `High variance on long-context subset`.
+
+### Notes on numeric encoding
+For v1, some numeric bundles are represented as compact strings to preserve backwards compatibility with existing Console ingestion. Eval Harness remains the system of record for the structured numeric representation.
+
+A v1.1 follow-up may add optional structured numeric fields while preserving the string fields.
+
+---
+
+## Cancellation
+### Endpoint
+`POST /v1/gates/runs/{gate_run_id}/cancel`
+
+Behavior:
+- If `PENDING`, run transitions to `CANCELED` quickly.
+- If `RUNNING`, Eval Harness attempts best-effort cancellation; some suites may finish.
+- Results endpoint will remain available for **7 days** for audit/debug.
+
+Client guidance:
+- Optimize should cancel superseded gate runs (e.g., user edits recommendation or a newer config diff replaces the old one).
+
+---
+
+## Retry, backoff, and error handling
+### Retryable errors
+Optimize should retry on:
+- `429` (rate limited)
+- `503` (temporary unavailable)
+- `504` (gateway timeout)
+- `5xx` (except where body indicates non-retryable)
+
+Backoff policy (client-side):
+- Max attempts: 3
+- Exponential backoff with jitter: 1s, 3s, 10s
+- Respect `Retry-After` header when present
+
+### Non-retryable errors
+- `400` invalid request (schema or required fields)
+- `401/403` authz failure
+- `409` invalid state transition (e.g., canceling a terminal run)
+- `422` semantic validation error (e.g., baseline mismatch with model/SKU)
+
+### Standard error response
+All error responses include:
+- `error_code` (string): stable machine code
+- `message` (string): human-readable
+- `request_id` (string): echo from caller if present
+
+Common `error_code` values:
+- `INVALID_SCHEMA_VERSION`
+- `BASELINE_NOT_FOUND`
+- `BASELINE_MODEL_MISMATCH`
+- `GPU_CAPACITY_UNAVAILABLE`
+- `COST_LIMIT_EXCEEDED`
+- `SUITE_QUARANTINED`
+- `INTERNAL_ERROR`
+
+---
+
+## SLAs and operational expectations
+### Service availability (production)
+- **Availability SLO:** 99.5% monthly for `GET status/results` endpoints
+- **Create run acceptance SLO:** 99.0% monthly (excluding `429` due to quota enforcement)
+
+### Gate runtime targets (wall-clock)
+These are targets, not hard guarantees; hard timeouts should be set using `constraints.max_wall_clock_seconds`.
+
+| Tier | Target P95 completion | Hard timeout default | Notes |
+|---|---:|---:|---|
+| `SMOKE` | ≤ 15 minutes | 25 minutes | Small prompt subset; fast feedback for one-click apply |
+| `FULL` | ≤ 90 minutes | 120 minutes | Broader coverage; may rerun borderline suites |
+
+### Artifact retention
+- Eval Harness retains artifacts for **30 days** (production).
+- Signed URLs returned via API expire within **24 hours**; clients should store `artifact_id` for later retrieval via internal artifact proxy.
+
+### Quotas / rate limits
+- Default per-caller limit: **10 concurrent gate runs** per region.
+- Burst: up to **20 concurrent** for `HIGH` priority (subject to GPU capacity).
+- Excess requests receive `429` with `Retry-After`.
+
+---
+
+## Result determinism and reproducibility requirements
+Eval Harness must record enough metadata to reproduce results:
+- Model id/version, tokenizer version (if applicable)
+- Serving SKU + runtime image id
+- Baseline reference (snapshot id or gate run id)
+- Candidate config diff (as received) + schema version
+- Prompt set versions (immutable ids)
+- Metric bundle versions
+- Random seeds where used (and note if nondeterministic decoding is allowed)
+
+Optimize requirements:
+- Provide stable `change_set_id` and `optimize_recommendation_id`.
+- Ensure the candidate config diff is the exact diff intended to be applied.
+
+---
+
+## Compatibility requirements for config diffs
+Eval Harness does not interpret the config diff, but it **does** enforce the following for audit and safety:
+- `config_diff_schema_version` must be present and supported.
+- `candidate.config_diff` must be under 256KB.
+- `change_set_id` must be stable across retries.
+
+Runtime-level validation (unsafe combinations, unsupported knobs) happens **before** this contract is invoked (see Optimize pre-gate static checks).
+
+---
+
+## Observability requirements (contractual)
+Eval Harness must emit:
+- Metrics:
+  - `quality_gate_runs_started_total{tier,region}`
+  - `quality_gate_runs_completed_total{tier,region,state}`
+  - `quality_gate_run_duration_seconds{tier,region}`
+  - `quality_gate_suite_failure_total{suite_id}`
+  - `quality_gate_flake_score{suite_id}` (gauge)
+- Traces:
+  - Root span per gate run, with `gate_run_id`, `request_id`, `change_set_id`
+- Logs:
+  - Structured log per state transition (`PENDING→RUNNING`, etc.)
+
+Optimize must propagate:
+- `request_id` and (when present) `trace_id` for cross-service correlation.
+
+---
+
+## Security and data handling
+- Prompt sets used for gating may contain customer-derived examples in anonymized form. Treat as **internal**.
+- Raw model outputs may include sensitive tokens; artifact access is controlled via signed URLs and internal RBAC.
+- Do not export artifacts outside Redwood systems without a security review.
+
+---
+
+## Change management
+Any change to:
+- required request fields
+- state machine semantics
+- result fields used for pass/fail decisions
+- artifact retention/access patterns
+
+…requires:
+1) Review from Optimize + Applied ML + SRE owners
+2) A staged rollout in staging → production
+3) Updated schema version and release notes in the Eval Harness changelog
+
+---
+
+## Appendix A: Minimal required fields checklist (Optimize)
+When creating a run, Optimize must include:
+- `request_id`
+- `gate_policy_id`
+- `tier`
+- `route.route_id`, `route.account_id`, `route.region`
+- `model.model_id`, `model.model_family`, `model.model_version`, `model.serving_sku`
+- `baseline.(baseline_snapshot_id|baseline_gate_run_id|baseline_tag)`
+- `candidate.config_diff`, `candidate.config_diff_schema_version`
+- At least one `suites[]` item
+- `metadata.optimize_recommendation_id`, `metadata.change_set_id`, `metadata.initiator`
+
+---
+
+## Appendix B: Known limitations (v1)
+- Some numeric metrics are returned as compact strings; structured numeric fields will be added in a minor schema update.
+- Prompt-level result payloads may be large; consumers should use artifact links instead of expecting full inline data.
+- Cross-region baselines are not supported; baseline must match the run region + serving SKU.
+
+---
+
+## Appendix C: Contact and escalation
+- Eval Harness paging: follow `runbook-optimize-quality-gate-failures` and page **Applied ML on-call** if gate failure patterns indicate metric regression.
+- Capacity/timeouts: engage **SRE on-call** for GPU scarcity or regional queue buildup.

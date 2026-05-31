@@ -1,0 +1,153 @@
+Cost Signal Fanout and Edge Actioning Playbook
+
+Summary
+
+This playbook describes the design, operational runbook, dashboard mappings, and rollout plan for the Cost Signal Fanout (CSF) system and its Edge Actioning component. CSF converts runtime cost telemetry into low-latency signals that inform per-request and per-tenant mitigation actions at the edge (API gateway, routing layer, or model selector). The goal is to keep unit economics predictable while preserving latency and quality SLOs.
+
+Background and motivation
+
+- Problem: spikes in per-token cost (e.g., due to unexpectedly long sequences, model cascade fallbacks, or noisy tenants) create unpredictable spend and SLA tension. Traditional billing alerts are slow and coarse-grained.
+- Objective: provide sub-second cost-aware decisions that can 1) reduce incremental cost without violating latency SLOs, 2) protect core tenants from noisy neighbors, and 3) provide observability and auditor-friendly traces for every action.
+- Scope: hosted and dedicated deployments where runtime can emit token-level or request-estimated cost signals. Private deployments require local adapter but follow same contract.
+
+Architecture overview
+
+1) Telemetry producers
+   - Serving runtime: emits per-request estimated_token_count, model_variant_id, quantization_profile_id, KV_cache_hit_ratio, and estimated_gpu_ms as JSON to our Kafka cost-topic.
+   - Edge proxies (gateway): emits request metadata (tenant_id, route, latency_budget_ms, client_priority).
+
+2) Cost Signal Fanout (CSF) service
+   - Ingest: Kafka consumer that enriches runtime signals with billing mappings and tenant quotas.
+   - Scoring: computes a short-lived cost_score and risk_score using sliding-window aggregations (30s, 5m) and decaying counters.
+   - Fanout: publishes lightweight action messages to a high-throughput pub/sub channel (NATS) for the edge to consume. Action messages are versioned and typed (SCALE_DOWN_HINT, FORCE_QUANTIZE, BUCKET_AND_THROTTLE, FALLBACK_TO_CHEAPER_MODEL).
+
+3) Edge Actioning adapters
+   - Gateway adapter: consumes action messages, applies transient token-level hints in a request context to the routing decision. Hints are advisory by default and require safety checks (see guards).
+   - Router adapter: enforces hard actions for tenant-level throttles or prioritized eviction.
+
+4) Observability and auditing
+   - Every action emits an audit-event (immutable) that includes cause (cost_score), rule_id, decision, and pre/post metrics. Audit-events are stored in ClickHouse for queries and in S3 cold storage for compliance.
+
+SLOs and safety constraints
+
+- Latency SLO: 95% of in-region requests must remain < 200ms p99 target unchanged for read-only paths. Any cost actions that increase tail latency must be denied.
+- Quality floor: automated quantization fallback only allowed if evaluated on model variant A/B tests with <2% ROUGE-change-like metric regression on target prompt sets.
+- Economic threshold: per-tenant short-window cost delta (30s) must exceed 3x baseline before hard throttles are permitted.
+- Action TTL: edge hints expire in 5 seconds unless refreshed.
+
+Safety guards (non-exhaustive)
+
+- Latency guard: do not apply actions that add >10ms expected additional compute path unless overridden by incident commander.
+- Blacklist guard: customers configured with "no-cost-mitigation" label in billing config are exempt.
+- Critical routes guard: routes tagged with "high-availability" in routing manifest cannot be hard-throttled; only advisory hints allowed.
+
+Config and rule catalog (excerpt)
+
+| rule_id | trigger_condition | action_type | soft_vs_hard | owner | notes |
+| RS-quant-01 | estimated_cost_per_token > 2.5x baseline and KV_cache_hit_ratio < 30% | FORCE_QUANTIZE | soft | runtime-team | advisory quantization hint to model selector |
+| RS-throt-05 | tenant_30s_cost_delta >= 3x baseline and recent_errors < 1% | BUCKET_AND_THROTTLE | hard | sres | tenant-level fair-share throttle |
+| RS-fb-02 | fallback_count_last_5m > 10 and latency_spike_timeline | FALLBACK_TO_CHEAPER_MODEL | soft | model-onboarding | triggers canary fallback policy |
+
+Operational runbook: actionable steps
+
+1) Detection and alerting
+   - Alert: csf.high_cost_spike (severity P3) triggers when global CSF cost_score 95th percentile exceeds configured threshold for 2 consecutive 30s windows.
+   - On alert, SRE oncall should open an incident in Jira and run initial triage (see section below).
+
+2) Initial triage (10 minutes)
+   - Check dashboards: CSF-overview, per-tenant cost heatmap, edge-action-audit-log.
+   - Identify if spike is tenant-specific or global. If tenant-specific, note tenant_id and owner.
+   - If global and due to model cascade fallback, consult runtime release notes and model-variant rollout dashboards.
+
+3) Apply manual mitigations (if automated mitigation did not resolve)
+   - For noisy tenant: apply temporary BUCKET throttle with 5s token-window and 20% capacity reduction using router-adapter CLI:
+
+   rtrctl apply-throttle --tenant tenant-123 --window 5s --capacity 0.8 --reason "noisy-neighbor-emergency"
+
+   - To enforce cheaper model fallback globally for non-critical routes:
+
+   csfctl publish-action --type FALLBACK_TO_CHEAPER_MODEL --routes "/async/**" --ttl 30s --rule RS-fb-02
+
+4) Post-incident follow-up (within 3 business days)
+   - Run retrospective: include cost delta timeline, root cause, actions taken, and followup owners.
+   - If action was triggered by an overly aggressive rule, update rule thresholds and deploy small canary to ensure correctness.
+
+Dashboards and alerts mapping
+
+- CSF Overview dashboard: global cost_score timelines, fanout-rate, action-rate, and action-latency histogram.
+- Per-tenant heatmap: cost per 30s window, estimated_token_count distribution, quantization hit-rate.
+- Edge action audit dashboard: counts by rule_id, action_latency_p99, and rollback_rate.
+- Key alerts: csf.high_cost_spike, csf.rule-failure-rate (action application failures >1% over 5m), csf-audit-delayed (audit events lag > 1m).
+
+Metrics to instrument (recommended list)
+
+- csf.cost_score (gauge) by tenant, region
+- csf.action_published_count (counter) by action_type, rule_id
+- csf.action_apply_success (counter) by edge_adapter, rule_id
+- csf.audit_event_lag_ms (histogram)
+- router.throttle_applied (counter) by tenant, severity
+
+Audit and compliance
+
+- Audit event schema example (JSON as string stored in ClickHouse):
+
+  {"ts":"2026-02-12T14:05:02Z","tenant_id":"tenant-123","rule_id":"RS-throt-05","action":"BUCKET_AND_THROTTLE","cause":{ "cost_score":12.3, "window":"30s"},"decision":"hard","actor":"csf-v2","trace":"trace-id-abc"}
+
+- Retention: ClickHouse live store 90 days, S3 cold store 7 years for customer-sensitive actions.
+
+Rollout plan and migration notes
+
+- Phase 0 (canary): route 5% of internal traffic through CSF in staging; ensure audit events and edge adapters correctly apply advisory hints.
+- Phase 1: enable soft actions for 20% of production traffic, monitor action_apply_success >= 99.5% and audit_event_lag < 200ms.
+- Phase 2: enable hard actions for non-critical routes and low-tier tenants after two weeks of stable metrics.
+- Phase 3: full rollout with configurable tenant exemptions and manual override UI in Console.
+
+Traceability and testing requirements
+
+- Every rule change must include unit tests for scoring logic, integration test for fanout path, and a staged A/B test that validates no >1.5% user-visible regression on key prompt sets.
+- Synthetic test harness: run population-scale synthetic traffic for 24h to capture stability under churn.
+
+Known limitations and future work
+
+- Current scoring relies on estimated_token_count emitted by runtime; requests with server-side streamed inputs (client-side continuation) can underreport. Improving hybrid-token-telemetry is next.
+- Integration with Dedicated tenant hardware labels (GPU topology) for more granular cost-modeling is planned.
+
+Retrospective template (to be used after any CSF-triggered incident)
+
+- Incident summary: short problem statement and impact window.
+- Timeline: detection, automations, manual mitigations, resolution.
+- Root cause analysis: telemetry evidence and contributing factors.
+- Action items: prioritized list with owners and due dates.
+
+Ownership and contacts
+
+- System owner: runtime-team (oncall: runtime-sre rotation)
+- Edge adapters owner: eng-platform-gateway team
+- Auditing and billing mappings: finance-legal (billing-integrations)
+- Escalation path: primary oncall -> platform oncall -> engineering director (see contacts page).
+
+Appendix: example rule YAML (for rule RS-quant-01)
+
+---
+rule_id: RS-quant-01
+description: "Advise quantization when per-token cost and cache misses indicate high cost"
+trigger:
+  - metric: estimated_cost_per_token
+    comparator: ">"
+    value: 2.5 * baseline
+  - metric: KV_cache_hit_ratio
+    comparator: "<"
+    value: 30
+action:
+  type: FORCE_QUANTIZE
+  mode: soft
+  ttl_seconds: 5
+owner: runtime-team
+---
+
+Contact and references
+
+- Slack channels: #platform-csf, #runtime-alerts
+- Related docs: runtime token telemetry spec, billing mapping schema, edge adapter implementation notes.
+
+End of document

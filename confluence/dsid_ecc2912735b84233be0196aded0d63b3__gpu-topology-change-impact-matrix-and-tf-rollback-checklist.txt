@@ -1,0 +1,136 @@
+GPU topology change impact matrix and TF rollback checklist
+
+Summary:
+This page defines a concise impact matrix for GPU topology changes and a standardized Terraform (TF) rollback checklist to reduce blast radius when modifying pool topology, placement groups, or inter-region networking for inference workloads. It is intended for infra engineers, SREs, and release owners performing topology changes that touch GPU fleet, VPC routing, or IAM boundaries.
+
+Why this exists:
+- Topology changes are high-risk: they can cause tenant evictions, KV cache warmup loss, and cross-region egress spikes.
+- Teams were lacking a uniform decision and rollback protocol, leading to inconsistent mitigations and longer incidents.
+
+Scope:
+- Included: TF work that modifies: GPU pool composition (flavor mix, GPU families), placement constraints (AZ/region hotslices), VPC peering/transit gateways used by inference clusters, subnet/route table changes, and node pool instance profiles.
+- Excluded: application-level config changes, model serving runtime flags, or non-GPU-only node changes. For those, follow the respective service runbook.
+
+Owners and stakeholders:
+- Primary owner: infra/allocator team (oncall: #infra-allocator)
+- SRE escalation: eng-sre (oncall link: pagerduty:eng-sre)
+- Release approver: infra-release-coordinator
+- Notified groups: ml-runtime, platform-security, finance-billing (for large topology changes that affect egress costs)
+
+Key definitions:
+- Topology change: any Terraform change that alters resources in the gpu-* or inference-network-* modules.
+- High-risk path: change types that can cause immediate tenant disconnection, e.g., removing a subnet or changing NAT gateway config.
+
+Impact matrix (decision grid):
+Use this matrix when triaging planned TF changes. Columns: Change class, Primary failure modes, Estimated time-to-failure, Likelihood, Risk rating, Mandatory mitigations.
+
+TABLE (text representation):
+| Change class | Primary failure modes | Time-to-failure | Likelihood | Risk | Mandatory mitigations |
+|-------------|-----------------------|-----------------|-----------:|------:|----------------------|
+| Remove AZ from placement (drain+delete) | Tenant eviction, KV cache cold starts, capacity shortfall | immediate (during drain) | medium | High | pre-seed warm pools, reserve 15% burst capacity, inform tenants, schedule maintenance window |
+| Swap GPU family (v100 -> a100 or q8) | Kernel mismatch, runtime OOMs for long sequences | minutes-hours | low | Medium-High | run mixed-precision canary, kernel compatibility smoke tests, quantization profile validation |
+| Subnet route table change (NAT/egress) | Traffic blackhole, egress cost change | immediate | medium | High | route sim in staging, egress re-route TL;DR, set circuit-breaker in proxy |
+| Transit-gateway peering change | Cross-region failures for private deployments | immediate | low | High | incremental peering, HA path, rollback plan and test traffic failover |
+| Instance profile / IAM role swap | Service account permission failures | immediate | low | Medium | dry-run IAM simulation (policy simulator), Canary with limited tenant UUIDs |
+| Add new GPU warm pool (heterogeneous) | Scheduler starvation, placement reshuffle | gradual | low | Medium | node labeling + affinity rules, canary placement, autoscaler safety caps |
+
+Risk rating guidance:
+- High: requires scheduled maintenance window, stakeholder notification 72 hours prior, and two approvers.
+- Medium-High: requires canary rollout, CI smoke tests, and SRE watch.
+- Medium: requires automated tests + post-rollout monitoring.
+
+Preflight checklist (must be run before applying TF):
+1) Git branch: open PR with explicit change scope, link the playbook runbook ticket.
+2) TF plan guardrails: run terraform plan with diff summary; attach plan artifact to PR and ensure plan size <= 100 resource diffs.
+3) Run the topology-change simulator (see step below) to estimate steady-state GPU utilization impact.
+4) Validate node selectors and runtime labels: ensure new nodes include hw-attrs and kernel-tag.
+5) Canary target selection: identify 1–3 low-impact tenants (IDs) for a canary. Add them to the canary annotation.
+6) Create warm-pool pre-seed job: spawn >= 20% expected extra capacity in the target pools for 30 minutes prior to change.
+7) Run automated smoke tests: model inference sanity tests and long-sequence tests; pass thresholds: p95 latency < 120 ms, error-rate < 0.5%.
+8) Notify stakeholders: post to #infra-changes, email ml-runtime and platform-security distribution lists, update status page maintenance entry.
+
+Topology-change simulator (quick how-to):
+- Purpose: estimate eviction probability and warm-cache loss when capacity is rebalanced.
+- Run command (internal): ./tools/topo-sim.sh --plan-artifact=plan.json --traffic-profile=production-24h --seed=2026-02-01 --output=sim-report.md
+- Key outputs to review: predicted eviction count, KV cache hit-rate delta, p95 latency delta, and egress delta (GB).
+
+CI/CD gating rules for topology TF PRs:
+- All TF PRs that touch modules starting with gpu- or inference-network- must pass:
+  - tfsec (no critical findings)
+  - terraform fmt and validate
+  - plan-sizer (diff <= 100 resources)
+  - topo-sim smoke pass (attached report)
+  - Manual approval: infra-release-coordinator + one SRE approver
+
+Terraform apply pattern (recommended):
+- Use a 3-stage apply: canary workspace -> limited-region apply -> full-region apply.
+- Example commands:
+  - terraform workspace select canary || terraform workspace new canary
+  - terraform apply -var-file=canary.tfvars -auto-approve
+  - monitor for 30 minutes (see monitoring checklist)
+  - promote workspace or apply to next region
+
+Monitoring and post-apply checklist (first 60 minutes):
+- Metrics to watch (SLOs/thresholds):
+  - GPU allocation SLO: available_gpu_fraction >= 0.12 (i.e., >=12% spare)
+  - Eviction rate: tenant_evictions/minute < 0.1
+  - KV cache hit-rate delta: no more than -8% relative drop
+  - p95 latency: < +25% relative increase and < 250 ms absolute
+  - Egress: hourly delta < 500 GB for single-region change unless pre-approved
+- Dashboards: inference/pool-capacity, routing/egress-meter, telemetry/token-cost-breakdown
+- If any threshold is crossed: trigger the rollback checklist immediately.
+
+Rollback checklist (ordered, execute until service restored):
+1) Abort ongoing apply: if terraform apply is still running, abort the session (ctrl-c) and let the CI cancel remaining tasks.
+2) Revert the PR: create a revert PR referencing the original change and mark it as urgent.
+3) Restore TF state snapshot (if state is corrupted):
+   - Latest safe state is in s3://redwood-tfstate/backups/gpu-topology/YYYYMMDD-HHMMSS.tfstate
+   - Command: aws s3 cp s3://redwood-tfstate/backups/<snapshot> /tmp/safe.tfstate && terraform state replace-provider -state=/tmp/safe.tfstate && terraform init && terraform apply -state=/tmp/safe.tfstate -auto-approve
+   - Note: only run state replacement with approval from infra-release-coordinator and SRE oncall.
+4) Recreate warm-pool / scale-up ephemeral nodes: run ci job: ci/ops/scale-warm-pool --pool-id=<pool> --growth=+25% --duration=60m to restore immediate capacity.
+5) Traffic-shift: shift traffic away from impacted pools via routing toggle: curl -XPOST https://ops-api.internal/route-toggle -d '{"from_pool":"pool-a","to_pool":"pool-b","percent":100}' (use ops-cli wrapper in practice).
+6) If egress route changed: re-provision previous NAT or BGP route via operator procedure in transit-gateway runbook.
+7) Postmortem stub: create PM ticket with tags: incident:topology-change, priority:major. Capture timeline and artifacts (plan.json, sim-report.md, monitoring graphs).
+
+After-action steps (mandatory for High and Medium-High events):
+- 1-week follow-up: run a root-cause session with infra, SRE, and ml-runtime.
+- 30-day changes: if topology change is reattempted, require an expanded simulation that includes customer synthetic traffic.
+
+Appendix A — Common commands and examples:
+- Terraform plan with remote backend snapshot:
+  - terraform init -backend-config=\"bucket=redwood-tfstate\" -backend-config=\"key=env/gpu-topology/plan.tfstate\"
+  - terraform plan -out=plan.out; terraform show -json plan.out > plan.json
+
+- Snapshot state to s3:
+  - aws s3 cp terraform.tfstate s3://redwood-tfstate/backups/gpu-topology/$(date -u +%Y%m%d-%H%M%S).tfstate
+
+- Quick canary redeploy sequence (example):
+  1. Create canary tfvars referencing canary tags (canary-tenant-ids: [\"t-001\",\"t-002\"]).
+  2. terraform workspace select canary || terraform workspace new canary
+  3. terraform apply -var-file=canary.tfvars -auto-approve
+  4. Wait 30m, run smoke tests: ./ci/smoke-tests.sh --targets=canary
+  5. If ok, apply to region-1; else, rollback.
+
+Appendix B — Failure cases observed (short list):
+- 2025-11-22: AZ removal without warm-pool seed caused 8% customer-facing latency regression. Root cause: autoscaler under-provisioning after node drain. Mitigation: preseed 15% warm capacity and autoscaler safety caps.
+- 2026-01-14: NAT swap during busy window created egress blackhole for 42 minutes. Root cause: missing route propagation to transit-gateway. Mitigation: route-sim and apply for 2-hour maintenance window only.
+
+References and further reading:
+- /confluence/eng-infra/terraform-and-iac/gpu-topology-placement-and-cross-account-iac-primer.json
+- /confluence/eng-infra/runbooks/gpu-rolling-reboot-and-network-bridge-playbook.json
+- Internal tools: tools/topo-sim.sh, ci/ops/scale-warm-pool
+
+Contact and escalation matrix:
+- infra/allocator oncall: #infra-allocator (Slack) / pagerduty:infra-allocator
+- eng-sre oncall: pagerduty:eng-sre
+- Release coordination: infra-release-coordinator@redwood.internal
+
+Document history:
+- Drafted: 2025-09-10 (Aisha Patel)
+- Simulation harness and CI hooks added: 2026-02-15 (Marta Kim)
+
+Notes and open items:
+- Add automated egress-cost estimation into topo-sim (owner: finance-billing).
+- Integrate policy-as-code gate so that top-level deletion of subnets requires two approvers.
+
+End of document.

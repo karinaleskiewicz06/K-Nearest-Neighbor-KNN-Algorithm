@@ -1,0 +1,173 @@
+GPU Eviction Economic Rebalancer and Invoice Recovery Playbook
+
+h1. GPU Eviction Economic Rebalancer and Invoice Recovery Playbook
+
+Short intro
+This playbook defines the economic rebalancer service for GPU tenant eviction events, the operational runbook for recovering invoiced compute from preempted work, and the Terraform + CI/CD patterns required to deploy the rebalancer safely. It is intended for infra engineers owning GPU capacity, billing engineers, and SREs who operate our burst/spot pools.
+
+Purpose
+- Minimize customer-visible impact when GPU nodes are preempted or evicted.
+- Recover accurate billable usage for customers who were charged for compute that was lost to eviction.
+- Automate rebalancing decisions to satisfy SLOs while preserving fairness and cost efficiency.
+
+Scope
+Applies to: hosted & dedicated GPU pools (spot, preemptible, reserved), tenant-level billing reconciliations, and the rebalancer Terraform module and CI/CD pipelines. Does NOT cover: on-prem private deployments (handled by private-deploy ops guide), or long-term contract renegotiations.
+
+Owner & contacts
+- Document owner: Marina Alvarez (infra capacity)
+- Primary oncall: gpu-fleet-oncall rotation
+- Billing lead: Ethan Cole
+- Slack channels: #gpu-fleet, #billing-ops, #oncall
+
+Definitions
+- Rebalancer: service that reassigns queued work / re-routes requests away from at-risk nodes and computes eviction-adjusted billing credits.
+- Eviction event: a node-level preempt or provider-initiated termination causing active work loss.
+- Charge window: billing window used for per-request token or VM usage invoicing.
+- Recovery credit: customer-visible credit applied when billed compute is invalidated by eviction.
+
+TL;DR
+- Run the economic rebalancer when eviction rate > 0.5% over 15m or when a multi-node zonal event occurs.
+- Apply automatic recovery credits for invoices where >30% of a charge window was served from nodes that evicted.
+- Use the Terraform module at module.rebalancer.v1 (see example) and gate releases with the ci/rebalancer-integration pipeline.
+
+SLOs and thresholds
+- Eviction detection latency: detect and emit event within 10s of node termination (metric: infra.eviction.detect_latency P50 < 10s).
+- Rebalancer action latency: begin tenant re-route within 30s of detection (P95 < 30s).
+- Fairness constraint: tenant priority inversion must not increase overall SLO breaches by >1% in a 24h window.
+- Billing reconciliation accuracy: reconciliation report must match exported usage within \u00b10.1% for top 90% of invoices.
+
+Metrics & dashboards (recommended)
+- infra.eviction.rate (per-region, per-instance-type)
+- infra.eviction.origin (spot|preempt|provider-maintenance)
+- rebalancer.actions.count (reroutes, reschedules, cancellations)
+- billing.recovery.credit_total (daily)
+- tenant.rebalance.latency (P50/P95)
+Dashboards: GPU Fleet -> Evictions Overview; Billing -> Recovery Credits; Rebalancer -> Actions by Tenant.
+
+Economic rebalancer algorithm (overview)
+1. Ingest eviction stream from kinesis/gcp-pubsub (provider adapters emit events for node lifecycle).
+2. Group events by tenant and charge window to produce eviction exposure score E:
+   - E = (evicted_compute_seconds) / (charged_compute_seconds)
+   - Track time-decayed score to avoid oscillation.
+3. If E > rebalancer.eviction_threshold (default 0.30) for a tenant-window, trigger recovery path:
+   - a) Mark affected invoice lines for manual review if (evicted_compute_seconds < MIN_THRESHOLD) and the tenant has dispute history.
+   - b) Auto-issue credit if E >= AUTO_CREDIT_THRESHOLD (default 0.50) and tenant passes fraud/safety checks.
+4. Rebalance routing: route future requests to warm-pool or reserved capacity using priority-preserving weighted policies until warm pools replenish.
+
+Pseudo-code (simplified)
+for event in eviction_stream:
+  tenant = event.tenant_id
+  window = get_charge_window(event.timestamp)
+  tenant.window[window].evicted += event.compute_seconds
+  tenant.window[window].charged += event.charged_seconds
+  E = tenant.window[window].evicted / max(tenant.window[window].charged, 1)
+  if E >= AUTO_CREDIT_THRESHOLD:
+    enqueue_recovery(tenant, window, auto=True)
+  elif E >= REVIEW_THRESHOLD:
+    enqueue_recovery(tenant, window, auto=False)
+
+Terraform module example (usage snippet)
+module "rebalancer" {
+  source = "appinfra/rebalancer/module/v1"
+  name   = "gpu-rebalancer-prod"
+  region = "us-west-2"
+
+  eviction_stream = "kinesis://prod-evictions"
+  billing_export_bucket = "s3://billing-exports-prod"
+
+  thresholds = {
+    auto_credit = 0.5
+    review      = 0.3
+  }
+
+  tags = {
+    team = "gpu-fleet"
+  }
+}
+
+Table: required inputs
+| input | description | default |
+| eviction_stream | provider stream ARN/URL | n/a |
+| billing_export_bucket | export location for raw usage | n/a |
+| thresholds.auto_credit | auto-credit threshold (fraction) | 0.5 |
+| thresholds.review | review threshold (fraction) | 0.3 |
+
+CI/CD and release gating
+- Repo: infra/rebalancer (monorepo)
+- Pipelines:
+  1. ci/unit -> runs go/python unit tests and linters
+  2. ci/integration -> spins ephemeral k8s cluster and injects simulated eviction events
+  3. ci/billing-smoke -> runs reconciliation against synthetic billing export using the same billing exporter used in prod
+  4. cd/canary -> deploy to canary namespace in us-west-2 with live feature flags disabled
+  5. cd/prod -> gradual rollout 10% -> 50% -> 100% with health checks
+- Gates:
+  - Integration must pass with <1% false-positive auto-credit in 4h simulated runs
+  - Billing-smoke must reconcile sample invoices within \u00b10.2%
+  - Canary must show no increase in SLO violations for 24h before progressing
+
+Testing matrix
+- Unit tests: algorithmic edge cases (divide-by-zero, clock skew, partial window)
+- Simulation tests: zonal outage with 10k synthetic tenants, variable compute shapes
+- Chaos tests: inject delayed eviction events, duplicate events, missing timestamps
+- Performance: ensure rebalancer can process 50k eviction events/minute with <99ms per-event P95
+
+Incident runbook: Eviction surge with incorrect credits
+Summary: If the daily credited amount spikes unexpectedly, follow these steps.
+1. Pager fires to #gpu-fleet and #billing-ops; ack and assess scope.
+2. Run quick query to locate top 10 tenants by credit amount in last 24h:
+   SELECT tenant_id, SUM(credit_amount) AS total_credit
+   FROM billing.recovery_credits
+   WHERE created_at >= now() - interval '24 hours'
+   GROUP BY tenant_id
+   ORDER BY total_credit DESC
+   LIMIT 10;
+3. If credits originate from same charge_window or same node pool, isolate the eviction stream consumer:
+   - kubectl scale deployment rebalancer-consumer --replicas=0 -n prod
+4. Suspend auto-crediting flag (feature flag: rebalancer.auto_credit.enabled = false) via FF-service UI or CLI:
+   - ffctl set rebalancer.auto_credit.enabled false --env prod
+5. Backfill manual reconciliations for affected tenants (billing lead to coordinate) and open a postmortem ticket (TICKET-xxxx).
+6. Re-enable consumer in controlled Canary then observe metrics for 6h before full reenable.
+
+Billing reconciliation steps (manual override)
+1. Export raw usage for tenant and charge window from billing_export_bucket.
+2. Run reconciliation tool:
+   - bin/reconcile --tenant $TENANT --window $WINDOW --input s3://billing-exports-prod/$WINDOW.json
+3. If tool marks credit required, set credit via billing-admin UI or run:
+   - billingctl credit --tenant $TENANT --amount $AMOUNT --reason \"eviction_recovery\"
+4. Log action in ticket and notify customer success when credit > $500.
+
+Post-incident analysis (required fields)
+- Root cause hypothesis
+- How eviction stream or algorithm failed (duplicate events, clock skew, bad join)
+- Mitigations deployed
+- Follow-ups (owner and ETA)
+- Billing impact and customer outreach list
+
+Rollout plan (timeline)
+- Week 0: merge Terraform module and integration tests
+- Week 1: deploy to staging; run full simulation harness
+- Week 2: canary in us-west-2 (10%), monitor 72h
+- Week 3: increase to 50% if metrics stable; monitor 7d
+- Week 4: full rollout
+
+Security and compliance considerations
+- Exported billing data is PII-adjacent; bucket must have encryption=SSE-KMS and restricted IAM. See security-and-compliance/audit-logging for audit rules.
+- Recovery credits must be auditable with signed events stored for 365 days.
+
+Runbook ownership and maintenance
+- Owner: infra/capacity team
+- Review cadence: quarterly or after any major provider change
+- Link to test harness repo: git@github.com:redwood/rebalancer-test-harness
+
+Related pages
+- /confluence/eng-infra/gpu-fleet-and-capacity/gpu-tenant-eviction-predictor-and-provisioning-guidelines
+- /confluence/eng-infra/terraform-and-iac/gpu-chargeback-exporter-and-iac-pattern-playbook
+- /confluence/finance-and-legal/billing-reconciliation-process
+
+Appendix: small troubleshooting checklist
+- Confirm eviction event timestamps are within 2s of provider metadata
+- Check for duplicate event de-duplication ID mismatch
+- Validate timezones when computing charge windows
+- If feature-flag toggles fail, revert using Terraform emergency variable set
+
+Last updated: 2026-01-10

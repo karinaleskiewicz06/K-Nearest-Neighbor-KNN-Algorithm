@@ -1,0 +1,403 @@
+Dedicated Autoscaler Troubleshooting Runbook (Bounds + Predictive Mode)
+
+## Purpose
+This runbook helps on-call engineers diagnose and mitigate Dedicated autoscaling issues after the introduction of **customer min/max bounds** and optional **predictive scaling**.
+
+The goals are:
+- Restore customer latency/SLOs quickly while respecting safety invariants (never exceed max; never scale below min).
+- Provide deterministic, auditable actions (document config changes and mitigations).
+- Reduce escalation ping-pong by giving clear ownership boundaries.
+
+## Scope
+Applies to **Redwood Dedicated** deployments using the Dedicated autoscaler (fleet-managed GPU pools).
+
+In-scope symptoms:
+- Stuck scale-up or stuck scale-down
+- Sustained queueing / saturation when at **max bound**
+- **Min bound unmet** (region shortage / provisioning failures)
+- Prediction pipeline outages or stale forecasts
+- Oscillation / jitter related to predictive inputs
+- Config churn / throttling on policy updates
+
+Out of scope:
+- Model runtime regressions (kernel issues, OOM loops) unless directly affecting autoscaler signals
+- Cross-region placement optimization (active-active)
+
+## Key invariants and semantics (must-know)
+Reference: ADR “Autoscaling bounds precedence and safety invariants”.
+
+1) **Bounds are hard limits**
+- Autoscaler clamps desired replicas: bounded_desired = clamp(requested_desired, min_replicas, max_replicas)
+- It is always a bug if we intentionally set desired > max or desired < min.
+
+2) **Predictive is advisory, reactive is authoritative when overloaded**
+- Predictive may increase baseline ahead of ramps.
+- If reactive signals indicate overload (queue depth, saturation), reactive scaling should override prediction *upward* (still respecting max).
+- If predictions are missing/stale, autoscaler must fall back to reactive-only behavior.
+
+3) **Deterministic/auditable evaluation**
+For every reconciliation, we record:
+- requested_desired (from predictive + reactive arbitration)
+- bounded_desired (after clamp)
+- reason fields (e.g., prediction_used=false, bound_hit=max, cooldown_active=true)
+
+## Primary dashboards, logs, and tools
+### Dashboards (Grafana)
+Use the “Dedicated Autoscaling — Bounds & Predictive” dashboard. Key panels:
+- Desired replicas vs Bounded replicas
+- Bound hit rate (min-hit/max-hit)
+- Queue depth + oldest queued age
+- Saturation (GPU busy %, KV cache pressure, token throughput)
+- Prediction vs actual demand + prediction staleness
+- Scale event timeline (reason codes)
+
+### Logs / events
+- Autoscaler decision logs (structured): includes deployment_id, region, requested_desired, bounded_desired, bound_hit, reason, cooldown flags
+- Audit events for scaling policy changes (who/when/what)
+
+### Admin CLI
+Internal admin CLI (requires on-call breakglass if customer-sensitive):
+- Dump effective policy and last decisions:
+  - `rw-admin dedicated scaling-policy dump --deployment <deployment_id> --region <region>`
+- View recent scale decisions:
+  - `rw-admin dedicated autoscaler decisions --deployment <deployment_id> --region <region> --since 2h`
+- Disable predictive mode (emergency) (requires approval; see Mitigation section):
+  - `rw-admin dedicated scaling-policy set --deployment <deployment_id> --region <region> --predictive-mode off --reason "INC-#### mitigation"`
+
+### Feature flags
+- Predictive mode is gated per account/deployment.
+- Bounds enforcement is default-on once enabled for the deployment.
+
+## Quick triage checklist (10 minutes)
+1) Identify the blast radius
+- One deployment? One region? Multiple deployments in the same fleet?
+- Is the customer actively impacted (p95 latency, error rate)?
+
+2) Verify bounds and current state
+- From dashboard: current_replicas, desired_replicas, bounded_desired, min/max
+- Determine if we are:
+  - At max bound (max-hit)
+  - At min bound (min-hit)
+  - Below min (min unmet)
+  - Oscillating between states
+
+3) Determine primary driver
+- Overload: queue depth rising + saturation high
+- Provisioning: desired increases but current replicas do not follow
+- Policy: cooldown/anti-oscillation preventing changes
+- Prediction: staleness or missing forecasts, confidence low, or wrong ramp timing
+
+4) Check for known “safety clamp” behavior
+- If requested_desired is high but bounded_desired == max, the autoscaler is behaving correctly; the issue is capacity/bounds, not autoscaler logic.
+
+5) Decide mitigation path
+- If customer is overloaded and max-bound is hit: escalate for temporary max increase or capacity add; enable routing degradation strategies.
+- If min is unmet due to shortage: open capacity shortage incident path and customer comms.
+- If predictive is causing oscillation: disable predictive for that deployment; revert to reactive.
+
+## Common scenarios
+
+### Scenario A: “Stuck scale-up” (desired increases, current replicas do not)
+**Symptoms**
+- bounded_desired increases, but current_replicas stays flat for >10–15 minutes
+- Queue depth increases, p95 latency worsens
+- Provisioning error events present (or silent failures)
+
+**Likely causes**
+- Region capacity shortage / allocator cannot place GPUs
+- Provisioning pipeline errors (quota, node failures)
+- Fleet safety backoff active
+- Deployment pinned to constrained GPU type
+
+**What to check**
+1) Dashboard: provisioning/placement errors, allocator retries
+2) Autoscaler decisions: verify it is not blocked by cooldown (cooldown should not block scale-up in overload situations; if it does, treat as bug/regression)
+3) Fleet capacity: available GPUs in region + reserved pool headroom
+
+**Safe mitigations**
+- If **max bound not hit** and allocation is failing:
+  - Escalate to Fleet/Infra immediately (Vanessa Ortiz / Keiko Yamamoto on rotation)
+  - Consider routing degradation if applicable (see Smart Routing section below)
+- If **max bound hit**:
+  - Treat as “max-bound saturation” (Scenario C)
+
+**Escalate**
+- Fleet allocator/provisioning: Eng-Infra on-call
+- If widespread (multiple customers / region): open incident in #incidents and page Infra lead
+
+
+### Scenario B: “Stuck scale-down” (replicas won’t decrease)
+**Symptoms**
+- requested_desired drops but bounded_desired stays high, or current_replicas remains above bounded_desired
+- Costs higher than expected; customer may complain about spend
+
+**Likely causes**
+- Min bound set higher than intended (policy is correctly preventing scale-down)
+- Scale-down cooldown / dampening active
+- Workload still saturated due to long tail (e.g., long context requests) even if request rate dropped
+- In-flight draining constraints / graceful termination windows too long
+
+**What to check**
+1) Compare bounded_desired to min_replicas
+2) Look at queue depth and saturation; if still high, scale-down should not occur
+3) Verify termination/drain settings: if pods cannot drain, current_replicas may lag
+
+**Safe mitigations**
+- If min is set too high and customer approves lowering:
+  - Route to Customer Success + Product for approval (contractual impact)
+  - Apply policy update with audit reason and ticket reference
+- If scale-down is blocked by cooldown and customer is not overloaded:
+  - Wait for cooldown unless extreme cost impact; do not manually force down below min
+
+**Escalate**
+- If scale-down never occurs after cooldown and saturation is low: file bug with autoscaler team; include decision logs and reason flags
+
+
+### Scenario C: “Max-bound saturation” (bounded_desired == max, queue builds)
+**Symptoms**
+- max-hit rate elevated (sustained)
+- queue depth increasing / oldest queued age increasing
+- bounded_desired == max_replicas (flatline)
+
+**Interpretation**
+Autoscaler is behaving correctly. The system is telling you: “we need more capacity but are contractually/config-limited.”
+
+**Actions**
+1) Confirm it is truly demand-driven
+- Verify saturation: GPU busy %, token throughput near ceiling, queue growing
+- Check for runtime errors causing artificial queueing (e.g., repeated 5xx leading to retries)
+
+2) Trigger customer-safe degradations (if enabled)
+- Smart Routing can optionally degrade to a compatible fallback model/tier *only if allowed by customer policy*.
+- Coordinate with Smart Routing (Mina Haddad / Ravi Menon) if routing changes are required.
+
+3) Engage CS/Product on bounds change
+- If customer wants to preserve SLO: propose increasing max bound or adding reserved capacity.
+- If customer wants strict spend cap: document that latency impact is expected when max is hit.
+
+**Safe mitigations**
+- Temporary max increase (only with explicit approval, ticket, and audit reason):
+  - `rw-admin dedicated scaling-policy set --deployment <id> --region <region> --max-replicas <N> --reason "SUP-##### / customer approved temporary cap increase"`
+- Add fleet capacity if this is a platform shortage, not a customer cap.
+
+**Escalate**
+- CS escalation: Rachel Kim / Dev Patel
+- Product guidance on bounds semantics: Lauren Bishop
+- Fleet capacity add: Vanessa Ortiz
+
+
+### Scenario D: “Min bound unmet” (current replicas < min_replicas)
+**Symptoms**
+- min-hit indicates we want to be at min, but current_replicas remains below min
+- Degraded state banner on dashboard (if enabled)
+
+**Likely causes**
+- Region capacity shortage
+- Provisioning failures (node issues)
+- Misconfigured deployment targeting unavailable GPU type
+
+**Actions**
+1) Confirm min bound and unmet duration
+- How long below min? Is it intermittent or sustained?
+
+2) Check allocator/provisioning errors
+- Look for placement failure reasons
+
+3) Communicate risk
+- This is a reliability contract risk for Dedicated; treat urgently.
+
+**Safe mitigations**
+- If alternative capacity exists in-region (different GPU SKU) and deployment supports it, coordinate with Infra (do not change SKU unilaterally).
+- If needed, disable predictive (does not fix min unmet, but reduces noise) and focus on provisioning.
+
+**Escalate**
+- Page Infra/Fleet on-call immediately
+- Open incident if any enterprise customer is below min for >10 minutes
+- Notify CS for customer comms
+
+
+### Scenario E: Prediction pipeline outage / stale forecasts
+**Symptoms**
+- prediction_used=false for extended periods
+- prediction_staleness_seconds above threshold (commonly >900s)
+- sudden return to reactive-only behavior; possible queueing during ramps
+
+**Expected behavior**
+- Autoscaler must fall back to reactive signals (no scale-to-zero; never below min).
+
+**Actions**
+1) Verify fallback is working
+- bounded_desired tracks reactive overload
+- No abnormal downscales
+
+2) Determine impact
+- If customer relies on predictive for scheduled ramps, queueing may occur until reactive catches up.
+
+**Safe mitigations**
+- If overload during ramp: consider temporarily raising min before ramp windows (requires approval) or raising max.
+- Disable predictive mode toggle is not necessary if predictor is already unavailable; do not churn config unless it reduces confusion for customer.
+
+**Escalate**
+- Prediction pipeline: Mei Lin / Sana Farid (Applied/ML infra), plus Eng-Infra on-call if pipeline is owned there
+- If staleness is widespread: open incident
+
+
+### Scenario F: Oscillation / jitter (frequent scale up/down)
+**Symptoms**
+- Many scale events per hour
+- current_replicas changes frequently; latency jitter
+- prediction error high; reactive vs predictive conflict
+
+**Likely causes**
+- Noisy prediction inputs
+- Cooldown/dampening mis-tuned for workload
+- Large step sizes combined with low traffic periods
+
+**Actions**
+1) Confirm guardrails are active
+- Cooldowns present
+- Minimum step sizing and dampening enabled
+
+2) Look for “prediction flips”
+- Prediction changes direction frequently
+
+**Safe mitigations**
+- Disable predictive mode for the deployment (most reliable immediate mitigation):
+  - `rw-admin dedicated scaling-policy set --deployment <id> --region <region> --predictive-mode off --reason "INC-#### mitigate oscillation"`
+- Increase scale-down cooldown (prefer over changing min unless customer explicitly requests)
+
+**Escalate**
+- Autoscaler team: Vanessa Ortiz / Keiko Yamamoto
+- If reproducible, attach decision logs + charts to ENG ticket
+
+
+### Scenario G: “Scale to zero” concerns (should not happen)
+**Statement**
+Dedicated deployments with bounds should never scale below min_replicas. Additionally, null/absent predictions must not trigger unsafe downscales.
+
+If you observe current_replicas approaching 0:
+1) Confirm min_replicas is not 0 (some test environments may allow min=0; enterprise Dedicated typically should not)
+2) Verify bounded_desired is not below min
+3) If bounded_desired < min, treat as a P0 bug and open incident
+
+Mitigation:
+- Set min_replicas to a safe value immediately (with audit reason)
+- Disable predictive mode
+
+
+## Operational procedures
+
+### How to collect a complete “autoscaling debug bundle”
+When escalating, include:
+- deployment_id, account_id, region, model route (if relevant)
+- Time window (UTC) of impact
+- Current policy values: min/max, cooldowns, predictive_mode, rollout flag state
+- Graph screenshots/exports for:
+  - queue depth + oldest queued age
+  - desired vs bounded vs current replicas
+  - bound hit rate
+  - prediction staleness + prediction vs actual
+- Last 50 autoscaler decisions (CLI output)
+- Any provisioning/allocator error snippets
+
+
+### Emergency mitigations and required approvals
+Some actions are contract- or spend-sensitive.
+
+| Action | When allowed | Approval needed | Notes |
+|---|---|---|---|
+| Disable predictive mode | Oscillation, incorrect ramps, predictor bugs | SRE on-call can execute; inform Product/CS | Lowest-risk; returns to reactive-only behavior |
+| Increase max_replicas | Customer wants SLO over cap; platform emergency | CS + customer approval (or incident commander if platform-wide) | Must add audit reason + ticket id |
+| Increase min_replicas | Pre-warming for known ramp or to avoid cold starts | Product/CS approval recommended | Can increase spend; do not do silently |
+| Lower min_replicas | Cost mitigation | Customer approval required | Can reduce baseline SLO |
+| Manual scaling override | Temporary provisioning issues | Infra on-call approval | Prefer policy-based changes for auditability |
+
+Always record:
+- Ticket/incident id
+- Who approved (name/role)
+- Duration / planned revert time
+
+
+## Escalation paths
+### Eng-Infra / Fleet Autoscaling
+Escalate when:
+- Provisioning/allocator failures
+- Region shortage
+- Autoscaler loop errors
+
+Primary contacts:
+- Vanessa Ortiz (Fleet autoscaling lead)
+- Keiko Yamamoto (Autoscaler implementation)
+
+### Platform Control Plane / Policy Service
+Escalate when:
+- Policy updates not applying
+- Validation/RBAC issues
+- Audit events missing
+
+Primary contacts:
+- Ethan Park (Control plane lead)
+- Benji Okafor (Config/policy API)
+- Jordan Lee (Policy engine)
+
+### Observability
+Escalate when:
+- Dashboards/alerts incorrect or missing
+- Metric cardinality issues
+- Bound-hit metrics not emitted
+
+Primary contacts:
+- Allison Grant
+- Sergio Costa
+
+### Smart Routing
+Engage when:
+- Bounded state needs graceful degradation
+- Requests should be routed to alternate capacity within allowed policy
+
+Primary contacts:
+- Mina Haddad
+- Ravi Menon
+
+### Customer comms / contractual guidance
+- Customer Success: Rachel Kim, Dev Patel
+- Product (Dedicated): Lauren Bishop
+
+
+## Alert handling notes (noise vs signal)
+- “Max-bound saturation” alerts are actionable only if paired with **sustained queue growth** (avoid paging on brief max-hit bursts).
+- Prediction staleness alerts should be **non-paging** unless multiple enterprise customers show queueing during known ramps.
+- Min unmet should be **paging** for enterprise Dedicated.
+
+Reference: Dedicated autoscaling SLO and alerting updates.
+
+
+## Post-incident follow-up (required)
+If any of the following occurred, open a follow-up ticket within 24 hours:
+- Min bound unmet for >10 minutes
+- Predictive mode caused oscillation impacting p95 latency
+- Any policy evaluation produced non-deterministic outputs or missing audit fields
+- Any customer required emergency max increase
+
+Include:
+- Root cause hypothesis
+- What guardrails failed (cooldown, dampening, staleness checks)
+- Proposed fix and owner
+
+
+## Appendix: Reason codes (common)
+These appear in autoscaler decision logs and the scale event timeline.
+- `bound_hit=max` / `bound_hit=min`
+- `prediction_used=true|false`
+- `prediction_stale=true`
+- `reactive_override=queue_depth` / `reactive_override=saturation`
+- `cooldown_active=scale_down`
+- `dampening_applied=true`
+- `provisioning_blocked=allocator_shortage`
+- `policy_update_throttled=true`
+
+
+## Appendix: Customer-safe language (for CS/support)
+- If at max bound: “Your deployment is operating at the configured maximum capacity. When traffic exceeds that cap, queueing/latency is expected. We can increase the maximum with your approval or discuss workload optimization.”
+- If prediction stale: “Predictive pre-scaling is currently unavailable; autoscaling is operating in reactive mode. Reactive scaling will still add capacity under load, but it may lag during rapid ramps.”
+- If min unmet: “We are currently unable to provision your minimum baseline capacity due to capacity constraints/provisioning failures. We are treating this as a high-priority reliability issue and will provide regular updates.”

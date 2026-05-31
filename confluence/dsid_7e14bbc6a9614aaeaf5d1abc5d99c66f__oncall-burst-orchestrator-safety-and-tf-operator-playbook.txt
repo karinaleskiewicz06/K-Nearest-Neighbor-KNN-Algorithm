@@ -1,0 +1,187 @@
+Oncall Burst Orchestrator: Safety Operations & Terraform Operator Playbook
+
+Summary
+-------
+This runbook defines the operational play for the Oncall Burst Orchestrator (OBO): a cross-account, multi-region controller that provisions temporary burst capacity (GPU + network egress) via a Terraform-driven operator. It covers automated safety gates, manual intervention steps, Terraform operational commands, alert thresholds, rollback procedures, and post-incident analysis requirements.
+
+Intended audience
+-----------------
+- Oncall infra engineers (primary responders)
+- Platform SRE (secondary)
+- Cloud accounts & networking leads (escalation)
+- IaC owners (Terraform operator maintainers)
+
+When to use this document
+------------------------
+Use this playbook when either: 
+1) The Burst Orchestrator fails to allocate capacity for a configured tenant within the SLO window, or
+2) The orchestrator provisions burst capacity that violates safety/cost guards (e.g., > allocated burst credit, unexpected egress spikes), or
+3) There are observed regressions in latency or tenant SLOs after a burst allocation.
+
+Key concepts
+------------
+- Burst unit: 1 vGPU-hour + egress-credit chunk (defined per tenant).
+- Safety fence: pre-provision checks enforced by the operator (quota, cost limit, affinity rules, egress caps).
+- Circuit breaker: policy that prevents new bursts for tenants with recent failures or billing anomalies.
+- Terraform Operator: in-cluster controller that applies pre-approved Terraform plans in a gated workspace.
+
+SLOs & alert thresholds
+-----------------------
+| Metric | Target | Alert condition | Owner |
+|---|---:|---|---|
+| Burst allocation success rate | >= 99% (5m window) | Alert if < 98% for 3 consecutive 5m windows | oncall-infra |
+| Tenant latency P95 during burst | < 120ms | Alert if P95 increases by >30% vs baseline for 10m | platform-sre |
+| Burst cost delta (per-tenant) | < configured monthly buffer | Alert if predicted month-to-date burst spend > 110% of buffer | finance-infra |
+| Egress rate (per-tenant) | < tenant-egress-cap | Alert on sustained egress > cap for 2m | cloud-networking |
+
+Pre-flight checks (automated)
+----------------------------
+Before the operator applies a plan the following automated checks run (with pass/fail reasons):
+- Tenant quota available (GPU quota / account quotas)
+- Cost guard: projected spend < tenant buffer threshold
+- Affinity rule: node/cell matching labels exists in target region
+- Egress path available: NAT / PrivateLink capacity
+- Security policy: KMS keys and IAM roles resolved
+
+Oncall runbook: step-by-step
+---------------------------
+1) Triage the alert
+   - Inspect the primary alert stream (PagerDuty -> Opsgenie). Note the alert id, tenant id, region, and timestamp.
+   - Open the OBO dashboard (Grafana: infra/obo) and correlate the alert with recent plan-executions.
+
+2) Quick verification (2–5 minutes)
+   - Query the operator replay log: kubectl -n infra logs deployment/terraform-operator | grep "plan" | tail -n 200
+   - Check Terraform workspace status (gitops workspace names follow: obo-<tenant>-<region>). Use the controller UI or: 
+
+```
+# show latest run for workspace
+kubectl -n infra exec deploy/terraform-operator -- /bin/terraformctl workspace status obo-${TENANT}-${REGION}
+```
+
+   - Verify cloud quotas: aws service-quotas get-service-quota --service-code ec2 --quota-code L-XXXXX (or cloud provider equivalent).
+
+3) If a pre-flight check failed (operator blocked plan)
+   - Identify which check failed from the operator event annotation. Typical failures: quota, affinity, egress path, cost guard.
+   - For quota failures: engage quota oncall or follow the quota escalation guide (see related_pages). If quota cannot be increased in time, abort and notify the tenant.
+   - For cost guard failures: confirm billing projection; if a one-off anomaly, you may temporarily increase tenant buffer (see manual override below) only after Finance approval.
+
+4) If the operator applied a plan but allocation did not appear on the target cluster
+   - Validate Terraform apply outcome: retrieve the apply logs from controller: kubectl -n infra logs deploy/terraform-operator | sed -n '/apply/,/completed/p'
+   - Confirm cloud resources exist: run provider CLI to list reserved instances / node groups created by the plan.
+   - If resources are present but not joining the cluster, check node bootstrap logs in SSM / instance serial output. Common causes: wrong user-data, missing kubelet token, AMI mismatch.
+
+5) Manual remediation patterns
+   - Requeue a plan: If the controller failed due to transient cloud error, requeue using: 
+
+```
+kubectl -n infra annotate terraformworkspace/obo-${TENANT}-${REGION} obo-requeue="manual:${ONCALL_NAME}:${TIMESTAMP}"
+```
+   - Patch affinity labels: If placement failed due to label mismatch, add temporary placement label to a warm node pool and requeue. Ensure labels are removed post-incident.
+   - Apply a quarantined rollback: If newly provisioned nodes cause tenant regression, scale down the new node group via provider CLI and annotate the workspace to mark as failed.
+
+6) Escalation matrix
+   - After 15 minutes unresolved: escalate to Platform SRE (pager group: platform-sre).
+   - After 30 minutes unresolved with production impact: page Cloud Accounts lead and Finance (if cost-related).
+   - For suspected security misconfiguration: immediately contact Security (pager) and freeze the workspace (see emergency freeze below).
+
+Emergency freeze (immediate stop)
+--------------------------------
+When a newly provisioned burst causes widespread degradation or potential data exfiltration: 
+- Run the freeze annotation to prevent further applies: 
+
+```
+kubectl -n infra annotate terraformoperator config freeze=true "reason=emergency-${INCIDENT_ID}"
+```
+- Manually scale the orchestrator down to 0 replicas (prevents concurrent applies): kubectl -n infra scale deployment/terraform-operator --replicas=0
+- Revoke temporary credentials used by the operator (rotate service-account keys or IAM role session).
+
+Terraform operator operational commands (common)
+------------------------------------------------
+- Re-run plan for a workspace: kubectl -n infra exec deploy/terraform-operator -- /usr/local/bin/terraformctl plan obo-${TENANT}-${REGION}
+- Force apply (only with approval and annotate): kubectl -n infra exec deploy/terraform-operator -- /usr/local/bin/terraformctl apply --workspace=obo-${TENANT}-${REGION} --force
+- Export logs for post-mortem: kubectl -n infra logs deploy/terraform-operator --since=2h > /tmp/obo-logs-${INCIDENT_ID}.log
+
+Safety and governance: approved exceptions
+----------------------------------------
+All manual overrides that change cost thresholds or apply force must be recorded in the exceptions ledger and have:
+- Rationale (short), owner (oncall name), duration, approver (Finance or Platform lead).
+- Examples of acceptable reasons: short-term spike to meet SLAs for a high-priority customer during an outage; controlled load-testing by ops.
+
+Temporary override CLI (example)
+------------------------------
+Only an approver may execute the buffer override helper. Example flow:
+
+```
+# request override (returns ticket id)
+obo-cli request-override --tenant $TENANT --amount 500 --duration 2h --reason "emergency SLA for checkout"
+# approver applies
+obo-cli approve-override --ticket $TICKET --approver maya.chen@redwood.ai
+```
+
+Common troubleshooting checklist
+--------------------------------
+- Confirm operator pod time and restarts (kubectl get pods -n infra -o wide).
+- Check cloud provider error codes in the apply log (rate limit 429, insufficientInstanceCapacity, etc.).
+- Verify IAM role permissions: run sts:AssumeRole simulation with the operator principal.
+- Check node bootstrap (cloud-init logs) for AMI drift.
+- Correlate with network telemetry: NAT gateway saturation, route table errors.
+
+Post-incident analysis (PIA) requirements
+---------------------------------------
+For any incident with > 10 minutes customer impact or > $1,000 unexpected cost:
+1. Author a PIA document within 72 hours describing sequence of events, root cause hypothesis, why safety gates failed, and recommended action items.
+2. Include these required artifacts: terraform operator logs, controller events, cloud provider request ids, tenant cost projections, Grafana dashboard snapshots.
+3. For cost incidents, Finance must validate the cost delta and sign off the remediation plan.
+
+Runbook examples: Terraform variable table
+-----------------------------------------
+| variable | description | example |
+|---|---|---|
+| tenant_id | Redwood tenant identifier | tenant-42 |
+| region | target cloud region | us-west-2 |
+| burst_vgpu_count | number of vGPUs requested | 8 |
+| burst_duration_minutes | requested lease time | 240 |
+| egress_cap_bytes | egress cap applied to tenant in bytes | 10737418240 (10GiB) |
+
+Ownership & maintenance
+-----------------------
+- Oncall infra (rotating): responsible for first response and triage.
+- Terraform operator team: maintain controller, CI/CD pipelines, and run operator upgrades.
+- Cloud accounts & networking: manage quotas, egress appliances, and PrivateLink endpoints.
+- Finance-infra liaison: monitors tenant buffers and approves overrides.
+
+Operational run cadence
+----------------------
+- Weekly: sanity checks of warm node pool labels and quota headroom (owner: cloud-accounts).
+- Monthly: cost guard audit; reconcile tenant burst spend (owner: finance-infra).
+- Quarterly: operator upgrade and chaos test (owner: terraform-operator team).
+
+Appendix: useful commands and links
+----------------------------------
+- Grafana OBO dashboard: https://grafana.redwood.internal/d/obo
+- Terraform operator repo: git@github.com:redwood/terraform-operator.git
+- Oncall helper CLI: obo-cli (s3://infra-tools/obo-cli/releases)
+- Example apply artifact snippet:
+
+```
+# snippet from a successful apply
+resource "aws_autoscaling_group" "obo_nodes" {
+  name_prefix = "obo-${var.tenant_id}-${var.region}-"
+  desired_capacity = 8
+  tags = [{ key = "obo-managed", value = "true", propagate_at_launch = true }]
+}
+```
+
+Change log
+----------
+- 2024-10-15: Initial draft by Aisha Patel.
+- 2025-05-10: Added emergency freeze flow and override CLI examples (reviewers: Diego Ramos).
+- 2026-02-02: Updated SLO thresholds and escalation matrix; added PIA artifacts checklist (reviewers: Linus Kwan, Maya Chen).
+
+Contact list
+------------
+- Oncall infra pager: #pager-infra (Opsgenie)
+- Terraform operator maintainers: infra-terraform@redwood.ai
+- Cloud accounts: cloud-accounts@redwood.ai
+- Finance-infra: finance-infra@redwood.ai
+- Security: sec-pager@redwood.ai

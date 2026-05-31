@@ -1,0 +1,216 @@
+ADR: Short/Long Prompt-Aware Scheduling Policy for Mixed Workloads
+
+## Status
+Published (runtime prototype behind feature flag; rollout gated by SRE guardrails).
+
+## Decision summary
+We will implement a **short/long prompt-aware scheduling policy** for the serving runtime to reduce user-visible tail latency under mixed prompt-length distributions.
+
+The policy is implemented as a **class-based scheduler (two-queue dispatch)**:
+- Classify requests into **SHORT** and **LONG** using prompt/context length and (where available) a lightweight prefill-cost estimate.
+- Maintain separate queues and enforce a **dispatch share / token budget** that favors SHORT to protect TTFT and p95 latency.
+- Include **aging / starvation prevention** guarantees so LONG requests continue to make progress under sustained SHORT load.
+
+This replaces “single-queue, length-agnostic” selection in mixed workloads while preserving continuous batching.
+
+## Context / problem
+Redwood’s continuous batching performs well on homogeneous workloads. In production, we see mixed distributions where short chat prompts (latency-sensitive) are interleaved with long-context prompts (prefill-heavy). In these cases:
+- Long-prefill work can dominate GPU iterations and batch selection.
+- SHORT requests experience head-of-line blocking, inflating **TTFT** and **p95** latency.
+- The impact is amplified during bursty load and when KV cache pressure causes additional overhead.
+
+We need a policy that improves SHORT p95 without materially regressing:
+- aggregate throughput,
+- LONG completion progress,
+- and overall fairness across requests.
+
+## Goals
+1. Reduce user-visible tail latency for SHORT requests under representative mixes (e.g., 80/20 short/long, long spikes).
+2. Preserve throughput within acceptable bounds for core SKUs.
+3. Provide operational safety: predictable guardrails, observability, and rollback.
+
+## Non-goals
+- Multi-tenant QoS productization (customer-configurable tiers and per-tenant SLAs) beyond internal knobs.
+- A full redesign of admission control and backpressure (we will minimally integrate with existing mechanisms).
+
+## Proposed policy (what we will build)
+### Classification
+A request is classified at enqueue time and may be re-evaluated at key transitions:
+- **SHORT** if prompt/context tokens <= `short_prompt_tokens_threshold` (default candidate: 256–512 depending on SKU/model) OR predicted prefill cost <= `short_prefill_cost_threshold`.
+- **LONG** otherwise.
+
+Notes:
+- Classification is based on **prompt/context** (prefill weight), not target output length.
+- We will avoid expensive predictors; the estimate must be O(1) and stable.
+
+### Dispatch algorithm (two-queue)
+At each scheduling iteration:
+1. Consider available queued work in SHORT and LONG.
+2. Enforce a **per-iteration token budget**:
+   - SHORT budget: `short_token_budget_per_iter`
+   - LONG budget: `long_token_budget_per_iter`
+3. Prefer dispatch from SHORT while budget remains.
+4. Dispatch from LONG when:
+   - LONG budget remains AND (SHORT is empty OR LONG has aged beyond threshold), OR
+   - starvation prevention triggers.
+
+### Starvation prevention / fairness
+We will guarantee progress for LONG via:
+- **Aging:** each queued request accumulates age; effective priority increases with age.
+- **Max skew / minimum share:** enforce a minimum LONG dispatch share over sliding windows.
+- **Burst caps:** limit how long the scheduler can run “SHORT-only” under continuous SHORT load.
+
+Explicit guardrail targets:
+- A LONG request should not exceed `max_long_queue_wait_ms` without receiving service (best-effort; exact guarantee depends on load and backpressure).
+- The scheduler maintains a `starvation_counter` metric and triggers warnings/alerts if thresholds are exceeded.
+
+### Prefill vs decode handling
+We will treat prefill-heavy work differently from decode-heavy work:
+- Separate hooks to prevent a long-prefill job from dominating the next batch selection.
+- Budgeting in terms of tokens (or equivalent work units) to limit tail amplification.
+- Avoid kernel selection thrash by constraining kernel switches within a bounded set per iteration.
+
+## Alternatives considered
+### A) Pure SRPT (Shortest Remaining Processing Time)
+**Description:** approximate SRPT using predicted remaining work (prefill + decode) and always schedule smallest first.
+
+**Pros**
+- Strong theoretical mean latency improvements.
+
+**Cons / reasons not chosen**
+- Requires reasonably accurate remaining-time prediction; mispredictions are common for LLM decode (stop conditions, tool calls, dynamic max tokens).
+- High risk of fairness violations and practical starvation under skewed traffic.
+- Implementation complexity: continuous batching, KV cache reuse, and kernel selection interactions increase stability risk.
+- Operationally difficult to reason about and tune across models/SKUs.
+
+### B) Strict token-based fairness (e.g., DRR/WFQ by tokens)
+**Description:** enforce per-request or per-queue fairness in terms of tokens served.
+
+**Pros**
+- Clear fairness properties; predictable “tokens per unit time” behavior.
+
+**Cons / reasons not chosen**
+- Does not directly protect latency-sensitive SHORT TTFT/p95 in mixed workloads; fairness can still allow long-prefill work to cause head-of-line blocking.
+- Adds overhead and tuning complexity (deficits, quanta, per-request accounting) with unclear user-visible benefits compared to two classes.
+- Can conflict with continuous batching efficiency if fairness slicing forces suboptimal batch composition.
+
+### C) Admission-control-only changes
+**Description:** keep scheduler unchanged; rely on backpressure/admission control to prevent long requests from entering when latency risk is high.
+
+**Pros**
+- Lower runtime complexity; easier to rollback.
+
+**Cons / reasons not chosen**
+- Fails to address the core issue when mixed workloads are accepted by design (Dedicated pools, enterprise usage, long-context features).
+- Would require customer-visible rejection/queuing behaviors to protect p95, creating a worse product experience.
+- Still leaves head-of-line blocking when long requests are admitted.
+
+### D) Separate pools / hard partitioning (short pool vs long pool)
+**Description:** route traffic to separate GPU pools.
+
+**Pros**
+- Strong isolation.
+
+**Cons / reasons not chosen (for prototype)**
+- Operationally expensive, capacity fragmentation, and poor fit for Dedicated pools where load varies.
+- Adds routing complexity and does not solve per-pool scheduling issues.
+
+## Why the chosen approach
+The short/long class-based policy is the smallest change that:
+- Directly targets the observed failure mode (long-prefill dominating mixed batches).
+- Is tunable and explainable with a small set of knobs.
+- Can provide explicit fairness guardrails without needing full SRPT prediction.
+- Preserves continuous batching and expected throughput on steady-state workloads.
+
+## Success criteria
+We will evaluate against baseline (current scheduler) using benchmark-lab scenarios and replayed anonymized traces.
+
+### Primary metrics (pass/fail)
+- SHORT requests: **p95 latency** improvement of **>= 20%** under 80/20 short/long and long-spike scenarios (or an equivalent reduction agreed with Product/SRE based on pool SLOs).
+- SHORT requests: **TTFT p95** must improve or remain within **+5%** of baseline in steady-state homogeneous short traffic.
+- Throughput: **<= 3% regression** at iso-quality settings for representative SKUs.
+
+### Guardrail metrics
+- LONG requests: p95 latency must not regress by more than **15%** in mixed scenarios (unless explicitly approved for specific pools as a trade-off).
+- Starvation: `starvation_counter` must remain at zero under normal operation; any sustained non-zero value triggers investigation.
+- Scheduler overhead: CPU time added per iteration must remain within acceptable bounds (measured in perf-canary).
+
+### Operational criteria
+- Feature flag must allow immediate disable without restart where possible.
+- Metrics/dashboards exist for per-class queueing and service share.
+- Rollback triggers align to SRE tail-latency SLO guardrails.
+
+## Risks and mitigations
+1. **Misclassification risk** (requests near the threshold behave like the other class)
+   - Mitigation: tune thresholds from production distributions; allow per-pool overrides; measure sensitivity.
+
+2. **LONG starvation under sustained SHORT load**
+   - Mitigation: aging + minimum LONG share + burst caps; add regression tests and perf-canary scenarios.
+
+3. **Kernel selection instability / thrash when mixing lengths**
+   - Mitigation: constrain kernel switching; add profiling guidance; track kernel-selection change rate metrics.
+
+4. **KV cache pressure / eviction spikes**
+   - Mitigation: budget prefill work; track cache eviction metrics alongside scheduler metrics; ensure fallback behavior is safe.
+
+5. **Throughput regressions due to less optimal batching**
+   - Mitigation: token budgets tuned per SKU; keep batch formation constraints; fail-safe to baseline policy.
+
+## Implementation notes (prototype-level)
+- Scheduler adds two internal queues and a class label on requests.
+- Config knobs (initial set; exact names may vary by config system):
+  - `short_prompt_tokens_threshold`
+  - `short_prefill_cost_threshold` (optional)
+  - `short_token_budget_per_iter`
+  - `long_token_budget_per_iter`
+  - `min_long_dispatch_share`
+  - `max_short_burst_iters`
+  - `aging_half_life_ms` (or equivalent aging slope)
+  - `max_long_queue_wait_ms`
+- All knobs must have safe bounds and validation; defaults are SKU- and model-aware.
+
+## Observability requirements
+Per-class metrics (at minimum):
+- Queue depth: `scheduler_queue_depth{class=short|long}`
+- Time-in-queue histograms: `scheduler_queue_wait_ms{class=...}`
+- Prefill latency: `prefill_latency_ms{class=...}`
+- TTFT and end-to-end latency: `ttft_ms{class=...}`, `request_latency_ms{class=...}`
+- Dispatch share: `scheduler_dispatch_tokens{class=...}` / `scheduler_dispatch_iters{class=...}`
+- Starvation counters and aging overrides: `scheduler_starvation_events_total`, `scheduler_aging_forced_dispatch_total`
+
+Dashboards must allow:
+- comparing baseline vs flag-enabled pools,
+- filtering by model and pool,
+- and correlating with KV cache metrics and kernel selection changes.
+
+## Rollout plan
+1. Ship behind feature flag (default off).
+2. Benchmark-lab pass on representative SKUs and models.
+3. Nightly perf-canary with mixed workload scenarios; set regression alerts.
+4. Limited canary in a single region + subset of Dedicated pools with explicit on-call coverage.
+5. Ramp gradually with rollback triggers:
+   - any sustained p95/p99 drift beyond SRE guardrails,
+   - non-zero starvation counters,
+   - or unexpected throughput degradation.
+
+## Consequences
+### Positive
+- Improved user-visible tail latency for short prompts in mixed workloads.
+- Clear knobs to tune trade-offs between latency protection and fairness.
+- Better observability into queueing and scheduling behavior.
+
+### Negative / costs
+- Increased scheduler complexity and tuning burden.
+- Risk of per-model/SKU parameter mismatch if defaults are not well-calibrated.
+- Additional metrics cardinality and dashboard maintenance.
+
+## Open questions / follow-ups
+- Final default thresholds per model family and SKU (to be derived from trace distributions and benchmark sweeps).
+- Whether to refine classification using a stable prefill-cost estimator (without introducing prediction brittleness).
+- How this policy composes with future multi-tenant QoS tiers (out of scope for prototype but must avoid blocking it).
+
+## Owners
+- Scheduler policy/implementation: Serving Runtime Scheduling (Sofia Ivanova, Lena Fischer)
+- Kernel interaction review: Serving Runtime Kernels (Hiro Tanaka)
+- SLO guardrails and rollout approval: SRE (Sean Gallagher)
+- Metrics/dashboard standards: Observability (Allison Grant)

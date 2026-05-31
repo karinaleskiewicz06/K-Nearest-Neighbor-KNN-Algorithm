@@ -1,0 +1,135 @@
+Runtime operator observability and diagnostic playbook
+
+Summary
+-------
+This playbook consolidates operator-facing observability patterns, diagnostic procedures, and escalation steps for the Redwood serving runtime. It bridges runtime architecture concepts (request routing, kernel scheduling, KV cache), profiling techniques, benchmarking checks, and runbook actions used during incidents and routine validation. The intended audience is oncall operators, SREs, and runtime engineers.
+
+Scope
+-----
+- Host-level and service-level telemetry required to diagnose perf and correctness issues
+- Kernel scheduling and admission controller signals relevant to prioritization and preemption
+- Profiling commands and sampling recipes for reproducing tail-latency and memory-pressure scenarios
+- Benchmarks and quick smoke checks to validate rollouts and hotfixes
+- Clear owner / escalation steps and related documentation links
+
+Roles & ownership
+-----------------
+- Oncall (Triage): first responder for alerts; run the checklist and collect traces/metrics.
+- Runtime Engineers (RTE): perform kernel-level debugging, implement mitigations, and ship canary fixes.
+- SRE: adjust global admission and capacity, coordinate capacity-driven fallbacks.
+- Release owner: coordinate rollouts and postmortem.
+
+SLOs and quick thresholds
+-------------------------
+- P99 generation latency per model route: 300ms (hosted), 150ms (dedicated).
+- Error rate (5xx) per service: < 0.2% over 5m.
+- Kernel queue length (per GPU): alarm if > 90th percentile of baseline for 10m.
+
+Operational traces and telemetry to collect (minimum)
+--------------------------------------------------
+- Request timeline trace (edge -> orchestrator -> kernel dispatcher -> GPU execution) with span tags: model, seq_len, kernel_variant, priority, tenant_id.
+- Kernel-level counters: active_kernels, preemptions, eviction_events, kv_cache_hits, kv_cache_misses.
+- GPU telemetry: memory_used, sm_utilization, mem_alloc_latency, temperature_C.
+- Admission signals: queue_depth_by_priority, available_slots, predictive_warmstart_score.
+
+Fast triage checklist (first 10 minutes)
+----------------------------------------
+1) Validate alert context and affected routes: check Console route dashboard for increased 5xx or latency.
+2) Capture representative traces: use trace-id from alert and run `rtrace fetch <trace-id>` to pull the full timeline.
+3) Metrics snapshot: export the following queries to a file (Prometheus / Cortex):
+   - promql: rate(runtime_request_errors_total[5m]) by (service, model)
+   - promql: histogram_quantile(0.99, sum(rate(runtime_request_duration_seconds_bucket[5m])) by (le, route))
+   - promql: sum(active_kernels) by (gpu_id)
+4) Check kernel scheduler status: `kubectl -n runtime get pods -l app=kernel-dispatcher -o wide` and `kubectl logs <dispatcher-pod> | tail -n 200`.
+5) If GPU memory pressure observed (memory_used > 95% sustained for 1m) — start memory-pressure runbook (below).
+
+Kernel scheduling knobs and their operational meaning
+---------------------------------------------------
+| knob_name | default | intent | operator action |
+|-----------|---------|--------|----------------|
+| preemption_budget_pct | 20 | maximum percent of task budget allowed for preemptions | reduce to 5–10 for critical low-latency routes during incident |
+| admission_backpressure_threshold | 0.85 | queue fullness fraction after which admission starts rejecting | increase by +0.05 to allow burst if healthy slots exist |
+| kernel_variant_preference | [fast_fp16, econ_int8, cpu_fallback] | ordered fallback chain | pin to fast_fp16 for SLA routes during canary |
+| kvcache_warmup_concurrency | 8 | number of parallel prefetch workers | increase to speed warmstarts on cold-model rollouts |
+
+(When editing knobs, follow the change-management window noted in infra-standards.)
+
+Profiling recipes (commands + sampling plan)
+------------------------------------------
+- Lightweight live sample (5–15 minutes):
+  - Enable `adaptive_latency_sampler` at 10% target rate for affected route.
+  - Run: `rprof sample --route <route> --duration 10m --output /tmp/prof-route.json`
+  - Produce flamegraph: `rprof flamegraph /tmp/prof-route.json > /tmp/flame.svg`
+- Deterministic micro-replay (devlab):
+  1. Capture representative request set (see benchmarking section).
+  2. Run `rreplay --corpus ./corpus.json --concurrency 8 --model-version vX.Y` against canary runtime.
+  3. Collect `nvprof` or vendor-specific traces on the accelerator host.
+
+Benchmarking smoke tests (quick checks for rollouts)
+--------------------------------------------------
+- Purpose: confirm no obvious latency regressions and that scheduling decisions match expected cost envelope.
+- Minimal checks (3–15m):
+  1. Small synthetic burst: 1000 short requests (seq_len <= 64) at T=200 RPS. Confirm P95 < 120ms on dedicated nodes.
+  2. Mixed-size steady test: 5m run with 60% short, 30% medium (seq_len 64–256), 10% long. Observe kernel_variant distribution and kv_cache hit-rate > 60%.
+  3. Cold-model warmup: redeploy model and measure cold-start 50th/95th percentiles. Expected cold-start P95 < 1.2s for pinned pin-size models.
+- Example curl-based generator (replace tokens and route):
+  - bash snippet:
+    for i in $(seq 1 1000); do curl -s -X POST \"https://api.redwood.internal/v1/generate?route=insights\" -H 'Authorization: Bearer $TOKEN' -d '{"prompt":"hi","max_tokens":16}' & done; wait
+
+Release note snippet (how to validate a runtime patch)
+-----------------------------------------------------
+- Patch summary: short description of kernel or scheduler change, risk classification (low / medium / high), and rollback plan.
+- Validation steps included in the PR: smoke benchmark results (before/after), unit tests for scheduler policy language, and canary traffic matrix.
+- Communication: post to #runtime-release with roll-forward time and rollback steps.
+
+Known issues index (active)
+--------------------------
+- ISSUE-2026-118: `kvcache_shard_serialization_delay` — symptom: sporadic 5xx on long-sequence workloads when shard repair triggers under high eviction. Mitigation: temporarily increase `kvcache_warmup_concurrency` and apply shard-rebalance. Owner: Cache Team. Link: /confluence/eng-serving-runtime/known-issues/kvcache-shard-skew-quantization-interaction-2026.
+- ISSUE-2026-212: `dispatcher-latency-spikes-on-burst` — symptom: dispatcher queue stalls after burst followed by sudden kernel preemption storms. Mitigation: lower preemption_budget_pct, enable burst_smoothing_policy, escalate to kernel-scheduler oncall if persists. Owner: Scheduler Team.
+
+Memory-pressure triage runbook (short form)
+------------------------------------------
+1) Confirm with metrics: GPU memory_used_pct > 95% for 60s and mem_alloc_latency increase > 5x baseline.
+2) Reduce admission for non-critical routes: `kubectl exec -n runtime <admission-controller-pod> -- patch ...` (follow safe change template).
+3) Trigger eviction of low-priority sessions: `rctl evict --priority low --gpu <gpu-id> --grace 5s` and monitor for recovery.
+4) If eviction fails or node unstable, cordon the node and drain: `kubectl cordon <node>` and `kubectl drain <node> --ignore-daemonsets`.
+5) Post-incident: gather kernel-level debug bundle: `rdiag collect --since 30m --traceids <list> --output /tmp/diag-bundle.tgz` and attach to postmortem.
+
+When to escalate to kernel-scheduler oncall
+------------------------------------------
+- Repeated kernel preemptions > 50/minute without corresponding queue depth increase.
+- Kernel dispatch logs showing repeated ‘variant_mismatch’ errors.
+- Any situation where immediate knob changes fail to restore latency within 10 minutes.
+
+Template: investigation timeline (first 90 minutes)
+---------------------------------------------------
+- 0–10m: Triage checklist, gather traces, confirm SLO breach and scope.
+- 10–30m: Apply minimal mitigations (admission control, knob tweak), capture before/after metrics.
+- 30–60m: If still unresolved, start canary rollback or constrained routing to fallback model variants.
+- 60–90m: Decide incident severity level, call for cross-team coordination, open postmortem.
+
+Artifacts to attach to a postmortem
+----------------------------------
+- Trace bundle (rtrace), profiler output (rprof), benchmark job outputs, manifest of knob changes, PR references, and timeline of alerts/commits.
+
+Appendix: handy queries and CLI snippets
+---------------------------------------
+- Top erroring routes: promql: topk(10, sum(rate(runtime_request_errors_total[5m])) by (route))
+- Kernel busy GPUs: promql: topk(5, sum(active_kernels) by (gpu_id))
+- Representative trace fetch: `rtrace fetch --service runtime --filter route=insights --limit 5`
+- Kernel dispatcher health: `kubectl -n runtime exec svc/kernel-dispatcher -- /usr/local/bin/dispatchctl status`
+
+Related documentation and runbooks
+--------------------------------
+- Runtime deployment circuit-breakers and SLA fallback playbook — link in related_pages.
+- Latency fingerprint & kernel sensitivity index — profiling-playbook (refer reviewer list).
+- Kernel scheduler design intent and contracts catalog — runtime-architecture team wiki.
+
+Revision history
+----------------
+- 2026-02-08: created by Aisha Patel.
+- 2026-03-01: updated with memory-pressure runbook and new kernel knobs table (reviewers: Miguel Ortega, Priya Shah).
+
+Contact
+-------
+For urgent escalations: #runtime-oncall (pager duty) and runtime-scheduler@redwood.internal for kernel-scheduler oncall.

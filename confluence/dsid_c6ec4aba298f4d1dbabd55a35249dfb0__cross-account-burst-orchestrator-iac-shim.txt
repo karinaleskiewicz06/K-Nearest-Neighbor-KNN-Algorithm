@@ -1,0 +1,198 @@
+cross-account-burst-orchestrator-iac-shim
+
+Summary
+-------
+This document describes the design, Terraform module interface, and operational runbook for the Cross-Account Burst Orchestrator (CABO) IaC shim. CABO mediates GPU burst requests across Redwood accounts and cloud projects, applies quota and egress policies, and provides a small network proxy fabric so tenants can safely burst into shared warm pools without directly trusting remote accounts.
+
+Goals:
+- Provide a minimal, auditable operator that enables fast, safe GPU bursting across accounts.
+- Keep host-side blast radius small: no long-lived cross-account credentials on tenant instances.
+- Enforce per-tenant credit accounting, egress shaping, and routing SLOs.
+- Blend with existing Terraform workflows and CI gates.
+
+Non-goals:
+- CABO is NOT a full scheduler replacement. It assumes both source and target clusters expose local allocation endpoints.
+- It does not replace trust boundaries for private customer VPCs; private deployments with strict compliance should use dedicated capacity.
+
+Motivation
+----------
+We frequently accept burst requests where a tenant in Account A needs ephemeral GPU capacity from a warm pool in Account B. Previous ad-hoc approaches created long-lived cross-account roles, hard-to-audit SSH tunnels, and inconsistent billing. CABO standardizes a shim operator: an IaC + small control-plane pair (controller + proxy) that runs in the receiving account and is installed via Terraform.
+
+Key constraints and design principles
+- Minimal trust: leverage short-lived signed tokens (STS + JWT) and ephemeral TLS certs.
+- Declarative install: one Terraform module to install the shim and register tenants.
+- Observable and reversible: audit logs emitted to central logging, and ability to revoke tenant tokens immediately.
+- Network-safe: default deny ingress from tenant to provider control plane; all tenant requests terminate on the orchestrator proxy.
+
+Architecture overview
+---------------------
+Components:
+1) CABO Controller (k8s Deployment in provider account)
+   - Reconciles TenantRegistration CRDs, issues ephemeral tokens, publishes cluster endpoints
+   - Responsible for quota enforcement and accounting exports to billing pipeline
+2) CABO Network Proxy (sidecar service mesh / lightweight envoy)
+   - Terminates tenant TLS, enforces egress shaping, applies route-level ACLs, performs NAT for tenant burst traffic
+3) Terraform IaC Module (single interface for install and tenant binds)
+   - Creates IAM roles, k8s resources, autoscaler hooks and an SQS-style request queue (or cloud-native queue)
+4) Tenant CLI / SDK (client-side small binary)
+   - Requests bursts, exchanges short-lived tokens, performs handshake and KV-cache warmup
+
+Sequence diagram (text):
+- Tenant CLI -> CABO Controller (Account A authenticated STS) request burst for X GPUs
+- Controller validates quota, enqueues request, signals provider queue
+- Provider CABO Controller dequeues, reserves GPUs via local allocator, returns ephemeral connection details
+- Tenant CLI connects to Network Proxy with ephemeral token -> traffic flows over TLS to proxied worker
+
+Terraform module interface (recommended)
+--------------------------------------
+This section documents the expected variables, outputs and basic usage pattern for the module: cabo/terraform/cabo-orchestrator.
+
+Variables (table):
+| name | type | description | default |
+|------|------|-------------|---------|
+| name | string | deployment name, used for k8s resources and tags | "cabo" |
+| provider_account_id | string | numeric account ID where CABO will run | <required> |
+| allowed_tenant_accounts | list(string) | tenant account IDs that can request bursts | [] |
+| burst_queue_type | string | queue implementation: sqs | "sqs" |
+| max_concurrent_bursts | number | global hard cap of concurrent bursts | 50 |
+| egress_shaper_profile | string | reference to egress shaping preset | "default" |
+
+Outputs (table):
+| name | description |
+|------|-------------|
+| controller_endpoint | k8s service URL for controller api |
+| proxy_endpoint | public proxy endpoint (TLS) |
+| iam_role_arn | IAM role for ephemeral token issuance |
+
+Example usage:
+```hcl
+module "cabo_provider" {
+  source = "github.com/redwood/cabo//terraform/cabo-orchestrator"
+  name = "cabo-us-west"
+  provider_account_id = "123456789012"
+  allowed_tenant_accounts = ["210987654321", "210987654322"]
+  burst_queue_type = "sqs"
+  max_concurrent_bursts = 120
+}
+```
+
+IAM and network responsibilities
+--------------------------------
+- Module creates a cross-account IAM Role (trusts tenant accounts) which is used only for minting short-lived STS tokens. The module also creates a single-service LoadBalancer (or ALB) which is locked to TLS + client certs.
+- Security posture:
+  - Security group: allow inbound from tenant NAT ranges only to the proxy port.
+  - Egress rules: provider workers are allowed to reach artifact registries and package repos; tenant data flows are NATed through the proxy.
+  - Audit: Every allocation generates structured log entries: tenant_account, request_id, GPUs_reserved, kernel_profile, duration_seconds, az, reply_token. Logs forwarded to central ELK and to billing topic.
+
+Operational runbook: burst request lifecycle and incidents
+------------------------------------------------------
+Normal flow (operator steps):
+1) Tenant requests burst via CLI with signed STS token.
+2) Controller validates and enqueues; logs appear in /cabo/requests stream.
+3) Provider reserves nodes and publishes ephemeral connection to proxy.
+4) Tenant connects; KV-cache warmup runs; operator monitors latency and token TTL.
+
+Primary SLOs and alerts:
+- Allocation latency P50 < 12s, P95 < 45s for warm-pool allocations (alert if P95 > 60s for 5m).
+- Proxy TLS handshake error rate < 0.5% per 5m (alert if > 2%).
+- Accounting export lag < 2m (alert if > 10m).
+
+Incident: failed allocations due to quota or out-of-capacity
+Steps:
+1) Check /cabo/requests and /cabo/reservations for the request_id.
+2) If rejection = QUOTA_EXCEEDED: notify tenant owner and show guidance to increase commit or retry later.
+3) If rejection = NO_CAPACITY: check warm-pool size (k8s nodes), autoscaler events, and preemption logs. If warm-pool drained unexpectedly:
+   a) Trigger warm-pool scale up: kubectl scale deployment/cabo-warmpool --replicas=N
+   b) If scale fails due to cloud quota: run the cloud quota request runbook (link below) and mark priority P1
+4) If proxy errors: restart proxy pods with rolling restart: kubectl rollout restart deploy/cabo-proxy -n cabo && monitor TLS error rate.
+
+Emergency rollback
+1) Toggle module variable allow_bursting = false via Terraform: this will cause controller to reject new enqueues and begin draining.
+2) Revoke tenant IAM role sessions: terraform apply will update role trust policy to deny; also revoke any active tokens via control-plane revoke endpoint.
+
+CI/CD and testing checklist for module changes
+---------------------------------------------
+Every change to the cabo/terraform module must pass the following CI gates:
+- Unit TF validate and fmt
+- tfsec and checkov scans with zero critical fail findings
+- Integration: terraform apply in a staging account with ephemeral credentials followed by an automated end-to-end smoke test: register test tenant, request 1xGPU burst, validate connection and billing record.
+- Canary rollout: deploy new module to a lower-priority provider account with allow_bursting=false, run 100 simulated bursts against that provider, evaluate latency and error rates.
+
+Example smoke test (bash):
+```bash
+set -e
+export AWS_PROFILE=staging-cabo
+terraform init && terraform apply -auto-approve
+# register test tenant
+python tests/register_tenant.py --account 999999999999 --role-name cabo-test
+# request burst and wait
+python tests/request_burst.py --gpus 1 --wait --assert-billing
+```
+
+Rollout strategy
+----------------
+1) Merge PR + pass CI.
+2) Deploy to canary provider account with allow_bursting=false. Run synthetic tests for 24 hours.
+3) If metrics good, enable allow_bursting for one tenant in production account for 1 hour.
+4) Gradual ramp every 4 hours increasing by factor 2 until production targets reached. Monitor SLOs in the first 30 minutes after each ramp.
+
+Telemetry and billing integration
+--------------------------------
+- Required metrics exported to Prometheus: cabo.allocations_total, cabo.alloc_latency_seconds (histogram), cabo.proxy_tls_errors_total, cabo.active_bursts_gauge.
+- Accounting exports: structured events to billing-topic SNS with schema version v2: {tenant_account, request_id, start_ts, end_ts, tokens_used, tokens_refunded}.
+
+Security & compliance notes
+--------------------------
+- The module defaults to short token TTL = 300s. Lower TTL for higher-risk tenants is supported.
+- All secrets created by the module (TLS keys, signing keys) use KMS-backed secrets manager with rotation policy 30 days.
+- Audit flows are mandatory: any change to allowed_tenant_accounts must go through a terraform plan review embed that includes an approver.
+
+Ownership and support matrix
+---------------------------
+- Service owner: infra/gpu-fleet (primary oncall)
+- Terraform module maintainers: infra-iac team (Marisol Chen, Omar Williams)
+- SRE escalation: pager to gpu-oncall -> infra-sre -> security (if IAM anomalies detected)
+
+Runbook quick commands
+---------------------
+- View queued requests: kubectl logs deploy/cabo-controller -n cabo | grep REQUEST
+- Force revoke tokens for tenant 210987654321: curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" https://$controller_endpoint/revoke?account=210987654321
+- Scale warm pool: kubectl scale deploy/cabo-warmpool -n cabo --replicas=8
+
+Testing matrix and acceptance criteria table
+-------------------------------------------
+| test | success criteria | run frequency |
+|------|------------------|---------------|
+| smoke end-to-end | burst allocs & billing event within 90s | on every module change |
+| tls regression | handshake error rate < 0.5% | daily synthetic |
+| quota enforcement | requests beyond quota return QUOTA_EXCEEDED with 403 | weekly |
+
+Appendices
+----------
+A. Example allocation event JSON (billing export)
+```json
+{
+  "schema": "cabo-allocation-v2",
+  "tenant_account": "210987654321",
+  "request_id": "req-20250110-abc123",
+  "gpus": 4,
+  "start_ts": "2025-01-10T15:04:05Z",
+  "end_ts": "2025-01-10T15:34:05Z",
+  "tokens_used": 360000
+}
+```
+
+B. Related runbooks and links
+- cloud-accounts-and-networking/gpu-cross-account-vpc-mesh-and-per-tenant-nat-scaling.json
+- eng-infra/runbooks/preflight-gpu-deployment-validation-and-rollback-playbook.json
+- terraform-and-iac/quota-enforcement-shim-terraform-module-and-slo-contracts.json
+
+Change log
+----------
+- 2024-09-12: Created (Marisol Chen)
+- 2024-11-02: Added egress shaper profiles and CI smoke test (Omar Williams)
+- 2025-01-10: Documented emergency rollback procedure and tightened TLS alerts (Priya Natarajan)
+
+Contact
+-------
+For questions or to request tenant access, open an internal support ticket and tag team infra-iac with priority.

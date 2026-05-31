@@ -1,0 +1,149 @@
+Service poison-pill safety and isolation guide
+
+Summary
+-------
+This guide defines detection, automated mitigation, and operator isolation procedures for "poison-pill" requests and workloads in the Redwood inference platform. A poison-pill is any request or workload pattern that rapidly escalates resource usage or error propagation and risks cross-tenant/service degradation (examples: pathological prompts that exhaust KV caches, malformed inputs that trigger infinite loops in model runtime, or tenant-driven token-surges).
+
+Scope & applicability
+---------------------
+Applies to: inference-gateway, batching-worker, kv-prefix-cache, model-eval-sandbox, and the routing layer (router and model-variant-fallbacker). Does NOT replace tenant-level security policies; complements quota and billing controls.
+
+Goals
+-----
+- Detect poison-pill behavior quickly with deterministic signals.
+- Isolate affected tenants/requests before systemic impact.
+- Provide safe automated mitigation with operator-safe kill paths.
+- Offer clear post-incident steps and test harnesses to prevent regressions.
+
+Definitions
+-----------
+- Poison-pill: a request or set of requests that cause runaway CPU/memory, unbounded token generation, excessive I/O, or errorstorm cascades.
+- Sweeper: an automated operator process that identifies and quarantines suspect traffic.
+- Quarantine: short-term routing and resource restrictions that allow investigation without impacting other tenants.
+
+Detecting poison-pills (signals)
+--------------------------------
+Primary signals (alert if condition sustained for 30s unless otherwise noted):
+1) Error amplification: service-level 5xx rate > 2% AND contributing request path error growth > 5x baseline over 1 minute.
+2) Resource surge: container memory growth > 30% in 60s or resident set > 85% of container limit.
+3) Token explosion: single request token generation > 50k tokens OR token-emit-rate > 10k tokens/s.
+4) KV miss storm: kv-prefix-cache read latency > 500ms and miss ratio > 60% for a tenant prefix.
+5) Tail latency spike: p99 latency increases > 10x baseline and correlated across > 3 nodes in a pool.
+6) Circuit-breaker saturation: > 75% of router circuits tripped for a tenant.
+
+Automated safeguards (default actions)
+-------------------------------------
+- Fast-fail fences: inference-gateway applies per-request synthetic limits (timeout=120s, token_limit=20000) unless tenant override is configured.
+- Token-rate limiter: burstable token bucket per-tenant (ref config table below). Exceeded -> 429 + route to canary fallback.
+- Quarantine-router: when threshold breached, request routing shifts tenant to isolated queue slice with reduced concurrency (default concurrency=2) and cached fallback model.
+- Safe preemption: batching-worker will evict the largest in-flight requests from offending tenant first (LIFO within tenant).
+- Memory guard: kernel oom_score_adj review hook and cgroup soft kill paths that prefer restarting the worker process over whole-node reboot.
+
+Operator isolation and remediation runbook (step-by-step)
+---------------------------------------------------------
+Trigger: 'Quarantine-router' alert OR manual detection via observability console.
+1) Triage (0-2 minutes)
+   a) Open incident channel: #platform-ops / incident-{YYYYMMDD}-{short}.
+   b) Run quick query: 
+      - kubectl top pods -n inference | grep <pool-name>
+      - curl -sS "https://observability/api/query?expr=token_emit_rate{tenant=\"TENANT_ID\"}" | jq .
+   c) Identify tenant_id, request_id(s), and service(s) involved.
+2) Immediate isolation (2-5 minutes)
+   a) Apply enforced tenant throttling: 
+      - opa policy patch: opa eval --data policies.json 'patch-policy("tenant/limit/ID")'
+   b) Move traffic to quarantine slice: 
+      - rtrctl isolate-tenant --tenant TENANT_ID --slice quarantine-2026-03 --concurrency 2
+   c) If KV miss-storm detected: mark prefix read-only and enable warmup cache for other tenants.
+3) Stabilize (5-20 minutes)
+   a) If memory leak suspected: capture heap profile and stacktrace: 
+      - kubectl exec -it pod/<pod> -- /bin/sh -c "curl localhost:6060/debug/pprof/heap > /tmp/heap.pprof"
+   b) If inflated token counts: temporarily enable model-variant-fallbacker to a conservative model: 
+      - rtrctl swap-fallback --service inference-gateway --from model-xlarge --to model-xsmall --reason "poison-pill mitigation"
+   c) Restart only the offending worker process where possible: 
+      - kubectl rollout restart deployment/batching-worker -n inference --field-selector metadata.name=<pod> --grace-period=30
+4) Remediation and business follow-up (20-90 minutes)
+   a) Collect request payloads (sanitizing PII): s3://redwood-incident-bucket/{inc}/payloads/
+   b) Run deterministic replay in the model-eval-sandbox with instrumentation (cpu/mem/token traces).
+   c) If caused by customer prompt abuse, open support ticket and apply billing/contract actions per customer policy.
+5) Restore and monitor (90-240 minutes)
+   a) Gradually lift quarantine by shifting 10% traffic increments every 10 minutes while observing SLOs.
+   b) Post-restore synthetic test: run 100 synthetic inferences with worst-case prompt families.
+
+Safe-kill checklist (quick reference)
+------------------------------------
+- Has traffic been routed away from shared pools? (yes/no)
+- Are core dumps and pprof collected? (yes/no)
+- Is restart targeted to container/process rather than node? (yes/no)
+- Have relevant owners been paged? (yes/no)
+- Is rollback plan prepared (stable image / config)? (yes/no)
+
+Config table: default thresholds and owner contacts
+-------------------------------------------------
+| component            | primary_threshold                   | auto-action                          | owner_team | oncall |
+|----------------------|-------------------------------------|--------------------------------------|------------|--------|
+| inference-gateway    | p99 > 2s OR token_rate > 10k/s     | quarantine-traffic, swap-fallback    | serving    | pg-serv |
+| batching-worker      | memory growth > 30% / 60s          | evict-inflight restart worker        | infra      | pg-infra |
+| kv-prefix-cache      | miss-rate > 60% & latency > 500ms  | prefix-readonly, prefetch warm cache | platform   | pg-cache |
+| model-eval-sandbox   | token-gen > 50k/request            | throttle, sandboxed-replay           | research   | pg-ml |
+| router               | circuits tripped > 75%             | route to quarantine slice            | platform   | pg-router |
+
+(Owners map: serving=eng-serving-runtime; infra=eng-infra; platform=eng-platform; research=eng-applied-ml)
+
+CLI examples and snippets
+-------------------------
+- Isolate tenant: rtrctl isolate-tenant --tenant T-42 --slice quarantine-2026-03 --concurrency 2
+- Capture trace for request: curl "https://inference-gateway/internal/trace?req_id=REQ123" -H "Authorization: Bearer $ANALYST_TOKEN" > /tmp/REQ123.trace
+- Query token emit rate (Grafana API): 
+  curl -s -H "Authorization: Bearer $GRAF_TOKEN" "https://grafana/api/datasources/proxy/1/api/v1/query?query=token_emit_rate%7Btenant%3D%27T-42%27%7D" | jq .
+
+Rollout and feature gating for a new "sweeper"
+------------------------------------------------
+Purpose: introduce a controlled automatic quarantining component that can be toggled by region/cluster.
+Phased rollout:
+1) Feature flag off in prod, enabled in staging with synthetic poison-pills.
+2) Canary: enable for 1% of traffic in us-west with verbose logging.
+3) Metrics gating: require stable latency, no cross-tenant error correlation, and <0.1% false positive rate for 48h.
+4) Gradual ramp: 1% -> 5% -> 25% -> 100% over 7 days with daily review.
+Fallback: immediate feature-flag off + revert config if SLO regression observed.
+
+Testing and exercise plan
+-------------------------
+- Chaos experiments: weekly gameday simulating token-surges and kv-prefix storms against a non-prod replica.
+- Unit/integration: simulate OOM via fault-injector and assert quarantine transitions.
+- Synthetic library: maintain a corpus of pathological prompts (stored in repo infra/poison-corpus) used in CI for release gating.
+
+Post-incident RCA template (to be attached to incident)
+------------------------------------------------------
+- Incident ID:
+- Start / End:
+- Services impacted:
+- Root cause summary (2-3 sentences):
+- Detection timeline (timestamps):
+- Mitigation actions taken and times:
+- Why the mitigation worked / did not work:
+- Persistent changes planned (config, code, policy):
+- Owner for follow-up tasks and ETA:
+
+Roles & ownership
+------------------
+- First responder: platform oncall (pg-platform). Responsible for initial isolation actions.
+- Runtime engineer: eng-serving-runtime. Responsible for heap traces and kernel-level restarts.
+- Cache owner: eng-platform (kv-team). Responsible for prefix freeze and warmups.
+- Customer success: engage for customer-facing communication if tenant is externally managed.
+
+References & links
+------------------
+- Observability SLI guide: ../dashboards-and-alerts/token-burst-forensics-and-debugging-workflow-2026.json
+- Emergency model swap runbook: ../runbooks/emergency-model-swap-and-token-surge-mitigation-2026.json
+- KV cache rebalancer: ../systems-and-services/operator-workflows-for-llm-kv-cache-sharding-and-rebalancing-2026.json
+
+Appendix: Example OPA policy (sanitized)
+----------------------------------------
+{\n  \"id\": \"tenant-rate-limit\",\n  \"effect\": \"deny\",\n  \"conditions\": { \"tenant\": \"T-42\", \"token_rate\": { \"gt\": 10000 } },\n  \"action\": \"isolate\"\n}
+
+Document maintenance
+--------------------
+- Owner: eng-platform (Priya Natarajan). Review cadence: quarterly or after any major poison-pill incident.
+- Additions to the synthetic corpus must be reviewed by eng-applied-ml and infra.
+
+This guide should be used in conjunction with per-service runbooks and security policy. If you find gaps or have observed a new poison pattern, file a PR against this page and tag the reviewers listed above.

@@ -1,0 +1,160 @@
+Edge proxy request mux and tenant routing standard
+
+Summary
+
+This document defines the standard for the edge proxy request multiplexer (request-mux) that handles tenant routing, request sharding, and early backpressure at Redwood inference edge. The goal is to ensure predictable latency, fair tenant isolation, and graceful degradation when capacity limits are reached. This standard covers API surface, header contracts, routing policies, throttling tokens, fallback behavior, observability signals, operational runbook steps, and a migration checklist.
+
+Motivation
+
+As Redwood operates multiple deployment modes (hosted API, Dedicated, Private), the edge proxy is the first point of control for multi-tenant fairness and cost-aware routing. Inconsistent routing behavior has previously caused noisy neighbors, head-of-line blocking, and unpredictable tail latency. Standardizing the request-mux behavior reduces outages, simplifies client expectations, and enables automated tenant-level cost controls.
+
+Scope
+
+- Applies to the API edge proxy service in hosted and Dedicated control planes.
+- Does not mandate internal runtime scheduling algorithms; instead defines the contract and signals used for routing and degradation.
+- Includes guidance for Private deployments when running the Redwood edge proxy as a managed component.
+
+Requirements
+
+1) Deterministic header-based tenant identification
+   - The proxy must extract tenant context from the following ordered sources: 1) token_authorization header (Bearer token mapping), 2) x-redwood-tenant-id header, 3) fallback IP-based tenant mapping for legacy customers.
+   - Tenant id resolution must complete within 3ms at the proxy. Failure to resolve should return 401 for auth error or 400 for malformed tenant header.
+
+2) Per-tenant capacity tokens and soft quotas
+   - Each tenant is represented by a capacity bucket expressed in request-units per second (RU/s). Default hosted free-tier: 5 RU/s. Enterprise tiers configured per contract.
+   - Proxy decrements token synchronously for admission. If tokens are exhausted, proxy emits a 429 with structured body and retry-after indicating backoff token age.
+
+3) Early backpressure and request classification
+   - The proxy classifies requests as latency-sensitive or batchable based on route and headers (x-redwood-request-class: latency|batch).
+   - Latency-sensitive routes are admitted at priority and charged against a latency SLA bucket; batchable requests may be queued up to 250ms or sent to a batching service.
+
+4) Sticky routing for session affinity
+   - When a client submits a sequence of dependent calls (chat sessions), proxies should honor x-redwood-session-id to route to the same serving shard when available to maximize KV cache hits. Sticky routing window: 300s.
+
+Design and API contract
+
+Header contract
+- x-redwood-tenant-id: tenant id string assigned by billing. Required unless token maps tenant.
+- Authorization: Bearer token (preferred).
+- x-redwood-request-class: latency|batch|bulk (optional). Defaults to latency.
+- x-redwood-session-id: opaque session id for affinity (optional).
+- x-redwood-cost-tag: free-text label used for cost allocation and internal telemetry (max 64 chars).
+
+Admission algorithm (high level)
+1) Authenticate token, resolve tenant id.
+2) Lookup tenant capacity profile and current usage snapshot.
+3) Classify request and check admission rules: priority SLA bucket first, then shared baseline bucket, then burst bucket.
+4) If admitted: forward to selected upstream pool (model shard or batching service) with x-redwood-routing-meta header describing routing decision.
+5) If rejected: reply 429 with body {code: quota_exceeded, detail: human message, retry_after_seconds: n} and increment tenant throttled counter.
+
+Routing metadata header example (forwarded to upstream):
+
+x-redwood-routing-meta: tenant=acme-corp;pool=dedicated-gpu-pool-17;shard=shard-3;affinity=sticky
+
+Fallback and graceful degradation rules
+
+- Local fallback ordering when upstream preferred pool is unavailable: sticky shard -> other shard in same pool -> universal cpu fallback pool -> universal quantized-gpu pool -> error.
+- For latency-sensitive requests, fallback to universal cpu pool only if expected added p95 latency < 2x configured p95 for the route; otherwise return 503 with structured reason and telemetry for manual triage.
+- When capacity is constrained globally, proxy may activate tenant-slice mode: reduce per-tenant RU/s by a factor proportional to total spare capacity deficit but never below a safety floor (10% of contractual RU unless explicitly agreed).
+
+Observability and SLOs
+
+Required metrics emitted at the proxy per tenant and per route:
+- requests_total (counter)
+- requests_admitted_total (counter)
+- requests_rejected_quota_total (counter)
+- requests_rejected_auth_total (counter)
+- proxy_p95_latency_ms (gauge)
+- proxy_p99_latency_ms (gauge)
+- admission_latency_ms (histogram)
+- sticky_affinity_hit_ratio (gauge)
+- upstream_fallback_rate (counter)
+- per-tenant_rlimit_utilization (gauge percent)
+
+Default SLOs for hosted edge:
+- edge_auth_success_rate >= 99.95% over 30d
+- admission_p95_latency <= 25ms for latency route
+- proxy_p99_latency <= 200ms
+- global_quota_overrun_incidents <= 2 per quarter causing client-visible 429 spikes
+
+Logging and structured traces
+- Every 429/503 must include structured trace id, tenant id, request_class, and routing_meta in the response body for easier debugging by customer success.
+- Proxy must emit a span per routing decision with attributes: tenant_id, route, chosen_pool, chosen_shard, fallback_reason (if any), admission_decision.
+
+Operational runbook (short)
+
+1) Detection
+   - Alert: tenant_throttle_rate > 5% for >15m for any enterprise tenant.
+   - Alert: edge_p99_latency > 300ms for >10m.
+
+2) Immediate mitigation steps
+   - Check proxy health dashboards and admission token store.
+   - Determine whether issue is localized to a pool or global. Use query: select count(*) from routing_events where fallback_reason != null group by chosen_pool order by count desc limit 20
+   - If pool-unavailable: attempt to rehydrate pool with the controller pipeline: curl -X POST http://controller/repopulate-pool?pool=dedicated-gpu-pool-17. If repopulation fails, enable emergency tenant-slice by toggling feature flag redwood.proxy.enable_tenant_slice -> true and set global_shed_factor to 0.6.
+
+3) Communication
+   - Notify on-call, include top 5 affected tenants and their contact owners.
+   - If customer visible degradation is ongoing, open a customer incident and page CS with templated message including request id, traces, and recommended client-side backoff parameters.
+
+4) Recovery and postmortem
+   - Revert tenant-slice flag only after p99 back under threshold for 60m.
+   - Run postmortem and include root cause and mitigation in confluence with timeline and action items.
+
+Configuration examples
+
+YAML: example proxy route profile
+
+```yaml
+routes:
+  - name: chat.generate
+    path: /v1/chat/generate
+    request_class: latency
+    default_ru_per_tenant: 2
+    sla_bucket_ru: 1
+    sticky_affinity_window_s: 300
+    allowed_fallbacks: [sticky_shard, pool_same, universal_quant_gpu, universal_cpu]
+
+tenants:
+  acme-corp:
+    tier: enterprise
+    ru_limit: 500
+    burst_capacity: 1000
+    billing_tag: sales-eu-2026
+```
+
+Client example showing handling 429 with retry header
+
+```bash
+curl -i -H 'Authorization: Bearer TOKEN' -H 'x-redwood-request-class: latency' https://api.redwood.ai/v1/chat/generate
+# response: 429 with body {code: quota_exceeded, retry_after_seconds: 12, trace_id: abc123}
+# client should implement exponential backoff starting at retry_after_seconds
+```
+
+Migration plan and compatibility guarantees
+
+- Backwards compatibility: existing clients without x-redwood-request-class will default to latency mode.
+- Rollout strategy: feature flag gated deployment across stages: canary (1% traffic) -> regional rollout (us-west/us-east) -> global.
+- API compatibility: any new header introduction must be optional and default to safe behavior. Breaking changes require ADR + two week deprecation period and client notification.
+
+Ownership and governance
+
+- Owner team: edge-platform subteam within engineering. Primary owner: priya.raman@redwood.com.
+- Review cadence: this document reviewed annually or after any major routing incident.
+
+Appendix: common failure scenarios and expected signals
+
+- No token mapping found for a tenant: response 401, metric requests_rejected_auth_total spikes, action: confirm token mapping service health.
+- Universal cpu fallback active at >20% traffic: metric upstream_fallback_rate high, increased costs and p99 latency; action: capacity scale or enable emergency tenant-slice.
+- Sticky affinity miss rate high: sticky_affinity_hit_ratio < 70% indicates session id not present or hashing changes; action: verify client session propagation and compare hash versions.
+
+Related artifacts and links
+
+- Controller replication API spec: internal link to controller docs.
+- Billing profile schema: internal link to finance page that maps tenant tiers to RU/s.
+
+Document history
+
+- 2026-01-12: created by Priya Raman
+- 2026-02-20: reviewed and published after canary feedback
+
+End of document

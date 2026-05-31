@@ -1,0 +1,392 @@
+Audit Exporter Service Architecture (SIEM-ready Audit Export Beta)
+
+# Overview
+The **Audit Exporter** is a multi-tenant service responsible for reliably delivering **Redwood audit events** to customer-controlled SIEM/logging destinations. This document describes the architecture for the **SIEM-ready audit export beta** (Hosted + Dedicated). Private/on-prem is explicitly out of scope for beta, but multi-region and deployment constraints are noted for follow-on.
+
+**Primary goals**
+- **At-least-once delivery** of audit events to configured destinations, with operator tooling for dead-letter/replay.
+- **Configurable filtering** with safe defaults and clear semantics.
+- **Operational visibility**: export lag, delivery success/error rates, per-destination health.
+- **Security posture**: tenant isolation, least-privilege credential handling, PII minimization, egress controls.
+
+**Non-goals (beta)**
+- Exactly-once delivery guarantees (customers must deduplicate by `event_id`).
+- Customer-managed sinks in air-gapped Private deployments.
+- Arbitrary destination plugins beyond Splunk HEC, Datadog Logs intake, and S3 delivery.
+
+---
+
+# High-level architecture
+## Components
+1. **Audit event producers (control plane + product services)**
+   - Emit audit events conforming to **Audit Event Schema v2**.
+   - Events include stable `event_id`, `occurred_at`, actor, action, resource, tenant/workspace identifiers, and network fields where applicable and permitted.
+
+2. **Audit event ingestion pipeline (internal)**
+   - Normalizes and persists audit events.
+   - Publishes to an internal **audit event stream** (append-only) consumed by downstream systems.
+
+3. **Export Configuration Service (control plane)**
+   - Stores per-tenant export configurations (destinations, credential references, filters, backfill window, enablement state).
+   - Enforces RBAC and produces an audit trail of config changes.
+
+4. **Audit Exporter Service (this doc)**
+   - Pulls audit events from the internal stream.
+   - Applies tenant-scoped routing and filtering.
+   - Batches and delivers to destination adapters.
+   - Maintains checkpoints, retries with backoff, and dead-lettering.
+
+5. **Destination adapters (beta)**
+   - **Splunk HEC** adapter
+   - **Datadog Logs intake** adapter
+   - **S3 delivery** adapter
+
+6. **Checkpoint store + DLQ**
+   - Checkpoint persistence for each (tenant, destination) to support resume/replay and operational visibility.
+   - Dead-letter queue (DLQ) for batches that exceed retry thresholds.
+
+7. **Observability stack**
+   - Metrics, logs, and traces exported to Redwood observability.
+   - Dashboards and alerts defined jointly with SRE.
+
+---
+
+# Data flow (end-to-end)
+## Steady-state delivery path
+1. **Produce**: Services emit audit events to the internal ingestion pipeline.
+2. **Stream**: Events land in the audit event stream partitioned by tenant.
+3. **Config sync**: Exporter maintains an up-to-date local view of export configs for allowed tenants.
+4. **Route**: For each event, exporter determines eligible destinations for the tenant, applies filters, and assigns the event to a destination-specific batch.
+5. **Batch**: Exporter batches events per (tenant, destination) to optimize throughput and respect downstream API limits.
+6. **Deliver**: Adapter sends the batch to the destination.
+7. **Checkpoint**: On successful delivery, exporter advances the checkpoint for that (tenant, destination).
+8. **Observe**: Metrics and structured logs are emitted for lag, throughput, and errors.
+
+## Backfill / replay path
+- When a destination is newly enabled or a backfill window is configured, the exporter replays events from a computed start point (bounded; see Retention & Backfill Semantics section).
+- Operators can replay DLQ batches using the replay CLI with guardrails.
+
+---
+
+# Canonical event schema expectations
+Exporter treats the audit event as opaque JSON payload but requires a minimal set of fields to enforce delivery semantics and SIEM mapping.
+
+**Exporter-required fields (must exist)**
+- `event_id` (stable unique identifier; dedup key)
+- `occurred_at` (RFC3339 timestamp of the audited action)
+- `emitted_at` (RFC3339 timestamp when Redwood emitted the event)
+- `tenant_id`
+- `workspace_id` (when applicable)
+- `category` and `action` (used for filtering and destination mapping)
+
+**Notes**
+- The exporter does **not** enrich events with PII.
+- Fields like source IP / user agent are included only when allowed by policy and event type.
+
+---
+
+# Storage, queues, and state
+## Audit event stream
+- Source-of-truth for replay is the internal audit event stream.
+- Exporter consumes with consumer groups scoped by region and deployment mode.
+- Partitioning: by `tenant_id` to support tenant isolation and consistent ordering per tenant partition.
+
+## Checkpoint model
+Checkpointing is required for at-least-once delivery with bounded replay and for reporting lag.
+
+**Checkpoint key**: `(tenant_id, destination_id, stream_partition)`
+
+**Checkpoint value**:
+- `last_delivered_cursor` (stream cursor/offset)
+- `last_delivered_event_id` (debuggability)
+- `last_success_at`
+- `last_error_at`, `last_error_code`, `last_error_message` (redacted)
+- `consecutive_failures`
+
+**Storage**
+- Persisted in a control-plane-managed data store (transactional DB) with strong tenant scoping.
+- Exporter maintains an in-memory cache but treats the DB as authoritative.
+
+## Dead-letter queue (DLQ)
+Batches are dead-lettered when they exceed retry thresholds or hit non-retryable errors.
+
+**DLQ entry includes**
+- Tenant + destination identifiers
+- Batch metadata (time range, size, attempt count)
+- Sanitized error details
+- Payload reference (encrypted blob pointer) or inline payload (size-limited)
+
+**Replay tooling**
+- Operator replay CLI supports:
+  - Single DLQ item replay
+  - Replay by tenant + destination + time window
+  - Rate-limited replay to avoid duplication storms
+  - “Dry run” option that validates connectivity/credentials without emitting
+
+---
+
+# Config sync and tenancy model
+## Config ownership
+- Export configs live in the control plane and are managed via API + Console UI.
+- Exporter is a read-only consumer of configs.
+
+## Sync mechanism
+- Exporter maintains a **config cache** refreshed via:
+  1) periodic polling (baseline), and
+  2) change notifications (when available), to reduce time-to-apply.
+
+**Config cache invariants**
+- Only configs for **feature-flag-allowed tenants** are loaded.
+- Each config is validated against a versioned schema before becoming active.
+- Invalid configs are marked `degraded` and do not receive events (fails closed).
+
+## Multi-tenant isolation
+- No cross-tenant batching.
+- Checkpoints and DLQ entries are strictly tenant-scoped.
+- Metrics are aggregated safely; tenant IDs are not emitted as high-cardinality labels (see Observability section).
+
+---
+
+# Filtering model (where and how it runs)
+## Where filters are evaluated
+- Filters are **evaluated in the exporter** at delivery time.
+- Control plane performs **validation only** (schema validation, allowed categories/actions, regex limits, etc.) to prevent expensive or unsafe filters.
+
+## Filter types (beta)
+- Category allowlist/denylist
+- Action allowlist/denylist
+- Resource-type predicates
+- Actor-type predicates (service/user/api_key)
+- Optional time windows for backfill start bounds
+
+## Safety and performance constraints
+- Filters must be deterministic and bounded.
+- Regex (if enabled) is limited in length and complexity; defaults to disabled for beta unless explicitly approved.
+- Filters are applied pre-batching to avoid sending filtered data downstream.
+
+---
+
+# Destination adapters
+All adapters implement the same interface:
+- `validate(config) -> warnings/errors`
+- `test_connection(config) -> ok/error` (used by Console)
+- `deliver(batch, config) -> success/retryable_error/non_retryable_error`
+
+## Common adapter behaviors
+- **Batching**: size-based and time-based flush triggers.
+- **Compression**: enabled when supported and beneficial.
+- **Idempotency**:
+  - Exporter is at-least-once.
+  - Destinations may receive duplicates.
+  - Customers deduplicate by `event_id`.
+- **Per-destination rate limiting**: token bucket or leaky bucket, configured by adapter defaults and customer overrides where safe.
+- **Circuit breaking**: opens on persistent failures (e.g., 401/403, repeated 429) to prevent runaway retries.
+
+## S3 adapter
+**Use case**: generic delivery for customers who want to ingest via their own pipelines, including SIEM forwarding.
+
+**Delivery format**
+- JSON Lines (one audit event per line) within gzip-compressed objects.
+- Partitioning:
+  - `s3://<bucket>/<prefix>/tenant_id=<TENANT>/date=<YYYY-MM-DD>/hour=<HH>/...`
+
+**Checkpoint granularity**
+- Checkpoint advances after successful object write and verify.
+
+**Encryption**
+- Supports SSE-S3 and SSE-KMS.
+- Cross-account delivery uses assume-role when configured.
+
+**Failure modes**
+- IAM access denied, missing KMS grants, multipart upload failures, throttling.
+
+## Splunk HEC adapter
+**Use case**: direct forwarding to Splunk via HTTP Event Collector.
+
+**Behavior**
+- Batches events into HEC payloads and posts to `/services/collector`.
+- Supports customer-configurable `index`, `source`, and `sourcetype` (validated).
+
+**Rate limiting & retries**
+- 429 handled with exponential backoff and jitter.
+- Circuit breaker on repeated auth failures (401/403).
+
+**Expected dedup behavior**
+- Customers should deduplicate using `event_id` in Splunk pipelines/searches if required for strict reporting.
+
+## Datadog Logs adapter
+**Use case**: forward to Datadog Logs intake with tags/facets for filtering and alerting.
+
+**Behavior**
+- Posts batches to Datadog logs intake endpoint.
+- Maps key schema fields to Datadog attributes and tags:
+  - `tenant_id`, `workspace_id`, `category`, `action`, `resource.type`
+
+**Rate limiting & retries**
+- Handles 429/5xx with backoff.
+- 403 often indicates API key scoping; treated as non-retryable until credentials rotate.
+
+---
+
+# Failure handling and delivery guarantees
+## Delivery semantics
+- Exporter provides **at-least-once** delivery.
+- Duplicates are possible on:
+  - transient downstream failures after a successful receive but before exporter observes success,
+  - exporter restart after delivery but before checkpoint commit,
+  - replay/backfill operations.
+
+## Retry policy
+- Retryable errors: network timeouts, 429, 5xx.
+- Non-retryable errors: malformed config, 401/403 (until credentials rotate), destination host validation failure.
+
+**Backoff strategy**
+- Exponential backoff with jitter.
+- Max retry duration per batch; after that, DLQ.
+
+## Backpressure and auto-pausing
+To protect the system during downstream outages:
+- Exporter enforces per-destination queue limits.
+- If lag exceeds a configured threshold or downstream is persistently failing, exporter may:
+  - reduce concurrency,
+  - shed optional work (e.g., aggressive backfill),
+  - or **auto-pause** a destination and surface status in Console.
+
+## Operator controls
+- Pause/resume exports per tenant/destination.
+- Rotate credentials (through control plane secret reference updates).
+- DLQ replay (rate-limited).
+
+---
+
+# Rate limiting model
+Rate limiting is applied at three layers:
+1. **Global exporter safety limits**
+   - Caps total concurrent deliveries per exporter instance.
+
+2. **Per-tenant fairness**
+   - Prevents a single tenant from consuming all adapter capacity.
+
+3. **Per-destination adapter limits**
+   - Defaults tuned to typical Splunk/Datadog/S3 behavior.
+   - Customer overrides supported where safe and validated.
+
+**Principles**
+- Prefer stable latency and bounded lag over maximizing throughput during downstream throttling.
+- Avoid amplification loops (retries increasing load).
+
+---
+
+# Multi-region and deployment considerations
+## Hosted and Dedicated (beta)
+- Exporter runs **per region** close to the audit event stream to minimize internal latency and cross-region bandwidth.
+- Destinations are assumed reachable from the region’s egress perimeter.
+
+## Dedicated tenants
+- Dedicated deployments may have stricter network isolation; exporter must honor tenant-specific egress policies.
+- Destination validation is performed against an allowlist where required.
+
+## Cross-region destinations
+- Supported, but may increase latency and error rates due to customer perimeter controls.
+- Strongly recommend customers choose regional endpoints aligned with their Redwood region.
+
+## Disaster recovery
+- Checkpoint store is backed by control-plane durability guarantees.
+- On exporter restart, delivery resumes from the last committed checkpoint.
+
+## Private/on-prem (follow-on)
+Expected future considerations:
+- Customer-managed sinks inside private networks
+- Air-gapped export packaging
+- Customer-controlled storage and keys
+
+---
+
+# Security and compliance considerations
+## Secrets handling
+- Exporter never stores raw secrets in logs.
+- Destination credentials are referenced via control-plane secret handles; retrieval is short-lived and cached minimally.
+- Token rotation should not require exporter restart (config refresh).
+
+## Egress controls and SSRF resistance
+- Destination URLs/hosts are validated against allowed patterns and/or allowlists.
+- Adapters do not follow redirects by default.
+- Outbound requests use fixed DNS resolution behavior consistent with platform standards.
+
+## PII minimization and redaction
+- Exporter does not add PII.
+- Structured logs and errors must be redacted (no payload dumps).
+- DLQ payloads are encrypted and access controlled.
+
+## Auditability
+- Config changes are audited (who changed what, when).
+- Exporter status endpoints provide evidence of delivery health without exposing sensitive payload.
+
+---
+
+# Observability
+## Key metrics (SRE-owned dashboards)
+- **Export lag**
+  - `audit_exporter_lag_seconds` (p50/p95/p99)
+- **Delivery success rate**
+  - `audit_exporter_delivery_success_total`
+  - `audit_exporter_delivery_failure_total` (by adapter + error class)
+- **Retries and DLQ**
+  - `audit_exporter_retry_total`
+  - `audit_exporter_dlq_enqueue_total`
+- **Throughput**
+  - `audit_exporter_events_delivered_total`
+  - `audit_exporter_batches_delivered_total`
+
+## Cardinality controls
+- Do not label metrics with raw `tenant_id`, `workspace_id`, destination URL, or other unbounded identifiers.
+- Use controlled labels:
+  - `adapter={s3|splunk_hec|datadog_logs}`
+  - `error_class={auth|throttle|network|validation|server}`
+  - `region`, `deployment_mode={hosted|dedicated}`
+
+## Logs and traces
+- Structured logs with request correlation IDs.
+- Traces around adapter delivery calls (sampling tuned to avoid cost explosions).
+
+---
+
+# Operational interfaces
+## Health endpoints
+- `/healthz`: process health
+- `/readyz`: dependency readiness (config store reachable, stream consumer active)
+- `/status`: aggregated delivery health (used by Console)
+
+## Console surfaces (admin-facing)
+- Destination status: healthy/degraded/paused
+- Last success timestamp
+- Last error (sanitized)
+- Approximate lag window
+
+---
+
+# Retention and backfill semantics (beta defaults)
+- Exporter can backfill within a bounded window defined by platform retention and beta policy.
+- Backfill start is computed as: `max(customer_requested_start, stream_retention_start, feature_enablement_time - allowed_backfill_window)`.
+- If the requested window exceeds limits, Console surfaces the effective start time.
+
+---
+
+# Known limitations / beta caveats
+- At-least-once delivery; duplicates are possible.
+- Backfill is bounded and may be reduced during incidents to protect overall system stability.
+- Some destination-side validation errors are only discoverable at delivery time (e.g., Splunk index permissions).
+- Private/on-prem patterns are not supported in beta.
+
+---
+
+# Ownership and escalation
+**Primary engineering owner**: Platform (Control Plane + Exporter)
+- Control plane config + RBAC: Ethan Park’s org
+- Exporter service runtime: Diego Santos / Platform Engineering
+
+**Security review**: Marcus Lin / Kevin Osei
+
+**SLOs, alerting, on-call readiness**: Sean Gallagher / Rafael Mendes
+
+For operational incidents, follow the runbook: *Runbook: Audit Exporter Delivery Failures* and engage Security if there is any risk of data leakage or unexpected payload exposure.

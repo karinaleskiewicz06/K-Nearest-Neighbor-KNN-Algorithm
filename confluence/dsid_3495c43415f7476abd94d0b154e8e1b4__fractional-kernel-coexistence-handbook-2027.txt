@@ -1,0 +1,206 @@
+Fractional Kernel Coexistence Handbook
+
+Overview
+
+This handbook documents the design, operational guidance, profiling procedures, benchmark suite, and incident runbooks for Fractional Kernel Coexistence (FKC) — the runtime pattern that allows multiple kernel implementations and fidelity levels to share physical accelerator capacity with fine-grained isolation and graceful degradation. It consolidates architecture intent, scheduler contracts, rollout checklist, and actionable troubleshooting flows so engineers and oncall SREs can operate FKC safely in production.
+
+Goals
+
+- Enable multiple kernel implementations (full-precision, quantized, sparse, optimized attention variants) to run concurrently on the same GPU(s) without violating latency SLOs for critical routes.
+- Provide bounded performance isolation: define and enforce resource shares, preemption semantics, and degradation fallbacks.
+- Make kernel transitions observable and revertible with low blast radius.
+- Instrument profiling and benchmark workflows that reflect production co-location effects.
+
+Audience
+
+- Runtime engineers, scheduler owners, serving SREs, release engineers, and applied ML engineers onboarding new kernels.
+
+Design summary
+
+1) Principle: soft-isolation via fractional allocation and latency budgets
+   - We do not rely on hardware partitioning exclusively; runtime allocates fractional execution slots and soft-resources (tensor memory caps, tensor-core credit buckets) and enforces latency budgets per request class.
+
+2) Components
+   - Kernel Registry: metadata store mapping model_variant -> kernel_tag, stability_grade, observed_seq_len_profile.
+   - Fractional Admission Controller (FAC): decides admission and slot sizing per incoming request. Implements token-accounting (credits) per kernel_tag.
+   - Kernel Handshake Protocol (KHP): short RPC between scheduler and kernel container to request/return fractional slots, handshake includes kernel_hints and kernel_fidelity_flags.
+   - Graceful Fallback Orchestrator: on admission failure or SLO violation, reroutes to compatible kernel variant or reduces fidelity according to policy.
+
+Scheduling model and contracts
+
+- Request classes: realtime-critical, background-batch, best-effort-async. Each class has a latency SLO, credit refill rate, and eviction priority.
+- Slot size: logical unit (fraction) representing amortized token throughput and memory footprint. Slot sizes are mapped to kernel categories (e.g., fp32-large, q4-small).
+- Preemption semantics: preemption is cooperative where possible. If kernel cannot yield (long-running large sequence generation), FAC will avoid new admissions for lower-priority classes and use fallback routing. Immediate preemption (hard kill) is reserved for safety-critical incidents and requires manual approval.
+
+Kernel handshake protocol (KHP) - message contract
+
+- handshake.request { request_id, kernel_tag, required_slots, max_latency_ms, kvcache_hint }
+- handshake.accept { allocation_id, granted_slots, preemption_token, expected_release_ms }
+- handshake.reject { reason_code, suggested_fallback_tags }
+- release { allocation_id, actual_duration_ms, observed_peak_mem_mb }
+
+Note: KHP messages are carried on the scheduler's local RPC bus and annotated in traces. Handshake defines fields but transport is protobuf-over-grpc in current implementation.
+
+Admission controller configuration (recommended defaults)
+
+| Parameter | Default | Description |
+|---|---:|---|
+| realtime.credit_rate | 500 credit/s | Refill rate for realtime routes |
+| batch.credit_rate | 200 credit/s | Refill rate for background batch |
+| small-slot-mem-cap_mb | 512 | Soft memory cap for q4-small category |
+| large-slot-mem-cap_mb | 16384 | Reserve for fp32-large |
+| preemption.grace_ms | 250 | Time to allow cooperative yield |
+
+Sample FAC policy (YAML)
+
+```
+admission_policies:
+  realtime:
+    min_slots: 2
+    max_concurrent: 600
+    credit_rate: 500
+  background:
+    min_slots: 0
+    max_concurrent: 200
+    credit_rate: 200
+kernel_categories:
+  q4-small:
+    slot_mem_mb: 512
+    priority: 30
+  fp32-large:
+    slot_mem_mb: 16384
+    priority: 10
+```
+
+Profiling playbook (co-located kernels)
+
+1) Objective: measure interference and performance coupling when two or more kernel variants run concurrently on the same physical GPU set.
+2) Inputs: production-like request traces (sequence distribution, prompt prefix patterns), representative models for each kernel variant, and noise traffic generator.
+3) Steps:
+   a) Reserve a test GPU pool with identical HW to production.
+   b) Deploy kernel variants with FAC enabled and set deterministic credits (freeze refill rates).
+   c) Start baseline: run single-kernel load for 30 minutes to capture baseline latency P50/P95/P99, GPU SM utilization, power, memory high-water mark.
+   d) Add second kernel mix slowly using traffic ramping (10% increments) until steady state. Collect traces.
+   e) Run adversarial microbursts (3x normal qps for 60s) targeting the lower-priority kernel to validate eviction and fallback.
+   f) Run a slot starvation injection where large-slot kernels hold allocations for longer than expected to validate FAC backpressure behavior.
+
+4) Telemetry to capture (metric names):
+   - runtime.admission.granted_slots_total
+   - runtime.admission.rejected_by_fac_total
+   - runtime.kernel.allocation_duration_ms (histogram)
+   - runtime.kernel.peak_mem_mb
+   - gpu.sm_util_pct (per device)
+   - runtime.latency.route.<route>.p50/p95/p99
+   - runtime.fallback.reroutes_total
+
+5) Success criteria:
+   - Critical realtime routes: p95 within SLO +10% overhead vs baseline.
+   - No memory OOMs; observed_peak_mem_mb < configured slot_mem_mb * 0.95.
+   - Reroute rate <= 0.5% for sustained load.
+
+Benchmark suite additions (co-location scenarios)
+
+- Add cross-kernel interference benchmarks to the perf-suite. Each benchmark is parameterized by: kernel_pair (primary, secondary), mix_ratio, sequence_length_quantile. The suite must run with at least three seeds and report: latency quantiles, per-device SM tail, and reroute/fallback rate.
+
+- Bench metadata example (JSON lines - user-facing test harness accepts NDJSON):
+
+```
+{ "name": "fkcoexist_q4-small_fp32-large_80-20_seq95_seed1", "primary":"q4-small","secondary":"fp32-large","mix_ratio":"80-20","seq_quantile":95 }
+```
+
+Release notes snapshot (v1.3 - FKC-alpha)
+
+- Feature: Fractional Kernel Coexistence alpha enabled behind feature-flag runtime.fkc.alpha.
+- Performance: observed median latency regression of 3% on realtime routes at 20% co-located load; p99 remained stable under controlled profiling.
+- Known limitations: hard preemption not implemented; rare allocation thrashing under pathological slot-starvation patterns.
+- Migration: default scheduling remains single-kernel; to opt-in see rollout checklist below.
+
+Known issues and mitigations
+
+- Issue: occasional allocation thrash when several large-slot kernels start simultaneously.
+  - Symptom: bursts of handshake.reject(reason=ALLOCATION_STARVATION), followed by high retry rate and elevated p99s.
+  - Mitigation: enable queue_smoothing_seconds=15 in FAC; stagger kernel container startups by 10s.
+
+- Issue: observed tenant isolation bleed-through when secondary kernel uses NVLINK heavily.
+  - Symptom: neighboring nodes see increased PCIe stalls and higher inter-node latency for control-plane RPCs.
+  - Mitigation: limit secondary kernel nvlink_bandwidth_pct to 30% via kernel hints; route heavy NVLINK kernels to dedicated node pools.
+
+Operational runbook (incident flows)
+
+Severity classification:
+- Sev1: Realtime p99 > SLO + 250ms for > 5 minutes and reroute rate > 5%
+- Sev2: Realtime p99 > SLO + 250ms for 2–5 minutes or reroute rate between 1%–5%
+- Sev3: Deployment or benchmark failures without immediate customer impact
+
+Sev1 quick steps:
+1) Page oncall runtime/sre and kernel owner.
+2) Run quick diagnostics:
+   - curl -s http://scheduler.local/health | jq .allocations_active
+   - kubectl -n runtime get pods -l app=kernel -o jsonpath='{range .items[*]}{.metadata.name} {.status.phase} {.metadata.annotations.kernel_tag}\n'
+3) Check FAC metrics in Grafana dashboard 'FKC - Admission' for rejected_by_fac_total spike and runtime.fallback.reroutes_total.
+4) If allocation thrashing: toggle feature flag runtime.fkc.safe-mode=true which enforces single-kernel policy for affected pool (immediate but safe fallback).
+5) If thermal/SM saturation across devices: run node eviction script to drain lower-priority cohorts, see commands below.
+
+Draining lower-priority cohorts (script snippet)
+```
+# mark nodes for low-priority eviction
+curl -XPOST http://operator.local/nodes/mark-evict -d '{"label":"fkcoexist-evictable","reason":"sev1-protect-realtime"}'
+# scale-down background admission
+kubectl -n runtime patch configmap fac-config --type merge -p '{"data":{"background.max_concurrent":"0"}}'
+```
+
+Rollback checklist (kernel rollout rollback)
+
+1) Disable rollout: runtime.fkc.rollout_enabled=false
+2) Revert kernel registry entries for staged nodes to previous kernel_tag via: POST /kernel-registry/v1/patch with previous_tag
+3) Restart scheduler processes in the affected pool with 60s stagger to avoid thundering herd.
+
+Onboarding checklist for new kernel variants
+
+- Owners: Kernel author, runtime-scheduler owner, applied-ml reviewer.
+- Pre-launch requirements:
+  - Pass unit kernel conformance tests (latency and mem invariants).
+  - Run FKC compatibility microbench (local) with sequence distribution matching production route.
+  - Submit benchmark NDJSON (see example) and get approval from scheduler owner.
+  - Add kernel_tag and fidelity metadata to Kernel Registry.
+- Launch: deploy to staging pool for 48h with FAC credit scaling at 10% traffic slice.
+- Post-launch: run profiling playbook and look for regressions in p95/p99; if any are > 10% over baseline, escalate.
+
+Ownership and contact list
+
+- Runtime scheduler: Marco Liu (marco@redwood.ai)
+- Kernel onboarding / applied ML: Evelyn Ortiz (evelyn@redwood.ai)
+- Serving SRE: Diego Fernandez (diego@redwood.ai)
+- Release engineering: Priya Nair (priya@redwood.ai)
+
+References and related pages
+
+- Kernel admission and signal negotiation manual — internal link in team library.
+- Runtime profiling playbooks (see profiling-playbook directory).
+- Benchmark suite contributor guide — follow perf-suite/README for NDJSON conventions.
+
+Appendix A — quick verification checklist (pre-merge gate)
+
+- [ ] Kernel tag registered with stability_grade >= canary
+- [ ] FAC policy set for pool and credit_rate validated
+- [ ] Benchmarks (3 seeds) show p95 within +10% of baseline for realtime route
+- [ ] Observability: tracing annotations for KHP added and sampling enabled
+- [ ] Release note entry drafted
+
+Appendix B — sample trace annotation snippet (pseudo-JSON)
+
+```
+{
+  "trace": {
+    "request_id": "r-abc123",
+    "events": [
+      {"ts": 167000000, "name": "fac.handshake.request", "kernel_tag": "q4-small"},
+      {"ts": 167000130, "name": "fac.handshake.accept", "allocation_id": "alloc-42"},
+      {"ts": 167000780, "name": "kernel.execute.start", "kernel_variant": "q4-small-v2"},
+      {"ts": 167001200, "name": "kernel.execute.end", "duration_ms": 420}
+    ]
+  }
+}
+```
+
+If anything in this handbook is unclear or you encounter behaviours not covered here, file a ticket in the runtime backlog and tag scheduler-owner and serving-sre for prioritization.

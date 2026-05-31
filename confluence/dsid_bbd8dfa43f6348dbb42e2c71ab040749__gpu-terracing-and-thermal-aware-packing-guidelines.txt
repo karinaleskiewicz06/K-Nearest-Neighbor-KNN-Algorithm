@@ -1,0 +1,153 @@
+GPU Terracing and Thermal‑Aware Packing Guidelines
+
+Overview
+
+This document defines the 'GPU terracing' floorplan and operational patterns we use to reduce thermal hotspots, improve power efficiency, and increase tenant density without compromising SLOs. It covers physical rack/zone mapping, node labelling, Terraform variables for placement-aware pools, CI/CD steps for image rollout that respect thermal constraints, monitoring signals, and an incident runbook for thermal events.
+
+Intended audience
+- Infra engineers running GPU fleet capacity
+- Capacity planning and SREs responsible for placement policies
+- Private/ Dedicated deployment engineers (on‑prem VPC/OEM partners)
+
+Goals and constraints
+- Reduce frequency of thermal throttling events by >= 60% for terraced pools vs. flat placement.
+- Maintain per-tenant tail latency SLO: p99 latency <= 350ms for small prompts and <= 1.2s for long inference (seq_length>2048).
+- Avoid cross-tenant noisy neighbor regressions by providing affinity / anti-affinity hints to scheduler.
+- Operate within datacenter power rail budgets: no terraced zone should exceed 85% of its rated feed for > 5m.
+
+Key concepts
+- Terracing: physical grouping of racks/nodes into 'terraces' that share a power/thermal boundary (e.g., rack-shelf or row segment). Terraces are the primitive used by the placement policy.
+- Thermal-aware packing: scheduler decisions that prefer placing new allocations in terraces with current thermal headroom and lower sustained duty-cycle.
+- Cooler zones: subsets of terraces reserved for tail-sensitive tenants or training/eval workloads that require long, sustained utilization.
+- Burst lanes: small per-terrace capacity reserved for short high-throughput bursts (e.g., eval harness).
+
+Topology and labeling
+- Node labels applied at provisioning time (via Terraform module outputs and node-bootstrap):
+  - terrace_id: string (e.g., terrace-eu-west-02-a)
+  - power_feed: feed-A | feed-B
+  - thermal_sector: low | medium | high
+  - rack_pos: top | middle | bottom
+  - cooling_class: standard | enhanced
+
+Terraform snippet (example variables)
+```hcl
+variable "terrace_id" { type = string }
+variable "power_feed" { type = string }
+variable "thermal_sector" { type = string }
+
+module "gpu_node" {
+  source = "git::ssh://git@repo/internal-iac.git//modules/gpu-node"
+  terrace_id = var.terrace_id
+  power_feed = var.power_feed
+  attrs = { thermal_sector = var.thermal_sector }
+}
+```
+
+Pool design patterns
+1) Terrace‑exclusive pools: dedicated pools where all nodes are in the same terrace. Used for high‑isolation tenants and thermal‑sensitive workloads.
+2) Cross‑terrace spread pools: default for best-effort workloads to improve resilience to single‑terrace failures. Scheduler enforces at most 1 replica per terrace.
+3) Cooler lanes: curated pools with enhanced cooling_class nodes and lower utilization targets (target duty-cycle 40–60%). Reserved for p99-critical customers.
+4) Burst lanes: 5–10% of terrace capacity reserved; short TTL allocations and preemptible pricing.
+
+Placement policy (algorithm summary)
+1. Candidate terraces selection: filter terraces with current power utilization < 80% and average inlet temp < 35°C (5m window).
+2. Score terraces by: (headroom_score * 0.5) + (idle_gpu_slots_score * 0.3) + (cooling_class_score * 0.2).
+3. Assign allocation to top-scoring terrace, unless tenant policy requires exclusive placement.
+4. If no terrace passes thresholds, fall back to 'degraded-placement' policy: allow cross-terrace placement with notified SLO-sidecar and autoscale throttle.
+
+Monitoring and alerts
+- Metrics (Prometheus names):
+  - dc_thermal.inlet_temp_celsius{terrace_id} (gauge)
+  - dc_power.draw_kw{terrace_id,power_feed} (gauge)
+  - gpu_node.duty_cycle_pct{node} (gauge)
+  - scheduler.alloc_failures{reason="thermal_limit"} (counter)
+  - tenant.p99_latency_ms{tenant_id} (histogram)
+
+- Grafana dashboards: "GPU Terrace Overview", "Terrace Thermal Trends", "Placement Failure Heatmap" (panel IDs: 2103, 2104, 2107)
+
+- Alerting rules (examples):
+  - Alert: TerracePowerApproachingLimit
+    - Expr: increase(dc_power.draw_kw[5m]) / terrace_capacity_kw > 0.85
+    - Severity: Sev2
+    - Runbook: follow thermal incident steps (see below)
+  - Alert: HighInletTemp
+    - Expr: max_over_time(dc_thermal.inlet_temp_celsius[5m]) > 38
+    - Severity: Sev2 / automatic placement throttling if > 40C
+
+CI/CD and Terraform flow
+- Image promotion and node bootstrap must be staged per-terrace to avoid large simultaneous thermal events. Guidelines:
+  1) Canary 1 node in cooler lane of target terrace. Wait 2h and observe thermal signals and duty cycle.
+  2) Promote to 10% of terrace (spread across rack_pos). Wait 6h.
+  3) Full terrace promotion.
+- Terraform strategy: use per-terrace workspaces and state locking. Example command sequence:
+  - terraform workspace select terrace-eu-west-02-a || terraform workspace new terrace-eu-west-02-a
+  - terraform apply -var 'terrace_id=terrace-eu-west-02-a'
+- CI gate: the pipeline will fail image promotion to a terrace if recent (24h) power-limit or thermal alerts triggered in that terrace. Gate check (pseudo):
+```bash
+if [[ $(curl -s "$MONITORING/api/terrace/alerts?terrace=$TERRACE&since=24h") != "[]" ]]; then
+  echo "Recent alerts in terrace, aborting promotion"
+  exit 1
+fi
+```
+
+Runbook: Thermal incident triage (playbook)
+1) Detect: Alert triggers HighInletTemp or TerracePowerApproachingLimit. PagerDuty: infra-thermal escalation.
+2) Initial triage (15m):
+  - Verify metrics in Grafana: inlet_temp, power.draw, node.duty_cycle
+  - Identify impacted terrace_id and affected tenants (scheduler logs / allocation events)
+  - Check recent promotions/CI pipeline activity (deploy logs)
+3) Mitigate (15–30m):
+  - If inlet_temp < 40C and power < 90%: enable scheduler placement-throttle (reduce new allocations into terrace by 50%)
+  - If inlet_temp >= 40C or power >= 95%: trigger preemptible eviction policy for burst lanes (kick short TTL allocations) and migrate long-running low-priority pods to cross-terrace spread pools.
+  - If cooling hardware anomaly suspected, notify facilities and open DC incident.
+4) Stabilize (30–90m):
+  - Monitor temperature to trend down for 30m.
+  - Rebalance tenants: move noise-makers to spread pools; move p99-sensitive tenants to cooler lanes if capacity exists.
+  - Schedule follow-up regression analysis (owner: GPU fleet team).
+5) Postmortem: record root cause, timeline, and corrective actions. Update Terraform variables or pool quotas if placement policy was the root cause.
+
+SLOs and acceptance criteria for terracing rollout
+- Thermal incidents per terrace: <= 1/month for terraces > 40 nodes.
+- Allocation failure due to thermal limit: < 0.1% of total allocations per week.
+- Tail latency regressions attributable to placement: < 0.05% of requests/week for customers in cooler lanes.
+
+Operational playbook for capacity planning
+- Quarterly capacity review steps:
+  1. Run terrace utilization report (last 90d), include duty_cycle_pct, average inlet_temp, peak_power_draw.
+  2. For terraces with duty_cycle > 75% sustained for > 14d, open capacity request to procurement and plan edge expansion or redistribution.
+  3. Reallocate 10% burst lanes from low-util terraces to hotspots.
+  4. Update Terraform terrace quotas and mark nodes for re-provisioning if cooling_class mismatch observed.
+
+Ownership and contacts
+- GPU Fleet Team (owner): gpu-fleet@redwood.ai (paging: #infra-gpu on Slack)
+- SRE Thermal Lead: Marco Chen (marco@redwood.ai)
+- Datacenter Facilities Contact: ops-facilities@redwood.ai
+
+Appendices
+A. Common Prometheus queries
+- Current terrace inlet temp (pod):
+  - "dc_thermal.inlet_temp_celsius{terrace_id=~\"terrace-.*\"}"
+- Terraces exceeding power threshold: 
+  - "topk(10, dc_power.draw_kw / terrace_capacity_kw)"
+
+B. Example Terraform variable table
+| variable | type | description | example |
+| terrace_id | string | logical id for terrace | terrace-eu-west-02-a |
+| cooling_class | string | node cooling capability | enhanced |
+| reserved_burst_pct | number | percent reserved for burst lanes | 7 |
+| capacity_kw | number | rated terrace feed capacity (kW) | 45 |
+
+C. Safety & compliance notes
+- Any action that moves tenant workloads between terraces must be logged and retained for 90 days for audit.
+- For Private/on‑prem installations we require facilities confirmation of power feed mapping before enabling terracing.
+
+Document change log
+- 2024-10-03: Initial draft (A. Patel)
+- 2025-05-11: Added CI gate checks and Terraform workspace guidance (Marco Chen)
+- 2026-02-15: Expanded runbook and quantitative SLOs; added cooler lanes design (S. Martinez)
+
+Related resources
+- GPU Thermal & Power Management Guidelines: /confluence/eng-infra/gpu-fleet-and-capacity/gpu-thermal-and-power-management-guidelines.json
+- Terrace-aware Terraform modules: /confluence/eng-infra/terraform-and-iac/terrace-gpu-module-catalog.json
+
+End of document

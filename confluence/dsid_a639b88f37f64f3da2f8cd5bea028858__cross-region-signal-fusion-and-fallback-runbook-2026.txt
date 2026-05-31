@@ -1,0 +1,155 @@
+Cross-region signal fusion and fallback runbook
+
+Summary
+-------
+This runbook describes how platform operators should interpret fused latency and cost signals across regions, escalate, and perform safe fallbacks for LLM inference traffic. It codifies signal sources, fusion heuristics, alert thresholds, operator actions, and automated fallback configuration. The goal is to preserve customer-facing SLOs (p95 latency < 300ms for interactive routes; token cost drift alerts at > +30% delta) while limiting unnecessary cross-region failovers and cost overruns.
+
+Scope
+-----
+- Services in scope: runtime-gateway, batch-router, kv-prefix-cache, regional-allocator, traffic-shepherd.
+- Regions: us-west-2, us-east-1, eu-west-1, ap-southeast-1.
+- Applies to hosted and dedicated deployments; private deployments may adapt the heuristics but should follow the same escalation flow.
+
+Signal sources and priorities
+----------------------------
+1) Latency telemetry (highest priority for interactive SLOs)
+   - Metrics: request_p95_ms, request_p99_ms from runtime-gateway and regional-edge-proxy.
+   - Dashboards: dash/cross-region-latency-fusion -> panel "p95 by region & route".
+2) Token cost / execution-time signals (priority for cost-driven routing)
+   - Metrics: avg_tokens_per_request, cost_per_1k_tokens_estimated from billing-proxy.
+3) Queue depth and backpressure (priority for safety/failure detection)
+   - Metrics: queue_depth, slow_consumer_count from batch-router.
+4) KV-cache-hit-rate and prefetch cohort fidelity
+   - Metrics: kv_cache_hit_ratio, prefetch_miss_streak.
+
+Fusion heuristics (how alerts are decided)
+-----------------------------------------
+- The fusion engine (service: signal-fuser) computes a composite score per region R:
+
+  composite_score(R) = w1 * normalized_p95(R) + w2 * normalized_cost_delta(R) + w3 * backpressure_penalty(R) - w4 * cache_health_bonus(R)
+
+  where (recommended weights): w1=0.6, w2=0.2, w3=0.15, w4=0.05.
+
+- Normalization: each input is mapped to 0..1 using rolling baseline windows (last 24h).
+- Composite score thresholds:
+  - Informational: score > 0.35
+  - Action recommended: score > 0.55
+  - Auto-fallback candidate: score > 0.75 (AND persistent for >= 5 minutes)
+
+Alerting and dashboards
+-----------------------
+- Alert definitions (Grafana/Alerter):
+  1) alert: CrossRegionLatencyWave_ActionRecommended
+     expr: composite_score > 0.55 for 5m
+     severity: P2 (Platform Operational)
+     runbook: this doc -> Operator actions (page anchor)
+  2) alert: CrossRegionFallbackCandidate
+     expr: composite_score > 0.75 for 5m AND avg(queue_depth) > 50% for 3m
+     severity: P1 (Immediate)
+     auto-remediation: initiate canary re-route to fallback model/region (see automated fallbacks).
+- Dashboard link: https://grafana.redwood.internal/d/dash/cross-region-latency-fusion
+- Panels to check: p95 by region, composite heatmap, queue depth heatmap, token-cost delta by tenant.
+
+Operator actions (ordered)
+-------------------------
+1) Triage
+   - Open the cross-region dashboard and confirm composite score growth is not caused by a single noisy tenant.
+   - Query: topk(10, sum by (tenant) (rate(request_tokens[5m]))) and compare to baseline.
+2) Contain
+   - If backpressure present on batch-router, increase worker concurrency for the affected allocation:
+
+     kubectl -n runtime scale deployment batch-router-uswest2 --replicas=6
+
+   - If kv-prefix-cache shows sustained prefetch_miss_streak > 0.2, flush targeted prefixes:
+
+     curl -X POST "https://ops-api.internal/cache/flush" -d '{"prefixes": ["tenant-1234-user-ctx"]}'
+
+3) Mitigate (manual fallback)
+   - If composite_score > 0.75 and operators confirm regional instability, perform a controlled reroute using traffic-shepherd:
+
+     # preview
+     traffic-shepherd preview-reroute --from us-west-2 --to us-east-1 --routes "interactive-*" --percent 10
+
+     # commit (staggered):
+     traffic-shepherd apply-reroute --from us-west-2 --to us-east-1 --routes "interactive-*" --percent 10 --stagger 2m --owner @oncall-platform
+
+   - Record the reroute ID and annotate the incident ticket.
+4) Escalate
+   - If reroute does not restore p95 within 10 minutes or causes cost > +40% vs baseline, escalate to Platform SRE on-call and open incident channel #inc-platform-regional-failover.
+
+Automated fallback configuration
+-------------------------------
+- Auto-fallbacks are enabled when alert CrossRegionFallbackCandidate fires and composite_score is sustained for 7m. Auto-fallback policy:
+  - Step 1: Canary 5% traffic to fallback region/model for 3m.
+  - Step 2: If fallback improves composite score by >= 20% within 3m, ramp to 30% for 5m.
+  - Step 3: If still improving, ramp to 100% over 10 minutes.
+- Overrides: tenants with "no-fallback" contract label are exempt. The auto-fallback actor uses the service regional-allocator and writes an audit entry to fallback-log.
+
+Rollback and safety checks
+-------------------------
+- Always validate output quality for canary traffic using the canary-eval job:
+
+  kubectl -n eval-job logs canary-eval-<id>
+
+  The job compares a predefined prompt-set S against baseline and reports 3 metrics: semantic_similarity (>=0.92 pass), generation_stability (<0.15 drift), latency_improvement_ms.
+- If semantic_similarity < 0.90 for canary, abort fallback and revert routing:
+
+  traffic-shepherd revert-reroute --id <reroute-id> --owner @oncall-platform --reason "canary-quality-failure"
+- Safety circuit: any automated fallback that increases estimated token-cost > +60% triggers immediate rollback and hands control to operators.
+
+Post-incident remediation checklist
+----------------------------------
+1) Annotate the incident ticket with composite_score graphs, reroute IDs, eviction/restart events, and canary-eval summaries.
+2) Run a root-cause hypothesis session (30–60m) with owners from runtime, allocator, and infra. Capture findings in: /confluence/eng-platform/retrospectives/<incident>-postmortem (link).
+3) If the incident involved cache fidelity, schedule a prefetch-cohort audit and add to backlog with priority P2.
+
+Runbook run-through (rapid script)
+----------------------------------
+1) Open: https://grafana.redwood.internal/d/dash/cross-region-latency-fusion
+2) Confirm composite_score alert and top offending tenants.
+3) Run: kubectl get deployment batch-router-uswest2 -o wide
+4) If queue_depth high: scale batch-router replicas (see contain step).
+5) If composite_score persists: preview and apply traffic-shepherd reroute (see mitigate).
+6) Monitor canary-eval and artifact logs for 15 minutes before ramping.
+
+Ownership and contacts
+----------------------
+- Primary owner: platform-ops (oncall rotation via PagerDuty: Platform SRE).
+- Secondary owner: runtime-team (Slack: #runtime).
+- Fallback automation owner: allocator-team (PagerDuty: Allocator SRE).
+
+Appendix: CLI snippets and JSON examples
+---------------------------------------
+- Example composite_score query (PromQL):
+
+  sum by(region) (
+    0.6 * (request_p95_ms / (histogram_quantile(0.95, sum(rate(request_duration_seconds_bucket[24h]))))) +
+    0.2 * cost_delta_normalized +
+    0.15 * clamp_max(queue_depth / 1000, 1) -
+    0.05 * kv_cache_hit_ratio
+  )
+
+- Sample fallback audit entry (JSON):
+
+  {
+    "reroute_id": "rr-20260302-84f2",
+    "from": "us-west-2",
+    "to": "us-east-1",
+    "routes": ["interactive-text", "chat-generic"],
+    "percent": 10,
+    "trigger": "CrossRegionFallbackCandidate",
+    "canary_eval": {"semantic_similarity": 0.948, "stability": 0.08},
+    "operator": "@oncall-platform"
+  }
+
+References and related reading
+----------------------------
+- Regional failure mode mapping: /confluence/eng-platform/dashboards-and-alerts/regional-failure-mode-mapping-and-observability-patterns-2026
+- Multiregion tenant routing guide: /confluence/eng-platform/how-tos/multiregion-latency-aware-tenant-routing-guide-2025
+- Prefetch cohort best-practices: /confluence/eng-platform/how-tos/cache-prefetch-prioritization-for-llm-workloads-2026
+
+Change history
+--------------
+- 2026-01-12: Created by Priya Natarajan (draft).
+- 2026-02-10: Added automated fallback policy and canary-eval tie-in (reviewers: Liam Chen).
+- 2026-03-02: Finalized weights and example queries; published.

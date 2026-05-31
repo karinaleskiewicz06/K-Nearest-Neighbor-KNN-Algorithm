@@ -1,0 +1,261 @@
+SDK client retry impact analysis (thundering herd risk) + rollout monitoring
+
+## Executive summary
+Client retries are a double-edged sword: they reduce tail latency for transient failures, but can amplify load during partial outages ("thundering herd"), worsening the incident and extending recovery.
+
+For the SDK parity initiative, SRE reviewed the proposed default retry policy and modeled load amplification under several failure modes (429 rate limiting, 5xx service errors, and network instability). The conclusion is that **the standardized retry defaults are safe** *if* we:
+
+1) **Respect `Retry-After` on 429**, 2) apply **exponential backoff with jitter**, 3) keep a **tight max attempt budget**, and 4) **do not automatically retry streaming mid-flight**.
+
+This page documents the analysis, recommended guardrails, and the dashboards/alerts required for rollout.
+
+---
+
+## Background and why this matters
+### What changed
+Across Python/TypeScript/Go, we are standardizing:
+- Retryable conditions (429/5xx + specific network errors)
+- Backoff + jitter behavior
+- Parsing and honoring `Retry-After`
+- Typed errors that expose `request_id`, `status_code`, `retry_count`, and `retryable`
+- Timeout defaults and how retries interact with timeouts
+
+### Known failure pattern
+During elevated 429s (capacity constrained or rate-limited tenants), aggressive client retries can:
+- Multiply requests per second (RPS) against the gateway
+- Increase queueing and p99 latency for all tenants
+- Create synchronized retry spikes if jitter is absent or poor
+
+SRE has previously observed this pattern in other client ecosystems: retry storms often appear **after** the initial degradation, delaying recovery by increasing load and saturating upstream dependencies.
+
+---
+
+## Key definitions
+- **Attempt:** One HTTP request issued by the SDK (initial call + any retries).
+- **Max attempts:** Upper bound on attempts per logical user operation.
+- **Retry budget:** The total extra traffic the platform must absorb due to retries.
+- **Load amplification factor (LAF):**
+  - `LAF = (total attempts) / (initial logical operations)`
+  - Example: max_attempts=3 and all attempts fail => LAF up to 3.0 for those operations.
+
+---
+
+## Modeling approach (simple, conservative)
+We used a first-order model to bound worst-case load. While simplistic, it is useful for answering: “Can defaults catastrophically amplify load?”
+
+### Inputs
+- `R`: baseline logical request rate (operations/sec)
+- `p_fail`: probability an attempt fails with a retryable error
+- `A`: max attempts (including the initial attempt)
+
+### Expected attempts per operation
+Assuming independent failures per attempt (not strictly true in incidents; see below):
+- `E[attempts] = 1 + p_fail + p_fail^2 + ... + p_fail^(A-1)`
+- So LAF is the same value.
+
+### Correlated failures (incident reality)
+During a real incident, failures are correlated: most attempts fail, especially for a window of time. In that case, **LAF approaches A** for impacted traffic.
+
+This is why **max attempts** and **backoff/jitter** are the two most important safety knobs.
+
+---
+
+## Scenarios and findings
+### Scenario 1: Elevated 429s (capacity constrained / rate limiting)
+**Observed platform behavior:** When capacity is constrained, the gateway issues 429s and (after platform work) will consistently return `Retry-After`.
+
+**Risk:** If clients ignore `Retry-After` or use very short backoffs, retries re-hit immediately, keeping the system in overload.
+
+**Finding:** Honoring `Retry-After` is the single biggest risk reducer. With `Retry-After` honored, retries spread over time and align with server guidance.
+
+### Scenario 2: 5xx spike (partial service degradation)
+**Risk:** Clients retry fast, creating additional work for services already failing (e.g., DB pool exhaustion).
+
+**Finding:** Exponential backoff with jitter significantly reduces synchronization. The remaining risk is bounded by max attempts.
+
+### Scenario 3: Network instability (timeouts, connection resets)
+**Risk:** Clients can generate extra traffic without corresponding server load reduction, especially if timeouts are too low and trigger premature retries.
+
+**Finding:** Default overall timeouts must not be so aggressive that they create self-inflicted retry loops. Timeout defaults should be tuned to be *predictable* and *long enough* for typical p99, while still allowing application-level cancellation.
+
+---
+
+## Recommended default policy (SRE signoff)
+This section reflects the SRE-approved defaults to ship across Python/TS/Go (details are codified in the SDK standard + ADRs).
+
+### Retryable conditions
+Retryable by default:
+- HTTP **429** (rate limit / capacity)
+- HTTP **500, 502, 503, 504**
+- Network errors where no response was received (examples: DNS failure, connection reset before headers, TLS handshake failure)
+
+Not retryable by default:
+- **400, 401, 403, 404, 409, 422**
+- Any error where the server returned a definitive non-retryable code
+
+Notes:
+- 408 (Request Timeout) is inconsistently produced across proxies. We treat it as retryable only if the SDK can confirm no body/partial stream was delivered.
+
+### Backoff and jitter (non-streaming)
+- Exponential backoff with jitter is required to avoid synchronization.
+- Backoff should respect `Retry-After` when present.
+
+SRE recommended parameters:
+- **max_attempts:** 3 (initial + up to 2 retries)
+- **base_delay:** 250ms
+- **max_delay:** 8s
+- **jitter:** full jitter (random between 0 and backoff cap)
+
+Rationale:
+- Attempts >3 provided diminishing returns in success rate during real incidents and materially increase load amplification.
+- base_delay below ~200–250ms increased the chance of re-hitting during short brownouts.
+- max_delay above ~8–10s tends to create long tail retries that complicate user experience and error attribution.
+
+### `Retry-After` handling (429)
+Required behavior:
+- Parse both `Retry-After: <seconds>` and HTTP-date formats.
+- Clamp unreasonable values:
+  - If `Retry-After` is missing: follow standard exponential backoff.
+  - If `Retry-After` > 60s: treat as 60s for default behavior (callers can override).
+  - If `Retry-After` is invalid/unparseable: ignore and use exponential backoff.
+
+Why clamp?
+- Prevents a single response header from causing extremely long hangs by default.
+
+### Streaming retries (conservative)
+Default behavior:
+- **Do not automatically retry** a streaming request once any stream bytes/events have been delivered.
+- If the request fails **before** receiving the first stream event (i.e., headers not received / connection fails early), the SDK may retry as a normal request.
+
+Rationale:
+- Streaming retries risk duplicated side effects (especially where the client application reacts to partial tokens) and can increase load significantly.
+- We instead require *clear error surfaces* so applications can implement idempotent retry where appropriate.
+
+### Idempotency guidance (application-level)
+- Where supported, recommend sending an idempotency key for non-streaming requests that cause side effects.
+- Always log and propagate `request_id` so Support/SRE can correlate attempts.
+
+---
+
+## Load amplification guidance (what “safe” looks like)
+### Practical bounds
+With max_attempts=3:
+- Worst case LAF for impacted operations is **3.0**.
+- If 30% of traffic experiences a retryable outage, overall platform attempts increase by up to:
+  - `1 + 0.30*(3-1) = 1.60x` (i.e., +60% attempts)
+
+This is meaningful but generally survivable if backoff/jitter spreads retries and `Retry-After` is honored.
+
+### What we want to avoid
+- max_attempts >= 5 combined with low backoff => LAF 5.0 for impacted traffic and much higher synchronized spikes.
+- No jitter => retry synchronization at exact delays (e.g., 250ms, 500ms, 1s), creating periodic load waves.
+- Ignoring `Retry-After` => constant pressure during 429 windows.
+
+---
+
+## Observability requirements and dashboards to watch
+### Required SDK-side fields (logging/telemetry)
+Each SDK should expose (via hooks or structured logs, depending on language norms):
+- `request_id` (from response headers or error bodies)
+- `attempt` and `max_attempts`
+- `retry_count` (attempts-1)
+- `retry_reason` (http_429, http_5xx, network_error, timeout)
+- `backoff_ms` (selected delay)
+- `retry_after_ms` (if applied)
+- `timeout_ms` (overall and/or connect/read if available)
+- For streaming: `streaming_disconnect_reason` and `stream_events_delivered` (count)
+
+Security note: ensure API keys/tokens are never logged; errors must redact secrets.
+
+### Platform metrics (must-have)
+We will monitor the following during beta and broad rollout:
+
+1) **Gateway request rate (RPS) and attempt rate**
+- Dimensions: route, model, region, customer_tier
+- Key derived metric: `attempts_per_operation` where available (approx via SDK telemetry sampling)
+
+2) **429 rate + `Retry-After` presence**
+- % of 429 responses with valid `Retry-After`
+- Distribution of `Retry-After` values (p50/p95)
+
+3) **5xx rate + latency**
+- 5xx rate by upstream service
+- p95/p99 latency for generation and embeddings endpoints
+
+4) **Retry storm indicators**
+- Sharp increase in attempts without corresponding increase in successful operations
+- Oscillating RPS waves at retry intervals (classic no-jitter signature)
+
+5) **Streaming disconnect rate**
+- Disconnect rate per route/region
+- Disconnect reasons (proxy_fin, idle_timeout, client_cancel, read_timeout)
+
+### Dashboards
+Primary rollout dashboards (see also the dashboard spec in Drive):
+- **SDK Retry/Timeout Rollout – Overview**
+  - RPS, attempts, 429/5xx, retry rate, timeout rate, streaming disconnects
+- **SDK Retry/Timeout Rollout – 429 Deep Dive**
+  - Retry-After presence, distribution, retry delay vs header guidance
+- **SDK Streaming Reliability**
+  - Disconnect reasons, time-to-disconnect, partial output rates
+
+Owners:
+- Dashboards: Observability (Logan Wright / Nadia Rahman)
+- Oncall interpretation & incident response: SRE (Sean Gallagher)
+
+---
+
+## Rollout guardrails and rollback triggers
+### Beta rollout recommendations
+- Start with internal dogfooding + canary customers.
+- Ramp by SDK version adoption, not by traffic shifting.
+
+### Guardrails (what we will enforce)
+- Max attempts default remains 3.
+- Jitter must remain enabled by default.
+- Retry-After honored for 429.
+- Streaming mid-flight retry disabled by default.
+
+### Rollback / halt triggers (actionable)
+During beta/staged rollout, halt or rollback if any of the following are observed and attributable to client retry behavior:
+
+1) **Attempt rate increases >25% week-over-week** without matching growth in unique operations (or paid usage).
+2) **429 rate increases >30%** on stable traffic while SDK adoption rises (possible retry amplification).
+3) **Gateway p99 latency increases >20%** coincident with increased retry rate.
+4) Clear evidence of synchronized retry waves (periodic spikes aligned to retry intervals).
+5) Streaming disconnect rate increases >15% after SDK changes (potential timeout/cancellation regression).
+
+Immediate mitigations (preferred order):
+1) Reduce max_attempts via SDK config guidance + docs hotfix.
+2) Increase base_delay and/or max_delay.
+3) Temporarily disable retries for 5xx in SDK defaults (keep 429 honoring Retry-After).
+4) Coordinate with platform to tighten rate limits or improve Retry-After accuracy.
+
+---
+
+## Coordination notes with platform
+To make the retry policy safe, platform must:
+- Emit `Retry-After` consistently on 429 (gateway).
+- Ensure `request_id` is present for both streaming and non-streaming errors.
+- Maintain stable error codes/fields so SDKs classify retryable vs terminal accurately.
+
+Status (as of last update): platform changes tracked in ENG-5130 and corresponding gateway PRs.
+
+---
+
+## FAQ
+### Why not increase max attempts to improve success rate?
+Beyond 3 attempts, marginal success gains during real incidents are low, but load amplification risk increases linearly. We prefer predictable behavior with an explicit opt-in for higher attempts in applications that can tolerate it.
+
+### Why clamp Retry-After?
+A very large Retry-After can turn transient throttling into a long, confusing hang by default. Callers who want to honor large delays can override. The default should be safe and user-friendly.
+
+### Why no mid-stream retry?
+Once partial output is delivered, retries can duplicate side effects and produce confusing partial results. The safer default is to surface a typed streaming disconnect error with `request_id` and let the application decide how to proceed.
+
+---
+
+## Changelog
+- 2026-02-20: Published with rollout triggers and dashboard requirements; aligned terminology with SDK parity ADRs.
+- 2026-02-06: Added streaming-specific monitoring guidance and disconnect taxonomy.
+- 2026-01-28: Initial draft and modeling notes.

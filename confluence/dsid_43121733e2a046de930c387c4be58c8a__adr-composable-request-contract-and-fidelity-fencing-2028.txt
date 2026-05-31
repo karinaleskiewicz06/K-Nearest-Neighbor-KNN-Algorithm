@@ -1,0 +1,175 @@
+ADR: Composable Request Contract and Fidelity Fencing
+
+Summary
+
+This ADR defines a composable request contract and a runtime "fidelity fencing" mechanism for Redwood inference APIs. The goal is to make the client-to-runtime capability negotiation explicit and minimal, enable safe progressive rollout of lower-cost model variants, and bind fidelity changes to observable SLO effects. This document formalizes fields, semantics, runtime decision points, rollout gates, and the test/gating checklist for adoption.
+
+Context and motivation
+
+Background: Redwood exposes multi-variant inference (hosted/dedicated/private) where a single request can be satisfied by different model variants (full precision, quantized, distilled, or fallback models). Historically, variant selection has been opaque: the server decided based on capacity and heuristics, with limited client signal. This caused surprising output shifts for clients and made quality regressions difficult to correlate to rollout events.
+
+Key problems we must solve:
+- Provide a minimal, backward-compatible request surface for clients to express cost/latency/quality preferences.
+- Prevent silent fidelity reductions that cause regressions for high-value customers.
+- Make runtime routing decisions auditable and tied to SLOs and rollout policies.
+
+Decision
+
+We adopt a new composable request contract with explicit fidelity hints and a "fidelity_fence" field. The server will evaluate fidelity fences before selecting a variant; fences act as runtime safety checks that reject or route requests when fidelity cannot be met. Implementation details and rollout gating are below. This ADR applies to all text/generation and chat endpoints and will be included in future streaming/embeddings contracts via incremental extension.
+
+Contract overview (fields and semantics)
+
+1) request.fidelity_hint (optional, string): one of ["high", "balanced", "low"]. If omitted, treated as "balanced". Hints are advisory; server may override when capacity or policy requires.
+
+2) request.fidelity_fence (optional, object represented as nested JSON string): a short declarative constraint set the server must honor or respond with a deterministic non-200 code. The fence has three orthogonal checks: quality_threshold, max_latency_ms, allowed_variants. Example (as JSON text in the request):
+
+```
+{
+  "quality_threshold": "0.92",
+  "max_latency_ms": 350,
+  "allowed_variants": ["fp16-v2","q8_0-v1"]
+}
+```
+
+Semantics:
+- quality_threshold is measured by the model-internal quality score produced by the evaluation hooks or a surrogate quality estimator. It is expressed as a decimal [0,1] where runtime maps to internal thresholds per model family.
+- max_latency_ms is a client SLO hint: if estimated response tail for candidate variants exceeds this, server must either route to a lower-latency allowed variant or return 409 with a structured error detailing the conflict.
+- allowed_variants is an explicit white-list to constrain selection. If empty, all compatible variants are allowed.
+
+3) request.cost_control_token (optional, string): an account-level token replacing per-request hints in high-throughput clients; binds to profile on the account with pre-approved cost/fidelity tradeoffs.
+
+Runtime behavior and codes
+
+- When fidelity_fence is present, server performs a deterministic check sequence: (a) candidate enumeration, (b) quality estimator evaluation (fast surrogate), (c) latency estimation using recent tail metrics for the account and variant, (d) apply allowed_variants filter.
+- If a candidate satisfies all fence checks, serve with that variant. If none satisfy, server returns HTTP 409 Conflict with a structured payload including: failed_checks (list), suggested_variants (list), and a request_recommendation (string).
+- For advisory fidelity_hint only, server may downgrade gracefully but must add a header `X-Fidelity-Decision: downgraded|honored|rejected` and telemetry that links the decision to request id and rollout flags.
+
+Rationale and alternatives considered
+
+Alternatives considered:
+- No explicit fence (status quo): allowed opaque decisions but we get regressions and customer confusion.
+- Full typed schema with many knobs: powerful but too complex for clients; increases surface area and coupling.
+- Server-only capability discovery endpoint with no per-request fence: helpful but does not prevent mid-request fidelity shifts when runtime load spikes.
+
+We chose composable fence because it is minimal, client-declarative, and enables short-circuit safety checks early in the scheduling pipeline. It also lays groundwork for automatic telemetry-driven rollback when fences start failing at scale.
+
+Implementation plan
+
+Scope: API contract change, runtime adapter in serving runtime, console exposure for per-account cost_control_token profiles, SDK updates, and e2e tests.
+
+High-level steps:
+1) API: Add parsing support for fidelity_fence in the API gateway (compatible with existing clients if field absent).
+2) Runtime: Implement fence evaluation in the request admission path before batching. Implement a fast surrogate quality estimator and latency estimator (see metrics below).
+3) SDKs: Add helpers to construct fidelity_fence JSON and cost_control_token plumbing.
+4) Console: Expose account profile editor for cost_control_token and default fidelity_hint.
+5) Tests: unit, integration, and degradation-sim tests (see Test Plan).
+6) Gradual rollout: dark launch -> opt-in by selected customers -> global default-to-enabled after 8 weeks and metric pass.
+
+Rollout gating and SLOs
+
+Gate thresholds to progress from dark to global enabled:
+- Telemetry: fidelity_fence accept rate > 99% for 72h for opt-in accounts, and failed_fence_rate < 0.3% for production traffic across accounts that opt in.
+- Quality: no customer-reported regression above baseline for opt-in cohort for 14 days (tracked via eval prompt sets and customer incidents).
+- Latency: 99th percentile latency change for affected routes <= +3% relative to baseline during dark launch.
+
+If any gate fails, we roll back the runtime change and notify the rollout owner team with incident classification.
+
+Configuration table (runtime defaults)
+
+| Setting | Default | Notes |
+|---|---:|---|
+| default_fidelity_hint | "balanced" | Treated as client absence fallback |
+| fence_evaluation_timeout_ms | "12" | Milliseconds budget for fast surrogate quality eval |
+| default_max_fence_latency_ms | "500" | Server will interpret missing max_latency_ms as this limit |
+| fence_failure_code | "409" | Structured conflict response |
+| fidelity_decision_header | "X-Fidelity-Decision" | Added to responses when hints/fences are present |
+
+(Represented above as markdown-style table inside the body string.)
+
+API examples
+
+1) Simple generation with advisory hint:
+
+curl -X POST https://api.redwoodinfra.internal/v1/generate -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"prompt":"Summarize X","fidelity_hint":"high"}'
+
+2) Request with fence (as JSON-string payload field):
+
+curl -X POST https://api.redwoodinfra.internal/v1/generate -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"prompt":"Explain Y","fidelity_fence":"{\"quality_threshold\":\"0.95\",\"max_latency_ms\":250,\"allowed_variants\":[\"fp16-v3\"]}"}'
+
+Structured 409 response example:
+
+```
+HTTP/1.1 409 Conflict
+Content-Type: application/json
+
+{
+  "error": "fidelity_fence_unsatisfiable",
+  "failed_checks": ["latency_estimate","quality_threshold"],
+  "suggested_variants": ["q8_0-v1"],
+  "request_recommendation": "Reduce quality_threshold to 0.90 or add q8_0-v1 to allowed_variants"
+}
+```
+
+Observability and telemetry requirements
+
+Every fence-engaged request must produce the following telemetry fields (structured, indexed):
+- request_id
+- account_id
+- fidelity_hint
+- fidelity_fence_present (bool)
+- fidelity_decision (honored|downgraded|rejected)
+- failed_checks (list)
+- chosen_variant
+- decision_latency_ms
+- rolling_99th_latency_of_chosen_variant_ms
+
+Dashboards and alerts:
+- Fence failure rate (per account tier) with threshold 0.3% -> page on breach.
+- Correlated quality-revision alert: if fidelity_decision == "downgraded" and customer-eval-failure_rate increases by > 1% in 24h, trigger a medium priority alert.
+
+Testing and acceptance criteria
+
+Unit tests:
+- Parser correctness for fidelity_fence JSON string, edge cases, and invalid fields.
+- Deterministic mapping of quality_threshold to internal estimator outputs.
+
+Integration tests:
+- Full admission pipeline using simulator variants and a reproducible latency model.
+- Contract test ensuring header `X-Fidelity-Decision` present when relevant.
+
+Degradation / chaos test plan:
+- Simulate GPU capacity exhaustion and verify that requests with strict fences receive 409 and that advisory hints get downgraded with clear telemetry.
+
+Migration and backward compatibility
+
+- Clients that omit the new fields experience no change.
+- SDKs will default to not sending fidelity_fence until explicitly toggled by developer or account profile.
+- Console profiles allow account admins to opt-in and generate cost_control_tokens.
+
+Security and privacy considerations
+
+- fidelity_fence values are non-sensitive; cost_control_token should be treated like an API key and stored in KMS-backed account metadata.
+- Telemetry exposes allowed_variants and chosen_variant; ensure these fields are scrubbed in public incident reports and redacted when sharing externally.
+
+Ownership and rollout contacts
+
+- Feature owner: Aisha Bennett (serving-runtime)
+- Runtime implementation lead: Lin Zhou
+- API gateway changes: Diego Ramirez
+- Console/account profile: Mira Patel
+
+Open questions and future work
+
+- Replace fast surrogate estimator with learned online estimator tied to continuous evals.
+- Add service-level constraint composition to blend multiple accounts' fences in multi-tenant batch contexts.
+- Extend fence semantics to embeddings and rerank endpoints with embedding-quality proxies.
+
+Appendix: example changelog entry (for release notes)
+
+- v2027.03.0: Introduced optional request.fidelity_hint and request.fidelity_fence. When fidelity_fence is present, server evaluates constraints and returns 409 if they cannot be satisfied. Console: Account profile and cost_control_token MVP. SDK: helpers for constructing fences (beta).
+
+References
+
+- Related: capability-signal-profiles-and-client-negotiation-playbook-2026
+- Related: multi-variant-contract-stability-playbook-2026
+

@@ -1,0 +1,413 @@
+Hardware tuning profiles: schema + compatibility rules
+
+## Summary
+This document defines the **hardware tuning profile schema** and the **compatibility/guardrail rules** used by the serving runtime to apply safe, versioned tuning presets across GPU SKUs (H100, B200, L40S) and across deployment modes (Hosted, Dedicated, Private).
+
+The schema is designed to:
+- Keep profile changes **safe-by-default** (strict validation, bounded knobs, explicit intent).
+- Make profile application **deterministic and debuggable** (explicit selection logic, metrics, logs).
+- Prevent **silent drift** between runtime defaults and shipped profile packs (normalized defaults + compatibility constraints).
+
+This is a design reference for implementation in `runtime-config` and the profile loader.
+
+---
+
+## Goals
+1. Define a **profile pack format** with versioning and a stable schema.
+2. Support **inheritance/overrides** to minimize duplication (common base → GPU family → SKU → mode).
+3. Define **hardware detection inputs** and normalization rules (including MIG/multi-GPU edge cases).
+4. Provide **compatibility rules** against:
+   - Runtime releases (min/max supported runtime version)
+   - Build capabilities (compiled features)
+   - Driver/CUDA constraints (esp. B200 early enablement)
+   - Deployment mode constraints (Hosted/Dedicated/Private)
+5. Define **guardrails** (validation, safe ranges, required invariants) and a **fallback strategy**.
+
+## Non-goals
+- Introducing new kernels from scratch.
+- Customer-specific bespoke tuning logic (handled via Support/Solutions using supported overrides).
+- API surface changes to inference endpoints.
+
+---
+
+## Terminology
+- **Profile pack**: a versioned bundle containing one or more profiles plus metadata.
+- **Profile**: named set of configuration values for runtime scheduling/kernels/memory behavior.
+- **Selector**: rules that determine when a profile is eligible (GPU SKU, driver, runtime, deployment mode).
+- **Effective config**: resolved runtime config after selection + inheritance + overrides.
+- **Override sources**: fleet default, per-pool, per-deployment (Helm), per-route, environment variables (see ADR for precedence).
+
+---
+
+## Design principles
+1. **Explicit compatibility > best-effort magic**
+   - Profiles must declare the runtime versions and environment assumptions they are compatible with.
+2. **Guardrails are enforced at runtime startup**
+   - Invalid profiles must not partially apply.
+3. **Selection is deterministic**
+   - Given the same node/runtime inputs and the same pack, selection returns the same profile.
+4. **Safe fallback path**
+   - If selection/validation fails, runtime falls back to known-safe defaults (or a base profile), and emits actionable logs/metrics.
+
+---
+
+## Profile pack structure
+### Files
+A pack is a directory or archive containing:
+- `pack.json` (metadata + index)
+- `profiles/*.json` (individual profiles)
+- optional `README.md` (human-readable)
+
+### Pack metadata (`pack.json`)
+Required fields (all strings unless noted):
+- `schema_version`: semantic version of the pack schema (e.g., `"1.1.0"`).
+- `pack_version`: semantic version of the pack content (e.g., `"2026.02.0"`).
+- `release_channel`: `"stable" | "beta" | "experimental"`.
+- `generated_at`: ISO date.
+- `profiles`: list of profile file names.
+- `default_profile`: name of the safe base profile (e.g., `"base/default"`).
+
+Notes:
+- `schema_version` gates parsing. Runtime must reject unsupported schema major versions.
+- `pack_version` gates rollouts/rollback and observability.
+
+---
+
+## Profile schema
+Profiles are JSON documents with:
+1) **Identity + documentation**
+2) **Selector (eligibility) rules**
+3) **Inheritance**
+4) **Config payload** (scheduler/kernel/memory/etc.)
+5) **Guardrails**
+
+### Top-level fields
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `name` | string | yes | Globally unique within the pack (e.g., `"h100/balanced"`). |
+| `description` | string | yes | Human-readable summary and intended workload envelope. |
+| `profile_version` | string | yes | SemVer; increments when semantics change. |
+| `inherits_from` | list of strings | no | Ordered list; later parents override earlier parents. |
+| `selector` | object (JSON) | yes | See Selector section; used to determine eligibility and priority. |
+| `compatibility` | object (JSON) | yes | Runtime/build/driver constraints. |
+| `config` | object (JSON) | yes | Actual tuning knobs; key-space is versioned by runtime. |
+| `guardrails` | object (JSON) | yes | Validation rules and invariants enforced by loader. |
+| `deprecations` | object (JSON) | no | Migration info for keys planned for removal. |
+
+Implementation note: although `selector`, `compatibility`, `config`, and `guardrails` are structured objects, they remain JSON objects in-file; validation happens via the runtime’s JSON schema + custom validators.
+
+---
+
+## Inheritance model
+Inheritance is intended to reduce duplication and make it obvious which knobs differ by SKU.
+
+### Rules
+1. `inherits_from` is an **ordered list**.
+   - Resolution order: apply first parent → next parent → this profile.
+2. Cycles are rejected.
+3. A profile may override a key by setting it to a new value.
+4. Key deletion is supported only via explicit tombstone:
+   - `"__delete__"` sentinel for specific namespaces (restricted; see Guardrails).
+
+### Recommended inheritance hierarchy
+- `base/default`
+- `gpu-family/hopper` (H100)
+- `sku/h100-sxm` vs `sku/h100-pcie` (only when materially different)
+- `mode/balanced` vs `mode/throughput-first`
+
+We prefer **fewer levels** and avoid per-instance-type profiles unless required (hardware variance handled via guardrails and detection normalization).
+
+---
+
+## Selector: eligibility + priority
+Selection chooses the “best” eligible profile given node/runtime facts.
+
+### Inputs available to selection
+- GPU facts (via NVML / device properties):
+  - `gpu.vendor` (must be NVIDIA for this pack)
+  - `gpu.arch` (e.g., hopper, blackwell)
+  - `gpu.sku_normalized` (e.g., `H100-SXM`, `H100-PCIe`, `B200-SXM`, `L40S`)
+  - `gpu.memory_gb`
+  - `gpu.is_mig` and MIG slice info (if applicable)
+  - `gpu.count`
+- Software facts:
+  - `runtime.version` (e.g., `1.24.3`)
+  - `runtime.build_features` (compiled capabilities)
+  - `cuda.version`, `driver.version`
+- Deployment facts:
+  - `deployment.mode`: `hosted | dedicated | private`
+  - `deployment.pool` (Hosted/Dedicated) or `deployment.cluster_name` (Private)
+  - `region`
+
+### Selector fields
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `match.gpu_skus` | list of strings | yes | Normalized SKUs; supports `"*"` only for base profiles. |
+| `match.deployment_modes` | list of strings | yes | One or more of hosted/dedicated/private. |
+| `match.mig` | string | no | `"allowed" | "disallowed" | "required"`. Default: allowed. |
+| `priority` | integer | yes | Higher wins if multiple profiles match. |
+| `rollout_tag` | string | no | For staged rollouts (e.g., `"b200-experimental"`). |
+
+### Tie-breaking
+If multiple eligible profiles have the same `priority`, select the profile with:
+1) More specific SKU match (exact > family alias > wildcard)
+2) Higher `profile_version` (semver compare)
+3) Lexicographic `name` (stable determinism)
+
+If still ambiguous, emit `PROFILE_SELECTION_AMBIGUOUS` and fall back to `pack.default_profile`.
+
+---
+
+## Compatibility rules
+Profiles must declare compatibility; the loader enforces it at startup and on reload.
+
+### Compatibility fields
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `runtime.min_version` | string | yes | Inclusive semver. |
+| `runtime.max_version` | string | no | Inclusive semver; recommended when keys are removed/behavior changes. |
+| `runtime.required_features` | list of strings | no | Build feature flags (e.g., `"kv_cache_budgeting"`). |
+| `cuda.min_version` | string | no | If set, enforce. |
+| `driver.min_version` | string | no | If set, enforce. |
+| `known_incompatible` | list of strings | no | Human-readable reasons/conditions; emitted in logs/metrics when detected. |
+| `maturity` | string | yes | `"stable" | "beta" | "experimental"`. |
+
+### Enforcement behavior
+- If `maturity=experimental`, runtime must require an explicit enable (feature flag or allowlist) depending on deployment mode:
+  - Hosted: allowlist by pool/region
+  - Dedicated: allowlist by pool
+  - Private: explicit Helm value + runtime flag
+- If compatibility checks fail:
+  1) Loader marks the profile **ineligible**.
+  2) Selection proceeds to next best profile.
+  3) If none eligible, fall back to `pack.default_profile`.
+
+### Runtime release compatibility strategy
+- We pin profiles to runtime minors to avoid “silent semantics changes” in knobs.
+- Default stance:
+  - `runtime.min_version` is the first runtime minor where the profile keys are fully supported.
+  - `runtime.max_version` is optional but should be set for experimental/B200 profiles until stabilized.
+
+---
+
+## Hardware detection and normalization
+Profile matching uses a normalized SKU string. Detection must be robust across providers and driver string variants.
+
+### Detection sources (ordered)
+1. NVML device name + PCI device ID (preferred)
+2. `nvidia-smi -q` parsing fallback
+3. Cloud metadata (instance type) only as a last resort
+
+### Normalized SKU strings (current)
+- `H100-SXM`
+- `H100-PCIe`
+- `B200-SXM`
+- `L40S`
+
+### Normalization rules
+- Trim vendor prefixes/suffixes and normalize separators:
+  - e.g., `"NVIDIA H100 80GB HBM3"` → `H100-SXM` or `H100-PCIe` based on PCI ID / form factor hint
+- Memory-based disambiguation is allowed only as a guardrail, not as the primary signal.
+
+### MIG
+- Profiles may specify `match.mig`.
+- Default behavior:
+  - If MIG is enabled and `match.mig=disallowed`, the profile is ineligible.
+  - If MIG is enabled and no MIG-specific profile matches, fallback to base.
+
+### Multi-GPU nodes
+- Profile selection is per **runtime process** (not per device). If a node has heterogeneous GPUs, selection is considered ambiguous and must fall back unless:
+  - A dedicated “heterogeneous” profile exists with explicit match rules.
+
+---
+
+## Config payload namespaces
+`config` is logically namespaced; the runtime’s config registry defines allowed keys and value types.
+
+### Current namespaces (v1.x runtime)
+- `scheduler.*`
+  - continuous batching knobs, prefill/decode fairness, queue limits, backpressure thresholds
+- `kernels.*`
+  - kernel auto-selection toggles, seq-len bucket boundaries, attention implementation selection
+- `memory.*`
+  - KV-cache budgets, fragmentation mitigation, admission control
+- `collectives.*` (optional)
+  - NCCL/collectives tuning for multi-GPU configurations (only when supported)
+- `cpu_runtime.*`
+  - thread pools, pinning hints, serialization overhead controls
+
+### Key constraints
+- Only keys registered in the runtime config registry may appear.
+- Keys are annotated with:
+  - supported runtime versions
+  - safe ranges
+  - whether they are “freezable” (safe to pin per SKU)
+
+---
+
+## Guardrails
+Guardrails are enforced during profile resolution and again after all overrides are applied.
+
+### Guardrails fields
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `limits.max_batch_tokens` | integer | yes | Hard cap; prevents runaway batching. |
+| `limits.max_concurrency` | integer | yes | Hard cap per runtime instance. |
+| `kv_cache.max_fraction_of_gpu_mem` | number | yes | 0.0–0.95; ensures headroom for activations/fragmentation. |
+| `queue.max_depth` | integer | yes | Admission control. |
+| `latency_slo_intent` | string | yes | `"balanced" | "throughput_first" | "latency_first"`; used for dashboards + review. |
+| `disallow_keys` | list of strings | no | Keys that must not be set by this profile. |
+| `require_keys` | list of strings | no | Keys that must be set (prevents partially-specified profiles). |
+| `invariants` | list of strings | no | Named checks implemented in code (e.g., `"prefill_fairness_nonzero"`). |
+
+### Examples of invariants (implemented checks)
+- `prefill_fairness_nonzero`: prefill/decode fairness parameter must be > 0 for streaming-enabled routes.
+- `kv_cache_budget_le_activation_headroom`: enforce KV cache budget leaves at least X GiB headroom.
+- `queue_limits_consistent`: queue depth and backpressure thresholds are consistent and non-negative.
+
+### Startup behavior on guardrail failures
+- If a guardrail fails after applying all overrides:
+  1) Emit `PROFILE_GUARDRAIL_VIOLATION` with which key and which source overrode it.
+  2) If violation is “hard” (OOM risk / invalid type / negative threshold), runtime **refuses to start** in Dedicated/Private and **auto-falls back** in Hosted (configurable by pool policy).
+  3) If violation is “soft” (performance risk), runtime starts but annotates metrics and logs.
+
+---
+
+## Override compatibility (post-resolution)
+Overrides are a feature; they must remain supportable.
+
+### Policy
+- Some keys are **pinnable** via profile but **not overridable** by downstream sources (to prevent unsafe customer configs).
+- Some keys are **overridable** but bounded.
+- Some keys are **adaptive-only** and must not be set in a profile.
+
+The runtime config registry carries these annotations; the loader enforces them when applying overrides.
+
+### Override precedence
+See ADR: `adr-hardware-tuning-profiles-distribution-and-override-order`.
+
+This doc’s requirement: **override source must be visible** in logs/metrics for each effective key that deviates from the selected profile.
+
+---
+
+## Versioning and deprecation
+### Versions
+- `schema_version`: pack schema (breaking changes only on major bump)
+- `pack_version`: content release version (rollout/rollback unit)
+- `profile_version`: semantics of a single profile
+
+### Deprecation strategy
+1. Mark keys deprecated in the runtime registry with:
+   - deprecation runtime version
+   - suggested replacement
+2. Loader emits warnings when a profile sets deprecated keys.
+3. After 2 runtime minors, deprecated keys become errors (unless explicitly allowlisted for Private backcompat).
+
+---
+
+## Observability requirements
+The runtime must expose the following at minimum:
+- Metric: `runtime_profile_selected{name, pack_version, profile_version, maturity}` (gauge = 1)
+- Metric: `runtime_profile_override_applied{key, source}` (counter)
+- Metric: `runtime_profile_ineligible{profile, reason}` (counter)
+- Startup log event: effective compatibility matrix (runtime version, pack version, selected profile, driver/cuda)
+- Debug endpoint (auth-gated): returns effective config + sources + guardrail status
+
+These are required for oncall triage and for perf-canary segmentation.
+
+---
+
+## Deployment mode compatibility
+### Hosted
+- Profiles are applied by fleet defaults; per-pool overrides are supported.
+- On incompatibility, fallback to base profile automatically (pool policy) to prioritize availability.
+
+### Dedicated
+- Profiles are applied by pool defaults; customer-specific overrides must remain within bounded knobs.
+- On hard guardrail violation, fail closed (do not silently start with unsafe config).
+
+### Private
+- Profiles shipped either baked into runtime or mounted via Helm values (per ADR).
+- Private environments must be able to:
+  - pin `pack_version`
+  - dump effective config
+  - disable profile selection and use runtime defaults
+
+---
+
+## Example (illustrative)
+Below is an illustrative profile showing the intended structure (names and keys are representative).
+
+```json
+{
+  "name": "h100/balanced",
+  "description": "H100 balanced preset for mixed seq-len, mixed streaming. Targets improved throughput without p95 regression > 5%.",
+  "profile_version": "1.3.0",
+  "inherits_from": ["base/default", "gpu-family/hopper"],
+  "selector": {
+    "match": {
+      "gpu_skus": ["H100-SXM", "H100-PCIe"],
+      "deployment_modes": ["hosted", "dedicated", "private"],
+      "mig": "allowed"
+    },
+    "priority": 200,
+    "rollout_tag": "h100-stable"
+  },
+  "compatibility": {
+    "runtime": {"min_version": "1.24.0"},
+    "driver": {"min_version": "550.54"},
+    "cuda": {"min_version": "12.3"},
+    "runtime.required_features": ["kernel_autoselect_v2", "kv_cache_budgeting"],
+    "maturity": "stable",
+    "known_incompatible": ["MIG with < 40GB slice may violate kv headroom guardrail."]
+  },
+  "config": {
+    "scheduler.continuous_batching.enabled": true,
+    "scheduler.queue.max_depth": 256,
+    "scheduler.backpressure.target_p95_ms": 250,
+    "scheduler.fairness.prefill_decode_ratio": 0.25,
+    "kernels.autoselect.enabled": true,
+    "kernels.autoselect.seq_len_buckets": [128, 512, 2048, 8192],
+    "memory.kv_cache.budget_fraction": 0.62
+  },
+  "guardrails": {
+    "limits.max_batch_tokens": 32768,
+    "limits.max_concurrency": 512,
+    "kv_cache.max_fraction_of_gpu_mem": 0.70,
+    "queue.max_depth": 512,
+    "latency_slo_intent": "balanced",
+    "disallow_keys": ["memory.unsafe_force_fragmentation_mode"],
+    "invariants": ["prefill_fairness_nonzero", "kv_cache_budget_le_activation_headroom"]
+  }
+}
+```
+
+---
+
+## Validation and review checklist
+A profile change is not shippable unless:
+1. Passes JSON schema validation and custom validators.
+2. Includes updated `profile_version` if semantics changed.
+3. Has explicit compatibility constraints.
+4. Has guardrails that cap OOM and queue growth.
+5. Has benchmark evidence in the workload matrix covering:
+   - streaming and non-streaming
+   - representative seq-len buckets
+   - concurrency sweep
+6. Has perf-canary gates updated (if needed).
+7. Has oncall-visible observability (metrics/logs) verified.
+
+Required reviewers for schema/loader changes:
+- Config/guardrails: Ethan Park, Quentin Harris
+- Scheduling knobs: Sofia Ivanova (or delegate)
+- Kernel selection knobs: Hiro Tanaka (or delegate)
+- SRE readiness/rollback: Neha Kapoor org (Sean Gallagher or delegate)
+
+---
+
+## Open questions (tracked)
+1. MIG-specific profiles: do we ship explicit MIG profiles for L40S/H100, or treat MIG as ineligible by default?
+2. NCCL/collectives knobs: which keys are safe to freeze per SKU without topology detection?
+3. Private backcompat: how long do we support deprecated keys for pinned older runtimes?
+
+(See the epic ENG-4821 for current status and decisions.)

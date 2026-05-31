@@ -1,0 +1,154 @@
+GPU image layering and multi-arch cache coordination playbook
+
+Overview
+
+This playbook documents the standard for building, layering, caching, and distributing GPU runtime images across multiple CPU/GPU architectures (x86_64/CUDA, aarch64/Jetson/Graviton, and AMD) with coordinated CI gating and Terraform module interfaces. Intended audience: infra, SRE, and platform engineers responsible for image build pipelines, registry layout, and tenant onboarding.
+
+Goals
+- Reduce redundant rebuild time by 60% through image layering and content-addressable caching.
+- Ensure multi-arch builds are reproducible and gated by automated integration tests.
+- Provide Terraform module inputs/output contract for landing-zone and registry configuration.
+- Prevent noisy rebuilds from causing registry egress spikes and tenant throttling incidents.
+
+Scope
+Covers: Build pipelines (Buildkite), container registry layout (GCR/ECR/Private), Terraform module contract for image promotion, caching invalidation policies, image SLOs, monitoring and runbook for failures. Does not cover model artifact packaging or eval CI (separate docs).
+
+Design principles
+- Content-addressable artifact storage: prefer digest-based image tags for promotion (sha256).
+- Layer reuse: separate OS/base, runtime (CUDA/ROCm), infra tools (telemetry, ssh), and app-layer.
+- CI as orchestrator, not author: pipelines assemble layers and publish signed manifests.
+- Coordinate multi-arch builds with a small state machine (see pipeline steps).
+
+High-level architecture
+1) Base image builders (per-arch) produce layered tarballs and push digests to the registry.
+2) Cross-arch manifest assembler combines per-arch digests into a single manifest list and tags it as promoted.
+3) Promotion pipeline verifies artifacts with integration smoke tests (container run, GPU driver probes, tiny inference run) before marking stable.
+4) Terraform modules read promoted tags (via registry index) to deploy nodes/launchers.
+
+Terraform module contract (recommended fields)
+| variable | type | description | example |
+|---------|------|-------------|---------|
+| registry_url | string | Registry root used by cluster | gcr.io/redwood-images |
+| promoted_tag_prefix | string | Prefix for promoted images | redwood/gpu-runtime/stable |
+| arch_filter | string | Optional arch selector for bootstrap | x86_64,cuda |
+| cache_busting_policy | string | none | timed:24h | manual:tag |
+| allowed_ecr_accounts | list[string] | Accounts allowed to pull | ["123456789012"] |
+
+Terraform outputs (consumers expect):
+- image_manifest_digest (string)
+- image_multiarch_tag (string)
+- build_promotion_timestamp (string ISO8601)
+
+CI pipeline pattern (Buildkite example)
+1) Start multi-arch orchestrator job.
+2) Fan-out to per-arch builders (x86_64-cuda, aarch64, amd64-rocm).
+3) Each builder: checkout, restore layer cache, build base layer -> runtime layer -> infra layer -> app layer, push layers, publish digest.
+4) Orchestrator waits, then runs manifest-assembly job to create multi-arch manifest and tag a candidate (candidate/YYYYMMDD/commit).
+5) Run smoke integration tests against candidate. If pass, run promotion job to tag as promoted/stable and notify registries and Terraform module index. If fail, create issue and rollback candidate manifest tag.
+
+Sample Buildkite YAML (simplified)
+```yaml
+steps:
+  - label: "orchestrate-multiarch"
+    command: "/bin/bash ./ci/orchestrate-multiarch.sh"
+  - wait: ~
+  - label: "promote-manifest"
+    if: "build.state == \"passed\""
+    command: "scripts/promote_manifest.sh $CANDIDATE_TAG"
+```
+
+Layering and cache strategy
+- Layer boundaries: OS -> GPU runtime (CUDA/ROCm) -> infra tools -> monitoring & security -> application.
+- Build caches should be restored from a content-addressable cache (S3 or GCS) keyed by Dockerfile step hash + relevant build args.
+- For kernel/driver sensitive steps, move probing into the smoke test rather than baking driver-specific binaries into shared layers.
+
+Registry layout and tagging convention
+- Use digest references for all Terraform consumption. E.g.: gcr.io/redwood/gpu-runtime@sha256:abcd...
+- Candidate and promoted tags: gcr.io/redwood/gpu-runtime:candidate/YYYYMMDD-<short-commit> and gcr.io/redwood/gpu-runtime:stable-<semver>-YYYYMMDD
+- Keep short-lived candidate tags for 72 hours; automated garbage collection must remove unpromoted candidates older than 7 days.
+
+Cache invalidation policy
+- Minor changes to infra layer: timed invalidation (24h) for caches.
+- Security/CVE layer: immediate invalidation and rebuild across all arches within 8 hours.
+- Forced manual invalidation: owner tags image with "invalidate:manual" label and triggers a rebuild.
+
+SLOs and operational thresholds
+- Image build time (per arch): median < 12 min, 95th < 40 min.
+- Promotion latency (candidate -> stable): median < 15 min (includes tests).
+- Registry egress: No single promotion should emit > 10GB egress; throttling must be applied.
+- On-call alert if promotion queue backlog > 6 hours.
+
+Monitoring and alerts (metrics to instrument)
+- ci.image_build.duration (per-arch)
+- ci.image_build.cache_hit_rate (per-step)
+- registry.promote.size_bytes
+- registry.unpromoted_candidates.count
+- ci.smoke_test.failures_last_24h
+
+Alert thresholds (examples)
+- ci.image_build.duration.p95 > 60m -> Pager (infra oncall)
+- registry.promote.size_bytes > 10GB -> Pager + auto-throttle
+- ci.smoke_test.failures_last_1h > 3 -> Pager, create incident.
+
+Runbook: common failure modes and remediation
+1) Build failing on missing apt packages:
+   - Confirm base image digest used. If base digest was garbage-collected, restore from cache bucket and rebuild.
+   - Re-run with BUILDKIT_TRACE=1 to inspect cache misses.
+2) Cache restore failure (timeout to GCS):
+   - Check service account permissions for CI runner.
+   - Fallback: run non-cached build (longer) and capture layer tarballs for later upload.
+3) Multi-arch manifest assembly fails:
+   - Check per-arch build artifacts exist and were pushed.
+   - Validate digest list: scripts/validate_manifests.sh shows per-arch digests and sizes.
+4) Promotion tests flaky:
+   - Isolate test by running locally in ephemeral node matching target AMI/kernel.
+   - If intermittent, quarantine candidate and increase test parallelism to capture failure pattern.
+
+Operational steps: promotion (1–2 oncall steps)
+1) If automated promotion fails, do not manually override. Follow these steps:
+   a) Re-run smoke tests against candidate in a fresh ephemeral project.
+   b) If tests pass, run promote_manifest.sh manually and annotate promotion with reason and CI run link.
+   c) If tests fail, mark candidate "quarantine/<date>" and open an alert with stack trace.
+
+Backwards compatibility and rollback
+- Always keep last two stable promoted tags and their digests.
+- Rollback process:
+  1) Identify previous stable digest via registry index (promotions.json)
+  2) Update Terraform input image_manifest_digest to previous digest and apply with no-recreate flag where supported.
+  3) Monitor SLOs for 30 minutes.
+
+Debugging scripts and helpers (location)
+- ci/scripts/restore_layer_cache.sh — debug cache keys and hit rates
+- ci/scripts/validate_manifests.sh — prints per-arch digests and size mismatches
+- tools/registry/promotions-indexer.py — builds the promotions.json used by Terraform modules
+
+Ownership and lifecycle
+- Owners: Image team (infra-images) for pipelines and Terraform contract.
+- Oncall: infra-oncall rotates weekly for CI/registry alerts.
+- Quarterly: review layer boundaries and remove deprecated dependencies.
+
+Migration checklist (for new architectures)
+1) Add per-arch builder template in Buildkite with credentials scoped to push only to "candidate/*" prefix.
+2) Update manifest assembly to include new arch signatures.
+3) Run 3 staged promotions: internal smoke, canary tenant, production.
+4) Validate Terraform consumers can resolve digest references and that IAM permissions are correct.
+
+Appendix: Example manifest assembly pseudo-command
+```bash
+# orchestrator after per-arch pushes
+archs=("linux/amd64" "linux/arm64")
+manifest-tool create \
+  --insecure \
+  --template-template.json \
+  --name gcr.io/redwood/gpu-runtime:candidate/$CANDIDATE \
+  ${per_arch_digests[@]}
+```
+
+References
+- See _gpu-ci-artifact-sharding-hermetic-builds_ for hermetic build patterns.
+- See _gpu-node-image-supply-chain-and-multi-account-iac-pipeline_ for cross-account promotion patterns.
+
+Revision history
+- 2024-05-10: Initial draft (E. Chen)
+- 2024-08-02: Added cache invalidation policy and monitoring metrics (M. Ruiz)
+- 2025-01-15: Polished promotion flow and Terraform contract (P. Natarajan)

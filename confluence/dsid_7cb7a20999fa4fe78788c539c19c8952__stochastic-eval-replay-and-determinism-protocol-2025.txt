@@ -1,0 +1,132 @@
+Stochastic Eval Replay and Determinism Protocol
+
+Summary
+-------
+This document defines the protocol and runbook for capturing, replaying, and triaging nondeterministic behavior observed in evaluation harness runs. It codifies artifact capture, deterministic-mode execution, tolerance thresholds, and escalation steps so engineering and applied ML teams can reliably diagnose and reduce stochastic divergence between runs.
+
+Scope
+-----
+- Applies to all automated and manual eval harness runs used for production model certification, A/B tests, and regression detection.
+- Covers sources of nondeterminism including sampling configs (temperature, top_k/top_p), tokenizer differences, runtime kernel scheduling, batch coalescing, KV cache state, and hardware/driver variance.
+- Does NOT cover data-collection-level label noise or human annotation variance (see separate QA guidelines).
+
+Goals
+-----
+- Make a failing or flaky eval reproducible within the harness >= 90% of the time using captured artifacts.
+- Provide a consistent artifact set that allows replays across environments (dev -> staging -> dedicated).
+- Reduce actionable nondeterminism by 30% year-over-year via instrumentation and targeted fixes.
+
+Terminology
+-----------
+- Replay bundle: a single tarball containing request payloads, RNG seeds, tokenizer checksums, runtime snapshot, model binary id, and KV cache dump where applicable.
+- Deterministic mode: runtime mode where sampling is disabled (greedy / beam) or sampling is run with explicit seed control and kernel pinning.
+- Divergence: measurable difference between responses (token-level edit distance, log-prob delta, or evaluation score delta).
+
+Artifact capture (what to collect)
+--------------------------------
+Collect the following for every eval run flagged as flaky or when running a determinism sweep: 
+- run_metadata.json (schema below)
+- request_payloads.ndjson (one request per line, include full prompt, headers, and model_version)
+- tokenizer_snapshot.txt (tokenizer version + serialized vocab checksum)
+- rng_state.bin (binary RNG state for CPU/GPU PRNGs if accessible) or seed log entry when binary not available
+- kv_cache_<shard>.bin (kv cache snapshot for the session; optional and gated by storage policy)
+- runtime_snapshot.txt (container image id, kernel id, CUDA/cuDNN driver versions, pinned kernel flags, environment variables relevant to runtime)
+- batching_log.jsonl (log of batch composition and timing for the run)
+- model_artifact_id.txt (release tag + checksum)
+- system_hardware_checksum.txt (GPU model + BIOS + minor revision string)
+
+Example run_metadata.json (single-line example)
+------------------------------------------------
+{"run_id": "eval-2025-03-12-2048", "env": "staging", "model": "redwood-7b-v1", "deterministic_mode": false, "seed": null, "sampling_policy": "top_p=0.95", "max_tokens": 256}
+
+Config reference table (keys accepted by harness)
+------------------------------------------------
+| key | type | description | default |
+|-----|------|-------------|---------|
+| deterministic_mode | boolean | Force non-sampling generation or enable seeded sampling pathway | false |
+| seed | integer | PRNG seed for sampling pathways; applied to CPU/GPU PRNGs when available | null |
+| sampling_policy | string | JSON-encoded sampling config (temperature, top_k, top_p) | \"{\"temperature\":1.0}\" |
+| runtime_snapshot | string | path to runtime_snapshot.txt to force replay env | current |
+| capture_kv_cache | boolean | whether to snapshot KV cache for the session | false |
+| batch_strategy | string | \"auto\" | \"auto\" |
+| tolerance_threshold | string | metric-specific threshold for acceptable divergence | \"metric:0.03\" |
+
+Protocol: capture -> replay -> classify
+-------------------------------------
+1) Capture: When a run is flagged (automated check or manual), immediately tag run as \"capture_required\". The harness should persist all artifacts above to S3 under /eval-replays/<run_id>. A capture job must finish within 30s of detection to maximize fidelity.
+
+2) Replay (local/staging):
+   a) Run the replay harness with the same request_payloads and runtime_snapshot. By default, start in deterministic_mode=true and seed=42.
+   b) If deterministic-mode reproduces the issue, classify as \"sampling-agnostic\". Proceed to kernel/runtime triage.
+   c) If deterministic-mode does NOT reproduce, run seeded sampling with the original sampling_policy and try seed enumeration (see Seed Enumeration below) up to 1,000 seeds or 1 hour wall time.
+   d) If seeded sampling finds a match, classify as \"seed-sensitive\". Record the matching seed in the replay bundle metadata.
+
+Seed Enumeration (when to use)
+-----------------------------
+- Use when nondeterminism is suspected to be due to sampling and the failure signature is easily comparable (exact token sequence or evaluation score threshold).
+- Enumeration approach: deterministic-mode -> seeded sampling sweep with offset strategy (seed = base_seed + offset) in parallel shards. Stop early when match found. Log seeds tested in seeds_tested.log.
+
+Classification of failures
+--------------------------
+- Deterministic mismatch: reproduced under deterministic_mode -> root causes: tokenizer drift, model binary mismatch, floating-point math/precision.
+- Seed-sensitive: reproducible only under specific seeds -> root causes: sampling edge cases, prompt-sensitive sampling boundaries.
+- Environment-dependent: reproduces only when runtime_snapshot differs -> root causes: driver/kernel/runtime flags, pinned kernels.
+- Batch-induced: only reproducible when batch composition matches original batching_log -> root causes: KV cache reads/writes, request interleaving, race conditions.
+
+Runbook: Reproduce a failing eval
+--------------------------------
+1) Fetch the replay bundle: aws s3 cp s3://redwood-eval-replays/<run_id>/bundle.tar.gz ./ && tar xzf bundle.tar.gz
+2) Inspect run_metadata.json and batching_log.jsonl for obvious mismatches.
+3) Start a replay node with runtime snapshot: eval-harness --runtime-snapshot=runtime_snapshot.txt --replay-dir=./<run_id>
+4) First attempt: eval-harness --deterministic-mode=true --requests=request_payloads.ndjson --model-id=$(cat model_artifact_id.txt)
+5) If step 4 fails to reproduce, run seeded sweep: eval-harness --seed-sweep --base-seed=1000 --parallel-shards=8 --requests=request_payloads.ndjson
+6) If reproduction occurs, create an issue with classification, attach matching seed (if any), and link to relevant telemetry (traces, GPU logs).
+
+Mitigation and rollback guidance
+--------------------------------
+- If classification shows tokenizer drift: pin tokenizer version in model onboarding and trigger a republish of tokenization artifacts. Notify model-onboarding team.
+- If environmental: pin runtime image + driver and roll forward to stable image across environments. Consider gating on canary traffic for 24h.
+- If batch-induced: enable strict batch boundaries for the failing route or force KV cache isolation for the short term.
+- If seed-sensitive but low impact: add seed-stability tests to the eval suite for the prompt in question. If high impact, consider adjusting sampling_policy (reduce temperature or clamp top_k).
+
+Acceptance criteria and SLOs
+---------------------------
+- Reproducible replay success rate: target >= 90% for high-confidence failures within 1 hour of analysis.
+- False-positive divergence alarms: < 2% of daily alerts.
+- Automated capture completion: 99.5% of flagged runs must have a complete replay bundle within 30s.
+
+Instrumentation and telemetry requirements
+-----------------------------------------
+- All eval harness runs must log batch composition (request ids + sample offsets) and streaming chunk boundaries.
+- RNG seeds (or seed generation method) must be logged to run_metadata.json for every run.
+- Tokenizer version and checksum must be recorded and surfaced in the Console for each model version.
+
+Ownership and escalation
+------------------------
+- Primary owner: Eval Harness Team (eng-applied-ml). On-call: eval-harness-oncall rotation.
+- Escalation path: Eval Harness -> Serving Runtime -> Model Onboarding -> Security (if artifacts contain customer PII).
+- Contact: evan.brooks@redwood.ai for process questions; use #eval-replay Slack channel for coordination.
+
+Appendix: Practical examples
+---------------------------
+- CLI: force deterministic replay
+  eval-harness --replay-dir=./eval-2025-03-12-2048 --deterministic-mode=true --model-id=$(cat model_artifact_id.txt)
+
+- YAML eval job snippet:
+  job_id: replay-2025-03-12
+  deterministic_mode: true
+  seed: 42
+  requests: request_payloads.ndjson
+  runtime_snapshot: runtime_snapshot.txt
+  capture_kv_cache: true
+
+References and related pages
+----------------------------
+- Serving simulation harness (simulation guidelines) -- /confluence/applied-ml-and-evals/eval-harness/serving-simulation-eval-harness-2026
+- KV cache quant stability audit -- /confluence/applied-ml-and-evals/quantization-profiles/kv-cache-quant-stability-audit-playbook-2025
+
+Revision history
+----------------
+- 2025-03-12: Initial draft filed (Evan Brooks).
+- 2025-04-08: Added seed enumeration strategy and example CLI (Sarah Liu review).
+- 2025-06-01: Formalized capture schema and SLO targets; moved to published status (Mateo Alvarez review).

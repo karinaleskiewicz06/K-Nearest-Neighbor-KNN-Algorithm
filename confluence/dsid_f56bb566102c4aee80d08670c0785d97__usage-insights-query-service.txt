@@ -1,0 +1,306 @@
+Usage Insights Query Service (UIQS) — system and service doc
+
+## Overview
+The **Usage Insights Query Service (UIQS)** is the backend service that powers in-console cost/usage breakdowns by **API route** and **model** (and optional dimensions like workspace/project, region, and deployment mode). It provides a low-latency query API for interactive console tables and driver explanations, while enforcing cost-visibility RBAC and protecting the telemetry warehouse from unbounded queries.
+
+UIQS does **not** compute attribution itself. It queries pre-aggregated datasets produced by Telemetry & Analytics jobs and applies additional filtering, bucketing, pagination, and explainability rules.
+
+### Primary consumers
+- **Redwood Console** (Usage → Cost → Route/Model views)
+- Internal tools for reconciliation/debugging (eng + support)
+- Export job subsystem (async CSV generation; see API contract for lifecycle)
+
+### Owners
+- Product area: Console Insights (Marissa Cole / Paula Mendes)
+- Engineering owner: Telemetry & Analytics Platform (Logan Wright)
+- Implementation leads: Chloe Martin (Console backend), Nadia Rahman (cost attribution semantics)
+
+---
+
+## Responsibilities
+UIQS is responsible for:
+1. **Serving breakdown queries** (tables and drilldowns) with consistent totals vs billing.
+2. **Serving “Top cost drivers” and “What changed?”** insights based on aggregated deltas.
+3. **AuthN/AuthZ enforcement** for cost visibility and export/share workflows.
+4. **Caching** to hit interactive latency targets while limiting warehouse load.
+5. **Guardrails**: strict query limits and dimension cardinality controls.
+6. **Returning data freshness metadata** so the console can display lag/partial-data banners.
+
+Non-goals (Phase 1–Beta):
+- Executing optimization actions (only recommendations and links)
+- Scheduled delivery (email, Slack digests)
+- Customer-defined arbitrary dimensions
+
+---
+
+## High-level architecture
+### Components
+- **API Gateway**: Redwood API gateway (handles auth token validation and request routing)
+- **UIQS**: Stateless query service (this doc)
+- **Telemetry Warehouse**: Primary query backend for aggregates (partitioned tables/materialized views)
+- **Aggregation jobs**: Continuous/periodic jobs producing rollups (hourly + daily)
+- **RBAC/Org service**: Source of workspace roles and cost-visibility settings
+- **Export service**: Async CSV generation and signed download URLs (UIQS triggers/validates)
+
+### Request flow (interactive breakdown)
+1. Console calls UIQS with filters (time range, workspace/project, route, model, etc.).
+2. UIQS authorizes the user/session against workspace settings (cost visibility + export permissions).
+3. UIQS validates request (dimension limits, max range, pagination bounds).
+4. UIQS checks cache; on miss, executes parameterized query against aggregates.
+5. UIQS returns:
+   - Rows + totals
+   - Query metadata (time zone used, applied bucketing)
+   - **freshness** (max event timestamp, aggregation watermark, lag seconds)
+
+### Data flow dependency map
+UIQS depends on the following datasets (logical names):
+- **usage_insights.route_model_hourly** (primary)
+  - Keys: workspace_id, project_id, env, time_bucket_hour, canonical_route, route_group, model_family, model_version_bucket, region, deployment_mode
+  - Measures: tokens_in, tokens_out, billed_tokens_in/out, cache_hit_tokens, cache_miss_tokens, requests, streaming_requests, retries, fallbacks, p50/p95_latency_ms_sum/count, cost_usd
+- **usage_insights.route_model_daily** (for long ranges; derived from hourly)
+- **dimensions.model_catalog** (model aliases → family/version bucket)
+- **dimensions.route_normalization_rules** (versioned rule set id; used to interpret canonical_route and groupings)
+- **billing.billing_totals_daily** (reconciliation reference; not used for every query but used for correctness checks and some “consistent totals” modes)
+
+Upstream systems feeding aggregates:
+- Metering ingestion (request/token events)
+- Route normalization library (templating + OpenAI-compat mapping)
+- Attribution pipeline (fallback/retry attribution rules)
+
+---
+
+## Service interface
+UIQS is exposed internally through the platform API layer and is consumed by the Console backend.
+
+- Service name: **usage-insights-query-service**
+- Runtime: stateless HTTP service
+- Primary region(s): us-east-1, eu-west-1 (data residency gates apply; see retention/export controls doc)
+
+---
+
+## Endpoints (v1)
+The canonical request/response shapes are specified in:
+- **API Standards: Usage Insights API Contract** (related page)
+
+Below is the service-level summary of endpoints and behavior.
+
+### Query endpoints
+| Endpoint | Purpose | Typical consumer | Notes |
+|---|---|---|---|
+| `GET /v1/usage-insights/breakdown` | Paginated breakdown table | Console tables | Supports group_by = route, model, route+model; optional dimensions as filters |
+| `GET /v1/usage-insights/timeseries` | Time series for charting | Console charts | Returns hourly/daily points based on range |
+| `GET /v1/usage-insights/top-drivers` | Ranked drivers + explainability strings | Console “Top cost drivers” | Computes deltas vs previous period; includes “what changed?” |
+| `GET /v1/usage-insights/freshness` | Data freshness + watermark | Console banners | Cheap endpoint; heavily cached |
+
+### Export endpoints (async)
+| Endpoint | Purpose | Notes |
+|---|---|---|
+| `POST /v1/usage-insights/exports` | Create export job | Enforces export RBAC + size/range limits |
+| `GET /v1/usage-insights/exports/{export_id}` | Job status | Includes row estimate, started/finished timestamps |
+| `POST /v1/usage-insights/exports/{export_id}/download` | Signed download URL | Emits audit log event on URL issuance + download completion |
+
+### Common filter semantics (service-enforced)
+- **time_range**: required; max lookback and max span enforced (see Guardrails)
+- **workspace_id**: required
+- **project_id / env**: optional
+- **canonical_route / route_group**: optional (route_group is preferred for stability)
+- **model_family / model_version_bucket**: optional
+- **deployment_mode**: hosted | dedicated | private
+- **region**: cloud region or “on-prem”
+- **time_zone**: defaults to workspace billing time zone; UIQS normalizes bucketing to that time zone
+
+---
+
+## Authentication & authorization
+### Authentication
+- UIQS trusts platform-issued auth and receives an authenticated principal from the gateway.
+- Supported principal types:
+  - User sessions (Console)
+  - Service tokens (internal automation / export pipelines)
+
+### Authorization (RBAC)
+UIQS enforces **cost visibility** and **export permissions** at request time.
+
+Core checks:
+1. **Workspace membership**: principal must be a member of workspace_id.
+2. **Cost visibility setting**: if workspace has “Hide cost” enabled, only privileged roles may view cost fields.
+3. **Role gating**:
+   - View breakdown (usage-only): workspace roles with UsageView
+   - View cost fields (USD): requires CostView
+   - Export/share: requires CostExport
+
+Implementation notes:
+- UIQS queries the RBAC/Org service for effective permissions and caches them briefly (see Caching).
+- When a user lacks cost permission, UIQS either:
+  - returns HTTP 403 (for cost-only endpoints/exports), or
+  - returns usage-only measures with cost fields omitted (contract-defined behavior).
+
+Audit logging:
+- Export creation and download actions must emit audit events including: workspace_id, principal_id, export_id, requested time range, and whether cost fields were included.
+- See **Usage Insights retention and export controls** for required audit fields and restricted workspace behavior.
+
+---
+
+## Caching strategy
+UIQS uses caching to protect the warehouse and meet console latency targets.
+
+### What is cached
+1. **Breakdown query results**
+   - Keyed by: workspace_id + normalized filter set + group_by + page + sort + time bucket strategy (hourly/daily)
+2. **Top drivers results**
+   - Keyed by: workspace_id + filter set + comparison window
+3. **Freshness**
+   - Keyed by: workspace_id (+ region/deployment_mode if applicable)
+4. **RBAC permission checks**
+   - Keyed by: principal_id + workspace_id
+
+### Cache TTLs (defaults)
+- Freshness: **60s**
+- RBAC: **120s** (short to reflect admin changes)
+- Breakdown/timeseries/top-drivers:
+  - Last 24h: **60–120s**
+  - Older ranges: **5–15 min**
+
+### Cache invalidation
+- Time-based TTL is the primary mechanism.
+- For export jobs, UIQS does not rely on interactive caches; exports query aggregates directly using the export runner’s dedicated limits.
+
+### Headers / client caching
+- Responses include caching metadata (contract-defined) for observability.
+- Console should not assume strong consistency; it must render freshness/watermark data.
+
+---
+
+## Query planning & performance
+### Latency targets (service-level)
+(See SLO doc for formal SLOs; these are the engineering targets used for design.)
+
+Interactive endpoints (p95, steady state):
+- `GET /breakdown` (typical 7d range, grouped by route+model, first page): **<= 800 ms**
+- `GET /timeseries` (7d, hourly points): **<= 700 ms**
+- `GET /top-drivers` (7d vs prior 7d): **<= 1200 ms**
+- `GET /freshness`: **<= 150 ms**
+
+Availability target:
+- 99.9% monthly for query endpoints during Beta; GA target may increase per SRE policy.
+
+### Warehouse query guidelines
+- UIQS queries **pre-aggregated rollups only** (hourly/daily) for interactive endpoints.
+- Raw event queries are disallowed in UIQS (separate debugging tools exist).
+- UIQS selects dataset by time span:
+  - <= 14 days: hourly
+  - > 14 days: daily (or hourly with stricter limits if explicitly requested)
+
+### Pagination and sorting
+- Pagination is cursor-based (contract-defined). UIQS enforces a maximum page size.
+- Sorting allowed only on an approved set of measures (cost_usd, tokens_out, requests, etc.).
+
+---
+
+## Guardrails and limits
+UIQS must reject or degrade queries that threaten latency/cost.
+
+Default limits (subject to change; keep in sync with API contract):
+- Maximum time span for interactive breakdown: **31 days**
+- Maximum time span for top-drivers: **90 days** (daily only)
+- Maximum group_by cardinality returned per page: **500 rows**
+- Maximum filters provided: **25**
+- Route dimension rules:
+  - Only **canonical_route** or **route_group** accepted; raw path is not accepted.
+  - If route cannot be normalized, it is grouped under `route_group = "other/untemplated"`.
+- Model bucketing:
+  - Always returned as (model_family, model_version_bucket) to avoid alias duplication.
+
+Failure behavior:
+- Return 400 for invalid filters/unsupported combinations.
+- Return 422 for “query too large” when it exceeds safe bounds with a user-actionable error message (e.g., “Reduce time range or remove dimensions”).
+
+---
+
+## Freshness and correctness
+UIQS exposes freshness metadata on relevant endpoints:
+- `aggregation_watermark_ts`: latest fully processed timestamp
+- `max_event_ts_seen`: latest event timestamp ingested (may be ahead of watermark)
+- `lag_seconds`: now - watermark
+- `is_partial`: boolean when lag exceeds threshold or upstream reports missing partitions
+
+Correctness vs billing:
+- UIQS uses the same pricing inputs as billing hooks embedded in aggregates (billed tokens, per-model price table snapshot).
+- Reconciliation checks run out-of-band; UIQS surfaces a warning flag when reconciliation drift is above tolerance for the selected window (contract-defined field).
+
+Known correctness risks:
+- Boundary effects at time range edges due to late events
+- Rounding differences (per-request vs aggregate)
+- Retry/fallback attribution semantics (see ADR)
+
+---
+
+## Observability
+### Metrics (must-have)
+- Request rate, error rate, latency (p50/p95/p99) by endpoint
+- Cache hit rate by endpoint
+- Warehouse query duration and bytes scanned
+- Rejected queries count (by reason)
+- Freshness lag (seconds) and partial-data occurrences
+- Top-drivers compute time (if computed in service)
+
+### Logs
+- Structured logs for:
+  - request_id, workspace_id, principal_id (hashed where required), endpoint
+  - filter footprint (redacted/normalized)
+  - warehouse query id
+  - cache status (hit/miss)
+  - rejection reason
+
+### Tracing
+- Propagate trace ids from gateway → UIQS → warehouse client.
+
+Dashboards and alerts:
+- See **Usage Insights data freshness and quality** for alert thresholds and on-call routing.
+
+---
+
+## Security and data handling
+- UIQS returns only aggregated metrics; no prompt or completion text is stored or served.
+- Data residency: EU workspaces must query EU datasets only; UIQS enforces residency routing.
+- Export controls:
+  - Exports may be disabled for restricted workspaces.
+  - Signed URLs are short-lived and scoped to the requesting principal.
+
+---
+
+## Deployment and operations
+- Deployment model: multi-region active/active behind gateway routing.
+- Dependencies must be region-local (warehouse endpoint, caches).
+- On-call: Eng Platform (Telemetry & Analytics) primary; Console backend secondary for UI regressions.
+
+Operational playbook (high level):
+1. If p95 latency breaches target: check cache hit rate → warehouse query time → dataset lag.
+2. If correctness drift reported: cross-check reconciliation job output and billing totals daily table.
+3. If partial-data banner spikes: inspect aggregation pipeline lag and missing partitions per freshness dashboard.
+
+---
+
+## Appendix: Example request patterns
+### Route+model breakdown for last 7 days
+- Filters: workspace_id, time_range=last_7_days
+- group_by: [route_group, model_family]
+- sort: cost_usd desc
+- page_size: 50
+
+### “What changed?” weekly comparison
+- Filters: workspace_id, time_range=this_week, compare=previous_period
+- top_drivers: enabled
+- Expectation: driver cards show token_out delta, cache hit-rate delta, and model mix shift explanations.
+
+---
+
+## Change management
+Any changes to:
+- attribution semantics (retry/fallback/caching)
+- route normalization rules
+- model bucketing
+- export permissions/audit fields
+
+…must be accompanied by:
+1) an ADR update (or new ADR), 2) API contract update, and 3) a backfill/compatibility note if aggregates change.

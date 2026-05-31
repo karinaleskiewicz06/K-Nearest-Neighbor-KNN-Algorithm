@@ -1,0 +1,168 @@
+sticky-cache-affinity-and-session-aware-routing-adr-2026
+
+Summary:
+
+This ADR records the decision to adopt a session-aware routing and sticky-cache affinity policy for a subset of Redwood Inference request classes that are sensitive to KV cache warmness and model-context locality. The goal is to reduce cold-KV cache penalties and improve end-to-end p99 latency for conversational and stateful tool-calling workloads while bounding tail risk and preserving multi-tenant isolation.
+
+Context and motivation:
+
+- Problem: some inference workloads (conversational chat, tool-calling, multi-turn summarization) show large latency and cost variance when a request is routed to a runtime instance with a cold KV cache or incompatible model variant. Cold-cache penalties are most visible at p95–p99 and cause customer-visible glitches during scaling events and cross-AZ failover.
+- Existing mitigations (aggressive prewarming, global routing to largest instances) are either expensive or insufficient under bursty traffic.
+- We need a principled standard that integrates routing, cache warming, and observability without weakening tenancy isolation or increasing the attack surface.
+
+Goals:
+
+1. Improve p95/p99 latency for identified stateful request classes by at least 30% relative to round-robin baseline in steady state.
+2. Keep tail-cost budget (additional reserved GPU time) under 12% of total inference spend for affected tenants.
+3. Maintain tenant isolation guarantees (no cross-tenant memory sharing).
+
+Non-goals:
+
+- This ADR does not change model artifact signing, quantization defaults, or core KV cache semantics.
+- This ADR does not permit persistent cross-tenant caches or bypass existing RBAC.
+
+Definitions and terminology:
+
+- session-key: an application-level identifier supplied with a request that signals affinity (e.g., conversation_id, user_id, ephemeral_session_id).
+- affinity-window: duration (seconds) for which routing prefers a previously-warmed backend.
+- affinity-score: numeric score that combines cache-warmness, recent successful hits, and instance capacity headroom.
+- warm-instance: runtime process with a KV cache pre-populated for the session-key/model variant.
+
+Options considered:
+
+1) Stateless routing (baseline): no affinity, rely on prewarming and autoscaling. Pros: simple, strong isolation. Cons: high tail latency on cache misses.
+
+2) Sticky affinity by connection (socket affinity): bind a long-lived TCP/HTTP2 connection to an instance. Pros: very low latency for persistent connections. Cons: brittle across network churn and unsuitable for short-lived API calls.
+
+3) Session-aware routing with soft affinity (chosen): route requests using session-key annotations and an affinity-score. Routing is "soft" — it prefers warmed instances but can route elsewhere if capacity constraints or health checks require it.
+
+4) Explicit pinning (hard): allow customers to pin sessions to dedicated nodes. Pros: deterministic. Cons: operationally expensive and requires reserved capacity contracts.
+
+Decision:
+
+We adopt option (3): session-aware routing with soft, time-limited sticky affinity. Key decisions:
+
+- Only annotated request classes will participate. Participation is opt-in and controlled by the API with two fields: "session_key" and "affinity_policy". Default is opt-out.
+- Affinity window default: 600 seconds (10 minutes). Per-tenant override allowed up to 3600 seconds with product approval.
+- Affinity ranking factors: cache_hit_rate (recent 5-minute EWMA), last_request_age (seconds since last request to the instance for this session-key), instance_load (CPU/GPU utilization), and instance_health score. We compute affinity_score as a weighted sum: affinity_score = 0.5 * cache_hit_rate + 0.25 * (1 / (1 + last_request_age)) + 0.25 * (1 - instance_load).
+- Soft fallback: if the preferred instance reports load > 85% or health degraded, router will failover to top-N alternatives. We will set N=3.
+- Isolation: caches remain per-tenant. Session-key is namespaced by tenant-id; no cross-tenant cache sharing permitted.
+
+Detailed design:
+
+Routing flow (high-level):
+
+1. Edge/proxy receives request with headers: X-Redwood-Tenant, X-Redwood-Session, X-Affinity-Policy (optional).
+2. Router consults per-tenant affinity table (TTL-backed) to find previously-warmed instance candidates.
+3. For each candidate, router fetches current instance metadata (cache_hit_rate, last_request_age, instance_load).
+4. Router computes affinity_score and sorts candidates.
+5. Router sends request to top candidate unless instance_load > 85% or healthfail. If so, select next candidate. If no warm instance qualifies, route according to baseline policy (latency-preferring shortest path).
+
+Affinity table and warming API:
+
+- We will introduce a bounded, TTL-backed affinity table per region. An entry is: (tenant-id, session-key) -> [instance_id, last_touch, model_variant, cache_version]. TTL equals affinity_window. Entries are signed by the control plane to prevent tampering.
+- Runtime exposes a warming API (/v1/internal/warm?session_key=...) that control-plane/routing can call to trigger KV prefetch for a session-key on a target instance. This call is rate-limited and authenticated via mTLS + service account.
+
+Configuration examples:
+
+Example client request (HTTP):
+
+curl -X POST https://api.redwood.ai/v1/generate \
+  -H "Authorization: Bearer $KEY" \
+  -H "X-Redwood-Session: conv-3f9a" \
+  -H "X-Affinity-Policy: soft" \
+  -d '{"model":"redwood-chat-large","input":"Hello again"}'
+
+Router affinity config (YAML):
+
+router:
+  affinity_window_seconds: 600
+  max_candidates: 5
+  instance_load_threshold: 0.85
+  affinity_weights:
+    cache_hit_rate: 0.5
+    last_request_age: 0.25
+    instance_load: 0.25
+  fallback_policy: latency_preferred
+
+Telemetry and observability:
+
+New metrics to add (names as prometheus labels):
+- inference_affinity_hit_ratio{tenant,region} — fraction of session-annotated requests routed to the preferred warmed instance. SLO target: >= 0.70 for steady-state workloads after warmup period.
+- affinity_cache_warmup_time_seconds{tenant,region} — time between warming API call and first successful cache hit. Target median < 120s.
+- affinity_routing_failovers_total{tenant,region} — count of times router had to failover from preferred instance. Alert if > 5% of annotated requests in a 5m window.
+- affinity_p99_latency_improvement_percent{tenant,region} — computed from baseline p99 vs current. Target >= 30% improvement for participating classes.
+
+We will add logs that include: session_key (hashed in logs), instance_id, cache_version, and affinity_score. Session_key must be hashed with tenant-scoped salt before persistence to logs to avoid PII leakage.
+
+SLO and dashboards changes:
+
+- Add a dedicated dashboard for affinity features showing affinity_hit_ratio, failovers, warmup times, and cost delta.
+- Add a composite SLO: p99_latency_improvement_for_affinitized_requests >= 30% within 7 days of rollout.
+
+Security and privacy considerations:
+
+- Never persist raw session_key in long-term logs. Use tenant-scoped HMAC(SALT, session_key) before storing. Documented in data-management standards.
+- Warming API uses mTLS + short-lived service tokens. Warming calls are rate-limited at 10 calls/sec per tenant by default to avoid polling attacks.
+- Affinity table entries are signed and TTL-limited; control-plane signs entries with a short-lived key to avoid replay.
+
+Costs and sizing impact:
+
+- Expected additional reserved GPU time for warm instances during steady state: 6–12% of GPU-hours for participating tenants (measured in early pilot).
+- Router table memory: each affinity entry ~512 bytes; with 100k concurrent affinity entries per region, memory < 50 MB.
+
+Rollout plan:
+
+1. Pilot (2 weeks): select three high-volume customers that opt-in and enable affinity for one chat-capable model. Run with affinity_window=300s and max_candidates=3. Collect metrics.
+2. Canary (3 weeks): enable for 10% of internal traffic across two regions; automated rollback if affinity_failover_rate > 5% or p99 regresses.
+3. Gradual rollout (2 months): expand to other customers and models with per-tenant tuning; expose tenancy controls in Console.
+
+Rollback criteria:
+
+- If affinity_routing_failovers_total > 5% of annotated requests in a 5m window for 10min or p99 increases vs baseline, automatically disable affinity for the impacted tenant/region.
+
+Operational runbook (abridged):
+
+- Symptom: Customers report high variance in chat p99 after rollout.
+  1) Check inference_affinity_hit_ratio and affinity_routing_failovers_total.
+  2) If < 50% hit ratio, inspect warming pipeline logs and warming API call success for the tenant.
+  3) If failovers high, check instance_load and instance health, consider temporarily reducing affinity_window or disabling affinity for the tenant.
+  4) To force re-warm: call /v1/internal/warm for the session_key on targeted instance(s) and monitor affinity_cache_warmup_time_seconds.
+
+Ownership and maintenance:
+
+- Routing subsystem: ownership assigned to Runtime Routing team (oncall: runtime-routing@redwood).
+- Observability instrumentation: ownership assigned to Platform Observability team.
+- Product gating and per-tenant policy: Product infra team.
+
+Consequences and limitations:
+
+- Improves tail latency for many conversational workloads but increases reserved runtime time and adds complexity to routing logic.
+- Soft affinity trades off strict determinism for availability — in extreme load or failure scenarios, requests will be routed away from warmed instances, which may reduce tail improvements.
+
+Related decisions and references:
+
+- See related: cache-warmup-and-kv-prefetch-guideline-2025 (guideline, not a decision record).
+- Telemetry design referenced: observability-sli-tracing-and-cost-guardrails-adr-2024.
+
+Appendix — example internal warming call (curl):
+
+curl -X POST "https://internal-router.region.redwood.svc/warm" \
+  -H "Authorization: Bearer $INTERNAL_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id":"t-1234","session_key":"conv-3f9a","model_variant":"redwood-chat-large-v2"}'
+
+Notes on alternative future work:
+
+- Consider temporary read-only prefetch lanes that pre-warm KV without routing traffic to the warmed instance (reduces load skew but increases network IO).
+- Evaluate ML-driven affinity scoring that adapts weights based on workload characteristics.
+
+Revision history:
+
+- 2026-01-20: Draft authored by Evelyn Chen.
+- 2026-01-28: Incorporated reviewer feedback on security and warmup rate limits.
+- 2026-03-01: Finalized weights and rollout plan; published.
+
+Owners: Evelyn Chen (author), Runtime Routing Team (owners).
+
+-- End of ADR --

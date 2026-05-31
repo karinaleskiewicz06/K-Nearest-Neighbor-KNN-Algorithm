@@ -1,0 +1,159 @@
+Probabilistic latency attribution playbook (sampling-first approach) - 2026
+
+Summary:
+
+This playbook describes a probabilistic approach to attributing observed request latency to runtime subsystems, kernels, and queueing stages when full-trace coverage is too expensive. The method combines lightweight sampling, sketch-based telemetry, and attribution heuristics to produce actionable signals for engineering and SRE teams.
+
+Intended audience:
+- Runtime engineers owning the scheduler and kernel mapper
+- SREs and performance investigators
+- Observability and telemetry engineers
+
+When to use this playbook:
+1) Production tail-latency events where full end-to-end tracing is disabled or introduces too much overhead.
+2) When seeking fast, statistically plausible root-cause hypotheses across dozens of GPUs/nodes.
+3) For continuous monitoring: convert the heuristics into alerts and periodic digests.
+
+Definitions and conventions:
+- request: a single API call delivered to the frontend routing layer.
+- hotpath: the portion of request execution that executes on GPU for token generation.
+- kernel step: atomic GPU kernel invocation (for example: attention, matmul, rotary).
+- sample: a full, detailed trace captured for 1/N requests per bucket.
+- sketch: compact aggregated metric (histogram, t-digest, count-min) emitted at 1s resolution.
+
+Scope and constraints:
+- This playbook focuses on inference serving runtime (GPU-backed path, KV cache, batching, and scheduler interactions). It does not replace detailed kernel profiling runs or microbenchmarks.
+- Assumes telemetry pipeline supports: traces (sampled), metrics (prometheus-style counters/histograms), and log events with minimal schema.
+
+Telemetry contract (required fields):
+- request_id (string)
+- model_family (string)
+- model_variant (string)
+- route (string)
+- arrival_ts (ISO8601)
+- dispatch_ts (ISO8601)
+- kernel_start_ts (ISO8601) optional per kernel when sampled
+- kernel_end_ts (ISO8601) optional per kernel when sampled
+- gpu_id (string)
+- shard_id (string)
+- batch_size (int)
+- tokens_generated (int)
+- outcome (enum: success|fallback|error)
+- trace_sampled (bool)
+
+Sampling strategy recommendations:
+- Baseline: 1/1000 sampled across all routes; increase to 1/100 for routes with observed tail greater than SLO threshold.
+- Stratified sampling keys: model_family, route, batch_size_bucket (1, 2-4, 5-8, >8), gpu_pool_tier (hosted|dedicated).
+- Burst sampling: when total 95th percentile latency exceeds configured threshold, temporarily increase sampling to 1/20 for the offending route for 10 minutes.
+
+How sampling and sketches combine (high level):
+1) Most requests emit lightweight sketches (per-minute histograms of request latency, queue wait, kernel execution) tagged by model_variant and route.
+2) A small fraction of requests produce full traces with per-kernel timings and GPU occupancy snapshots.
+3) Attribution uses samples to estimate distribution of per-kernel latencies within each sketch bucket using importance weighting.
+
+Attribution algorithm (procedural):
+1) Select window: choose the incident window (T0..T1) and the route/model to analyze.
+2) Compute sketch deltas: obtain histogram of request latency and queue wait from sketches for the window.
+3) Retrieve sampled traces: pull all sampled traces matching the same route/model and time window.
+4) For each sampled trace, compute kernel fractions: f_k = kernel_k_time / total_gpu_time.
+5) Use importance weights w = (count_histogram_bin / sample_count_bin) * adjustment_factor to scale sample fractions to the full histogram bins.
+6) Estimate per-kernel latency contribution per bin: est_k_bin = f_k * median_latency_bin * w.
+7) Aggregate across bins to produce: total_est_k, percent_contrib_k, and confidence intervals (bootstrap samples on the traces).
+
+Example: if 95th requests have median latency 420ms and sampled traces show 60% time in attention kernels and 30% in KV cache sync, attribution reports attention approximately 252ms (60%), KV sync approximately 126ms (30%), remainder in queueing and overhead.
+
+Practical investigation playbook (step-by-step):
+1) Identify the symptom: route X, 95th latency 2x SLO, time window 13:02-13:22 UTC.
+2) Pull three artifacts: sketches (1s resolution), sampled traces (all), node-level GPU metrics (occupancy, mem_bw).
+3) Run attribution algorithm to produce per-kernel contributions and confidence bands.
+4) If attention kernels are dominant: run quick kernel heatmap query and check recent kernel parameter changes or new model variants rolled out in that window.
+5) If queue/warmup dominates: inspect autoscaling and pre-warm logs; check request arrival patterns and burst rates.
+6) If KV cache sync shows up: correlate with cache miss rate and backend store latency.
+7) Generate an incident hypothesis and log in the incident tracker, attaching top three contributing factors and suggested mitigations.
+
+Automatable checks and quick queries (examples):
+- PromQL: 5m rate of requests and 95th latency by route
+  sum by (route) (histogram_quantile(0.95, sum(rate(request_latency_bucket[5m])) by (le, route)))
+
+- PromQL: kernel occupancy heatmap (approx):
+  topk(20, sum by (kernel_name, gpu_id) (rate(gpu_kernel_time_seconds_sum[1m])))
+
+- SQL (telemetry catalog): compute sample-weighted kernel fraction per route
+  SELECT route, kernel_name, SUM(kernel_time * weight) / SUM(total_gpu_time * weight) AS frac
+  FROM sampled_traces
+  WHERE time >= '2026-02-01T00:00:00Z' AND route = 'inference-chat'
+  GROUP BY route, kernel_name;
+
+Confidence and caveats:
+- Small sample sizes can bias the attribution; always report sample_count and bootstrap confidence intervals.
+- Sampling bias: if sampling selection correlates with client size or request shape, stratify or reweight by the known metadata.
+- Kernel durations measured on traces may vary across GPU types; normalize by hardware class when attributing across heterogeneous pools.
+
+Mitigations and quick fixes mapped to root causes:
+- Scheduler-induced queueing: lower batch_size cap for the route, enforce hard preemption window, or increase dedicated capacity for the tier.
+- Attention kernel slowdown: revert recent kernel patch, change kernel mapper to fallback, or pin model to older compiled variant.
+- KV cache sync latency: enable local cache warmup, increase async writeback threshold, or route reads to a faster replica.
+- Memory fragmentation or OOM patterns: eject long-running allocations, increase malloc arena reuse, and schedule compaction during low-load windows.
+
+Runbook checklist (for on-call):
+1) Validate incoming alert: confirm sketch 95th greater than threshold and check recent deploys.
+2) Run automated attribution job (script: tools/latency-attrib/run.sh) with window +/-30m.
+3) Share initial results in incident channel with table: top-5 kernel contributors and sample_count.
+4) If CI indicates kernel-level regression with high confidence (greater than 80% contribution and more than 50 sample traces), page runtime-owner and kernel-owner teams.
+5) If no clear kernel signal, escalate to SRE to investigate infra (network, storage latencies).
+
+Telemetry table (recommended emission cadence):
+- Request sketches: per-route per-minute histograms (latency, queue_wait) - aggregation: t-digest/hd-pairs
+- Sampled traces: per-request full trace JSON with per-kernel timings - 1/1000 baseline
+- Node metrics: per-GPU 1s counters for kernel_time, kernel_count, occupancy, mem_bw
+- Deployment events: model_variant_rollout, kernel_release tags as discrete events
+
+Example sampled-trace (flattened representation):
+- request_id: req-123
+- route: inference-chat
+- model_variant: gptx-7b-q4
+- arrival_ts: 2026-02-08T13:14:05.123Z
+- dispatch_ts: 2026-02-08T13:14:05.130Z
+- gpu_id: gpu-az3-045
+- batch_size: 4
+- total_gpu_time_ms: 380
+- kernels: attention_fwd=210ms, matmul_ffn=80ms, kv_sync=70ms
+
+Ownership and escalation:
+- Primary: eng-serving-runtime (runtime-kernel squad) - pager: #runtime-pager (oncall rotation)
+- Secondary: eng-infra (GPU fleet) - pager: #infra-pager
+- For storage/cache escalations: platform-storage team
+
+Automation and dashboards to build (owners suggested):
+- Attribution digest dashboard: per-route top contributors with CI bars updated every 5m. Owner: runtime-observability
+- Sampling controller: auto-tune sampling rate per-route based on 95th latency and sample availability. Owner: telemetry
+- Kernel heatmap: live matrix of kernel_time by kernel_name x gpu_model. Owner: runtime-performance
+
+When to trigger a rollback or hotfix:
+- If attribution shows greater than 50% regression attributable to a single kernel associated with a new kernel release or variant rollout and confidence greater than 90% (bootstrap), trigger rollback per deployment rollback runbook.
+
+Post-incident follow-ups (template):
+1) Hypothesis and evidence (sketches + traces + kernel heatmap).
+2) Actions taken and immediate outcomes (rollback, config change, capacity increase).
+3) Root cause summary with supporting confidence interval plots.
+4) Long-term fixes and owners (for example: increase sample rate for route X; create test harness for kernel Y).
+
+Changelog:
+- 2025-11-12: Initial draft and internal review.
+- 2026-01-08: Added burst sampling and bootstrap CI guidance (reviewer: Marcus Lee).
+- 2026-02-10: Added PromQL/SQL examples and automation recommendations.
+
+References and related reading:
+- /confluence/eng-serving-runtime/profiling-playbook/continuous-runtime-profiling-strategy-2026
+- /confluence/eng-serving-runtime/benchmarking-and-perf-suite/tail-latency-investigation-and-mitigation-playbook-2026
+- Telemetry schema docs: /confluence/eng-infra/team-wiki/telemetry-schema-v2
+
+Appendix A - utility scripts:
+- tools/latency-attrib/run.sh --window start end --route <route> --out results.json
+- tools/latency-attrib/bootstrap.py --input results.json --iterations 1000 --out ci.json
+
+Appendix B - quick checklist for product managers (non-technical):
+- Is the incident tied to a model variant rollout? If yes, consider temporary pin to previous variant.
+- Does the incident affect paying customers? If yes, notify customer success with summary and ETA.
+
+End of document.

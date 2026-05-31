@@ -1,0 +1,198 @@
+OPA policy examples for tenant quota and eviction
+
+Summary
+-------
+This document provides concrete Open Policy Agent (OPA/Rego) policy examples for encoding tenant quota enforcement and staged eviction decisions inside Redwood's runtime control plane. The intent is to provide safe, testable, auditable policy snippets that operators and platform engineers can adapt to: token quotas, cost budget windows, SLO-driven soft-eviction, and emergency hard-eviction.
+
+Why OPA here?
+- OPA enables a declarative, versionable policy surface separate from runtime code.
+- Policies can be unit-tested, linted, and evaluated in CI before being deployed to the policy decision point (PDP).
+- Clear policy semantics reduce operator cognitive load during incidents and make rollback trivial.
+
+When to use these examples
+- Enforcing per-tenant token or request quotas (daily/hourly windows).
+- Implementing eviction heuristics when capacity pressure or SLO risk exceeds thresholds.
+- Configuring short-circuit operator overrides (emergency pause, global protect).
+
+High-level design constraints
+1) Safety-first: default effect must be "allow" for non-critical paths; for eviction decisions default to "no-evict" unless explicit conditions are met.
+2) Idempotence: policies must evaluate deterministically given the same input.
+3) Auditability: every decision must include evidence fields (reason, metric snapshot, rule id).
+4) Performance: policy evaluation should be O(1) per decision or cached for short time windows.
+
+Input schema (expected by PDP)
+- input.tenant_id: string
+- input.window: {"start": string (RFC3339), "end": string (RFC3339)}
+- input.metrics: {"tokens_used": number, "requests": number, "slo_violations_1h": number, "cost_usd_24h": number, "queue_time_ms": number}
+- input.config: {"quota_tokens": number, "quota_requests": number, "cost_budget_usd": number, "slo_violation_threshold": number}
+- input.runtime: {"capacity_pressure": "low"|"moderate"|"high", "region": string}
+- input.operator_override: {"action": "none"|"evict"|"protect", "reason": string, "expires_at": RFC3339}
+
+Policy example 1 — soft quota enforcement (hourly tokens)
+- Objective: mark tenants as "throttable" when they exceed 90% of hourly token quota.
+- Action: return decision {allow: boolean, mode: "normal"|"throttle", evidence: {rule: string, tokens_used: number, quota: number}}
+
+Rego snippet (copy/paste)
+```
+package redwood.tenant.quota
+
+default decision = {"allow": true, "mode": "normal", "evidence": {"rule": "none"}}
+
+# Condition: tokens exceed 90% of configured hourly quota
+high_usage[tenant] {
+  quota := input.config.quota_tokens
+  quota > 0
+  input.metrics.tokens_used >= (quota * 0.9)
+  tenant := input.tenant_id
+}
+
+decision = {"allow": false, "mode": "throttle", "evidence": {
+    "rule": "high_usage_tokens",
+    "tokens_used": sprintf("%v", [input.metrics.tokens_used]),
+    "quota": sprintf("%v", [input.config.quota_tokens])
+  }} {
+  high_usage[_]
+}
+```
+
+Notes:
+- Throttling versus outright eviction: this snippet triggers a throttle mode; downstream controllers should map throttle -> token rate-limit or 429 behavior.
+- Tune the threshold (0.9) per tenant-class; consider using input.config.per_tier_thresholds for fine-grained control.
+
+Policy example 2 — cost-budget-driven graceful eviction
+- Objective: initiate a staged eviction plan if a tenant exceeds cost budget and region capacity is under high pressure.
+- Action: return decision {evict: boolean, stage: "warn"|"soft_eviction"|"hard_eviction", evidence: {...}}
+
+Rego snippet (copy/paste)
+```
+package redwood.tenant.eviction
+
+default decision = {"evict": false, "stage": "none", "evidence": {"rule": "none"}}
+
+# Helper: cost over budget
+cost_over_budget {
+  input.metrics.cost_usd_24h > input.config.cost_budget_usd
+}
+
+# Rule: soft eviction (warn) if cost over budget and moderate pressure
+decision = {"evict": true, "stage": "warn", "evidence": {"rule": "cost_warn", "cost": sprintf("%v", [input.metrics.cost_usd_24h])}} {
+  cost_over_budget
+  input.runtime.capacity_pressure == "moderate"
+}
+
+# Rule: soft eviction if cost over budget and high pressure or SLO violations rising
+decision = {"evict": true, "stage": "soft_eviction", "evidence": {"rule": "cost_soft", "cost": sprintf("%v", [input.metrics.cost_usd_24h]), "slo_violations": sprintf("%v", [input.metrics.slo_violations_1h])}} {
+  cost_over_budget
+  (input.runtime.capacity_pressure == "high"; input.metrics.slo_violations_1h >= input.config.slo_violation_threshold)
+}
+
+# Rule: hard eviction if cost massively exceeds budget (e.g., > 200%) and region is at critical pressure
+decision = {"evict": true, "stage": "hard_eviction", "evidence": {"rule": "cost_hard", "cost": sprintf("%v", [input.metrics.cost_usd_24h])}} {
+  input.metrics.cost_usd_24h >= (2 * input.config.cost_budget_usd)
+  input.runtime.capacity_pressure == "high"
+}
+```
+
+Notes:
+- Stages map to operator actions in the orchestration layer:
+  - warn: send billing notice + reduce burst credits
+  - soft_eviction: reduce priority, evict from best-effort pools to reserved or blocked queues
+  - hard_eviction: terminate or suspend non-essential sessions and refuse new requests
+- Ensure billing team is notified on "warn" decisions.
+
+Policy example 3 — SLO-driven preemptive protection (protect tenants with paid SLA)
+- Objective: protect tenants with enterprise SLA from being evicted unless operator_override is explicit.
+
+Rego snippet (copy/paste)
+```
+package redwood.tenant.protection
+
+default decision = {"protected": false, "reason": "none"}
+
+# Protect if tenant has enterprise_sla flag attached in config
+decision = {"protected": true, "reason": "enterprise_sla"} {
+  input.config.enterprise_sla == true
+}
+
+# Operator override can force eviction even for protected tenants, but it must carry an expires_at and an operator id
+decision = {"protected": false, "reason": "operator_forced"} {
+  input.operator_override.action == "evict"
+  time.now_ns() < time.parse_rfc3339_ns(input.operator_override.expires_at)
+}
+```
+
+Testing and CI patterns
+- Unit tests: write rego tests alongside policy file and run `opa test ./` in CI. Example test case names should cover boundary conditions (e.g., 89%, 90%, 91% of quota).
+- Fuzz inputs: run a small fuzzer for metrics ranges to catch non-determinism.
+- Linting: run `opa fmt` and `opa check` as part of pre-commit.
+- Data-driven policy variation: use input.config.per_tier_thresholds to avoid hardcoding numeric thresholds.
+
+Operational rollout checklist
+1) Stage policy in the policy staging PDP with read-only mode for 24 hours (evaluate decisions but do not enforce).
+2) Compare decisions vs actual runtime actions using a decision-sampling pipeline (capture decisions into telemetry).
+3) Gradually enable enforcement for a small percentage (5%) of tenants using a rollout flag.
+4) Expand by doubling percentage every 6 hours while monitoring SLOs and cost signals.
+5) After 72 hours without regressions, promote to stable.
+
+Rollout metrics to monitor (minimum)
+- decision_mismatch_rate: fraction of sampled decisions that would have differed from previous rule baseline (>1% triggers pause).
+- evictions_per_hour: baseline must be stable; >3x baseline triggers immediate rollback.
+- downstream_429_rate_by_tenant: spikes indicate throttle mapping regressions.
+- billing_alerts_sent: ensure notify pipeline fires for warn-stage decisions.
+
+Dashboard and alerting guidance
+- Create a dashboard with: capacity_pressure_by_region, top-20 tenants by cost_usd_24h, evictions_by_stage, decision_mismatch_rate, and operator_override_activity.
+- Alerts:
+  - decision_mismatch_rate > 1% for 30m => P2 to eng-platform
+  - evictions_per_hour increases >3x baseline for 15m => P1 oncall page
+  - operator_override with action=evict without expires_at => compliance alert (security team)
+
+Operator runbook (short)
+1) When an alert fires (evictions spike or mismatch): collect last 30m of decisions and metric snapshots.
+2) If evictions are accidental, flip enforcement flag to "read-only" and scale down enforcement percentage to 0% immediately.
+3) Notify affected tenants via preconfigured messaging channels; enable billing hold if necessary.
+4) Re-run policy tests locally with captured input examples to reproduce the trigger.
+5) Roll back policy commit and open a post-incident ticket including decision evidence.
+
+Compliance & audit notes
+- All policy changes must be committed to the policy repo and require two reviewers for production promotion.
+- Decision sampling logs must be stored for 90 days to support billing and compliance disputes.
+- Operator overrides are immutable records: require operator id, reason, and expires_at; store in audit log.
+
+Examples of CLI commands and tests
+- Evaluate a single decision locally:
+  opa eval -i input.json -d tenant_quota.rego "data.redwood.tenant.quota.decision" --format pretty
+- Run unit tests in repo:
+  opa test ./policies -v
+- Format and lint:
+  opa fmt ./policies && opa check ./policies
+
+Migration notes (from legacy heuristics)
+- Legacy eviction code used heuristic thresholds embedded in runtime (hardcode). Migration steps: 1) port heuristic to rego with equivalent semantics, 2) run staging for 48 hours, 3) compare outputs, 4) flip enforcement.
+- Where a historical exception list exists, import it into a policy data file (data/legacy_exceptions.json) and reference via input.data.
+
+Ownership and contacts
+- Primary owner: eng-platform (policy-pdp team).
+- Pager: eng-platform oncall rotation.
+- Policy review cadence: quarterly or upon major pricing/model changes.
+
+Related artefacts and next steps
+- Add a scheduled synthetic job that generates representative tenant inputs nightly and asserts no-rule regressions.
+- Integrate the decision-sampling telemetry with the billing pipeline to validate financial impact.
+
+Appendix: sample input.json for local testing
+{
+  "tenant_id": "tenant-42",
+  "window": {"start": "2026-02-14T10:00:00Z", "end": "2026-02-14T11:00:00Z"},
+  "metrics": {"tokens_used": 910000, "requests": 12000, "slo_violations_1h": 2, "cost_usd_24h": 450.25, "queue_time_ms": 15},
+  "config": {"quota_tokens": 1000000, "quota_requests": 20000, "cost_budget_usd": 200, "slo_violation_threshold": 5, "enterprise_sla": false},
+  "runtime": {"capacity_pressure": "high", "region": "us-west-2"},
+  "operator_override": {"action": "none", "reason": "", "expires_at": ""}
+}
+
+Document history
+- 2025-11-12: Created by Priya Nair (initial draft).
+- 2026-01-18: Added cost-driven eviction stages and operator override guidance (reviewers: Evan Chen).
+- 2026-02-15: Finalized rollout checklist, dashboards and alerts; promoted to published.
+
+END OF DOCUMENT

@@ -1,0 +1,195 @@
+Bandwidth contract test lab and Terraform bridge
+
+Overview
+
+This document describes the Bandwidth Contract Test Lab (BCTL) and the accompanying Terraform Bridge used to validate regional egress bandwidth commitments, provider contract behavior, and billing reconciliation across multi-account and multi-region deployments. The BCTL is a small, repeatable harness that lets infra engineers and SREs run deterministic network loads, assert SLOs, and produce canonical telemetry for finance reconciliation and Terraform-based assertions.
+
+Why this exists
+
+- Cloud bandwidth contracts and negotiated egress commitments often contain non-obvious throttles, burst allowances, and cross-region caps. We need a trustworthy, automated way to validate what the cloud provider will actually bill and whether our application-level fallbacks work.
+- Existing egress testbeds exercise simple throughput patterns but do not integrate with Terraform contracts or emit the billing-shaped telemetry required by finance and product teams.
+
+Goals
+
+1. Provide a reproducible harness to simulate tenant egress patterns (burst, sustained, burst-with-decay).
+2. Validate Terraform-managed egress resources (bandwidth reservations, NAT gateway pools, transit gateways) end-to-end.
+3. Produce standardized artifact outputs: CSV of measured throughput per minute, provider-side metric URLs, and a Terraform plan/assert report.
+4. Allow CI gating: Terraform module integration tests can fail early if provider behavior violates contract assumptions.
+
+Non-goals
+
+- This lab is not intended for high-scale production benchmarking (use the large-scale performance lab for that).
+- It will not attempt to emulate every third-party network service; focus is on provider egress plumbing and billing signals.
+
+Ownership and contact
+
+- Primary owner: Eng-Infra Networking (pager: #eng-infra-networking)
+- Author: Maya Rodriguez (maya@redwood.ai)
+- Secondary owner for Terraform Bridge: Infra IaC team (reviewer Priya Singh)
+
+Architecture and components
+
+- Controller VM set: small fleet of test runners (ci-small instances in each target region) that execute traffic generators and collect client-side telemetry.
+- Traffic generator: sbw (small-bandwidth-wrangler), our lightweight Go tool for deterministic TCP/HTTP streams (see CLI commands below).
+- Provider hooks: provider-metrics-scraper — pulls cloud provider egress metrics (ASN-level, NAT gateway, inter-region egress) via cloud APIs every 30s.
+- Terraform Bridge: a small utility (tf-assert) that runs terraform plan/apply in a sandbox, captures the provider-side resource IDs, and wires them to the BCTL harness for test setup/teardown.
+
+Diagram (text)
+
+Controller VM pool -> (1) Terraform Bridge apply -> creates NATs/transit -> (2) Controller config -> (3) Traffic runs -> (4) Provider metrics scraped -> (5) Postprocess + assert
+
+SLOs and acceptance criteria
+
+- Measured sustained throughput matches reservation within +/- 7% over a 5-minute window.
+- Burst allowance: short bursts (<=60s) may exceed reservation but must not exceed the documented provider burst ceiling by >10% during tests.
+- No unexplained drops: packet loss >1% sustained for 2 minutes triggers a fail.
+- Terraform assertions: resources created must have expected tags, attachment IDs, and CIDR allocations per policy.
+
+Operational runbook (how to run locally)
+
+Prereqs
+
+1. Terraform 1.4+ installed
+2. Go 1.20+ for sbw and tf-assert (or use provided binaries)
+3. AWS/GCP/azure credentials for target region in environment (set AWS_PROFILE/$GOOGLE_APPLICATION_CREDENTIALS/AZURE_SUBSCRIPTION_ID)
+4. CI runner with 2 vCPU/4GB RAM and ephemeral 100GB scratch
+
+Steps
+
+1. Clone the test harness:
+
+   git clone git@github.com:redwood-infra/bctl.git
+   cd bctl
+
+2. Prepare a workspace (example for us-west-2):
+
+   export BCTL_REGION=us-west-2
+   export TF_VAR_workload_name=bctl-smoke
+   ./tf-assert init && ./tf-assert apply --auto-approve
+
+   Notes: tf-assert creates a temporary Terraform workspace named bctl-<shorthash> and outputs a JSON file with resource ids: ./out/current-resources.json
+
+3. Start provider-metrics-scraper in background:
+
+   ./provider-metrics-scraper --region $BCTL_REGION --out ./out/provider-metrics.log &
+
+4. Run sbw traffic profiles (examples below):
+
+   # sustained 500 Mbps for 10 minutes
+   ./sbw run --target https://ingress-test.redwood.local --pattern sustained --bandwidth 500m --duration 600 --out ./out/sustained-500m.csv
+
+   # burst-with-decay: 1 Gbps for 60s, then decay to 200 Mbps
+   ./sbw run --pattern burst-decay --peak 1g --sustain 60 --decay-to 200m --duration 600 --out ./out/burst-decay.csv
+
+5. Postprocess and assert
+
+   ./bctl-postprocess --provider-metrics ./out/provider-metrics.log --client-metrics ./out/sustained-500m.csv --tf-resources ./out/current-resources.json --assert ./out/assert-report.json
+
+6. Tear down
+
+   ./tf-assert destroy --auto-approve
+
+Terraform Bridge design notes
+
+- tf-assert behavior:
+  - init -> creates isolated workspace
+  - apply -> injects tags: { "bctl-run": "<run-id>", "owner": "eng-infra" }
+  - exports an assertions file (resource ids, egress-attachment ARNs, public IPs)
+- Implementation detail: tf-assert uses terraform's JSON output (terraform show -json) and normalizes provider fields we depend on (nat_gateway_id, egress_bandwidth_setting).
+- The bridge also writes a small policy file that the BCTL harness consumes to map traffic-generators to NAT/ENI IPs.
+
+Test matrix and sample policy table
+
+| Test name | Region | Reservation (Mbps) | Pattern | Expected outcome |
+|-----------|--------|--------------------:|---------|------------------|
+| sustained-500m | us-west-2 | 500 | sustained 10m | pass within 7% |
+| burst-decay-1g | eu-central-1 | 250 | burst 60s peak 1g | burst allowed, billing tag present |
+| small-burst | ap-southeast-1 | 50 | repeated short bursts | no sustained throttle |
+
+Terraform example snippets (sanitized)
+
+module "bctl_nat" {
+  source = "git::ssh://git@github.com/redwood-modules/nat-gateway.git//modules/nat"
+
+  region = var.region
+  tier = "bctl-test"
+  egress_bandwidth = var.requested_egress_mbps
+  tags = merge(var.common_tags, {"bctl-run" = var.run_id})
+}
+
+CLI assertions and exit codes
+
+- bctl-postprocess exits 0 on success, 2 on soft-fail (SLO close but within tolerance), 3 on hard-fail (SLO violated), 4 on infra mismatch (Terraform ids mismatch).
+- CI pipelines should treat 3 and 4 as failures; 2 should be treated as warning but block merges for infra modules (configurable per repo policy).
+
+Telemetry and artifact formats
+
+- Client-side CSV columns: timestamp, client_ip, target_ip, throughput_bps, rtt_ms, packet_loss_pct
+- Provider metrics: exported JSON lines with timestamp, resource_id, metric_name, value
+- Assertion report: JSON lines (limited schema), plus human readable summary in ./out/assert-summary.md
+
+CI integration
+
+- Add the BCTL job to module-level pipelines for terraform/egress modules. Example (Buildkite step):
+
+  - label: ":satellite: bctl integration"
+    command:
+      - ./tf-assert init && ./tf-assert apply --auto-approve
+      - ./sbw run --pattern ci-smoke --bandwidth 100m --duration 120
+      - ./bctl-postprocess --assert ./out/assert-report.json
+      - ./tf-assert destroy --auto-approve
+    agents:
+      queue: infra-ci-small
+
+- Timeout guidance: allow 45 minutes per run to accommodate apply/destroy latency and provider eventual consistency.
+
+Common failure modes and troubleshooting
+
+1. Apply times out in provider region
+   - Symptom: tf-assert stuck on provider resource creation > 15 minutes
+   - Action: inspect terraform state: terraform show -json; check provider console for quota errors; if quota, bump via quota request or use alternate test account.
+
+2. Measured throughput lower than expected
+   - Symptom: clients report < reservation and provider metrics show lower egress
+   - Action: check controller VM CPU/ENI saturation (htop, ifstat). Verify that sbw is multi-threaded and not CPU-bound. Use smaller packet sizes to measure.
+
+3. Provider metrics missing or delayed
+   - Symptom: provider-metrics-scraper shows gaps
+   - Action: increase scrape window, validate API permissions (read-only metrics role), check cloud provider rate limits. Use internal metrics proxy if rate-limited.
+
+4. Billing mismatch after run
+   - Symptom: finance sees charges inconsistent with provider metrics
+   - Action: capture provider bill export and correlate by tag/usage account + timestamps. Open a provider support ticket referencing export id and BCTL run id.
+
+Safety and cost controls
+
+- Quota caps: tf-assert will refuse to create reservations > 2x typical dev quota unless run_id is in an allowlist.
+- Budget guard: CI runs set a TTL (default 90 minutes) and destroy is enforced by a cleanup lambda that runs every 15 minutes.
+- Tagging: every resource created by BCTL must include: project=bctl, run_id, owner=eng-infra, env=test
+
+Rollout and roadmap
+
+- Q1 2026: Add automated reconciliation against the provider billing export (cost per MB) and a matching score.
+- Q2 2026: Integrate with Redwood Console synthetic probes so product teams can simulate app-level egress patterns.
+
+Related links and artifacts
+
+- Repo: git@github.com:redwood-infra/bctl.git
+- Terraform Bridge RFC: /confluence/eng-infra/decision-records/tf-assert-rfc-2025
+- Provider metric mapping doc: /confluence/eng-infra/cloud-accounts-and-networking/provider-metric-mapping.json
+
+Appendix: sbw quick reference
+
+- sbw run --target <url> --pattern sustained --bandwidth 500m --duration 600 --conns 50
+- sbw run --pattern ramp --start 10m --end 1g --duration 1200
+
+Contact and escalation
+
+- Pager: #eng-infra-networking
+- Owner: Maya Rodriguez (maya@redwood.ai)
+- Escalation: Eng-Infra oncall if CI gates fail for multiple merges within 24h
+
+Change log
+
+- 2025-09-12: Initial draft and prototype scripts
+- 2026-02-15: Added TF bridge details, CI integration, and failure-mode guidance

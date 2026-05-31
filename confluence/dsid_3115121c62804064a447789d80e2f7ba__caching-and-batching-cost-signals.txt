@@ -1,0 +1,309 @@
+Caching & Batching Cost Signals (Serving Runtime Profiling Playbook)
+
+## Purpose
+This playbook documents the serving-runtime signals we rely on to *explain* changes in unit cost (blended $/1M output tokens). It focuses on the three most common runtime drivers:
+
+1) **Batching utilization** (how much GPU time is spent doing useful work vs waiting/underfilled)
+2) **KV/prefix cache effectiveness** (how much compute we avoid by reusing previous work)
+3) **Prefill vs decode mix** (how request shape and context length shift GPU cost per output token)
+
+This page is referenced by the Unit Economics dashboard and the on-call discrepancy playbooks. It is intended for Serving Runtime, Telemetry/Analytics, and SRE.
+
+---
+
+## How runtime signals map to blended $/1M output tokens
+### The mental model
+At a high level:
+
+**blended $/1M output tokens** ≈ (GPU $ + overhead allocations) / (output tokens) * 1,000,000
+
+When the metric moves, one (or more) of these must be true:
+
+- **Numerator increased**: we spent more GPU-hours for the same output tokens (e.g., lower batching efficiency, more prefill work, cache regression, slower kernels, lower quant efficiency).
+- **Denominator decreased**: we reported fewer output tokens for the same GPU-hours (e.g., metering bug, streaming path undercount, increased truncation, more failures).
+- **Mix shifted**: traffic changed in a way that makes output tokens more expensive (e.g., longer prompts → prefill-heavy, shorter generations with high prompt overhead, different model/quant profile, region/provider changes).
+
+### Cost-driver decomposition (runtime-focused)
+The unit cost typically correlates with the following derived factors:
+
+- **Effective throughput:** output_tokens / GPU_second (higher is better)
+- **Batching efficiency:** useful_compute_time / allocated_compute_time (higher is better)
+- **Cache savings:** avoided_prefill_tokens (or avoided_attention_work) / total_prefill_work (higher is better)
+- **Prefill load:** prefill_tokens / output_tokens (lower is better, but workload-dependent)
+
+These are not accounting numbers; they are *explanatory signals* that should directionally match changes in blended cost.
+
+---
+
+## Required dimensions (to make signals actionable)
+All runtime signals used for unit economics must be taggable by the dimensions the dashboard supports, within cardinality limits:
+
+**Required dimensions** (where available):
+- model_id (canonical)
+- model_version (if pinned or surfaced via routing policy)
+- quantization_profile (allowed-values only)
+- region (normalized)
+- customer_tier (self-serve / dedicated / private / enterprise)
+- streaming (true/false)
+
+**Important:** do *not* tag by customer_id, route_id with high uniqueness, or raw prompt hashes. See the cardinality standard referenced above.
+
+---
+
+## Signal 1: Batching utilization
+### Why it matters
+Continuous batching is the primary lever for improving GPU utilization for decode. Underfilled batches waste GPU cycles, increasing $ per output token.
+
+Batching issues are one of the most common causes of sudden regional or model-specific unit cost spikes.
+
+### Definitions
+Use these terms consistently:
+
+- **Batch size (decode):** number of active sequences decoded per step.
+- **Batch occupancy:** batch_size / max_batch_size (or / capacity at the current kernel/sequence length).
+- **Batching wait time:** time requests spend queued to form a batch.
+- **Compute time:** time spent executing kernels.
+
+### Recommended runtime metrics (names are illustrative)
+Collect at least:
+
+- redwood_runtime_decode_active_sequences_avg{model_id,region,quantization_profile,streaming}
+- redwood_runtime_decode_max_active_sequences{...} (or configured max)
+- redwood_runtime_batch_wait_ms_p50/p95{model_id,region}
+- redwood_runtime_gpu_busy_ratio{region,cluster} (if available)
+- redwood_runtime_decode_tokens_total{model_id,region,quantization_profile}
+
+### Derived metrics & interpretation
+- **Decode batch utilization** = active_sequences_avg / max_active_sequences
+  - Healthy ranges vary by model/hardware, but sustained drops (e.g., 0.70 → 0.40) usually show up as a unit cost increase.
+
+- **Queueing vs compute tradeoff**
+  - If batch_wait_ms_p95 increases sharply while utilization remains low, we likely have fragmentation (many small pools), admission control issues, or a routing policy change.
+  - If batch_wait_ms_p95 increases and utilization increases, we may have intentionally optimized cost at the expense of latency (confirm against SLOs).
+
+### Common root causes
+- Traffic fragmentation across too many pools (by model version, quant profile, region, tier)
+- Overly strict routing/affinity rules preventing consolidation
+- Misconfigured max_batch_size for new model or kernel regime
+- Increased request concurrency variance (bursty traffic) + conservative batching windows
+- Increased prefill pressure causing decode starvation
+
+### What to do when batching utilization drops
+1) Confirm the issue is real (not a missing-tag or sampling artifact).
+2) Check for recent changes:
+   - routing policy updates
+   - canary rollout that split traffic
+   - autoscaling events / pool resizing
+   - model version pinning changes
+3) Compare by dimension:
+   - model_id + quantization_profile
+   - region
+   - customer_tier
+4) Mitigation options (runtime-owned):
+   - increase consolidation (reduce pool fragmentation)
+   - adjust batching window/limits for affected pool
+   - revisit admission control thresholds
+   - consider fallback to a compatible model variant during capacity stress (if policy allows)
+
+---
+
+## Signal 2: KV cache and prefix cache hit rates
+### Why it matters
+Cache hits reduce prefill compute. Prefill can be a large fraction of GPU work for long-context workloads, so cache regressions can materially raise blended $/1M output tokens.
+
+Important nuance: cache benefits can be workload-specific and may not show in all traffic (e.g., highly unique prompts).
+
+### Cache types
+- **Prefix cache (a.k.a. prompt cache):** reuses computed attention states for a shared prefix across requests.
+- **KV cache reuse within session:** reuses per-sequence KV as decode progresses (normal decode state). This is not a “hit rate” in the same sense; the cost signal here is more about *KV cache pressure/evictions* and *context growth*.
+
+### Definitions
+- **Prefix cache hit:** request’s prefill can reuse a stored prefix representation, reducing prefill tokens processed.
+- **Prefix cache hit rate:** hits / (hits + misses)
+- **Cache saved tokens:** estimated prefill_tokens_avoided due to cache hits
+- **Evictions / churn:** how often cached entries are removed due to memory pressure or TTL
+
+### Recommended runtime metrics
+Prefix cache:
+- redwood_runtime_prefix_cache_hits_total{model_id,region,quantization_profile}
+- redwood_runtime_prefix_cache_misses_total{...}
+- redwood_runtime_prefix_cache_saved_prefill_tokens_total{...} (preferred; avoids inference from hits)
+- redwood_runtime_prefix_cache_evictions_total{region,model_id}
+- redwood_runtime_prefix_cache_bytes_in_use{region,model_id}
+
+KV cache pressure (decode state / memory):
+- redwood_runtime_kv_cache_bytes_in_use{model_id,region}
+- redwood_runtime_kv_cache_oom_events_total{model_id,region}
+- redwood_runtime_kv_cache_evictions_total{model_id,region} (if applicable)
+
+### Derived metrics & interpretation
+- **Prefix cache hit rate** = hits / (hits + misses)
+  - Use as a qualitative indicator. It can be misleading if “hit” does not imply a large token savings.
+
+- **Prefill tokens saved rate** = saved_prefill_tokens / total_prefill_tokens
+  - Prefer this for cost attribution. A small hit rate can still save a lot if hits are on long prefixes.
+
+- **Cost mapping**
+  - When cache effectiveness drops, expect:
+    - prefill_tokens / output_tokens to rise
+    - GPU-seconds per output token to rise
+    - blended $/1M output tokens to rise
+
+### Common root causes of cache regressions
+- Cache key changes (tokenization changes, prompt formatting changes, system prompt edits)
+- TTL/size configuration changes reducing retention
+- Memory pressure from longer contexts causing evictions
+- Increased traffic diversity (fewer repeated prefixes)
+- Region or pool split lowering reuse probability
+
+### What to do when cache hit rate drops
+1) Validate the workload changed (e.g., product launched new prompt template) vs system regression.
+2) Compare cache signals alongside prompt length distributions:
+   - rising average prompt length + falling cache savings often indicates evictions.
+3) Check for a drop isolated to:
+   - a region (config divergence)
+   - a quantization profile (different cache capacity/behavior)
+   - streaming vs non-streaming (request metadata differences)
+4) Mitigations:
+   - increase cache capacity (bytes) or TTL (if safe)
+   - revert/adjust prompt formatting to stabilize prefixes
+   - consolidate pools to increase reuse rate
+   - fix cache key/versioning if mismatched between gateway/runtime
+
+---
+
+## Signal 3: Prefill vs decode ratio (request shape)
+### Why it matters
+Even if batching and caching are stable, unit cost can move due to request mix:
+
+- Longer prompts increase **prefill** work.
+- Shorter generations reduce **output tokens** per request, increasing overhead per output token.
+- Tool calling / structured output may change average output length and stop conditions.
+
+This is the most common explanation for “no regression found” in runtime code, but unit cost still increased.
+
+### Definitions
+- **Prefill tokens:** input tokens processed to build attention state before generating output.
+- **Decode tokens:** output tokens generated.
+- **Prefill/decode ratio:** prefill_tokens / decode_tokens (or / output_tokens).
+
+### Recommended runtime metrics
+- redwood_runtime_prefill_tokens_total{model_id,region,quantization_profile,streaming}
+- redwood_runtime_decode_tokens_total{model_id,region,quantization_profile,streaming}
+- redwood_runtime_request_count_total{model_id,region,streaming}
+- redwood_runtime_prompt_tokens_histogram{model_id,region} (bucketed)
+- redwood_runtime_output_tokens_histogram{model_id,region} (bucketed)
+
+### Derived metrics & interpretation
+- **Prefill/Output ratio** = prefill_tokens_total / decode_tokens_total
+  - Rising ratio means each output token “costs” more prefill work.
+  - Often driven by longer context windows or by product features that add system/tool context.
+
+- **Output tokens per request** = decode_tokens_total / request_count
+  - Falling output/request increases fixed overhead per output token (scheduler overhead, network, per-request setup).
+
+- **Streaming vs non-streaming mix**
+  - Streaming often correlates with shorter outputs (users stop early) and different cancellation patterns.
+  - Ensure output token metering parity across streaming paths before drawing conclusions.
+
+---
+
+## Investigation workflow: explaining a unit cost change
+Use this workflow when the Unit Economics dashboard shows a spike or drift in blended $/1M output tokens.
+
+### Step 0 — Validate data integrity (before debugging runtime)
+- Confirm output token metering completeness for the affected slice (especially streaming=true).
+- Confirm dimension coverage (region/model/tier/quantization_profile not missing).
+- Check the reconciliation report vs billing totals for the same time window.
+
+If any of the above fail, follow the on-call guide and stop here.
+
+### Step 1 — Determine if it’s numerator, denominator, or mix
+For the same slice (model_id/region/tier), compare to previous period:
+- GPU-hours (or allocated GPU cost proxy) trend
+- output_tokens trend
+- requests trend
+
+Quick heuristics:
+- output_tokens down but requests stable: likely metering, truncation, or behavior change.
+- GPU cost up with tokens stable: likely utilization/efficiency regression.
+
+### Step 2 — Check batching utilization
+- decode batch utilization
+- batch wait times
+- GPU busy ratio (if available)
+
+If utilization dropped, prioritize routing/pool fragmentation and autoscaling events.
+
+### Step 3 — Check cache effectiveness
+- saved_prefill_tokens / total_prefill_tokens
+- hit/miss rate (secondary)
+- evictions and cache bytes in use
+
+If cache savings dropped, check prompt/template changes and cache config.
+
+### Step 4 — Check prefill/decode mix
+- prefill/output ratio
+- prompt token distribution shift
+- output tokens per request shift
+
+If prefill/output ratio rose, look for product changes (system prompts, context injection), model changes (context window defaults), or customer-specific usage patterns.
+
+### Step 5 — Tie back to unit economics narrative
+Document the most likely driver(s) with:
+- which signal moved
+- magnitude of change
+- impacted dimensions
+- suspected cause
+- next action + owner
+
+This summary is what Product/Finance expects in an incident or exec readout.
+
+---
+
+## Practical guidance: what “good” looks like (directional)
+These are not SLAs; they are sanity-checks.
+
+- **Batch utilization (decode):** stable over time within a pool; abrupt step changes are suspicious.
+- **Prefix cache savings:** should not drop to ~0 without an obvious prompt/template change or a cache outage.
+- **Prefill/output ratio:** varies by use case; watch for week-over-week shifts, especially per customer tier.
+- **Per-dimension stability:** if the aggregate metric moves but *no* per-model or per-region slice moves, suspect a reporting or dimension-mapping issue.
+
+---
+
+## Known pitfalls (do not mis-diagnose)
+- **Hit rate ≠ savings:** use saved_prefill_tokens where possible.
+- **Batch utilization can improve while unit cost worsens:** if prefill load rises dramatically, decode may be fine but total cost still increases.
+- **Streaming cancellation:** early cancels can reduce output tokens per request; verify whether cancellation rate changed.
+- **Quantization profile changes:** can change throughput and memory behavior; ensure telemetry tags the actual profile used at execution time.
+- **Pool splitting for compliance/tier isolation:** expected to reduce batching/cache reuse; Finance/Product should be aware when interpreting tier-specific costs.
+
+---
+
+## Action items for instrumentation gaps
+If you cannot explain a cost change because signals are missing or not dimensioned correctly, file a ticket with:
+- which metric is missing
+- required dimensions
+- expected cardinality behavior
+- how it supports unit economics drilldowns
+
+Tag owners:
+- Runtime signals: Serving Runtime
+- Metering dimensions: Telemetry/Analytics (token metering)
+- Dashboards/alerts: SRE/Observability
+
+---
+
+## Appendix: Suggested queries (warehouse-friendly)
+Use warehouse views where available; do not query raw high-cardinality metrics for broad time ranges.
+
+1) Prefill/output ratio by model and region:
+- prefill_tokens_total / output_tokens_total grouped by (model_id, region, quantization_profile)
+
+2) Cache savings rate by model:
+- saved_prefill_tokens_total / prefill_tokens_total grouped by (model_id, region)
+
+3) Batching utilization proxy (if exported):
+- avg_active_sequences / max_active_sequences grouped by (model_id, region)
+
+If these views do not exist yet, coordinate with Mei Lin (warehouse/views) and Logan Wright (Telemetry/Analytics) to materialize the minimum set needed for the Unit Economics dashboard drilldowns.

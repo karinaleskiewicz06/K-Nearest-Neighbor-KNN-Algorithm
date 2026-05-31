@@ -1,0 +1,197 @@
+GPU control-plane dependency isolation and cross-account shim runbook
+
+  Summary
+  -------
+  This runbook documents the procedure and operational controls for isolating the GPU control plane from noisy cloud account dependencies and for deploying a cross-account "shim" that safely proxies egress and control-plane calls across tenant boundaries.
+
+  Goal and scope
+  ---------------
+  - Goal: Reduce incidents where external account-level network churn, NAT gateway spikes, or IAM propagation delays cause GPU scheduler/control-plane instability for inference workloads.
+  - Scope: Applies to Redwood-hosted GPU control-plane services (gpu-allocator, kv-cache-reconciler, warm-pool-manager) and the cross-account networking patterns used when tenants live in separate cloud accounts/partitions. Covers preflight, deployment, controlled failover, rollback, and post-incident remediation.
+  - Out of scope: Tenant application-level logic, on-prem private deployment guides (see eng-private-deployments for that content).
+
+  Background and motivation
+  --------------------------
+  Historically we've observed two classes of incidents:
+  1) Egress surge from tenant VPCs saturating shared NAT/egress paths and causing control-plane RPC timeouts to internal metadata services and provisioning APIs.
+  2) IAM/cross-account role propagation delays causing control-plane reconciliation loops when creating spot-backed instances or attaching network interfaces.
+
+  The shim pattern centralizes fragile cross-account operations behind a lightweight, autoscaling proxy running in the control-plane account. It enforces retries, rate-limits, and policy (OPA) and provides a stable egress endpoint for the control plane.
+
+  Owner and on-call
+  ------------------
+  - Primary owner: Team: infra-gpu (pager: #infra-gpu-oncall, escalation: infra-sre@redwood.com)
+  - Secondary owner: cloud-accounts (pager: #cloud-oncall)
+  - SLOs to respect during operations:
+    - Provision success within 90s: 99.9%
+    - API call error rate (control-plane->cloud APIs): <0.5% over 1h rolling window
+    - Shim CPU 95th percentile utilization: <70%
+
+  Preflight checklist (run before any change)
+  -------------------------------------------
+  1) Confirm canary test environment is healthy
+     - curl -sS https://canary-gpu-proxy.internal/health || fail
+     - kubectl -n control-plane get hpa gpu-shim -o yaml (HPA healthy, >= 2 replicas)
+  2) Verify terraform plan is clean
+     - cd infra/gpu-shim
+     - terraform init && terraform plan -var-file=secrets.tfvars
+     - Ensure no destructive changes to VPC or shared IAM roles
+  3) Validate OPA policy unit tests
+     - make test-opa (or opa test ./policies ./policies/test)
+  4) Ensure metric alerts are unmuted: control-plane-timeouts, shim-error-rate
+  5) Notify stakeholders: post to #platform-changes with runbook link and ETA
+
+  Deployment procedure (controlled rollout)
+  -----------------------------------------
+  1) Prepare change window and CI/CD
+     - Create a change CR in the internal tracker referencing this runbook.
+     - Use the git branch: gpu/shim/rollout-<date> and open PR against infra-main.
+  2) Apply Terraform in canary account
+     - terraform apply -target=module.gpu_shim -auto-approve -var-file=canary.tfvars
+     - Wait for canary shim to show Stable and pass health checks for 15 minutes.
+  3) Run synthetic provisioning tests (canary)
+     - ./scripts/provision-smoke.sh --target=canary
+     - Expected result: 10/10 ephemeral GPU instances provisioned within SLO
+  4) Promote to staggered accounts
+     - Use stagger factor 3: apply to low-traffic account group A, wait 30 min, group B, then all remaining.
+     - For each promotion: run terraform apply with the account-specific tfvars and validate cloudwatch/stackdriver metrics.
+  5) Observe and validate
+     - Monitor dashboards: control-plane-rpc-latency, shim-error-rate, allocator-failures.
+     - Verify no increase >10% in tail latency and no degradation in provisioning success.
+
+  Cross-account shim design notes
+  -------------------------------
+  - Architecture: shim runs in the control-plane account inside a constrained EKS namespace. Tenants call the shim via an mTLS endpoint. Shim routes to target account using short-lived AssumeRole credentials.
+  - Resiliency patterns:
+    - Local retry + jitter for transient IAM/STS errors (max 5 retries with exponential backoff)
+    - Token batching for high-frequency ephemeral create/delete calls
+    - Backpressure: when downstream account quota exceeded, shim responds with 429 and a Retry-After header
+  - Security:
+    - Principle of least privilege for AssumeRole: tenant-specific roles with limited actions (ec2:RunInstances, ec2:CreateNetworkInterface, iam:PassRole)
+    - Audit logging: all AssumeRole STS calls and proxied API calls are logged to a dedicated S3 audit bucket (kms-encrypted)
+
+  Terraform & IaC snippets (illustrative)
+  ---------------------------------------
+  - Example IAM trust policy for the role the shim uses to assume into tenant account:
+
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Principal": {"AWS": "arn:aws:iam::${var.control_plane_account}:role/shim-executor"},
+          "Action": "sts:AssumeRole",
+          "Condition": {"StringEquals": {"aws:RequestedRegion": "${var.region}"}}
+        }
+      ]
+    }
+
+  - Minimal terraform module invocation (control plane account):
+
+    module "gpu_shim" {
+      source = "git::ssh://git@repo.redwood/infrastructure/terraform-modules//gpu-shim"
+      namespace = "control-plane"
+      instance_profile = "shim-executor"
+      replica_target = 3
+    }
+
+  OPA policy example (pseudo)
+  ---------------------------
+  # deny requests that attempt to allocate > 16 GPUs per minute per tenant
+  package gpu.shim.auth
+  default allow = false
+  allow {
+    input.tenant_rate <= 16
+    input.requester in data.tenants.registered
+  }
+
+  Monitoring and observability
+  ----------------------------
+  Dashboards to watch during rollout:
+  - Control plane: control-plane/rpc-latency (p50/p95/p99), control-plane/allocations-per-minute
+  - Shim: shim/error-rate, shim/assume-role-latency, shim/retry-count, shim/429s
+  - Cloud accounts: cross-account/iam-errors, cross-account/ec2-throttles
+
+  Important alerts (examples)
+  - shim-error-rate > 1% for 5m -> paging to infra-gpu
+  - control-plane-alloc-failure-rate > 0.5% 10m -> paging to infra-sre
+  - cross-account-iam-errors > 0.2% 15m -> notify cloud-accounts team
+
+  Troubleshooting checklist (common failure modes)
+  ------------------------------------------------
+  1) STS AssumeRole fails with AccessDenied
+     - Check role trust policy in tenant account matches the control-plane role ARN
+     - Run: aws sts assume-role --role-arn arn:aws:iam::<account>:role/shim-target --role-session-name test
+     - If it fails: request tenant IAM admin to add proper trust with exact control-plane role ARN and region condition.
+  2) Excessive 429s from downstream EC2 API
+     - Inspect shim logs for bursting patterns and batching behavior
+     - Reduce request rate via temp throttling in shim config (configmap: shim-throttle-ms)
+     - Coordinate with cloud vendor support for quota increases if sustained traffic expected
+  3) DNS resolution flakiness for cross-account endpoints
+     - Validate VPC resolver rules and Transit Gateway route tables
+     - Check: dig +short proxy-account.internal from a control-plane pod
+  4) Terraform drift or plan shows resource replacement
+     - Do not apply replacements that touch shared VPCs without SRE approval
+     - Run terraform state rm for problematic ephemeral resources and re-import after stabilization
+
+  Emergency rollback procedure
+  ---------------------------
+  Use only when rollout causes widespread provisioning regressions or SLA breaches.
+  1) Immediately mute non-critical alerts and notify stakeholders
+  2) Scale down new shim replicas to previous stable replica count
+     - kubectl -n control-plane scale deploy/gpu-shim --replicas=2
+  3) Revert Terraform change via a committed revert PR and apply to the affected account group
+  4) If IAM changes were applied, revert role/trust modifications and confirm assume-role calls succeed for the original flow
+  5) Open an incident with long-form timeline and assign to infra-gpu for postmortem
+
+  Post-incident and remediation
+  -----------------------------
+  - Conduct a 60-minute RCA within 72 hours of the incident. Include traffic graphs, terraform diff, and OPA decision logs.
+  - Identify whether the root cause was design (quota/architecture) vs operational (change applied without canary) and add preventive controls.
+  - Add a regression test to the CI pipeline: terraform apply into a sandbox account followed by the provision-smoke pipeline.
+
+  Runbook automation and CI/CD integration
+  ---------------------------------------
+  - CI jobs tied to the gpu-shim module must include the following stages:
+    1) unit: lint, go vet, opa test
+    2) infra-plan: terraform init & plan against sandbox account
+    3) canary-deploy: terraform apply to canary and run provision-smoke
+    4) promote: manual approval step then terraform apply to production groups
+
+  - Example GitHub Actions job step (abridged):
+
+    - name: run-canary-deploy
+      run: |
+        cd infra/gpu-shim
+        terraform init
+        terraform apply -var-file=canary.tfvars -auto-approve
+        ./scripts/provision-smoke.sh --target=canary || exit 1
+
+  Related operational references
+  ------------------------------
+  - See eng-infra/runbooks/kv-cache-consensus-and-warmup-coordination-runbook for KV cache warmup dependency handling.
+  - See eng-infra/cloud-accounts-and-networking/gpu-vpc-peering-and-secure-proxy-patterns for legacy peering patterns.
+
+  Appendix: quick commands
+  ------------------------
+  Verify shim health:
+  - kubectl -n control-plane get deploy/gpu-shim -o wide
+  - kubectl -n control-plane logs deploy/gpu-shim --since=10m | tail -n 200
+
+  Force a canary provision test:
+  - ./scripts/provision-smoke.sh --target=canary
+
+  Assume role debug (run from control-plane bastion):
+  - aws sts assume-role --role-arn arn:aws:iam::<tenant-account>:role/shim-target --role-session-name debug
+
+  Contacts
+  --------
+  - infra-gpu Slack: #infra-gpu-oncall
+  - cloud-accounts Slack: #cloud-accounts
+  - Pager duty: infra-gpu-primary
+
+  Revision history
+  ----------------
+  - 2024-08-05: Document created by Priya Desai
+  - 2024-11-14: Added OPA policy examples and throttling knobs (review: Ethan Cole)
+  - 2025-02-12: Expanded troubleshooting section with STS and DNS diagnostics (review: Mariana Alvarez)

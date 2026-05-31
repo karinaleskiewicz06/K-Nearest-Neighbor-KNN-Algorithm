@@ -1,0 +1,135 @@
+Scheduler inspection and repro lab manual
+
+Summary
+
+This runbook describes a reproducible lab process for inspecting scheduler-related anomalies in the serving runtime. It is intended for oncall engineers, SREs, and runtime devs who need to: detect a regression, reproduce the failure in a controlled environment, collect deterministic traces and kernel-level telemetry, and run targeted benchmarks to validate fixes.
+
+Scope
+
+- Components covered: dispatch, slot-manager, kernel-coordinator, prefetch-orchestrator, kvcache-agent
+- Environments: staging (recommended), canary, and dev-lab nodes
+- Not covered: hardware-level root cause analysis for faulty accelerators (separate HW Playbook)
+
+Why this doc exists
+
+Scheduler issues manifest as: elevated p99 latency, increased enqueue-to-dispatch time, unfair slot allocation, or kernel contention that appears as slowper-token regressions. Those symptoms often require coordinated tracing and a lab repro to validate kernel fixes, admission policy adjustments, or scheduler-profile changes.
+
+Signal detection (what to watch for)
+
+- Metric thresholds (alerts):
+  - dispatch.enqueue_to_dispatch_p95 > 120ms for 5m
+  - kernel-queue-depth spike > 3x baseline for 1m
+  - per-gpu-active-slots variance (stddev) > 2.0 across hosts
+  - request-abort-rate > 0.5% while throughput steady
+- Correlated signs: elevated kernel tail latency, OOM churn, or frequent kernel-handoff logs with WARN level
+
+Quick triage checklist (first 10 minutes)
+
+1. Identify impacted cohort: model, route, and tenant tags (use observability route filters).
+2. Confirm alert signals across both control-plane and data-plane: traces, kernel metrics, and host-level metrics.
+3. Flame graph quick check: run `rbctl trace tail --service dispatch --filter "route=<route>" --last 2m` to capture high-level traces.
+4. If the symptom is reproducible in staging, proceed to the repro lab steps below. Otherwise gather traces and escalate owner.
+
+Repro lab: create a deterministic experiment
+
+Goal: reproduce the observed pathology on an isolated set of nodes so we can iterate on kernel/scheduler changes. Follow these numbered steps.
+
+Prerequisites
+- Staging cluster with identical runtime binaries to production (tagged `prod-like-<date>`).
+- Access to the experiment cluster and `rbctl` CLI with `trace:write` and `bench:run` roles.
+- Synthetic workload generator `inference-loadgen` (v2.3+) available in staging.
+
+Steps to repro
+
+1. Snapshot current scheduler config: `rbctl config get scheduler --cluster staging > scheduler.snapshot.yaml`
+2. Reserve 3 nodes for experiment: `rbctl node claim --cluster staging --nodes 3 --label lab=inspector`
+3. Deploy a controlled model instance: `rbctl deploy model --name repro-model --image model-prod:sha --replicas 1 --routes "/test-repro" --cluster staging`
+4. Start kernel/hotpath trace collection on the claimed nodes:
+   - `rbctl trace start --targets kernel-coordinator,slot-manager --duration 180s --out /tmp/kernel-trace.json`
+5. Run `inference-loadgen` with the recorded workload signature (use the original tenant's traffic shape if available)
+   - Example: `inference-loadgen --route /test-repro --qps 80 --burst 200 --seq-dist gaussian --seed 1729 --duration 5m`
+6. Capture kernel metrics and host state during the run:
+   - `rbctl metrics collect --targets gpu:* --interval 1s --duration 6m --out /tmp/gpu-metrics.csv`
+7. If the failure reproduces, record the exact command, config, and time window and move to deterministic tracing.
+
+Collecting deterministic traces and artifacts
+
+- Required artifacts: kernel-trace.json, dispatch-traces.json, gpu-metrics.csv, scheduler.snapshot.yaml, loadgen-config.json, and system dmesg/secure logs for the timeframe.
+- Deterministic trace commands: 
+  - `rbctl trace export --trace-id <id> --format ndjson > /tmp/trace.ndjson`
+  - `rbctl kernel-snapshot --node <node> --out /tmp/kernel-snap.pb` (binary snapshot but referenced in the bug ticket)
+- Tag all artifacts with experiment id `sched-lab-<YYYYMMDD>-<run>` in the ticket and storage.
+
+Instrumentation checklist (what to enable)
+
+- High-frequency kernel telemetry: kernel.dispatch_latency_ns, kernel.queue_depth, kernel.slot_acquire_latency
+- Scheduler signals: admission_score, prefetch_hint_hit_ratio, slot_steal_count
+- Host metrics: GPU_util, GPU_mem_alloc, nvlink_error_count, cpu_iowait
+- KV cache metrics: kvcache.miss_rate, kvcache.prefetch_latency
+
+Profiling and trace snippets (examples)
+
+- Example: identify slot starvation from trace
+  - In kernel-trace.json, find events `slot_acquire_attempt` -> `slot_acquired` and compute delta. A median > 10ms and p99 > 200ms indicates contention.
+- Example `rbctl` commands to get a concise summary:
+  - `rbctl trace summarize --in /tmp/trace.ndjson --group-by kernel_id,route --agg p50,p95,p99 --out /tmp/trace-summary.csv`
+  - `jq -r '.events[] | select(.name=="slot_acquire") | [.ts, .node, .duration_ns] | @csv' /tmp/kernel-trace.json | head -n 50`
+
+Benchmarking guidance to validate fixes
+
+- Microbench: use `bench:kernel-sim` to run small, deterministic sequences that exercise kernel handoff and preemption. Target size: 1–8 concurrent sessions per GPU.
+- End-to-end: `inference-loadgen` with full token generation to validate per-token latency under representative QPS. Use the same seed and sequence-length distribution as the incident.
+- Acceptance criteria (example):
+  - p99 end-to-end latency reduces by at least 20% vs baseline for the repro workload
+  - slot_acquire_p99 < 80ms
+  - kernel.queue_stall_time < 5s per minute aggregated
+
+Common failure modes and focused mitigations
+
+- Mode: kernel handoff thrash (many aborted handoffs)
+  - Mitigation: increase slot handoff backoff from 20ms to 50ms; enable `slot-handoff-jitter=true`
+- Mode: admission policy starvation for low-priority routes
+  - Mitigation: add short-lived admission credits for low-priority routes during bursts; adjust economic-priority-governor thresholds (see related pages)
+- Mode: prefetch thrash causing KV cache churn
+  - Mitigation: tighten prefetch window heuristics and enable conservative prefetch profiling for the tenant
+
+Escalation and ownership matrix
+
+- Tier 1 (oncall runtime): initial triage, run reproducibility lab, collect traces
+- Tier 2 (runtime dev): implement scheduler config adjustments, prototype kernel patch, run microbenchmarks
+- Tier 3 (platform SRE/hw): if nvlink/gpu ECC errors or host-level anomalies are present, coordinate with infra and cloud provider
+
+Postmortem and experiment hygiene
+
+- Create an incident experiment ticket with: hypothesis, repro steps, artifacts, bench results, and selected fix candidate.
+- Every experiment must have a rollback plan: restore scheduler.snapshot.yaml and redeploy the original config.
+- Tag the experiment with the causality label and link to the regression-run in the benchmarking suite.
+
+Appendix: quick-reference commands and sample config table
+
+Commands
+- rbctl config get scheduler --cluster staging > scheduler.snapshot.yaml
+- rbctl node claim --cluster staging --nodes 3 --label lab=inspector
+- rbctl trace start --targets kernel-coordinator,slot-manager --duration 180s --out /tmp/kernel-trace.json
+- inference-loadgen --route /test-repro --qps 80 --burst 200 --seq-dist gaussian --seed 1729 --duration 5m
+- rbctl metrics collect --targets gpu:* --interval 1s --duration 6m --out /tmp/gpu-metrics.csv
+
+Sample config table (fields to capture as YAML or record in ticket)
+| field | description | example |
+| scheduler.policy | Admission and priority policy blob | economic-priority-governor v2 |
+| scheduler.slot_handoff_backoff_ms | Backoff between handoff attempts | 50 |
+| prefetch.window_ms | Prefetch lookahead window | 300 |
+| kernel.kv_prefetch_enabled | Enable kvcache prefetch | true |
+
+Related pages and references
+- Scheduler policy language (internal) and admission governor design notes (see related_pages)
+- Kernel telemetry contract: runtime-telemetry-sampling-policy (team-wiki)
+
+Ownership and contact
+- Primary owner: Anika Patel (runtime infra)
+- SRE escalation: Marcus Liu
+- Kernel owner: Sophie Nguyen
+
+Revision history
+- 2025-11-12: created by Anika Patel
+- 2026-01-18: updated repro lab steps and added benchmark acceptance criteria

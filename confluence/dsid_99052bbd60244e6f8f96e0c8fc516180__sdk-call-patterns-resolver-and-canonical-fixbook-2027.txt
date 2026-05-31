@@ -1,0 +1,190 @@
+SDK call-patterns resolver and canonical fixbook
+
+Summary
+
+This playbook explains common SDK call patterns we see in customer and internal integrations, how those patterns interact with the Redwood inference runtime, the important telemetry signals to monitor, and a compact set of canonical fixes for top support issues. The goal is to provide engineers and support to quickly resolve integration issues and optimize for cost/latency without deep runtime knowledge.
+
+Intent and scope
+
+- Audience: SDK authors, integration engineers, Developer Experience (DX) on-call, Customer Support L2/L3.
+- Scope: client-side call shapes (single-request, streaming, batched, prefetch/pipeline), retry/idempotency strategies, local cache/encoder patterns, telemetry queries to triage root cause, and step-by-step canonical fixes.
+- Not covered: server-side kernel tuning, GPU allocation internals (see eng-serving-runtime docs).
+
+When to use this doc
+
+- You are debugging a customer report that "responses are truncated on streaming" or "cost spiked overnight".
+- You are designing an SDK integration and want a validated default for retries, batching windows, and telemetry events.
+- You need a short runbook for on-call to triage request-level issues and suggest immediate mitigations.
+
+High-level call patterns and recommended defaults
+
+1) Single-shot generation (synchronous)
+- Pattern: client sends prompt -> wait for final completion token -> parse JSON/text output.
+- SDK defaults we recommend: timeout=30s, max_tokens=512, retries=1 (idempotent false), content-type=application/json.
+- SLO impact: p95 latency depends on model/seq length; aim to keep client timeout >= runtime p95 + 50% cushion.
+
+2) Streaming generation (incremental tokens)
+- Pattern: client opens persistent stream, receives chunked tokens/events.
+- SDK defaults: heartbeat/ping interval 45s, reconnect backoff jittered 500ms-3s, client-side buffer flush every 120ms.
+- Important flags: resume_id (for resuming incomplete streams), allow_partial=true for degraded UX fallback.
+
+3) Bundled/batched requests (multi-prompt or multi-user multiplex)
+- Pattern: client aggregates small requests into a single RPC to reduce per-token overhead.
+- SDK defaults: bundling window = 15ms (latency-sensitive) or 250ms (throughput-optimized), max batch tokens = 32k, max batch items = 32.
+- Observability: track batch_size_histogram and batch_wait_ms. High batch_wait_ms indicates client-side backlog or misconfigured window.
+
+4) Prefetch/encoder-first (embeddings + generation)
+- Pattern: compute embeddings or encoded prefixes, stash in cache, then call generation with cached KV.
+- SDK defaults: cache_ttl=5m for session-based use; cache eviction by LRU.
+- Cost note: redundant embedding calls are a common source of cost spikes — prefer cached embeddings where user flows repeat.
+
+Telemetry signals to collect (client + platform)
+
+Essential events we expect SDKs to emit by default:
+- request.start, request.end, request.error (with error_code), stream.ping, stream.resume_attempt, batch.emit_size, auth.token_refresh.
+
+Minimal PromQL examples (Redwood telemetry/Prometheus):
+- p95 request latency by model: histogram_quantile(0.95, sum(rate(request_duration_seconds_bucket{job="runtime", model=~".*"}[5m])) by (le, model))
+- batch wait > 200ms rate: sum(rate(batch_wait_ms_bucket{job="runtime"}[5m])) by (le)
+- token cost trend (per hour): increase(token_cost_total[1h])
+
+Trace-level triage checklist (ordered)
+
+1) Reproduce the problem locally with customer inputs (if available) or similar seed prompts.
+2) Identify call pattern: single-shot, streaming, batch, prefetch.
+3) Pull request-level trace from dx-telemetry or request-id. Typical CLI:
+
+```
+redwood dx trace get --id=<request-id> --since=2h
+```
+
+4) Inspect the fields: client_sdk_version, user_agent, batch_size, batch_wait_ms, model_variant, kernel_hint, auth_principal.
+
+5) If streaming: check stream.ping and stream.resume_attempt events and server-side stream timeout (default 60s).
+
+Canonical issues, triage notes, and fixes
+
+A) Symptom: Streaming disconnects after ~60s of silence
+- Likely cause: intermediary load balancer or client-side idle timeout.
+- Evidence: trace shows no stream.ping events, server sent keepalive but client-side closed socket.
+- Fix (fast): enable SDK heartbeat/ping at 30–45s and increase server keepalive grace to 90s for affected tenant.
+- Fix (permanent): update SDK default to heartbeat=45s and add documentation snippet for proxies (NGINX/Envoy) to set proxy_read_timeout >= 120s.
+
+B) Symptom: Overnight cost spike with many small embedding calls
+- Likely cause: embedding calls executed per keystroke or per-character due to unguarded client loop.
+- Evidence: token_cost_total and embedding_call_count spiked; many identical inputs; cache miss rate high.
+- Fix: add client-side debounce to embedding requests (250–500ms), enable local LRU cache with TTL 5m, and add server-side quota alert rule: rate(embedding_call_count[5m]) > threshold triggers paging to on-call.
+
+C) Symptom: High p50 but normal p95 latency
+- Likely cause: batching window too aggressive — some requests wait for window to fill, others go through fast.
+- Evidence: batch_wait_ms histogram shows bimodal distribution; batch_size variance high.
+- Fix: decrease bundling window for latency-sensitive routes (from 250ms to 20ms) or split critical route to dedicated route with direct non-bundled path.
+
+D) Symptom: Deterministic JSON parse error from model output
+- Likely cause: model occasionally emits trailing tokens that break strict JSON parsing.
+- Evidence: request response bodies contain JSON + stray characters on retries.
+- Fixes: (1) apply tolerant parser on client that strips trailing non-JSON characters; (2) use the model function-calling schema (structured output) when strict structured output required; (3) enable server-side output normalization hook for pinned model versions.
+
+E) Symptom: Frequent 429s after SDK upgrade
+- Likely cause: SDK changed retry/backoff or concurrent connection defaults.
+- Evidence: spike in client concurrent_connections, rate of retries increased.
+- Fix: rollback SDK to previous version or change SDK config: set retries=2, backoff_base=300ms, max_concurrency=10. Communicate recommended config in release notes.
+
+F) Symptom: Duplicate completions (same request returned twice)
+- Likely cause: misapplied idempotency key or client-side race where retry occurs after partial success.
+- Evidence: two request IDs with identical payload and different timestamps; server logs show first request succeeded but client retried.
+- Fix: adopt per-request idempotency_key and server-side dedupe window (60s). Update SDK to surface idempotency_key generation helpers.
+
+Runbook: Immediate mitigations for customer-impacting incidents
+
+1) If customer is blocked (broken UX): temporarily flip to a known-good route/model via the routing API:
+
+```
+redwood routes set --tenant=<tenant> --route=/chat --model=gptx-lite-v1 --mode=direct
+```
+
+2) If cost runaway: pause non-critical tenants or disable embeddings pipeline for tenant:
+
+```
+redwood tenant suspend-ops --id=<tenant> --ops=embeddings
+```
+
+3) If latency outlier: enable temporary dedicated burst pool for tenant (5 GPUs) and increase priority:
+
+```
+redwood capacity allocate --tenant=<tenant> --pool=burst --gpus=5 --priority=high
+```
+
+4) Communicate: post incident-specific status and a minimal repro to #dx-oncall Slack and to the customer within 30 minutes with the mitigation and ETA for a fix.
+
+SDK code examples and recommended config snippets
+
+- Example robust streaming client (pseudo-JS):
+
+```
+const client = new RedwoodSDK({heartbeatMs: 45000, resume: true, retries: 2, backoffBaseMs: 500});
+const stream = await client.stream.create({model: 'redwood-gen-v1', prompt: userPrompt});
+stream.on('token', t => render(t));
+stream.on('ping', () => stream.send({type: 'keepalive'}));
+stream.on('closed', async meta => { if(meta.resumeable) await client.stream.resume(meta.resume_id); });
+```
+
+- Example bundling config (YAML):
+
+```
+bundler:
+  enabled: true
+  window_ms: 20
+  max_items: 16
+  max_tokens: 16000
+```
+
+- Example telemetry event (JSON) for request.start:
+
+```
+{
+  "event": "request.start",
+  "client_sdk_version": "1.8.0",
+  "route": "/chat",
+  "model": "redwood-gen-v1",
+  "user_id": "u-1234",
+  "trace_id": "t-abcdef"
+}
+```
+
+Checklist for SDK authors before release
+
+- Ensure telemetry events above are emitted for all call patterns.
+- Confirm default bundling window is documented with guidance for latency vs cost.
+- Add examples for proxy keepalives (NGINX/Envoy) in README.
+- Run the SDK through the devx-chaos harness (link: /confluence/eng-developer-experience/quickstarts-and-templates/sdk-chaos-testing-and-resilience-experiments-2026).
+- Include migration notes when changing retry/backoff defaults.
+
+Ownership and escalation
+
+- Owner: Developer Experience SDK Team (dx-sdk). Primary on-call: dx-oncall rotation.
+- Escalation: dx-oncall -> eng-sre -> runtime-team for kernel/model issues.
+- Related pages: /confluence/eng-serving-runtime/profiling-playbook/, /confluence/eng-developer-experience/support-top-issues/, /confluence/eng-developer-experience/api-examples/
+
+Appendix: sample queries and thresholds we use in alerts
+
+- Alert: streaming.disconnect_rate > 0.02 for 10m -> page dx-oncall
+- Alert: embed_call_rate_per_tenant > 1000/min -> create high-priority ticket and throttle tenant
+- Alert: p95_latency(model="redwood-gen-v1") > 800ms for 5m -> page eng-sre
+
+Table: quick reference fixes
+
+| Symptom | Immediate mitigation | Long-term fix | Owner |
+| --- | --- | --- | --- |
+| Streaming disconnects | increase client heartbeat to 30s | update SDK defaults & proxy docs | dx-sdk |
+| Cost spike embeddings | debounce client + enable cache | TTL-based cache + quota | dx-sdk + billing |
+| High batch wait | reduce bundling window for route | route split to dedicated low-latency pool | dx-sdk + runtime |
+| JSON parse errors | tolerant parser | function-calling schema | dx-sdk + model-onboarding |
+
+Notes and history
+
+- 2026-10-15: initial draft by Elena Kim.
+- 2026-12-11: added embedding cost mitigation and debounce recommendation after two customer incidents.
+- 2027-02-20: promoted to published after reviewer approvals and added CLI mitigation commands.
+
+If you have additional canonical fixes to add, file a PR to this page and ping dx-sdk for review.

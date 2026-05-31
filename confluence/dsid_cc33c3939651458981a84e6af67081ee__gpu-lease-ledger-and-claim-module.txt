@@ -1,0 +1,160 @@
+GPU Lease Ledger and Claim Terraform Module
+
+Summary:
+
+This document describes the design, Terraform module interface, CI/CD promotion workflow, and operational runbook for the `gpu-lease-ledger` pattern: a lightweight, auditable, cross-account GPU capacity claim and lease ledger implemented as an IaC module and runtime sidecar service. The goal is to provide tenants and internal teams a single, idempotent API for reserving fractional or whole GPUs, recording metadata (owner, project, business unit, egress budget), and enforcing eviction/TTL semantics across mixed cloud accounts.
+
+Motivation:
+
+- We frequently need short-lived, preemptible, and long-lived GPU allocations across multiple cloud accounts and namespaces. Existing ad-hoc scripts and per-team state cause drift, untracked capacity, and billing surprises.
+- A canonical, Terraform-first lease ledger reduces out-of-band bookkeeping, makes claims reproducible, and enables automated reconciliation with billing exports and the capacity allocator.
+
+Goals (non-exhaustive):
+
+1. Provide an opinionated Terraform module that installs a lease ledger CRD or Dynamo/Spanner-backed table depending on cloud provider.
+2. Attach per-claim annotations: tenant_id, project, environment, requested_gpus (float allowed for fractional sharing), lease_ttl, priority, egress_bucket_id, and billing_center.
+3. Expose a read/write API for compute schedulers and CI/CD pipelines to request and release leases without hand-editing state.
+4. Emit events for reconciliation and alerting (claim_created, claim_released, claim_evicted, ttl_expired).
+
+Non-goals:
+
+- Not a replacement for tenant-level quota and billing enforcement in the billing stack. The ledger is a source of truth for ephemeral allocations; billing reconciliation remains separate.
+
+Design overview:
+
+- Terraform module (single module with provider adapters)
+  - Installs either: a Kubernetes CRD + controller (for private clusters) OR a managed table (DynamoDB / Cloud Spanner) + Lambda/Cloud Function controller (for cloud-tenant orchestration).
+  - Optionally creates a small REST/gRPC sidecar service per region responsible for TTL sweeps and eviction decisions.
+  - Provides outputs consumed by the cluster autoscaler and tenant schedulers.
+
+- Claim lifecycle (high level):
+  1. Requestor calls the module-managed API (via CLI or client library) with a claim spec.
+  2. Controller validates request (permissions, per-tenant max GPUs hard/soft limits).
+  3. Ledger records claim with unique id, TTL, and priority.
+  4. Scheduler or runtime system consumes the claim and binds workload -> node.
+  5. On release or TTL expiry controller clears the claim and emits an event.
+
+Security and access control:
+
+- Claims are namespaced by tenant_id and require short-lived signed tokens to create or release (OIDC or mTLS).
+- Terraform module includes IAM roles/policies allowing the controller to read/write the ledger but limiting broad table access.
+- Audit logging is mandatory: every mutation must be auditable with who/when/reason fields.
+
+Terraform module interface (inputs/outputs):
+
+Table: Inputs
+- name: module name (string)
+- provider_mode: "k8s" | "dynamo" | "spanner" (string)
+- region: primary region (string)
+- replication_regions: comma-separated regions (string)
+- default_ttl_seconds: default claim TTL (integer as string)
+- fractional_sharing_enabled: true|false (string)
+- eviction_policy: "soft" | "hard" (string)
+- max_claims_per_tenant: integer (string)
+- audit_log_sink: ARN or logging destination (string)
+- iam_service_account: existing SA/role to run controller (string)
+- tags: freeform list of tags (comma separated) (string)
+
+Table: Outputs
+- ledger_endpoint: URL or CR name (string)
+- controller_service_account_arn: (string)
+- sample_claim_cli: Example CLI invocation (string)
+- terraform_module_version: module semver (string)
+
+Operational runbook (page-friendly steps):
+
+1) Incident: "Failed to create claim - 409 or 500"
+   - Check controller logs: `kubectl -n infra logs deploy/gpu-lease-controller` OR Cloud Function logs.
+   - Verify ledger table health: look for throttling metrics and read capacity units.
+   - If throttled: scale table or enable autoscaling per provider documentation.
+   - If controller reporting permissions error: inspect IAM role bound to controller.
+
+2) Incident: "Stale claims after node failure"
+   - Run reconciliation: `terraform apply` is NOT sufficient. Use the controller's manual reconcile endpoint: POST /reconcile?force=true (or run the provided CLI `rwl lease reconcile --force --region`).
+   - Check claim.last_heartbeat timestamp and the controller's eviction thresholds.
+   - If reclaiming capacity will cause disruption, release claim with a documented reason and contact the owner.
+
+3) Incident: "Unexpected evictions during high-priority run"
+   - Verify TTL and priority values. High priority claims should have `priority=production` and a `lease_ttl` >= expected runtime.
+   - Check autoscaler logs to ensure scale-up occurred in time. If not, raise an alert to oncall to increase warm-pool count for the tenant.
+
+CI/CD promotion workflow (how module changes make it to prod):
+
+- Branch: feature/* with module code and integration tests in `infra/terraform/modules/gpu-lease-ledger`
+- PR must include: unit tests for HCL validations, a plan output snapshot for the drift test harness, and a small e2e test that provisions the module in a non-prod account and runs the controller image from the canary repo.
+- Buildkite pipeline steps (example):
+  1. terraform fmt/lint/checks
+  2. `terratest` unit and integration suite (parallel)
+  3. plan and post to PR comment (via infra-bot)
+  4. after merge: canary apply to `staging` account (manual approval)
+  5. monitor metrics for 24h: creation latency, write error rate < 0.1%, TTL sweep success rate > 99%
+  6. promote to `prod` account via gated release job (requires two approvers from infra-sre team)
+
+Migration and rollout notes:
+
+- For existing ad-hoc ledgers, use the provided importer tool (scripted in `scripts/import_claims.py`) that reads CSV/Billing exports and creates equivalent claims with `state=imported` and conservative TTLs.
+- Run a reconciliation job in dry-run mode for 48 hours to compare expected vs observed allocations.
+- A migration cutover checklist is provided in the appendix.
+
+Metrics and SLOs to monitor (suggested):
+
+- Claim API latency (p50/p95/p99): target p95 < 120ms for simple creates in-host region.
+- Write error rate: < 0.1% over 1h windows.
+- TTL sweep success ratio: >= 99% over 24h.
+- Reconciliation drift percentage: percent of claims without bound node after 10 minutes < 0.5%
+- Audit log completeness: percent of mutations with actor metadata present = 100%
+
+Billing and cost controls:
+
+- Each claim writes a `billing_center` and `estimated_gpu_hours` field. The capacity chargeback export job consumes ledger snapshots hourly and pushes approximate costs into the internal ledger used by finance.
+- The module emits a cost-estimate output that is consumed by the self-serve provisioning portal during the approval step.
+
+Appendix A — sample claim JSON (API example):
+
+{
+  "claim_id": "clm-20260219-7a2f",
+  "tenant_id": "tenant-42",
+  "project": "image-sim",
+  "requested_gpus": "0.25",
+  "lease_ttl_seconds": "10800",
+  "priority": "staging",
+  "egress_bucket_id": "egress-07",
+  "billing_center": "platform-engineering"
+}
+
+Appendix B — sample Terraform module invocation (HCL snippet):
+
+module "gpu_lease_ledgers" {
+  source = "git::ssh://git@github.com/redwood/infra-modules.git//gpu-lease-ledger?ref=v1.2.0"
+  provider_mode = "dynamo"
+  region = "us-west-2"
+  replication_regions = "us-east-1,eu-west-1"
+  default_ttl_seconds = "7200"
+  fractional_sharing_enabled = "true"
+  eviction_policy = "soft"
+  max_claims_per_tenant = "200"
+  audit_log_sink = "arn:aws:logs:us-west-2:123456:log-group:gpu-lease-audit"
+}
+
+Owners and escalation paths:
+
+- Module owner: eng-infra/terraform team (primary: Priya Nair)
+- Controller runtime: eng-serving-runtime (oncall: gpu-runtime-pager)
+- Billing reconciliation: finance-ops (contact: Diego Martinez)
+- For urgent production outages open a P1 incident and follow the standard oncall runbook.
+
+Appendix C — migration cutover checklist (short):
+
+1. Run importer in dry-run and inspect delta report.
+2. Apply module to staging, verify controller registers and emits metrics.
+3. Run reconciliation job and fix mismatches.
+4. Schedule quiet-window cutover with affected tenants.
+5. Flip read-only -> authoritative flag and monitor 72 hours.
+6. Post-mortem and lessons learned.
+
+Notes and future work:
+
+- Future features under consideration: GPU affinity hints, cost-driven eviction, integrated per-tenant warm pools, and a webhook-based notification system for claim lifecycle events.
+- Long-term: integrate ledger events into the central event bus and let analytics compute true per-token inference cost mappings.
+
+If you plan to use this module, follow the CI/CD promotion workflow and ping `#infra-terraform` on Slack with the module PR.

@@ -1,0 +1,184 @@
+Runtime Coordinator and Hardware Affinity Playbook
+
+Overview
+=======
+This playbook documents the Runtime Coordinator (rcd) component and the hardware-affinity model used to bind inference requests to physical accelerator resources. It covers architecture rationale, scheduler integration, kernel hinting, profiling recipes, benchmarking guidance, release notes for the coordinator v1.3.0, operational runbooks, and a short known-issues catalog. It is intended for runtime engineers, SREs, and performance-focused ML engineers who operate Hybrid GPU pools (mixed vRam / NVLink topologies) and want predictable latency/cost tradeoffs.
+
+Goals
+-----
+- Provide a deterministic affinity model that preserves tail-latency SLOs while improving throughput and utilization.
+- Make kernel-selection and device placement decisions observable and reversible.
+- Offer repeatable profiling and benchmarking guidance so changes to affinity heuristics can be validated.
+- Provide clear runbook actions for common failure modes related to affinity and coordinator decisions.
+
+Quick summary of decisions
+--------------------------
+- Affinity is scored using a weighted vector: (Topological proximity, free_memory_fraction, current_kernel_compat_score, recent_error_rate). We bias toward proximity if expected sequence length > 512 tokens.
+- The Runtime Coordinator exposes a declarative affinity-profile per deployment that can be tuned (e.g., latency-first, cost-first, isolation-first).
+- Kernel hinting metadata travels with the request header (X-Runtime-Kernel-Hint) and is used to pick precompiled kernels; fallback path is explicit and logged.
+
+Architecture and data flow
+--------------------------
+1) Ingress receives request -> classifier extracts route, model, latency tier, and expected sequence length.
+2) Coordinator consults the Affinity Engine to rank candidate devices.
+3) Coordinator requests a kernel reservation from Kernel Broker for the scored device.
+4) If kernel reservation succeeds, the request is dispatched; if not, coordinator tries the next device or triggers fallback routing policy.
+
+Key components
+- Runtime Coordinator (rcd): decision engine implementing affinity policies, placement scoring, and escalation/fallback logic.
+- Affinity Engine: in-memory topology graph + historical metrics (eviction rates, kernel success).
+- Kernel Broker: lease manager for in-memory kernels and residency state (hot / warmed / cold).
+- Device Telemetry Adapter: exposes device metrics (mem, temperature, PCIe bandwidth) into the Affinity Engine.
+
+Affinity model and scoring
+-------------------------
+Scoring vector (each normalized 0..1):
+- topology_proximity (0.5 weight): 1.0 for GPU on same NUMA socket + NVLink; 0.6 for same server different NUMA; 0.2 for different host.
+- free_memory_fraction (0.25 weight): fraction free after reserving estimated KV cache + prompt payload.
+- kernel_compat_score (0.15 weight): historical success ratio for model-variant + quantization combo.
+- recent_error_rate (0.10 weight, inverted): recent failure rate (lower is better).
+
+Final score = weighted_sum; ties broken by LRU of last_use_timestamp to improve locality.
+
+Affinity Profiles (examples)
+- latency-first: topology_proximity=0.8, free_memory=0.1, kernel_compat=0.05, errors=0.05
+- cost-first: topology_proximity=0.2, free_memory=0.3, kernel_compat=0.3, errors=0.2
+- isolation-first: prefers devices with low cross-tenant memory usage, adds +0.2 safety bonus to devices with isolation flags set.
+
+Scheduler integration and kernel handoff
+--------------------------------------
+- The rcd integrates with the global scheduler using a lightweight RPC (gRPC) interface: AllocateDevice(request_meta) -> DeviceLease. DeviceLease includes device_id, kernel_hint, lease_ttl_ms.
+- Kernels are loaded lazily. Kernel Broker supports two strategies: optimistic prefetch (load on ranking) and conservative (load on assignment). Use optimistic for latency-first profiles and conservative for cost-first.
+- Handshake sequence (simplified):
+  1. rcd -> kernel broker: reserve kernel on device X
+  2. kernel broker -> device agent: pin kernel and return success/failure
+  3. If success, rcd marks device as reserved and dispatches request; otherwise rcd increments kernel_compat_bad counter and retries.
+
+Kernel hinting and contract
+--------------------------
+- Requests may carry an X-Runtime-Kernel-Hint header: format "model:variant:quantization". The coordinator uses this to prefer kernels but validates compatibility.
+- Kernel Broker exposes kernel metadata: {kernel_id, compiled_for_sm, quantized_bits, expected_workspace_bytes}.
+- Compatibility rules: compiled_for_sm must match device.sm_family OR kernel is marked multi-sm compatible. workspace_bytes <= device.free_workspace_limit.
+
+Profiling recipes (developer/SRE guidance)
+------------------------------------------
+Prerequisites: nsys, ncu (or ROCm equivalents), runtime debug build, traces enabled.
+
+1) Kernel-level latency hotspot
+- Step 1: Capture short trace at production traffic (10–60s) with sampling: `nsys profile --sample=cpu,gpu -o /tmp/rcd-kernel-trace`
+- Step 2: Use the trace to map kernel launch times to request ids (rcd correlator). Look for repeated long launches (>95th percentile).
+- Step 3: If kernel stalls appear on specific SM families, collect `ncu --target-processes=all` to inspect tensor core utilization and register spilling.
+
+2) PCIe / host-side stalls
+- Step 1: Inject a synthetic heavy-kv-evict workload using the benchmark harness (see Benchmarking Guidance) across co-tenants in a staging cluster.
+- Step 2: Collect perf counters on the host PCIe root port: `perf record -e pci:*` and cross-correlate with device telemetry.
+
+3) End-to-end latency attribution
+- Use the runtime's correlator to produce a waterfall trace. If kernel handoff retries are >1% of requests, the coordinator is a dominant contributor.
+
+Benchmarking guidance (how to validate changes)
+------------------------------------------------
+Goals: validate SLOs (p50/p95/p99), kernel success rates, and cost per token under representative mixes.
+
+Benchmark steps:
+1. Build synthetic workload with sequence-length distribution matching production (we provide a corpus builder tool: workload-corpus-gen).
+2. Run three profile passes: micro (single-GPU), rack (topology-aware, NVLink present), cluster (mixed types). Each pass should run 30 minutes minimum for stable percentiles.
+3. Metrics to collect: token/sec, p50/p95/p99 latency, kernel_fallback_rate, KV_cache_hit_ratio, device_multiprogramming_index (DMI).
+4. Validation gates: any change that increases p99 by >7% or kernel_fallback_rate by >0.5pp must be blocked and reviewed.
+
+Sample benchmark command (example)
+```
+benchmark-runner --corpus /bench/corpora/seq-dist-512.json --parallelism 200 --profile rack --out /tmp/bench-rcd-202609
+```
+
+Configuration table (recommended defaults)
+----------------------------------------
+|| config_key || default || notes ||
+| affinity.profile | latency-first | can be overridden per-tenant |
+| coordinator.max_retries | 3 | kernel reservation retries before fallback |
+| kernelbroker.prefetch | optimistic | set to conservative for cost-first experiments |
+| coordinator.lease_ttl_ms | 8000 | typical request TTL; tune for longer generation workloads |
+| affinity.topo_bias_threshold | 0.12 | minimum score delta to prefer topology |
+
+Release notes (rcd v1.3.0)
+-------------------------
+- New: Affinity profiles (latency/cost/isolation) configurable per-tenant.
+- New: Kernel hint header support and explicit fallback logging.
+- Improvement: Kernel Broker prefetch heuristics reduce p99 by 6% in mixed NVLink racks (internal benchmark).
+- Fix: Prevented a race where two rcd instances double-reserved the same kernel after a lease renew failure.
+
+Operational runbook: affinity-related incidents
+----------------------------------------------
+Incident type A: sudden p99 regression with high kernel_fallback_rate
+1. Detect: Alert when kernel_fallback_rate > 0.5% for 10m and p99 > baseline + 7%.
+2. Immediate mitigation: Switch tenant to conservative affinity profile (API call: `POST /v1/tenants/{id}/affinity?action=switch&profile=conservative`).
+3. If mitigation fails: Drain the affected device pool using the scheduler's drain API and route new requests to fallback pool.
+4. Postmortem: Collect traces, Kernel Broker logs, and device telemetry for the 30 minutes before incident.
+
+Incident type B: device-level OOM during assignment
+1. Detect: Device telemetry shows sudden free_memory_fraction drop and kernel_compat_score falls to 0.
+2. Mitigate: Immediately revoke leases to the device (rcd -> kernel-broker revoke) and trigger eviction script: `rcdctl evict --device {id} --grace 120s`.
+3. Recovery: Reimage device agent if OOM persists after eviction; escalate to HW team if host-level memory errors persist.
+
+Incident type C: PCIe saturation causing multi-tenant latency spikes
+1. Detect: host_pcie_util > 85% correlated with crostalk in tenant latencies.
+2. Mitigate: Reduce parallelism for co-located tenants via token-based admission: `rcdctl set-parallelism --tenant {id} --value 0.6` (reduces allowed concurrent slots).
+
+Known issues (short catalog)
+---------------------------
+- PCIe-root-port-saturation-eviction(2026-07): observed when large KV cache flushes are scheduled simultaneously with cross-host prefetch. Mitigation: stagger prefetch windows and apply host-level preemption.
+- ephemeral-kernel-compile-time-deadlock(2026-03): rare deadlock in the kernel compilation pool leading to stalls when two incompatible quantization requests race. Workaround: restart kernel-broker service; patch in v1.3.1 planned.
+- nvlink-failover-delay(2025-11): NVLink path failover can add 1–3ms to p95 during hardware link reconfiguration; translated into affinity score jitter. We added smoothing in the scoring logic to avoid thrash.
+
+Signals and SLOs to watch
+------------------------
+- SLOs: p50 <= 15ms (small models), p95 <= 60ms, p99 <= 150ms (production defaults; tenant configs may differ).
+- Signals: kernel_fallback_rate, kernel_reserve_latency, device_eviction_rate, kvcache_hit_ratio, device_pcie_util.
+
+Rollout checklist for affinity changes
+-------------------------------------
+1. Add unit tests for score vector math and tie-breaking.
+2. Run microbench + rackbench in staging with production traffic replay.
+3. Deploy canary to 5% of traffic with conservatively higher telemetry sampling.
+4. Wait 48 hours, validate gates (p99, fallback rate, cost delta).
+5. Gradually ramp to 25%, 50%, 100% while monitoring.
+
+Operational ownership and contacts
+----------------------------------
+- Primary owner: eng-serving-runtime (pager: #eng-runtime-oncall).
+- Secondary escalation: infra-gpu-team.
+- Performance review contact: Priya Nair (priya@redwood.ai).
+
+Related pages and artifacts
+---------------------------
+- Runtime observability contract (link internal: /confluence/eng-serving-runtime/team-wiki/runtime-observability-data-model-and-tracebook-2026)
+- Kernel Broker API spec (internal link: /confluence/eng-serving-runtime/kernel-and-scheduling/kernel-broker-api-2025)
+- Benchmark corpora (s3://redwood-bench/corpora/seq-dist-512.json)
+
+Appendix: example affinity profile YAML
+-------------------------------------
+```
+# latency-first profile
+profile_name: latency-first
+weights:
+  topology_proximity: 0.8
+  free_memory_fraction: 0.1
+  kernel_compat_score: 0.05
+  recent_error_rate: 0.05
+preferences:
+  prefetch: optimistic
+  prefer_nvlink: true
+  max_retries: 3
+```
+
+Notes and next steps
+--------------------
+- Short-term: ship kernel-broker v1.3.1 with the compile-deadlock fix and improved lease renewal telemetry.
+- Medium-term: prototype a learned-scoring variant that incorporates request-level latency predictions from a lightweight model.
+- Long-term: integrate with Dedicated capacity planner so that affinity profiles can be used as a placement hint for reserved pools.
+
+Document history
+----------------
+- 2026-02-12: initial draft by Sofia Ramirez.
+- 2026-04-20: profiling recipes expanded (Liam Chen).
+- 2026-09-04: updated scoring weights and release notes (Priya Nair).

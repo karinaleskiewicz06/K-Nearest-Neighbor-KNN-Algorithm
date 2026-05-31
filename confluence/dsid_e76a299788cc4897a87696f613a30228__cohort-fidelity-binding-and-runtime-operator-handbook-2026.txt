@@ -1,0 +1,168 @@
+Cohort Fidelity Binding and Runtime Operator Handbook
+
+Summary
+-------
+This handbook defines the Cohort Fidelity Binding pattern: a runtime-first contract that ties request-level fidelity tiers (quality/cost tradeoffs) to kernel scheduling and execution behavior. It is intended for runtime operators, SREs, and runtime engineers who coordinate kernel selection, admission, and rollback across mixed-tenancy GPU pools.
+
+Scope
+-----
+- Applies to the inference serving runtime and scheduler components (kernel mapper, admission-controller, cohort manager).
+- Covers policy, observability, runbook procedures, benchmarking recommendations, and known failure modes.
+- Not intended for model training pipelines or control plane-only features.
+
+Why this exists
+----------------
+We observed production incidents where aggressive kernel choice and cross-tenant packing produced regressions in output fidelity (hallucination rate / quality) while improving token cost. Cohort Fidelity Binding formalizes the mapping so the scheduler can make safe, observable tradeoffs and platform teams can audit fidelity changes.
+
+Key concepts
+------------
+- Fidelity tier: a labeled quality-cost bucket (e.g., high, standard, low).
+- Cohort: a short-lived grouping of requests sharing affinity and fidelity constraints (per-customer/per-route/per-model variant).
+- Binding: immutable policy applied on cohort creation that constrains kernel family, quantization profile, KV cache behavior, and prefetch hints.
+- Degradation budget: a soft limit (percentage) of requests allowed to run at lower fidelity for cost/availability reasons.
+
+Architecture & Dataflow (overview)
+--------------------------------
+1. API / Ingress annotates requests with requested_fidelity and route metadata.
+2. Cohort Manager assigns a cohort id and materializes the binding (policy lookup + augmentation).
+3. Admission controller evaluates cohort binding against current capacity and SLOs.
+4. Kernel mapper selects a kernel candidate set that satisfies binding constraints.
+5. Execution runtime enforces kernel selection and emits binding telemetry.
+
+Scheduler Contract: required fields
+----------------------------------
+The scheduler must expose the following contract to the runtime:
+- cohort_id (string)
+- fidelity_tier (enum: high|standard|low)
+- kernel_hint (string list)
+- quant_profile (string)
+- allow_degradation (bool)
+- degradation_deadline_ms (integer; optional)
+
+Example scheduler policy (declarative YAML snippet)
+--------------------------------------------------
+```yaml
+policies:
+  - name: enterprise-high-fidelity
+    match:
+      route_prefix: /v1/generate/enterprise
+    binding:
+      fidelity_tier: high
+      kernel_hint: [cuda-fp16-opt, upward-attn-optim]
+      quant_profile: none
+      allow_degradation: false
+
+  - name: burst-standard-economy
+    match:
+      tag: burstable
+    binding:
+      fidelity_tier: standard
+      kernel_hint: [cuda-fp16, opportunistic-fusion-v2]
+      quant_profile: q4_0
+      allow_degradation: true
+      degradation_deadline_ms: 250
+```
+
+Operational observability (metrics & traces)
+-------------------------------------------
+Required metrics (emitted per cohort and per request):
+- runtime.cohort.count (counter, cohort lifecycle events)
+- runtime.binding.applied (gauge, 1 when binding enforced)
+- runtime.binding.kernel_candidates (histogram, candidate sizes)
+- runtime.fidelity.fallback_rate (ratio of requests served at lower fidelity)
+- runtime.fidelity.quality_regression_pct (derived; requires eval hooks)
+- kernel.selection.latency_ms (p95/p99)
+- request.kvcache.hit_ratio (per-cohort)
+Recommended traces must include: cohort_id, kernel_hint, quant_profile, decision_path and any cost estimates used.
+
+SLOs and thresholds (recommended defaults)
+-----------------------------------------
+- Per-route p95 latency target: 120ms for high fidelity; 180ms for standard; 300ms for low.
+- Maximum fallback_rate (daily rolling): 0.5% for high; 2.5% for standard; 10% for low.
+- Quality regression alert: >0.3% increase in regression_pct over 24h baseline triggers P1 review.
+
+Runbook: Fidelity-binding incident diagnosis (step-by-step)
+---------------------------------------------------------
+1. Detect: Alert fired for fidelity.quality_regression_pct or sudden spike in fallback_rate.
+2. Triage: Open incident page and capture cohort_id(s) from alert.
+3. Inspect binding: `redwoodctl runtime cohorts get <cohort_id>` — confirm fidelity_tier and kernel_hint.
+4. Correlate kernels: query `runtime.kernel.selection` traces for the cohort to see which kernel variant was selected.
+5. Compare with golden eval set: execute the prompt set against the original (previous) kernel variant in the sandbox to reproduce regression.
+6. If regression reproduced: run rollback path (see Remediation). If not: escalate to research/ML for model behavior analysis.
+
+Remediation actions (ordered)
+---------------------------
+1. Soft rollback: update cohort binding to prefer the previous kernel family (CLI):
+   - `redwoodctl runtime binding update --cohort <id> --kernel_hint \"cuda-fp16-opt\" --force`
+2. Block new cohorts using same binding: set policy to `allow_degradation: false` and throttle via admin flags.
+3. Canary test: create a shadow cohort with `fidelity_tier: high` and replay 1% traffic to validate.
+4. If kernel-level bug suspected: pin kernel version on affected nodes and open kernel-rollout ticket.
+5. Postmortem and prevention: add targeted evals to the continuous harness and add a specific regression alert.
+
+Example CLI snippets
+--------------------
+- List active cohorts: `redwoodctl runtime cohorts list --since 1h`
+- Get cohort: `redwoodctl runtime cohorts get <cohort_id> --format yaml`
+- Force binding update: `redwoodctl runtime binding update --cohort <cohort_id> --set quant_profile=q4_1`
+
+Benchmarking protocol for fidelity changes
+-----------------------------------------
+1. Baseline capture: run 10k requests distribution-matched to production for both current kernel and proposed kernel. Capture latency, p95/p99, token costs, KV hit ratios, and quality metrics (BLEU / ROUGE / eval prompts pass-rate).
+2. Statistical test: require p95 latency not worsen by more than 5% and quality pass-rate delta <= 0.2% (for high fidelity) before rollout.
+3. Stress test: emulate mixed-tenancy packing at 75–125% of expected concurrency to validate eviction and preempt behaviors.
+4. Shadow run: deploy for 24h with shadowing on 5% of traffic and automated regression gating.
+
+Profiling playbook (when fidelity regressions are intermittent)
+------------------------------------------------------------
+- Stratified sampling: collect traces stratified by cohort_id, input_length_bucket, and token_entropy_bucket.
+- Kernel microbenchmarks: run the microbenchmark harness with identical sequence lengths and kvcache warmness to isolate kernel variance.
+- Repro harness: use deterministic seeds and model weights pinned to the version used in production; log full random seed and kernel launch config.
+- Signal enrichment: correlate GPU SM util, PCIe latency, nvlink errors and kernel selection decisions.
+
+Known issues and cautions
+------------------------
+| Issue | Symptom | Temporary mitigation | Owner |
+|---|---|---|---|
+| q4_0 small-batch quality variance | Occasional 0.2–0.5% model-quality drop on short inputs | Prefer q4_1 for short sequence cohorts; adjust prefetch policy | inference-runtime-team |
+| kernel-v2 dispatch floor | Increased selection latency p99 during high churn | Increase kernel_mapper cache TTL to 30s | kernel-team |
+| kvcache-staleness-after-eviction | Stale KV reads cause token misalignment in long chats | Force warmup-pass for long-lived cohorts; conservative eviction for high-fidelity | runtime-sre |
+
+Rollout checklist for new fidelity bindings
+-----------------------------------------
+- [ ] Define binding YAML and unit tests
+- [ ] Add cohort-level eval set and backfill baseline metrics
+- [ ] Run synthetic benchmark at 1x/2x concurrency profiles
+- [ ] Shadow 5% traffic for 24h with regression gating
+- [ ] Coordinate with kernel team to schedule rollout window
+- [ ] Monitor metrics for 48h and run manual spot-checks on failing prompts
+
+Operational responsibilities and ownership matrix
+------------------------------------------------
+- Cohort Manager code/contract: runtime-core (owner)
+- Scheduler policy validation and tooling: kernel-and-scheduling (owner)
+- Quality/eval harness for cohort regressions: applied-ml-and-evals (owner)
+- Incident remediation and rollout: eng-sre + runtime-core oncall (owners)
+
+Appendix: example minimal binding JSON (for API)
+------------------------------------------------
+```json
+{
+  \"cohort_id\": \"c-20260112-abc123\",
+  \"fidelity_tier\": \"standard\",
+  \"kernel_hint\": [\"cuda-fp16\"],
+  \"quant_profile\": \"q4_1\",
+  \"allow_degradation\": true
+}
+```
+
+References and links
+--------------------
+- Runtime scheduler policy language: /confluence/eng-serving-runtime/kernel-and-scheduling/scheduler-policy-language-declarative-profiles-2026
+- Fidelity rollout playbook: /confluence/eng-serving-runtime/runbooks/quantization-rollout-safety-and-quality-gate-playbook-2026
+- Continuous eval harness: /confluence/applied-ml-and-evals/eval-harness/continuous-eval-harness-2025
+
+Change log
+----------
+- 2025-09-15: initial draft (Maya Chen)
+- 2025-11-03: added benchmarking protocol and CLI snippets (Arjun Patel)
+- 2026-01-12: published with runbook steps and ownership matrix (Maya Chen)

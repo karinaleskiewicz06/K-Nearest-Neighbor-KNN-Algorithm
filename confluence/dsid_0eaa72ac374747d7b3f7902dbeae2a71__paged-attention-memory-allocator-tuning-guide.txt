@@ -1,0 +1,133 @@
+Paged Attention Memory Spikes (OOM) — Allocator & Block Manager Tuning Guide
+
+## Overview
+This page documents a recurring production failure mode for paged-attention model shards: GPU memory spikes and occasional OOMs under high concurrency and long KV cache lifetimes. The issue typically manifests as allocation storms (cudaMalloc/cudaFree) triggered by frequent block-manager compaction sweeps, leading to fragmentation and latency tail regressions.
+
+This guide consolidates what we learned from the initial canary regressions (runtime rollout around commit f3a9b2c) and subsequent fixes shipped in later runtime releases.
+
+## Symptoms
+### What you’ll see
+- Sudden GPU memory spikes on specific shards (often correlated with high QPS and long-running sessions).
+- Latency tail regression (p99/p999) coincident with allocator activity.
+- OOMs shortly after a series of compaction events.
+
+### Representative log snippet
+```
+W blockmgr: compacting 24 blocks -> moved 18, freed 6, compaction_cost_ms=42
+I kvcache: reserve_block(0x7f8c) -> size=256k
+E allocator: cudaMalloc failed after 3.1s, retrying
+OOM on device 0, requested 1.2GB
+```
+
+## Root causes (most common)
+1. **Fragmentation + small allocation churn**
+   - Default allocator path issues many device allocations when compaction moves blocks and temporary attention buffers are not reused.
+2. **Allocator arena/pool too small for workload**
+   - A small arena leads to frequent device allocations under sustained load.
+3. **Aggressive compaction behavior**
+   - Compaction that attempts to move too many blocks in a single sweep can create a cascading allocation burst.
+
+## Immediate mitigations (recommended order)
+### 1) Enable CUDA async pool allocator (cudaMallocAsync)
+**When to use:** Any paged-attention deployment where compaction frequency is non-trivial (most high-QPS clusters).
+
+**Why it helps:** Reduces cudaMalloc/cudaFree storms by routing allocations through a pool.
+
+**Caveats:**
+- cudaMallocAsync changes lifetime semantics. Buffers must be returned promptly to avoid pool bloat.
+- Pool fragmentation is still possible when block sizes are highly variable.
+
+### 2) Increase allocator arena size
+Empirically, increasing the per-GPU arena/pool reserve reduces allocation hot-path noise.
+
+**Current guidance (2026-02):**
+- Start at **256MB** per GPU for mid-size models (e.g., OPT 2–7B class).
+- Use **512MB** per GPU for very high concurrency or long session lifetimes.
+
+Note: Our runtime defaults were raised after the initial incident; confirm your deployed version before overriding.
+
+### 3) Tune paged-attention block size
+Block size is a tradeoff:
+- Smaller blocks => more blocks => more compaction activity and allocation churn.
+- Larger blocks => fewer compactions and fewer allocations, but more internal slack (wasted memory in partially filled blocks).
+
+**Current recommendation:**
+- Prefer **512KB** blocks for most production workloads.
+- Avoid **1MB** unless allocation call counts dominate and you have headroom for internal slack.
+
+## Tuning results (reference)
+The following benchmark matrix (originally reproduced on redwood/opt-2.7b, seq_len=2048, steady QPS ~1200 on prod-ish canary) shows typical trends:
+
+```
+results:
+- block=256k + default alloc: p99=120ms, mem_peak=18.1GB, alloc_calls=1780
+- block=256k + async pool:   p99=90ms,  mem_peak=15.9GB, alloc_calls=320
+- block=512k + async pool:   p99=68ms,  mem_peak=16.8GB, alloc_calls=210
+- block=1MB   + async pool:  p99=72ms,  mem_peak=18.9GB, alloc_calls=140
+```
+
+Interpretation:
+- **Async pool** produces the biggest win by reducing allocation call volume.
+- **512KB blocks** typically minimize latency tail with acceptable memory footprint.
+- **1MB blocks** may reduce alloc calls further but can increase wasted memory.
+
+## Standard configuration (recommended starting point)
+### Runtime config (JSON)
+```
+{
+  "allocator": "cuda_async_pool",
+  "arena_size_bytes": 268435456,
+  "enable_workspace_reserve": true,
+  "paged_attn_block_size_bytes": 524288,
+  "compaction_max_relocate_fraction": 0.60
+}
+```
+
+Notes:
+- `arena_size_bytes`: start at 256MB; increase to 512MB if pool high-water repeatedly hits the cap during sustained traffic.
+- `paged_attn_block_size_bytes`: 512KB default is recommended unless a model has extreme KV sparsity.
+- `compaction_max_relocate_fraction`: safety guard to prevent compaction from attempting a massive sweep. Earlier experiments used 0.75; production experience showed 0.60 is safer under bursty loads.
+
+### Canary rollout guidance
+1. Enable flags on a small canary set (e.g., 5 nodes / <5% traffic).
+2. Observe for 24 hours:
+   - allocator call count (rate)
+   - pool high-water mark
+   - compaction runs and compaction duration
+   - OOM count and retry logs
+   - p99/p999 latency for affected routes
+3. If stable, roll out gradually in 25% increments.
+
+## Observability: what to measure
+Track these metrics (names may differ by runtime version; use the closest equivalent):
+- `alloc_call_count` (or `cuda_alloc_calls_total`)
+- `pool_high_water_bytes`
+- `pool_current_bytes`
+- `compaction_runs_total`
+- `compaction_cost_ms` (histogram)
+- `kvcache_reserved_blocks`
+- `oom_events_total`
+
+Red flags:
+- Rising `pool_high_water_bytes` with flat traffic suggests buffers are not being returned.
+- `compaction_runs_total` spiking during steady-state suggests block size too small or compaction thresholds too aggressive.
+
+## Troubleshooting checklist
+1. Confirm allocator mode
+   - Ensure the deployment is actually using `cuda_async_pool` (misconfigurations commonly fall back to default).
+2. Check arena/pool sizing
+   - If pool high-water reaches the configured max repeatedly, increase `arena_size_bytes`.
+3. Validate block size
+   - If compaction runs are frequent and move many blocks, try 512KB.
+4. Audit temporary buffers
+   - Ensure attention workspace buffers and temporary blocks are reused rather than reallocated each request.
+5. Compaction safety
+   - Confirm compaction guard is enabled to avoid single-sweep relocation bursts.
+
+## Release notes / behavioral changes
+- Enabling `cudaMallocAsync` changes how memory reuse behaves. Include a release note when toggling this on for customer-facing clusters.
+- Block-size changes can shift memory footprint slightly (often upward due to slack) even while reducing OOM risk.
+
+## Ownership and escalation
+- Owner: Serving Runtime (eng-serving-runtime)
+- Escalate to: #eng-runtime with (a) model name, (b) seq_len / concurrency, (c) allocator config, (d) compaction metrics snapshot, and (e) a 10-minute profiler capture if available.

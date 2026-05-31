@@ -1,0 +1,170 @@
+Partial-result Checkpointing and Client Resume Contract
+
+Summary
+-------
+This document defines a cross-service contract and operational playbook for partial-result checkpointing and client-driven resume for streaming inference calls. It provides a deterministic HTTP/WebSocket/HTTP/2 streaming contract that enables clients to tolerate transient connection failures, resume long-running generation requests, and reconcile partial outputs without risking duplicate side-effects or quality regressions. The contract balances developer ergonomics, predictable economics, and production safety for Redwood’s hosted and dedicated offerings.
+
+Scope
+-----
+Applies to API surfaces that provide: text generation streaming, structured output streaming (tables/records), long-running embeddings/rerank jobs with incremental progress, and any route that supports server-sent partial outputs (examples: /v1/generate.stream, /v1/chat.stream, /v1/rerank.stream).
+
+This specifically covers:
+- Wire-level semantics for checkpoints and resume tokens.
+- Idempotency requirements and server-side deduplication semantics.
+- Storage, retention, and encryption requirements for checkpoint artifacts.
+- Operational SLOs and alerting thresholds.
+- Client and server rollout and compatibility strategy.
+
+Motivation
+----------
+We observe that long-running streams (interactive assistants, long-form generation, batched rerank) are sensitive to transient network glitches and HTTP connection limits, which cause poor user experience or expensive restarts. Implementing a lightweight checkpoint/resume mechanism: reduces perceived latency, lowers token cost by avoiding full re-generation, and improves reliability for customers on poor networks or intermediate proxies.
+
+Goals (non-exhaustive)
+- Allow clients to resume a previously-started stream from the last acknowledged checkpoint.
+- Guarantee exactly-once external side-effect semantics for requests that produce side-effects (webhooks, downstream writes) via server-side gating.
+- Keep checkpoint storage small and short-lived by checkpointing only the minimal resume state (KV cache ID, consumed token count, model variant id, deterministic RNG seed if applicable).
+- Make the contract backward-compatible with clients that do not implement resume.
+
+Contract: Wire semantics and payloads
+----------------------------------
+1) Checkpoint messages
+- Servers MUST emit a stable checkpoint envelope at configurable intervals (default every 512 tokens or 10s, whichever comes first).
+- Checkpoint envelope fields (JSON):
+  - type: "checkpoint"
+  - checkpoint_id: string (UUIDv4)
+  - request_id: string (Redwood request id)
+  - model_variant: string
+  - token_offset: integer (number of tokens produced so far)
+  - kv_cache_ref: string (opaque id for server-side cache)
+  - truncated_output_hash: string (SHA256 of last emitted chunk to enable client reconciliation)
+  - expires_at: ISO8601 timestamp (checkpoint TTL)
+  - signature: string (HMAC-SHA256 of envelope using per-tenant key)
+
+Example checkpoint envelope (server -> client):
+{
+  "type": "checkpoint",
+  "checkpoint_id": "b8f3d8f8-3d2f-4d5a-9f2b-6a7c12c4e9bb",
+  "request_id": "r-2026-00012345",
+  "model_variant": "redwood-large-v2-quant",
+  "token_offset": 1536,
+  "kv_cache_ref": "cache://tenant-42/shard-17/ckpt-42",
+  "truncated_output_hash": "sha256:abcd...",
+  "expires_at": "2026-03-12T18:42:00Z",
+  "signature": "sig:..."
+}
+
+2) Resume requests
+- Client may initiate a resume by sending a ResumeRequest to the same endpoint (prefer HTTP/2 or WebSocket), passing the checkpoint_id and an optional client_ack_hash to indicate the last received chunk.
+- ResumeRequest fields (JSON):
+  - type: "resume_request"
+  - checkpoint_id: string
+  - client_ack_hash: string (optional)
+  - client_id: string
+  - request_metadata: map (opaque string kvs)
+  - desired_resume_window: integer (tokens; server may honor subset)
+
+Example ResumeRequest (client -> server):
+{
+  "type": "resume_request",
+  "checkpoint_id": "b8f3d8f8-3d2f-4d5a-9f2b-6a7c12c4e9bb",
+  "client_ack_hash": "sha256:abcd...",
+  "client_id": "web-6d2a",
+  "request_metadata": {"ui_session":"sess-123"},
+  "desired_resume_window": 1024
+}
+
+3) Server resume response
+- Server verifies signature and TTL. If valid, server responds with either:
+  - resume_accepted: provides a new stream that resumes generation from token_offset, or
+  - resume_denied: provides reason (expired, checkpoint-not-found, variant-mismatch) and optional best-effort fallback (restart token and cost estimate).
+- Servers must not resume across incompatible model variants; resume across quantization variants is allowed only if deterministic equivalence is guaranteed (see model-compatibility ledger).
+
+4) Idempotency and side-effect handling
+- For requests that may trigger external side-effects, servers MUST not replay side-effects on resume. Implement one of two modes chosen per-route:
+  - server-gated side-effects: the first successful finalization of the request generates an immutable side-effect token; clients must present this token when invoking any follow-up action.
+  - client-ack-guarded mode: side-effects are only emitted after explicit client acknowledgement of final chunk.
+
+5) Failure modes and reconciliation
+- If the client’s client_ack_hash does not match the server’s truncated_output_hash, server SHOULD emit a ‘divergence’ event containing the minimal suffix the client is missing and a suggested merge strategy.
+
+Operational requirements and configuration table
+------------------------------------------------
+| Key | Default | Unit | Description | Owner |
+|-----|---------|------|-------------|-------|
+| checkpoint.interval_tokens | 512 | tokens | Default token cadence for emitting checkpoints | inference-runtime |
+| checkpoint.interval_seconds | 10 | seconds | Time-based cadence upper bound | inference-runtime |
+| checkpoint.ttl_seconds | 86400 | seconds | Default checkpoint retention (24h) | storage-team |
+| checkpoint.max_size_bytes | 16384 | bytes | Max size of serialized checkpoint metadata | storage-team |
+| resume.auth_window_seconds | 300 | seconds | Time window after checkpoint creation where resume is allowed without re-authorization | identity |
+| resume.p95_restart_latency | 150 | ms | SLO for resuming and starting token emission after a resume request | eng-sre |
+| resume.max_parallel_resumes_per_tenant | 5 | count | Rate-limit per tenant to prevent abuse | quota-service |
+
+Storage and encryption
+- Checkpoints are stored in the checkpoint-store service (S3-compatible). All checkpoint metadata must be encrypted at rest with customer KMS, and signed with a per-tenant resume key. Checkpoint payloads must avoid storing user PII or full prompts unless configured by customer (private deployments).
+
+SLOs and alerts
+---------------
+- Resume success rate (per-tenant) >= 99.5% over 24h.
+- Resume p95 latency <= resume.p95_restart_latency (150ms default).
+- Checkpoint persistence latency (write to checkpoint-store) p99 < 200ms.
+- Alert if > 1% of resumed streams require full restart due to divergence in a 24h window.
+- Alert on checkpoint-store error rate > 0.5% sustained for 5 minutes.
+
+Observability and telemetry
+-------------------------
+- Emit events with standardized tags: checkpoint.emitted, checkpoint.persisted, resume.requested, resume.accepted, resume.denied, resume.divergence.
+- Each event must include: request_id, checkpoint_id, tenant_id, model_variant, route, token_offset, and p99 latency metric dimensions.
+- Trace spans: stream-gateway -> checkpoint-service -> inference-runtime -> checkpoint-store must be stitched with the same trace id for end-to-end debugging.
+
+Rollout and compatibility
+-------------------------
+1) Backwards compatibility
+- If an older client does not implement resume, server continues to emit checkpoints but ignores resume requests. The server must support default behavior of restarting from scratch with a clear restart-cost estimate.
+2) Canary rollout steps (recommended):
+  a) Implement server-side checkpoint emission behind a runtime flag (flag: checkpointing.enabled).
+  b) Enable for internal tenants only and run synthetic failover tests for 72h.
+  c) Gradually enable for 5% of external tenants, monitor resume success metrics and downstream cost delta.
+  d) Increase to 25% then 100% if thresholds met.
+3) Rollback plan: TTL reduction + immediate disable of checkpointing flag. Documented incident playbook in eng-platform/runbooks.
+
+Testing and validation checklist
+-------------------------------
+- Unit tests for checkpoint envelope creation and signature verification.
+- Integration tests: simulate connection interruption at token boundaries and mid-chunk; validate client resume produces the same final payload within tolerance threshold for structured outputs.
+- Chaos tests: drop TCP connections, simulate transparent proxies, and ensure resume success > 99.5%.
+- Cost regression: ensure average token cost delta after enabling resume < 3% (positive or negative).
+
+Security considerations
+----------------------
+- Ensure checkpoint signatures use per-tenant HMAC keys stored in KMS. Rotate keys with zero-downtime using dual-signature validation during rotation window.
+- Checkpoints must not expose raw secret keys, or PII unless explicitly enabled by customer and documented in private deployment configs.
+
+Appendix: example CLI flows and cURL
+-----------------------------------
+Emit stream (client):
+curl -N -H "Authorization: Bearer $REDWOOD_KEY" -d '{"prompt":"Write a long analysis...","stream":true}' https://api.redwood.ai/v1/generate.stream
+
+Resume flow (client):
+# client reads checkpoint_id from last message and issues resume
+curl -X POST -H "Authorization: Bearer $REDWOOD_KEY" -H "Content-Type: application/json" \ 
+  -d '{"type":"resume_request","checkpoint_id":"b8f3d8f8-3d2f-4d5a-9f2b-6a7c12c4e9bb","client_id":"web-6d2a","client_ack_hash":"sha256:abcd..."}' \ 
+  https://api.redwood.ai/v1/generate.resume
+
+Operational owners and contact
+----------------------------
+- inference-runtime: @inference-runtime-team (primary implementer)
+- checkpoint-store/storage-team: @storage-team (persistence, encryption)
+- stream-gateway: @edge-team (protocol / rate-limiting)
+- eng-sre: oncall for SLO violations and rollback.
+
+Related reading
+---------------
+- Model variant compatibility ledger (model-serving-standards/variant-compatibility-ledger-and-stewardship-protocol-2026)
+- Cost-aware streaming payload schema guideline
+- Runbook: stream-resume-incident-playbook (eng-platform/runbooks/stream-resume-incident-playbook)
+
+Revision history
+----------------
+- 2026-01-12: Initial draft by Maya Chen.
+- 2026-02-05: Added SLO thresholds and storage encryption detail (reviewers: Rohit, Liam).
+- 2026-03-05: Final edits and publication, clarified divergence reconciliation logic.

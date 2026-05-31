@@ -1,0 +1,415 @@
+Optimize Quality Gates — System Design (v1)
+
+## Summary
+This document describes the end-to-end system design for **Quality Guardrails Gating for Optimize**. The feature ensures that any Optimize recommendation that changes serving behavior (batching policy, prefix/KV cache settings, quantization profiles) is **blocked from production traffic** until it passes required quality evaluations (offline gates + optional online canary signals). The design includes:
+- Service boundaries and interactions (Optimize, eval-harness, Console, Rollout Controller)
+- Data model for gate runs and baselines
+- APIs and contracts
+- Gate run state machine: `pending` → `running` → `passed|failed` with `canceled|timed_out` and `overridden`
+- Failure modes, retries, and operational guardrails
+
+## Goals
+1. **Prevent silent quality regressions** from cost optimizations.
+2. Provide **consistent pass/fail gates** with statistical handling for variance and flaky prompt sets.
+3. Provide a **traceable audit trail**: what changed, why, what ran, artifacts, and who approved/overrode.
+4. Keep developer experience fast via **tiered gates** (smoke → full) and clear error reasons.
+5. Ensure **defense-in-depth enforcement**: block at apply boundary and also block rollout promotion.
+
+## Non-goals (v1)
+- Fully automated gating inside **Private/on-prem** deployments (documented manual workflow only).
+- Redesigning model onboarding / eval prompt set creation (we integrate with existing harness and sets).
+- Building new online evaluation systems; we only consume existing canary signals where available.
+
+## Definitions
+- **Candidate config**: the proposed config diff to apply to a route/model/hardware.
+- **Baseline config**: the currently active production config (or selected baseline for quantization per model family + GPU SKU).
+- **Gate tier**:
+  - **Smoke**: fast subset of prompt sets for quick feedback.
+  - **Full**: comprehensive suites required before production rollout/promotion.
+- **Gate policy**: rules mapping config change types + route/account tier → required tiers, thresholds, and who may override.
+
+## High-level architecture
+### Services
+- **Optimize Service** (control plane)
+  - Stores recommendations and proposed config diffs.
+  - Orchestrates gate runs and enforces blocking at apply boundary.
+  - Persists state machine, baseline selection decisions, and audit events.
+
+- **Eval Harness Service** (compute/orchestration)
+  - Executes offline evaluation runs given (baseline, candidate, prompt sets, metrics).
+  - Produces structured scores, deltas, and artifacts (logs, traces, sample outputs).
+  - Handles retries, reruns, and flake scoring.
+
+- **Rollout Controller**
+  - Manages canary → promotion workflows for serving config changes.
+  - Requires passed gates for promotion and triggers rollback/halt when gates fail.
+
+- **Console API / Console UI**
+  - Surfaces gate status and artifacts.
+  - Blocks one-click apply on failure.
+  - Supports override request/grant flows and audit views.
+
+### Data stores (logical)
+- Optimize DB (Postgres): authoritative source of gate state, policy decisions, and audit log pointers.
+- Artifact store (S3/GCS): eval artifacts referenced by IDs/URLs (access controlled).
+- Observability backend: metrics/traces/logs for gates and rollouts.
+
+### Request flow overview (text diagram)
+1) Optimize generates a recommendation → candidate config diff
+2) Optimize selects baseline + gate policy → creates GateRun (`pending`)
+3) Optimize triggers eval-harness → GateRun (`running`)
+4) Eval-harness executes suites → returns results + artifacts
+5) Optimize computes pass/fail, records decision + audit events
+6) Console displays results; Apply/Promote paths query GateRun state
+7) Rollout Controller blocks promotion if gate not `passed` (unless `overridden` with valid unexpired exception)
+
+## Supported config change types (v1)
+1. **Batching**
+   - e.g., max batch tokens, batch wait time, continuous batching enablement
+2. **Prefix / KV caching**
+   - e.g., cache enablement, cache capacity, eviction policy, prefix cache eligibility
+3. **Quantization profile**
+   - e.g., fp16 → int8, per-channel vs per-tensor, kernel selection profile
+
+## Design principles
+- **Authoritative gating decision lives in Optimize**, and is checked in multiple enforcement points.
+- **Eval-harness is deterministic by contract** with explicit versioning of suites and metrics.
+- **Policy-driven**: per route/account tier/model family; defaults are safe.
+- **Fail-closed** for production apply/promotion when gates are missing or unknown.
+- **Time-bounded overrides** with explicit reason and owner.
+
+## Data model
+All entities are stored in Optimize DB unless noted.
+
+### Entity: GateRun
+Represents a single gating evaluation attempt for a specific config diff.
+
+Fields (conceptual; column names may differ):
+- `gate_run_id` (UUID)
+- `recommendation_id` (UUID, nullable for manual changes)
+- `route_id` (string)
+- `account_id` (string, nullable for global defaults)
+- `model_id` (string)
+- `model_family` (string)
+- `hardware_sku` (string, e.g., "A100-80GB", "H100")
+- `change_type` (enum: batching|caching|quantization|mixed)
+- `baseline_config_ref` (string: pointer to config snapshot)
+- `candidate_config_ref` (string: pointer to config snapshot)
+- `config_diff_schema_version` (string)
+- `gate_policy_id` (string)
+- `gate_tier` (enum: smoke|full)
+- `state` (enum: pending|running|passed|failed|canceled|timed_out|overridden)
+- `result_summary` (string; compact human-readable summary)
+- `metrics_json_ref` (string; pointer to stored structured output blob)
+- `artifact_refs` (string; comma-separated artifact IDs/URLs; see “Artifacts”)
+- `flake_score` (number encoded as string for storage/reporting, e.g., "0.12")
+- `attempt` (int)
+- `created_by` (string: user/service)
+- `created_at` / `updated_at`
+- `expires_at` (nullable; used for overrides and for “stale results” policy)
+
+### Entity: GatePolicy
+Represents gating requirements and thresholds.
+- `gate_policy_id`
+- `scope` (route/account tier/model family)
+- `required_tiers` (string list encoding; e.g., "smoke,full")
+- `thresholds_ref` (string; points to metrics/thresholds doc version)
+- `min_sample_size` (string)
+- `max_runtime_seconds` (string)
+- `override_rules_ref` (string)
+- `created_at` / `updated_at`
+
+### Entity: GateDecisionEvent (Audit)
+Append-only audit log entries (also exported to the platform audit log stream).
+- `event_id`
+- `gate_run_id`
+- `event_type` (gate_created|gate_started|gate_completed|gate_failed|gate_passed|override_requested|override_granted|override_expired|apply_blocked|promotion_blocked)
+- `actor` (user/service)
+- `reason` (string; required for overrides)
+- `timestamp`
+- `metadata_ref` (string pointer to extended metadata)
+
+### Artifacts
+Artifacts are stored outside Optimize DB and referenced by ID/URL:
+- Per-suite result JSON
+- Aggregated metric deltas
+- Sample outputs (redacted as required)
+- Prompt set IDs + suite versions
+- Harness logs + execution metadata (region, worker type, runtime)
+
+## Gate run state machine
+### States
+- `pending`: created, waiting to be scheduled/triggered
+- `running`: eval-harness job started
+- `passed`: all required metrics within thresholds (after rerun/aggregation policy)
+- `failed`: one or more required metrics outside thresholds OR static validation failed
+- `timed_out`: harness did not complete within policy bound
+- `canceled`: user/system canceled (e.g., recommendation superseded)
+- `overridden`: exception granted; treated as “allow” but time-bounded and visible
+
+### Transitions
+- `pending` → `running` when Optimize successfully triggers eval-harness
+- `running` → `passed|failed` on completion
+- `running` → `timed_out` on wall-clock max runtime breach
+- `pending|running` → `canceled` if superseded by a newer candidate config or manual cancel
+- `failed` → `pending` only via explicit “re-run” action (new GateRun with incremented attempt)
+- `failed|timed_out` → `overridden` only via authorized override grant
+- `overridden` → (implicit) expiration; on expiry we do NOT revert the GateRun state, but enforcement treats the override as invalid
+
+### Important invariants
+- Apply/promotion checks treat **only** `passed` as clean allow.
+- `overridden` is an allow only if override is **unexpired** and actor is authorized.
+- Missing gate run or unknown state results in **block** for in-scope config changes.
+
+## Policy evaluation and baseline selection
+### Policy evaluation
+Policy selection is performed by Optimize using:
+- route/account tier (self-serve vs enterprise)
+- change_type (batching/caching/quant/mixed)
+- model_family + hardware_sku
+- environment (staging vs prod)
+
+If a change matches multiple policies, Optimize uses most specific match:
+1) account+route
+2) account
+3) route
+4) model_family+hardware
+5) global default
+
+### Baseline selection
+- For batching/caching changes: baseline is the **currently active production config** for that route/model/hardware.
+- For quantization profile changes: baseline must be chosen per **model_family + hardware_sku** to avoid comparing across incompatible kernels.
+  - Example: For Llama-family on H100, baseline is “current stable fp16 profile” pinned by runtime.
+  - If no baseline exists, gating is blocked and flagged as “baseline_missing” (requires Applied ML + Runtime action).
+
+## API design
+This section specifies external interfaces between services. Payload examples are illustrative and may evolve; schema versions are mandatory.
+
+### Optimize → Eval-harness: Trigger gate run
+**Endpoint**: `POST /v1/gates/runs`
+
+Required inputs:
+- gate_run_id
+- config_diff (candidate vs baseline) + schema version
+- baseline_config snapshot reference
+- candidate_config snapshot reference
+- suites to run (by prompt_set_id and suite_version)
+- metric definitions + threshold IDs
+- required tier (smoke/full)
+- runtime constraints (max_runtime_seconds, region affinity)
+
+Response:
+- harness_run_id
+- accepted_at
+- estimated_completion_seconds (optional)
+
+### Eval-harness → Optimize: Report completion
+**Endpoint**: `POST /internal/optimize/gates/runs/{gate_run_id}/complete`
+
+Outputs:
+- summary outcome (pass/fail + reason codes)
+- metric deltas with confidence intervals
+- flake_score
+- artifact references (IDs/URLs)
+- suite versions actually executed
+- execution metadata (region, worker type, retries performed)
+
+### Optimize internal: Query gate status (Console/Rollout Controller)
+**Endpoint**: `GET /v1/optimize/gates/runs/{gate_run_id}`
+Returns:
+- state
+- summary
+- started_at/finished_at
+- tier
+- gating policy reference
+- links to artifacts (or artifact IDs)
+
+**Endpoint**: `GET /v1/optimize/gates/status?route_id=...&model_id=...&candidate_config_ref=...`
+Returns the “effective gating decision” used by enforcement:
+- allow: true|false
+- allow_reason: passed|override_valid|not_in_scope
+- block_reason: gate_missing|running|failed|timed_out|override_expired|policy_error
+- gate_run_id (if exists)
+
+### Optimize: Apply config (enforced boundary)
+**Endpoint**: `POST /v1/optimize/recommendations/{id}/apply`
+Behavior:
+- For in-scope config types, server checks gating status.
+- If gate not passed (or valid override), returns 409 with:
+  - `block_reason`
+  - `gate_run_id`
+  - `next_actions` (e.g., re-run gate, request override)
+
+### Overrides
+**Endpoint**: `POST /v1/optimize/gates/runs/{gate_run_id}/override-request`
+- Creates a pending override request record (stored as audit events + metadata).
+
+**Endpoint**: `POST /v1/optimize/gates/runs/{gate_run_id}/override-grant`
+- Requires RBAC permission `optimize.gates.override.grant`.
+- Requires:
+  - reason (free text)
+  - expiration (max duration per policy)
+  - evidence links (e.g., incident, customer approval, eval artifacts)
+- Emits audit events and marks gate run as overridden.
+
+## Static validation (pre-gate)
+Before running expensive evals, Optimize performs static checks:
+- schema validation for config diff
+- runtime safety constraints (known unsafe combos)
+- compatibility checks (model_family, hardware_sku)
+
+If static validation fails:
+- GateRun transitions to `failed` with reason `static_validation_failed`
+- No eval-harness job is triggered
+
+## Execution model: tiered gates
+### Smoke gate
+- Runs small prompt subset targeting common failure modes.
+- Target wall clock: <= 8 minutes (p50), <= 15 minutes (p95)
+- Use when:
+  - batching/caching changes with low expected semantic impact
+  - early feedback in UI before committing to full gate
+
+### Full gate
+- Required before:
+  - production rollout promotion
+  - quantization profile changes
+  - any “risky” runtime knobs identified by runtime team
+- Target wall clock: <= 35 minutes (p50), <= 60 minutes (p95)
+
+Policy may require smoke + full, or full only.
+
+## Rollout Controller integration
+### Enforcement points
+1) **Apply boundary** (Optimize)
+- Prevents enabling config for production traffic if gating not satisfied.
+
+2) **Promotion boundary** (Rollout Controller)
+- Before canary promotion, controller queries Optimize gating status.
+- If not allowed, promotion is blocked and rollout is halted.
+
+### Rollback hooks
+If a rollout is already in canary and:
+- online canary signals breach (optional integration), or
+- a late-arriving full gate fails (e.g., triggered asynchronously)
+
+Then Rollout Controller:
+- halts promotion
+- rolls back to baseline config
+- emits notification + audit event
+
+## Console integration
+Console surfaces:
+- Gate status pill: Pending / Running / Passed / Failed / Timed out / Overridden
+- Summary: key metric deltas and threshold comparisons
+- Links: artifacts (suite details, sample outputs, harness logs)
+- Actions:
+  - re-run gates (with tier selection per policy)
+  - request override
+  - view audit trail
+
+UI copy requirements:
+- Failure states must include a short reason code and the next action.
+- Overrides must display expiration, approver, and reason prominently.
+
+## Observability
+Required (see observability standard for canonical names):
+- Gate run funnel metrics: created/running/passed/failed/timed_out
+- Duration metrics by tier, model_family, region
+- Flake rate and rerun counts
+- Apply blocked counts (by route/account tier)
+- Promotion blocked counts
+- Error budgets for gating system itself (see SLOs)
+
+Tracing:
+- Propagate `gate_run_id` through Optimize → eval-harness → back.
+- Add spans for: policy evaluation, baseline selection, static validation, harness trigger, result processing.
+
+Logging:
+- Structured logs with `gate_run_id`, `route_id`, `model_id`, `change_type`, `state`, `reason_code`.
+
+## SLOs and reliability requirements
+These are service-level requirements for the gating pipeline; they are separate from model serving SLOs.
+- **Correctness SLO**: 99.9% of in-scope apply/promotion attempts must be correctly blocked/allowed according to policy.
+- **Latency SLO (smoke)**: p95 end-to-end time-to-decision <= 15 minutes.
+- **Latency SLO (full)**: p95 end-to-end time-to-decision <= 60 minutes.
+- **Availability SLO**: gating status API p99 <= 500ms and 99.95% availability.
+
+Fail-closed policy:
+- If gating status cannot be determined due to Optimize DB outage or policy error, apply/promotion is blocked (with clear error messaging).
+
+## Failure modes and mitigations
+### 1) Eval-harness capacity shortage / queue delays
+Symptoms:
+- Gate runs stuck in `pending` or `running` beyond target.
+Mitigations:
+- Tiered gates to reduce load.
+- Region affinity + fallback regions where policy allows.
+- Explicit `timed_out` state and retry mechanics.
+- SRE alert on queue depth and p95 duration.
+
+### 2) Flaky eval suites cause false fails
+Symptoms:
+- High variance, inconsistent pass/fail across reruns.
+Mitigations:
+- Harness computes `flake_score` and applies rerun policy.
+- Quarantine workflow for prompt sets (admin tooling), tracked in audit.
+- Gate policy can require minimum sample size and confidence intervals.
+
+### 3) Baseline selection is wrong/inconsistent
+Symptoms:
+- Comparing candidate against non-equivalent baseline (especially quantization).
+Mitigations:
+- Baseline selection algorithm keyed by model_family + hardware_sku.
+- Store baseline_config_ref explicitly on GateRun.
+- Block when baseline is missing/ambiguous.
+
+### 4) Race condition: config superseded mid-run
+Symptoms:
+- Gate completes for an old candidate; user tries to apply new candidate.
+Mitigations:
+- GateRun binds to candidate_config_ref; apply checks must match active candidate.
+- Superseded runs are marked `canceled` and ignored by enforcement.
+
+### 5) Partial results / callback failures
+Symptoms:
+- Harness completed but Optimize never receives completion callback.
+Mitigations:
+- Periodic reconciliation job in Optimize that queries harness by harness_run_id and finalizes.
+- Idempotent completion endpoint.
+
+### 6) Override misuse
+Symptoms:
+- Overrides granted too broadly or without evidence.
+Mitigations:
+- Strict RBAC, time-bounded overrides, required reason and evidence.
+- Audit events exported; Console highlights overridden states.
+- Optional policy: require second approver for enterprise routes.
+
+## Security and privacy
+- Artifacts may contain prompt content; store with least privilege and redaction where required.
+- Console artifact access is scoped by account/route permissions.
+- Overrides and audit events are considered security-relevant and must be retained per retention policy.
+- Ensure gate results can be exported for enterprise audit (SIEM-friendly fields).
+
+## Open questions / follow-ups (tracked in Linear)
+- Define default policies for self-serve vs enterprise (smoke vs full) per change type.
+- Finalize minimum sample sizes and statistical significance thresholds.
+- Confirm artifact retention durations and storage costs.
+- Define “stale result” policy: when a passed gate expires due to model/runtime version drift.
+
+## Appendix A: Reason codes (initial)
+- `static_validation_failed`
+- `baseline_missing`
+- `policy_error`
+- `harness_trigger_failed`
+- `harness_runtime_timeout`
+- `metric_threshold_regression`
+- `insufficient_sample_size`
+- `flake_detected_quarantined_suite`
+- `override_expired`
+
+## Appendix B: Operational runbook links
+- Runbook: Optimize quality gate failures
+- Regression triage playbook for optimization changes
+- Quality gates observability standard

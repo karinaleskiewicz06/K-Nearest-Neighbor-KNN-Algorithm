@@ -1,0 +1,129 @@
+Policy-driven load probe and scheduler feedback protocol
+
+Summary
+-------
+This page documents the Policy-driven Load Probe and Scheduler Feedback Protocol (PLP-SFP). The protocol is designed to safely surface scheduler and kernel behavior under controlled, policy-shaped load while providing deterministic feedback signals that the runtime scheduler can consume to adjust admission, backfill, and priority heuristics.
+
+Intended audience
+- Runtime engineers
+- Benchmarking and perf-sig members
+- Oncall and SRE rotation responsible for scheduler incidents
+
+Goals
+- Provide a reproducible method for injecting targeted load shapes into the serving runtime without violating customer SLAs.
+- Produce canonical telemetry artifacts (probe reports) that map directly to scheduler decision signals.
+- Define automated feedback actions the scheduler can take when probes indicate a regression or resource pressure.
+
+Scope and non-goals
+- In scope: admission/backfill behavior, KV cache warmup under shaped bursts, per-kernel latency distribution under mixed-concurrency, slot coalescing effectiveness.
+- Out of scope: long-running model training, hardware-level failure injections (handled by infra chaos team).
+
+Glossary
+- Probe: controlled synthetic traffic pattern exercised against a target model and route.
+- Fingerprint: compact summary of latency/cost distribution for a probe (see Probe fingerprint format).
+- Decision signal: normalized metric emitted by the probe runner that the scheduler consumes (e.g., kernel contention score, slot-utilization drift).
+
+Architecture overview
+1) Controller: probe-runner service (bench-probe) that schedules probes and collects traces. Owned by benchmarking team.
+2) Collector: high-throughput telemetry pipeline that annotates traces with request-provenance and kernel hints. Uses the runtime trace bus.
+3) Aggregator: offline/nearline job that produces a probe fingerprint and decision signals. Runs in namespace perf-aggregator.
+4) Consumer: scheduler decision fabric subscribes to decision signals via the signal bus and maps signals to policy actions (admit/reject/backfill/tier-shift).
+
+Probe types and recommended usage
+- Smoke probe: short (30s) steady QPS at nominal concurrency. Use for CI verifications.
+- Burst probe: 5–60s high-intensity spike aimed at stressing KV cache and kernel preemption. Use for degradation mode tests.
+- Ramp probe: linear ramp from 10% to 110% nominal QPS over 5–10 minutes to find nonlinear breakpoints.
+- Cohort probe: multi-route correlated traffic that exercises cross-tenant memory eviction and kernel-sharing.
+
+Probe configuration (recommended defaults)
+| field                  | description                                              | default        | notes |
+|------------------------|----------------------------------------------------------|----------------|-------|
+| model                  | model variant to exercise (e.g., gptx-3-8b-quant)        | required       | pick a representative variant |
+| duration_seconds       | probe wall time                                           | 60             | adjust for probe type |
+| qps_target             | aggregate queries per second                              | 50             | expressed at client ingress |
+| concurrency_target     | target in-flight requests                                 | 8              | prefer 1–32 |
+| input_seq_length       | input token length distribution (CSV of percentiles)      | 8,32,128       | used to exercise kernel breakpoints |
+| trace_level            | trace/detail (none|header|full)                           | header         | full increases telemetry cost |
+| allow_fallbacks        | whether probe may trigger model fallback                  | false          | keep false for fidelity baseline |
+
+Probe fingerprint format
+- single-line canonicalization: <probe-name> | <median-lat-ms> | <p95-lat-ms> | <cost-per-token-µs> | <kv-hit-rate> | <kernel-contention-score>
+- store fingerprints in perf-store keyed by probe id and commit sha.
+
+Operational procedure: running a scheduled probe
+1) Author probe manifest and check against policy validator: bench-probe validate <manifest.yaml>.
+2) Schedule in bench-probe: bench-probe run --manifest manifest.yaml --dry-run (dry-run verifies signal wiring without emitting traffic).
+3) Execute during a controlled window (must coordinate with SRE). Add marker to rollout calendar.
+4) After run, wait for aggregator job to publish the fingerprint artifact.
+5) Review report in perf-dashboard and file any anomalies in the perf-issue tracker with tag "plp-sfp".
+
+Example probe manifest (manifest.yaml)
+---
+probe_name: "kv-warmup-burst-az1"
+model: "redwood/gptx-3-8b-quant-v2"
+duration_seconds: 45
+qps_target: 250
+concurrency_target: 12
+input_seq_length: "8,32,128"
+trace_level: "header"
+allow_fallbacks: false
+---
+
+Telemetry and key metrics to collect
+- request_latency_ms (p50/p90/p95/p99) broken out by kernel and end-to-end
+- kernel_queue_depth and kernel_dispatch_time_ms
+- kv_cache_hit_rate and kv_locality_ratio
+- token_throughput and token_cost_estimate_us
+- kernel_contention_score: synthetic metric combining kernel-wait time and preemption counts
+
+Automated feedback and mapping to scheduler actions
+- If kernel_contention_score > 0.45 for sustained 30s: reduce admit rate for affected slot by 30% and enable slot-coalescing for that cohort for 2 minutes.
+- If kv_cache_hit_rate falls below 0.6 during burst probe: prioritize pre-warmed slots (warmstart=true) and temporarily prefer slot affinity to nodes with warm caches.
+- If p99 request_latency exceeds configured SLO + 2x baseline during a smoke probe: mark the latest deployment as suspect and open a canary rollback action.
+
+Policy validation rules (validator checks)
+- Probes must not target production tenant routes unless a written SLA waiver exists.
+- qps_target * duration_seconds must be within the probe window budget assigned to the bench namespace.
+- allow_fallbacks must be false for fidelity-critical probes.
+
+Scheduler mapping examples
+- Decision signal: {kernel_contention: 0.52, cohort: "search-heavy"} -> Action: cohort_priority -= 1; trigger_backfill_threshold=0.65; run eviction-smoothing for 90s.
+- Decision signal: {kv_hit: 0.45, node_affinity: [n1,n2]} -> Action: nominate pull-warmslot job for nodes n1,n2; increase preferred_affinity_weight for 60s.
+
+Runbook: probe-caused outage mitigation (oncall steps)
+1) Identify active probes via bench-probe events and correlate with perf ingest times.
+2) If production SLOs are impacted: disable probe by ID immediately (bench-probe cancel <id>).
+3) Escalate to scheduler-owner and runtime-oncall. Attach probe fingerprint to the incident ticket.
+4) If degradation persists after probe cancellation, run the rollback matrix: a) reduce admission to reserve 20% capacity for critical routes b) enable coarse-grained fallback routes for enterprise customers.
+5) Post-incident: run a shaded replay of the probe in a canary namespace and collect aggregated artifacts for root cause analysis.
+
+Reporting and dashboards
+- perf-dashboard/plp-sfp: single-pane view showing live probe status, fingerprint changes over time, vulnerable cohorts, and aggregated decision signals.
+- Alerting: probe-failure (job failed to complete), probe-sla-impact (if probe correlates to any route SLO breach within 1m), probe-signal-spike (kernel_contention > 0.5).
+
+Automation and CI integration
+- Short smoke probes run on every runtime scheduler merge to main. CI job: bench-probe ci-run --manifest ci-smoke.yaml.
+- Longer ramp and burst probes are gated behind an internal release window and require SRE approval.
+
+Ownership and contacts
+- Primary owner: Benchmarking team (owner group: eng-serving-runtime-benchmarking).
+- Scheduler consumer: Runtime Scheduler team (contact: @arjun.patel).
+- Oncall escalation: runtime-oncall rotation.
+
+Related artifacts and references
+- Probe runner implementation: git://repo/bench-probe (internal)
+- Fingerprint schema: perf-store/docs/fingerprint-spec.md
+- Scheduler signal bus contract: /confluence/eng-serving-runtime/kernel-and-scheduling/scheduler-telemetry-synthesis-and-proofing-2025.json
+
+Change log
+- 2026-01-12: Draft created by Maya Chen.
+- 2026-03-02: Added probe fingerprint schema and initial mapping rules.
+- 2026-09-04: Updated automated feedback thresholds and example manifest; added runbook steps for probe-caused outages.
+
+Appendix: troubleshooting checklist
+- If aggregator fails to produce fingerprint: verify telemetry pipeline health, ensure bench-probe wrote trace ids to perf-ingest, check S3 bucket for raw traces.
+- If scheduler ignored decision signals: confirm signal bus ACLs, confirm consumer subscription, validate schema version alignment.
+- If KV warmup did not occur: check warmstart job logs and node affinity assignments.
+
+---
+Please reach out to the reviewers listed above for review requests or to schedule a probe window.

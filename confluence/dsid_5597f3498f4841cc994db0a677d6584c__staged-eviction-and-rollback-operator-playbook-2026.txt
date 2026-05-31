@@ -1,0 +1,150 @@
+Staged eviction and rollback operator playbook for private deployments
+
+This playbook describes an operator-driven, low-risk procedure to stage tenant eviction from runtime nodes and, if required, perform a controlled rollback of runtime artifacts in private (VPC/on-prem) deployments. It covers preflight checks, phased eviction, rollback decision criteria, forensic evidence capture, monitoring thresholds, customer communication templates, and CLI/YAML snippets for common control-plane and runtime tools.
+Applies to Redwood Private deployments (VPC and on-prem) for tenant-level evacuations caused by thermal events, hardware retirement, corrupt KV state, quantization regression, or model artifact incompatibility. Does NOT apply to full-cluster emergency evacuations (see operator-evacuation-topology-playbook).
+Oncall operators, field engineers, SREs supporting private deployments, and customer success engineers performing high-risk tenant maintenance with customer coordination.
+- Access: operator role with 'tenant-evict' and 'artifact-rollforward' permissions in the private control plane.
+- Tools: kubectl (v1.26+), redwoodctl (release >= 2026.03), runtime-agent CLI, and access to customer KMS/HSM if key rotation is needed.
+- Evidence capture: write-enabled S3/GCS bucket or customer-provisioned secure evidence store.
+- Backups: most recent KV snapshot and model-artifact manifest for the tenant present in the artifact registry.
+- Communication: pre-approved customer notification template and escalation contact.
+- SLO guardrails agreed with customer (latency thresholds, max acceptable error rate) and rollback window defined in the delivery contract.
+1) Validate control-plane health:
+   - redwoodctl status control-plane --region <region>
+   - Expected: all services OK, control-plane API latency < 120ms p95.
+2) Confirm runtime node telemetry and temperature below safety window OR already in warning state (thermal > 80C but < 95C).
+   - runtime-agent node-metrics --node <node>
+3) Verify latest KV snapshot is present and checksums match: sha256 manifest.
+4) Confirm model artifact signatures and quantization profiles compatible with runtime kernels (see kernel-abi-compat matrix).
+5) Confirm failure domain and tenant affinity map to choose eviction targets (no single-tenant co-located critical state).
+6) Notify customer with planned start time and expected impact (template in this doc).
+7) Create an evidence bundle ID and allocate storage path (e.g., s3://redwood-evidence/<bundle-id>/).
+Goal: move traffic and runtime state off target nodes with minimal query loss and while preserving forensic evidence.
+
+High-level phases:
+- Phase 0: Observe and tag
+  - Mark target node(s) with eviction: redwoodctl node annotate <node> eviction.pending=true reason=\"thermal-80-warning\"
+  - Record live KV checkpoints: runtime-agent kv-checkpoint --tenant <tenant> --out /tmp/kv-<tenant>-ts.snap
+  - Snapshot open sessions: runtime-agent sessions dump --tenant <tenant> --out /tmp/sessions-<tenant>.json
+
+- Phase 1: Traffic drain (soft) — 5–15 minutes
+  1. Move new requests away from node by updating routing policy: redwoodctl routing update --tenant <tenant> --prefer zones!=<target-zone> --drain-weight 0.2
+  2. Observe p95 latency and error-rate for 10 minutes. If p95 increases > 25% or error-rate > customer SLA, pause and revert.
+  3. Record per-route token counts and streaming sessions for evidence.
+
+- Phase 2: State migration (atomic KV handoff)
+  1. Trigger KV incremental replication: runtime-agent kv-replicate --tenant <tenant> --target node=<evac-node> --consistency=quorum --timeout=30m
+  2. Verify replication: runtime-agent kv-status --tenant <tenant> returns 'replicated=true' and last_applied_index increases.
+  3. If replication stalls for > 10m, escalate to oncall-sre and mark rollback_cause=\"kv_replication_stall\".
+
+- Phase 3: Controlled eviction (hard)
+  1. Set node to maintenance: kubectl label node <node> redwood/maintenance=evict-ready
+  2. Command runtime agent to flush KV shards and seal ephemeral caches: runtime-agent flush --tenant <tenant> --mode seal
+  3. Redirection: redwoodctl routing finalize-eviction --tenant <tenant> --node <node>
+  4. Confirm zero active live handles on node for tenant.
+  5. Remove node from active pool and mark evidence: store /tmp/kv-<tenant>-ts.snap and /tmp/sessions-<tenant>.json to evidence store.
+
+Safety checks during eviction:
+- If packet-loss > 2% during drain, pause and increase drain window.
+- If latency p95 jumps > 40% for > 5 minutes, initiate rollback as described below.
+- If KV replication inconsistency detected (checksum mismatch), abort eviction and proceed to forensic capture and rollback decisioning.
+Decision criteria for rollback (any of the following):
+- Degraded user-facing latency beyond SLA for > 5 minutes after traffic detention.
+- Error-rate spike > compound SLA threshold for critical routes.
+- CRC/checksum mismatch on restored KV shard.
+- Model inference quality regression exceeding guardrail thresholds (evals trigger).
+
+Rollback steps (fast path):
+1) Abort eviction in-flight: redwoodctl routing abort-eviction --tenant <tenant> --node <node>
+2) Re-open routing weights: redwoodctl routing update --tenant <tenant> --weights-from backup-routing-file.yaml
+3) If KV inconsistency was the cause, restore KV snapshot: runtime-agent kv-restore --tenant <tenant> --from s3://evidence/<bundle-id>/kv-<tenant>-latest.snap --consistency=quorum
+   - Wait for runtime-agent kv-status to report 'in-sync'.
+4) Re-instate model artifact if artifact swap caused regression: redwoodctl model rollback --tenant <tenant> --artifact <previous-artifact-id> --force  --reason \"quality-regression\"
+5) Validate end-to-end with canary traffic (5–10% sample) for minimum 15 minutes. If canary good, fully resume.
+
+Rollback steps (forensic-preserving slow path):
+1) If KV corruption suspected, isolate node and capture disk snapshot (operator step requires field access for onprem): 
+   - For on-prem: follow hardware-snapshot runbook and preserve disk LUN.
+   - For VPC: create snapshot of instance store if available or attach forensic EBS and take forensic snapshot.
+2) Copy all logs, diagnostics, and runtime core dumps to evidence store. Include control-plane traces (trace ids) and routing decisions.
+3) Engage customer security and legal if PII risk exists.
+4) Rehydrate service from last-good snapshot and progressively re-enable traffic as in the fast-path.
+
+Post-rollback documentation: create a short post-action report including timeline, decision rationale, artifacts restored, evidence bundle id, customer impact (p50/p95 latencies, errors), and recommended follow-up items. Attach to the incident ticket and customer-facing postmortem template.
+Verification checklist after eviction or rollback:
+- end-to-end latency (p50/p95), error-rate per-route, and token throughput compared to baseline (pre-action).
+- KV consistency: runtime-agent kv-checksum --tenant <tenant> equals manifest checksum.
+- Session continuity: compare sessions dump pre/post, no orphaned streaming sessions.
+- Model outputs sanity: run small eval-set against warm canary and compare metrics (exact-match %, top-k BLEU-like heuristics).
+
+Forensic artifacts to collect (required):
+- Control-plane audit logs with trace IDs for the operation.
+- Node-level telemetry: thermals, disk IO, GPU telemetry, network jitter metrics.
+- KV snapshots and replication logs.
+- Model artifact manifests + signature validation report.
+- redwoodctl and runtime-agent output for each step.
+- Customer request logs for impacted time window (if customer consents).
+Primary SLOs and emergency thresholds used by playbook: 
+- Latency SLO (customer-facing): p95 < 250ms (default) — action threshold: p95 > 300ms for 3 consecutive 1m windows triggers operator alert.
+- Error SLO: route error-rate < 1% — action threshold: > 3% for 5m triggers rollback evaluation.
+- KV replication lag: tail_applied_index_lag < 1000 ops — action threshold: lag > 5000 ops triggers immediate stall alert.
+
+Monitoring runbooks to reference:
+- control-plane observability (dashboards): /confluence/eng-platform/dashboards-and-alerts/control-plane-runtime-views
+- runtime node telemetry: node-thermal-dashboard and kv-replication-view.
+
+Automated alerting playbook examples (alert -> channel -> runbook):
+- alert: KV_REPLICATION_STALL -> #private-ops -> escalate to sres oncall (pager).
+- alert: EVICTION_LATENCY_DEGRADATION -> #customer-ops -> start customer communications channel.
+Services and artifacts referenced: 
+- control-plane: redwood-control-api, redwood-routing-service, artifact-registry.
+- runtime services: runtime-agent, kv-cache-service, model-runtime-interface.
+- infra: kubelet/node-exporter, cluster-autoscaler (when scale decisions required).
+- customer: KMS/HSM (for key rotations) and evidence-bucket where customer agrees to store snapshots.
+
+Integration checkpoints with other teams: 
+- Eng-SRE: capacity impact analysis and scheduled windows.
+- Customer Success: customer-facing comms and SLA re-negotiation if needed.
+- Security & Legal: if forensic artifacts touch PII.
+- Field Ops: for on-prem physical disk snapshot and chain-of-custody handling.
+Minimum items to share with the customer after a staged-eviction/rollback event: 
+- Timeline of actions with timestamps and operator IDs.
+- Evidence bundle ID and a copy of checksums for KV/model artifacts.
+- Impact summary: percent of requests rerouted, p50/p95 during event, and error-rate.
+- Remediation plan and next steps (hardware replacement, artifact rollback, or scheduling for deeper forensic).
+
+Customer notification template (short): 
+- Subject: [Redwood] Tenant maintenance completed — action id <bundle-id>
+- Body: We performed a planned staged eviction for <tenant> on <date>. Impact: <brief>. Restored artifacts: <artifact-ids>. Evidence bundle available at: <link>. Contact: <oncall@redwood.ai>.
+1) Allocate evidence bundle ID (example):
+   BUNDLE=$(uuidgen)
+   mkdir /tmp/evidence-$BUNDLE
+2) Snapshot KV (example):
+   runtime-agent kv-checkpoint --tenant acme-corp --out /tmp/evidence-$BUNDLE/kv-acme.snap
+3) Routing drain command (example):
+   redwoodctl routing update --tenant acme-corp --prefer 'zones!=us-east-1a' --drain-weight 0.15
+4) Abort eviction (example):
+   redwoodctl routing abort-eviction --tenant acme-corp --node ip-10-0-2-45
+5) KV restore (example):
+   runtime-agent kv-restore --tenant acme-corp --from s3://evidence/$BUNDLE/kv-acme.snap --consistency quorum --wait
+
+Small YAML manifest example (artifact rollback):
+---
+apiVersion: redwood/v1
+kind: ModelRollout
+metadata:
+  tenant: acme-corp
+spec:
+  targetArtifact: art-2026-03-11
+  strategy: immediate-rollback
+  reason: \"quality-regression\"
+
+Relevant runbooks and reference pages: 
+- Kernel ABI / quantization matrix: /confluence/eng-serving-runtime/kernel-and-scheduling/kernel-abi-quantization-kernel-compatibility-guidelines-2026.json
+- Evidence preservation and forensic runbook: /confluence/eng-private-deployments/upgrade-and-rollback/private-deploy-evidence-preservation-and-forensic-playbook-2026.json
+- Operator hardware snapshot procedures (onprem): /confluence/eng-private-deployments/onprem-packaging/hardware-root-of-trust-provisioning-and-supply-chain-playbook-2026.json
+
+Change history: 
+- 2026-02-12: created by Jordan Kim (initial draft).
+- 2026-06-20: expanded forensic slow-path and added evidence bundle convention (Aisha Patel).
+- 2026-10-03: adjusted latency thresholds and added canary verification steps (Priya Nair).

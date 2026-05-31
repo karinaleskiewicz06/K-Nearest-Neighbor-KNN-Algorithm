@@ -1,0 +1,233 @@
+Hosted API tail-latency guardrails for KV cache compaction/eviction rollout
+
+## Purpose
+This page defines SRE-facing guardrails to protect Hosted API tail latency (p95/p99) during the staged rollout of KV cache compaction + tier-aware eviction in the serving runtime.
+
+The rollout introduces new runtime behaviors (budgeted compaction work and eviction under pressure) that can improve long-tail performance under bursty mixed-length decode workloads, but can also regress latency if:
+- compaction work is performed on the critical path more than intended,
+- eviction selection becomes too aggressive for certain traffic mixes,
+- allocator state oscillates (fragmentation ↔ compaction ↔ eviction) and increases CPU/GPU overhead,
+- cancellation/streaming edge cases increase lock contention.
+
+This page standardizes:
+- **SLO targets** and what counts as a rollback-worthy regression
+- **Alert thresholds** and paging policy during the canary
+- **Automated rollback criteria** (progressive delivery gates)
+- **Human-in-the-loop authority** for kill-switch use
+
+## Scope
+**In scope:** Hosted API runtime pools (hosted multi-tenant), including chat/text generation routes that exercise long decode windows.
+
+**Out of scope:** Dedicated and Private deployments (separate guardrails; see their rollout checklists).
+
+## Definitions (what we measure)
+We track end-to-end request latencies and compaction/eviction health signals. For the compaction rollout, we explicitly gate on **tail latency** and **error/oom/request-shedding** signals.
+
+### Latency SLIs (Hosted API)
+1) **TTFT (time to first token)** for streaming generation routes
+- Sensitive to scheduler contention and any synchronous compaction budget.
+
+2) **E2E request latency** for non-streaming requests and for “completion finished” in streaming
+- Sensitive to decode slowdowns, cache pressure, and eviction thrash.
+
+### Runtime health SLIs
+- **Fragmentation ratio**: indicates KV arena health and compaction effectiveness.
+- **Compaction work**: bytes moved and time spent moving blocks/pages.
+- **Evictions**: count/rate; by tier and reason.
+- **Allocator pressure**: OOM-prevent events, forced sheds, and emergency fallbacks.
+
+Metric names and labels must follow: confluence://architecture-and-standards/performance-standards/kv-cache-fragmentation-metrics-standard
+
+## SLO targets (Hosted API)
+These are the operational targets used for canary gating. They are intentionally conservative; Product may maintain separate external messaging.
+
+### Primary SLO targets (canary gating)
+Applies per region (us-east, us-west, eu-west) and per primary model family pool.
+
+| SLI | Target (steady state) | Canary regression budget | Notes |
+|---|---:|---:|---|
+| TTFT p99 (streaming) | <= 1.2s | +10% vs baseline for <= 10 min allowed | Gated on change vs baseline to avoid false positives due to diurnal load |
+| E2E p99 (streaming “finished”) | <= 12.0s | +10% vs baseline for <= 10 min allowed | Use normalized cohorts; exclude client disconnects |
+| E2E p99 (non-streaming) | <= 8.0s | +10% vs baseline for <= 10 min allowed | Only for routes where non-streaming is supported |
+| Error rate (5xx) | <= 0.20% | >0.30% for 5 min triggers rollback | Measured at inference-gateway and runtime-worker |
+| Shed rate (overload / forced drop) | <= 0.05% | >0.10% for 5 min triggers rollback | Includes admission control drops and “no capacity” |
+
+### Secondary targets (investigation triggers)
+These do not automatically roll back by themselves, but they should trigger an SRE+Runtime investigation and may be used as supporting evidence.
+
+| Signal | Expected range during canary | Investigation threshold |
+|---|---:|---:|
+| KV fragmentation ratio (median) | 0.10–0.25 | >= 0.35 for 10 min (per pool) |
+| Compaction time p99 (per step) | <= 2ms | > 5ms for 5 min |
+| Compaction bytes moved rate | workload-dependent | sudden sustained > 4 GiB/min per worker (10 min) |
+| Eviction rate (all reasons) | near-zero normally | sustained > 50 evictions/min/worker (10 min) |
+| Evictions of non-preemptible sequences | 0 | any > 0 is a stop-ship bug |
+
+## Canary strategy (Hosted API)
+Rollout is progressive, by region and pool. A typical progression:
+1) **Internal canary**: 1% of workers in one low-risk region/pool
+2) **Hosted subset**: 5% → 10% in one region
+3) **Multi-region**: 10% in each region
+4) **Expand**: 25% → 50% → 100% (per pool)
+
+Guardrails apply at every stage; rollback should be localized to the pool/region cohort when possible.
+
+## Alerting policy during the canary
+We run both standard Hosted API alerts and compaction-specific alerts. During canary, compaction alerts are routed to the **#eng-sre** oncall and the **#eng-runtime** secondary.
+
+### Paging vs ticketing
+- **Page (P1)** when user impact is likely or ongoing:
+  - p99 latency regression gate violated (see Automated rollback criteria)
+  - 5xx error gate violated
+  - shed/forced-drop gate violated
+  - allocator OOM/forced shed increases (even if 5xx not yet elevated)
+
+- **Create ticket (P2/P3)** for compaction efficiency issues without user impact:
+  - fragmentation remains high but latency is stable
+  - compaction bytes moved is higher than expected, but within budget
+  - eviction rate increases but no latency or error impact
+
+### Recommended alert thresholds (initial rollout)
+Note: thresholds are expressed as *per cohort/pool* wherever possible to avoid masking.
+
+1) Tail latency regression (page)
+- **TTFT p99**: > baseline * 1.10 for 10 minutes
+- **E2E p99**: > baseline * 1.10 for 10 minutes
+
+2) Errors and shedding (page)
+- **HTTP 5xx** (inference-gateway): > 0.30% for 5 minutes
+- **runtime_worker.request_failed_total / request_total**: > 0.30% for 5 minutes
+- **shed rate**: > 0.10% for 5 minutes
+
+3) Compaction/eviction safety (page)
+- **kv_allocator_oom_prevent_total**: any non-zero sustained increase vs baseline for 2 minutes (cohort)
+- **kv_evictions_total{eviction_class="non_preemptible"}**: any non-zero (immediate page; stop rollout)
+- **kv_relocation_errors_total**: any non-zero (immediate page; stop rollout)
+
+4) Compaction budget overrun (ticket unless correlated with latency)
+- **kv_compaction_step_time_ms_p99**: > 5ms for 5 minutes
+- **kv_compaction_bytes_moved_total rate**: sustained > 4 GiB/min/worker for 10 minutes
+
+## Automated rollback criteria (progressive delivery gates)
+Rollout automation (Paula Mendes / Rollout system) should continuously evaluate the following gates for the canary cohort.
+
+### Hard rollback gates (automatic rollback)
+If any gate is violated, rollback the feature flag to the previous stable state for the cohort and freeze expansion.
+
+A) Tail latency regression
+- Condition: (TTFT p99 > baseline * 1.10) OR (E2E p99 > baseline * 1.10)
+- Window: 10 minutes rolling
+- Baseline: previous 24h median for same weekday/time bucket OR the pre-canary 60-minute window (whichever is more stable for that pool)
+- Action: rollback flag in cohort; notify #incidents and open an incident if user-visible
+
+B) User-facing failures
+- Condition: HTTP 5xx > 0.30% OR shed rate > 0.10%
+- Window: 5 minutes rolling
+- Action: rollback flag in cohort; page SRE oncall
+
+C) Allocator pressure spike
+- Condition: kv_allocator_oom_prevent_total rate > baseline + 0.05/min/worker (or any sharp step-change when baseline is ~0)
+- Window: 2 minutes rolling
+- Action: rollback flag in cohort; page SRE+Runtime
+
+D) Safety invariants
+- Condition: kv_evictions_total{eviction_class="non_preemptible"} > 0 OR kv_relocation_errors_total > 0
+- Window: 1 minute rolling
+- Action: rollback + stop-ship; page Runtime TL and SRE oncall
+
+### Soft gates (pause expansion; human review)
+These do not roll back automatically, but they should prevent further expansion until reviewed.
+
+E) High fragmentation not improving
+- Condition: kv_cache_fragmentation_ratio_p50 >= 0.35 AND no downward trend for 30 minutes
+- Action: pause expansion; request Runtime to validate thresholds and compaction trigger logic
+
+F) High eviction without user impact
+- Condition: kv_evictions_total rate increases > 5x baseline for 20 minutes
+- Action: pause expansion; check if eviction is masking a deeper capacity issue (admission control, traffic burst)
+
+## Operational playbook (during a canary)
+### 1) Triage order
+When alerted, triage in this order:
+1. **Is user impact real?** Check inference-gateway p99, TTFT p99, 5xx, shed.
+2. **Is the impact localized to the canary cohort/pool?** Compare canary vs control pools.
+3. **Is the runtime doing too much compaction on the hot path?** Check compaction step time p99 and bytes moved.
+4. **Is eviction thrashing?** Check evictions/min, and whether evictions correlate with TTFT/E2E spikes.
+5. **Is fragmentation climbing despite compaction?** Check fragmentation ratio trend and allocator free-list stats.
+
+### 2) Immediate mitigations
+- **Rollback the cohort flag** (preferred).
+- If rollback is too slow due to config propagation, use the **kill-switch** (see Authority + kill-switch policy).
+- If the pool is near capacity, consider temporary actions:
+  - increase headroom (shift traffic, add workers)
+  - tighten admission control (prefer protecting p99 over accepting excess load)
+
+### 3) Post-rollback verification
+Within 15 minutes of rollback:
+- p99 metrics should converge toward baseline.
+- compaction/eviction metrics should return to control-like patterns.
+- confirm config propagation completion across workers.
+
+Document any rollback in the incident channel and link:
+- pool/region
+- timestamps
+- graphs (latency + compaction + eviction)
+- flag states
+
+## Authority and kill-switch policy
+### Who can flip the kill-switch
+- **Primary:** SRE oncall (authority to protect SLOs)
+- **Secondary:** Runtime TL oncall (or Omar El-Sayed / Sofia Ivanova as delegates)
+
+### When to flip the kill-switch (vs cohort rollback)
+Flip the kill-switch if:
+- automated rollback has not stabilized p99 within 10–15 minutes, OR
+- config propagation is lagging and impact is increasing, OR
+- safety invariants are violated (non-preemptible eviction, relocation errors)
+
+Kill-switch behavior must be fail-safe:
+- disables compaction work scheduling immediately
+- disables new evictions except emergency OOM-prevent mode (per ADR)
+- leaves existing sequences correct (no partial relocation)
+
+See: confluence://eng-serving-runtime/runbooks/runtime-kv-cache-compaction-runbook
+
+## Dashboard and query pointers
+Primary dashboard panels required for the canary (per pool/region):
+- TTFT p95/p99 (streaming)
+- E2E p95/p99
+- 5xx rate, shed rate
+- fragmentation ratio p50/p95
+- compaction bytes moved (rate), compaction step time p95/p99
+- evictions (rate) by tier and reason
+- allocator OOM-prevent events (rate)
+
+Example PromQL-style queries (names may vary by cluster; confirm in metrics standard):
+- TTFT p99: histogram_quantile(0.99, sum by (le, pool) (rate(hosted_ttft_ms_bucket{route=~"chat|generate", cohort="canary"}[5m])))
+- Fragmentation ratio: avg by (pool) (kv_cache_fragmentation_ratio{cohort="canary"})
+- Compaction step p99: histogram_quantile(0.99, sum by (le, pool) (rate(kv_compaction_step_time_ms_bucket{cohort="canary"}[5m])))
+- Eviction rate: sum by (pool, tier, reason) (rate(kv_evictions_total{cohort="canary"}[5m]))
+
+## Change management and review cadence
+During rollout weeks:
+- Daily 15-minute check (SRE + Runtime) focusing on p99 deltas and any eviction anomalies.
+- Any threshold changes must be documented in:
+  - the rollout ticket (runtime-1.22)
+  - the metrics standard (if naming/definition changes)
+
+## Known failure modes (what to watch for)
+- **Compaction budget creep:** step time p99 rises; TTFT p99 rises first.
+- **Eviction masking capacity issues:** eviction rate rises but fragmentation falls; watch shed rate and overall throughput.
+- **Fragmentation not improving:** fragmentation ratio stays elevated; compaction bytes moved climbs; possible free-list/coalescing bug.
+- **Cancellation edge cases:** relocation errors or allocator leaks; watch kv_relocation_errors_total and worker restarts.
+
+## Contacts
+- SRE owner: Sean Gallagher
+- Observability/metrics: Allison Grant
+- Runtime TL (KV cache): Omar El-Sayed
+- Oncall readiness/runbooks: Rafael Mendes
+- Rollout automation/gates: Paula Mendes / Marissa Cole
+
+## Revision history
+- 2026-01-20: Initial published version for runtime-1.22 canary gates.
+- 2026-02-12: Updated hard rollback gates to include allocator OOM-prevent spike and clarified baseline selection guidance.

@@ -1,0 +1,208 @@
+ADR-018: Audit Export Delivery Semantics and Idempotency
+
+## Status
+Published.
+
+## Decision drivers
+Enterprise customers need audit events exported into SIEM tooling (Splunk, Datadog, and generic S3 delivery) with delivery guarantees suitable for compliance evidence and incident response. We must support retries/backfill without losing events, while minimizing operational risk (runaway retries, duplication storms) and avoiding requirements that cannot be met reliably across heterogeneous sinks.
+
+This ADR defines:
+- Delivery semantics (what we guarantee, and what we explicitly do *not* guarantee)
+- The idempotency strategy (how duplicates are identified and handled)
+- The checkpoint model (how we ensure continuity and recoverability)
+- Replay/backfill semantics (how we re-send historical data safely)
+- Downstream expectations (how customers should deduplicate)
+
+## Context
+### Terminology
+- **Audit event**: A single canonical event emitted by Redwood services (schema v2). Includes stable `event_id`, timestamps, actor/action/resource, and tenant/workspace.
+- **Export config**: A tenant-scoped configuration describing destination + credentials reference + filtering + optional backfill window.
+- **Destination adapter**: Sink-specific delivery implementation (S3 / Splunk HEC / Datadog Logs intake).
+- **Checkpoint**: Persistent cursor tracking the last successfully delivered position per export config.
+- **Replay/backfill**: A deliberate process to (re-)export past events.
+
+### Non-goals
+- Exactly-once delivery end-to-end across all destinations.
+- Strong global ordering across all events.
+- Customer-managed on-prem/Private (air-gapped) export semantics (tracked separately; out of scope for beta).
+
+## Decision
+### 1) Delivery semantics: at-least-once per destination
+The audit exporter provides **at-least-once delivery** for enabled exports:
+- If an event is within scope (passes filters) and within the supported retention/backfill window, the exporter will make best-effort to deliver it.
+- In the presence of failures (network errors, 429 throttling, transient auth errors, downstream outages), the exporter will retry.
+- As a result of retries and failure recovery, **duplicate deliveries are possible**.
+
+We explicitly do **not** guarantee:
+- Exactly-once delivery.
+- Immediate delivery (delivery is asynchronous and subject to lag).
+- Strict ordering across all events (see ordering section below).
+
+Rationale:
+- Exactly-once requires transactional coordination between Redwood’s checkpoint store and each third-party sink. Splunk/Datadog/S3 each have different acknowledgement models; some do not provide a robust “commit offset” primitive.
+- At-least-once is the industry-standard tradeoff for audit/telemetry export when sinks are heterogeneous.
+
+### 2) Idempotency key: stable `event_id` in schema v2
+All audit exports must include a stable `event_id` (schema v2). This is the **only supported idempotency key** for downstream deduplication.
+
+`event_id` requirements:
+- Globally unique within Redwood (practically: UUIDv7; time-ordered uniqueness).
+- Stable across retries, replays, and backfills (the same logical audit event keeps the same `event_id`).
+- Present on every exported event (required field).
+- Not derived from PII.
+
+Additional exporter metadata (for observability only):
+- `export_config_id`: which export config produced this delivery
+- `exported_at`: when exporter attempted delivery
+- `export_batch_id`: identifier for the batch sent to a destination
+- `export_attempt`: monotonically increasing attempt number for a batch
+
+These exporter fields help support/SRE triage but should not be used as the idempotency key by customers.
+
+### 3) Checkpoint model: per (tenant, export config, stream partition)
+The exporter persists checkpoints to ensure continuity and to bound replay scope.
+
+Checkpoint granularity:
+- A checkpoint is stored **per tenant_id + export_config_id + input stream partition**.
+- Checkpoints advance only after a batch is considered successfully delivered according to the adapter’s success criteria.
+
+Checkpoint contents (conceptual):
+- `cursor_type`: input cursor type (e.g., kafka_offset or db_cursor)
+- `cursor_value`: last committed cursor position for that partition
+- `last_committed_event_time`: timestamp of the last committed event (for debugging/visibility)
+- `updated_at`: checkpoint update time
+
+Commit rule:
+- The exporter may deliver a batch containing N events for a partition. If the adapter reports success, the exporter commits the checkpoint to the *highest* cursor value in that batch.
+- If delivery fails, the checkpoint is **not advanced**, and the exporter will retry. This is the primary source of duplicates (re-sending a batch after partial downstream processing).
+
+Why per-partition:
+- Our event ingestion pipeline is partitioned for throughput. Per-partition checkpointing preserves scalable consumption and avoids global locks.
+
+### 4) Retry, backoff, and dead-lettering
+To balance delivery guarantees with platform safety:
+
+Retry strategy:
+- Exponential backoff with jitter.
+- Adapter-specific handling:
+  - Splunk HEC: honor 429s; backoff and circuit break on repeated throttling.
+  - Datadog: backoff on 429/5xx; treat 403/401 as non-retryable until credentials are rotated.
+  - S3: retry transient errors; handle multipart failures explicitly.
+
+Non-retryable failures:
+- Invalid destination configuration (e.g., malformed URL, disallowed host).
+- Persistent auth failures (e.g., revoked token) after a small number of immediate retries.
+
+Dead-letter queue (DLQ):
+- After a bounded number of retries (per adapter policy), a batch may be moved to a DLQ with diagnostic context.
+- DLQ entries must be replayable by an operator tool, with guardrails to prevent unbounded duplication storms.
+
+Operational safety controls:
+- The exporter can auto-pause an export config when max lag or repeated failures exceed thresholds (to protect system stability and avoid runaway retries).
+- Pause/resume is auditable (config change events are emitted and stored as audit events).
+
+### 5) Replay and backfill behavior
+#### 5.1 Replays (operator-driven)
+Purpose: recover from downstream outage or adapter bug after fixes are applied.
+
+Semantics:
+- A replay re-sends events that may have already been delivered.
+- Replays **do not** mutate or delete previously exported data.
+- Replays are safe only when downstream deduplicates on `event_id`.
+
+Mechanisms:
+- DLQ replay: re-send specific failed batches.
+- Checkpoint reset (restricted): reset checkpoint to an earlier cursor to reprocess a range.
+
+Access control:
+- Checkpoint resets and DLQ replay are restricted to Redwood operators (SRE) and limited internal roles during beta.
+
+#### 5.2 Customer-requested backfill (configurable window)
+Purpose: initial SIEM onboarding and evidence gathering.
+
+Semantics:
+- Backfill is defined as exporting historical events starting at a specified timestamp.
+- Backfill is executed by setting the export’s starting cursor/time and then processing forward.
+- Backfill may create duplicates relative to events already exported (e.g., if customer enables export, disables, and later requests a backfill overlapping the enabled period).
+
+Limits:
+- Beta default: backfill limited to a bounded window (documented in product requirements) and bounded by Redwood’s audit log retention.
+- Backfill requests outside supported retention must return a clear validation error.
+
+Visibility:
+- Export status must show whether an export is currently backfilling, including estimated lag.
+
+### 6) Ordering semantics
+We guarantee only best-effort ordering:
+- **Within a single input partition**: events are processed in cursor order.
+- **Across partitions**: no total order guarantee.
+
+Consumers must rely on:
+- `event_time` (when the audited action occurred)
+- `observed_at` / `ingested_at` (when Redwood observed/recorded the event)
+
+Recommendation: downstream correlation should use timestamps + `event_id`, not arrival order.
+
+## Expected downstream deduplication patterns
+Because duplicates are expected under at-least-once semantics, customers must plan to deduplicate using `event_id`.
+
+### Splunk (HEC)
+- Redwood exports must include `event_id` as a top-level field (and/or under `fields` depending on HEC payload format).
+- Splunk does not automatically deduplicate ingested events. Customers should deduplicate in searches and/or in downstream processing.
+- Recommended search pattern for investigation reports:
+  - Use `dedup event_id` for time-bounded queries.
+
+### Datadog Logs
+- Redwood exports must include `event_id` as a facet-able attribute (e.g., `event_id`).
+- Datadog does not provide guaranteed automatic deduplication for logs. Customers should deduplicate in analytics queries or in pipelines if needed.
+
+### S3 delivery
+- S3 is an object store and cannot deduplicate by itself.
+- Customers should deduplicate during ingestion into their SIEM/data lake (e.g., Glue/Athena/Spark/Logstash) using `event_id`.
+- File/object boundaries must not be assumed to be unique or non-overlapping across retries; consumers should treat the dataset as append-only with possible repeats.
+
+## Consequences
+### Positive
+- Clear, implementable guarantees across heterogeneous destinations.
+- Robust recovery from transient outages and throttling without losing events.
+- A stable, portable idempotency key (`event_id`) across all integrations.
+- Operational controls (DLQ, pause/resume, lag thresholds) reduce platform risk.
+
+### Negative / tradeoffs
+- Customers must accept and handle duplicates.
+- Evidence queries (e.g., “count of admin actions”) must be written carefully with deduplication.
+- Some customers will ask for exactly-once; the correct response is that we provide at-least-once plus stable dedup keys.
+
+## Alternatives considered
+### A) Exactly-once delivery
+Rejected.
+- Would require sink-specific transactional semantics, which are not available consistently (especially for Splunk/Datadog).
+- Would complicate the system significantly and increase risk of silent data loss (e.g., if we incorrectly “commit” without durable downstream persistence).
+
+### B) Best-effort (at-most-once) delivery
+Rejected.
+- Not acceptable for security/compliance use cases; drops during outages are unacceptable.
+
+### C) Destination-specific idempotency keys
+Rejected.
+- Inconsistent for customers, hard to support, and not portable across destinations.
+
+## Implementation notes / requirements
+- All exported payloads MUST include schema v2 `event_id`.
+- Exporter MUST NOT advance checkpoints on partial failures.
+- Adapter success criteria must be explicit and documented (e.g., HTTP 2xx as success, with sink-specific caveats).
+- Exporter logs and metrics MUST NOT include sensitive payloads; reference the PII/sensitive fields policy for audit events.
+
+## Operational notes
+- SLOs and alerting for lag and adapter failures are defined in the Audit Exporter SLO page.
+- On-call procedures for delivery failures, pausing exports, and credential rotation are defined in the Audit Exporter runbook.
+
+## Open questions
+- For S3, do we standardize a manifest/index file for easier incremental ingestion, or rely on partitioned object keys only?
+- For Splunk, do we offer optional `sourcetype`/`source` defaults per category, or keep minimal mapping to avoid cardinality issues?
+- GA: should we support a customer-visible “replay last N hours” button (guarded), or keep replays operator-driven?
+
+## Follow-ups
+- Ensure control plane export config API returns explicit documentation strings about at-least-once semantics and dedup expectations.
+- Ensure Console UI includes a “Delivery guarantees” help panel linking to the customer-facing FAQ language.
+- Validate that `event_id` generation is consistent across all audit event emitters before enabling beta tenants.

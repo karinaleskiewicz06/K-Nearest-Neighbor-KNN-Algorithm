@@ -1,0 +1,132 @@
+GPU VPC peering and secure-proxy patterns
+
+Summary
+-------
+This document describes recommended VPC peering and secure-proxy (bastion/proxy) patterns we use to expose GPU fleets to tenant workloads across accounts and regions while preserving strong egress controls, auditability, and IaC-friendly modules. It complements the tenant network onboarding guide by focusing on cross-account connectivity, minimum-privilege routing, and the CI/CD runbook for network changes.
+
+Goals
+-----
+- Provide low-latency, high-throughput connectivity between tenant VPCs and GPU pools.
+- Enforce egress and ingress controls for regulatory and cost reasons.
+- Offer Terraform module interfaces that are safe for cross-account application.
+- Define rollout and rollback runbook for network changes to avoid wide impact.
+
+Scope
+-----
+In scope: cross-account VPC peering, Transit Gateway / PrivateLink tradeoffs, bastion/proxy options for management and control-plane traffic, route-table strategies, Terraform module inputs/outputs, CI/CD gating for network changes, test validation commands, SLOs.
+Out of scope: application-level routing (service mesh), GPU scheduler internals, on-prem interconnect (see separate onprem-packaging docs).
+
+When to use which pattern
+------------------------
+- VPC Peering (direct peering): Good for single-region, low-latency tenant-to-GPU access when both accounts are in the same cloud org and CIDR scopes do not overlap.
+- Transit Gateway (TGW): Preferred for many tenants or when scaling cross-account attachments across regions/accounts. Uses central routing and simplifies management at scale.
+- PrivateLink / Interface endpoints: Use when you want to present a managed API endpoint (e.g., inference API) rather than exposing raw IPs. Good for restricting egress and applying auth at the edge.
+- Secure-proxy (bastion + proxy): Use for management/control-plane and for tenants that require SSH/API jump proxies instead of wide network peering.
+
+Architectural overview (text diagram)
+-------------------------------------
+- Tenant Account A (VPC-A)  <--(peering/TGW/PL)--  GPU Account (VPC-GPU)  <--(private-link)--  Control Plane Account (VPC-CP)
+- Bastion/proxy lives in a hardened management VPC with SSM/Proxy agent and explicit TLS mTLS towards GPU service.
+- Egress to internet flows via a centralized egress account with NAT GW + firewall (WAF/IPS) for audit and cost controls.
+
+Security controls and routing table matrix
+-----------------------------------------
+| Purpose                      | Recommended control                               | Route table placement      | Notes |
+|-----------------------------|---------------------------------------------------|----------------------------|-------|
+| Tenant -> GPU data plane     | VPC Peering or TGW, security-group whitelist only | GPU-subnet route-table     | Deny 0.0.0.0/0; explicit routes only |
+| Management access to GPUs    | Bastion + SSM or proxy with mTLS                 | Management subnet RT       | MFA + SSO enforced |
+| Control plane API exposure   | PrivateLink + ALB + IAM policy                    | Control-plane subnet RT    | Fine-grained IAM + VPC endpoint policies |
+| Internet egress (audit)     | Central egress account + proxy                    | Egress account route-table | Flow logs + SCC alerts |
+
+Terraform module interface (recommended inputs/outputs)
+-----------------------------------------------------
+Use these patterns in tenant onboarding modules. Keep modules small and composable. Example arguments for a GPU-vpc-attachment module: 
+- inputs (list): ["tenant_account_id", "tenant_vpc_id", "tenant_cidr", "attachment_mode", "allowed_port_ranges", "peering_name", "tags"]
+- outputs (list): ["attachment_id", "route_table_ids", "security_group_id", "peer_vpc_id"]
+
+Example Terraform snippet (pseudo-HCL)
+-------------------------------------
+resource "aws_vpc_peering_connection" "gpu_peer" {
+  peer_owner_id = var.tenant_account_id
+  peer_vpc_id   = var.tenant_vpc_id
+  vpc_id        = module.gpu_vpc.vpc_id
+  tags = { Name = var.peering_name }
+}
+
+resource "aws_route" "tenant_to_gpu" {
+  route_table_id         = element(module.tenant_route_tables.ids, 0)
+  destination_cidr_block = module.gpu_vpc.cidr_block
+  vpc_peering_connection_id = aws_vpc_peering_connection.gpu_peer.id
+}
+
+Hardening and least-privilege checklist
+----------------------------------------
+- Security groups: allow only TCP/UDP ports required (e.g., 443 for API, 7888 for custom GPU agent).
+- Route tables: avoid catch-all 0.0.0.0/0 routes in tenant-facing route tables.
+- Flow logs: enable VPC Flow Logs to centralized logging (s3/kinesis).
+- IAM: use service-linked roles and cross-account assume-role with short sessions.
+- Encryption: enforce TLS 1.2+ and mTLS for control-plane channels.
+
+CI/CD and change management for network/IaC
+-------------------------------------------
+1) Author changes in a feature branch of terraform/modules/network/ (max 50 line diffs).
+2) Run local preflight: terraform fmt, tflint, and terraform validate.
+3) Open PR with a documented change summary and a targeted impact statement (which tenants affected, expected downtime, rollback plan).
+4) CI pipeline runs: plan against a staging account (no apply), runs integration tests (see validation steps below).
+5) Approval gate: network-reviewers group (at least two reviewers) + SRE signoff if route propagation or TGW changes.
+6) Canary apply: apply to a single non-production tenant or canary VPC via automation.
+7) Smoke tests; if green, schedule production window and apply via controlled runbook.
+
+Testing and validation (commands)
+--------------------------------
+- Terraform plan against target account: terraform plan -var-file=canary.tfvars -out=plan.tfplan
+- Validate connectivity (from bastion): curl -v --resolve gpu.internal:443:<gpu-addr> https://gpu.internal/healthz
+- Throughput test: iperf3 -c <gpu-host> -t 30 -P 4    (expected > 6 Gbps for 100GbE links)
+- Flow log verification (sample): aws logs filter-log-events --log-group-name /vpc/flowlogs --filter-pattern "ACCEPT" --start-time <epoch>
+
+Runbook: Rolling a peering/TGW route change (emergency safe path)
+---------------------------------------------------------------
+1) Pre-checks (15 minutes): verify active sessions count on GPUs (redwood-gpu-metrics, query: active_connections > 100 triggers caution).
+2) Notify channels: #infra-notify, #oncall-sre, affected tenant owners. Add incident channel if expected > 5 min impact.
+3) Apply canary in staging: terraform apply plan.tfplan --target=module.gpu_vpc_attachment["canary"]
+4) Run connectivity smoke tests (see above).
+5) If failures, rollback target: terraform apply -refresh-only then revert PR and run apply for revert.
+6) If success, proceed with a phased rollout: attach 10% tenants -> 30% -> 100% with 5–10 minute observation windows.
+7) Post-change validation: confirm VPC Flow Logs are being written and that control-plane metrics (request latency) have not regressed > 10%.
+
+Ownership, SLOs, and alerting
+-----------------------------
+- Ownership: networking infra (eng-infra) owns module code and runbooks; eng-sre owns oncall response for outages.
+- SLOs (example): 
+  - Inter-VPC connectivity: 99.95% (measured as successful health-checks per minute between tenant and GPU).
+  - Time-to-detect route regression: 2 minutes (alert if health-check fails > 2 minutes).
+  - Rollback-target: 100% success on revert for standard peering changes in <30 minutes for non-global changes.
+- Alerts: route-blackhole-alert (if more than 5% of expected IPs show no flow logs), tgw-attachment-failure, vpc-peering-deleted.
+
+Known limitations and tradeoffs
+------------------------------
+- VPC Peering does not support transitive routing; scaling to hundreds of tenants pushes us to TGW which adds cost and operational complexity.
+- PrivateLink provides strong isolation but requires per-service endpoint management and can add latency for bulk data transfers versus peering.
+- Multi-region designs require additional replication of attachments or an active-active TGW strategy.
+
+Onboarding checklist for a new tenant (summary)
+---------------------------------------------
+1) Collect tenant_account_id, tenant_vpc_id, tenant_cidr, contact_owner.
+2) Confirm non-overlapping CIDR or schedule NAT/translation.
+3) Populate tenant tfvars and open onboarding PR.
+4) Run plan in staging and validate connectivity via canary VPC.
+5) Apply in production window and validate with perf and flow logs.
+
+References and links
+--------------------
+- Refer to: /confluence/eng-infra/terraform-and-iac/tenant-gpu-network-onboarding-and-iac-patterns 
+- Refer to: /confluence/eng-infra/cloud-accounts-and-networking/vpc-egress-gpu-segmentation-iac-adapter-runbook
+- Internal tool: redwood-netctl (CLI for verifying attachments) — run redwood-netctl list-attachments --tenant <id>
+
+Appendix A: Example canary tfvars
+--------------------------------
+tenant_account_id = "111122223333"
+tenant_vpc_id     = "vpc-0abc123def"
+attachment_mode    = "peering"
+allowed_port_ranges = ["443", "7888-7890"]
+peering_name       = "tenant-canary-peer"

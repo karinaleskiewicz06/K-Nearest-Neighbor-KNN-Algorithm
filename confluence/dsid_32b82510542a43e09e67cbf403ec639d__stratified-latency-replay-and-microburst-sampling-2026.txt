@@ -1,0 +1,168 @@
+Stratified Latency Replay and Microburst Sampling Playbook
+
+Summary
+
+This playbook defines the Stratified Latency Sampling (SLS) pipeline and the Microburst Sampler for Redwood's serving runtime. The goal is to capture representative traces across latency bands and microburst events with bounded cost, enable high-fidelity replays for kernel-sensitivity debugging, and produce actionable signals for autotune and regression detection. This is operational guidance for engineers on the runtime, telemetry, and replay tooling.
+
+Why this exists
+
+- Static uniform sampling misses rare high-latency clusters and transient microbursts that correlate strongly with kernel regressions.
+- SLS guarantees coverage across p50/p95/p99 bands while keeping the sampling budget predictable.
+- Microburst sampling captures short-lived queuing spikes and NVLink/PCIe anomalies that are often the root cause of degraded tail latency.
+
+Audience and scope
+
+- Primary: runtime engineering, profiling, and SRE teams.
+- Scope: production-hosted and dedicated clusters (not air-gapped private installations unless customer opts in). Provides config recommendations, playbook run steps, and troubleshooting guidance.
+
+Key concepts and terminology
+
+- Stratified Latency Sampling (SLS): sampling policy that partitions requests by latency buckets and assigns per-bucket rates.
+- Microburst: brief (100ms to 10s) increase in request concurrency or kernel contention causing tail latency spikes.
+- Shadow Replay: deterministic replay of sampled requests in a sandboxed profiler service (prof-run) to reproduce kernel execution history.
+
+SLOs and budget constraints
+
+- Sampling budget: target telemetry overhead <= 0.6% of total token compute cost for a cluster under normal load.
+- Replay budget: limit to 8 concurrent replays per runtime cluster and 500 replays per day for a single customer namespace.
+- Detection targets: achieve at least 95% probability of capturing at least one event per unique microburst class within 24 hours for clusters with sustained traffic > 10 RPS.
+
+High-level pipeline
+
+1. Runtime annotates each request with runtime.request.latency_ms, request.signature (hash of model, seq_len, route, user_tier), and sample_hint fields.
+2. Sampler service (samplerd) consumes metrics stream and applies stratification policy.
+3. Selected samples are persisted to the trace-store (S3 prefix: s3://redwood-profiles/{cluster}/{date}/) and indexed in the replay-catalog.
+4. Shadow replays are scheduled to prof-run with kernel tracing enabled and archived as replay-artifacts.
+
+Sampling policy (recommended config)
+
+| bucket | latency range (ms) | target share | sample rate (requests/sec per 1k RPS) | rationale |
+|--------|--------------------:|-------------:|---------------------------------------:|----------|
+| hot    | 0 - 50             | 60%          | 300                                    | captures normal traffic shape |
+| warm   | 50 - 200           | 30%          | 150                                    | captures slow tails and emergent drift |
+| cold   | 200 - 2000         | 8%           | 40                                     | focuses on p99+ anomalies |
+| burst  | >2000 or queued>50 | 2%           | 10                                     | microburst and severe degradation cases |
+
+Operational knobs (summary)
+
+- per-cluster_budget_pct: percent of cluster CPU/IO budget allocated to sampler processing (default: "0.6").
+- max_daily_replays: upper bound on replays to avoid profiler overload (default: "500").
+- allow_private_replay: boolean to enable replays for private deployments (default: "false").
+
+YAML example (samplerd config snippet)
+
+```yaml
+# samplerd.yaml
+cluster: "eu-west-1-runtime-1"
+strata:
+  - name: hot
+    min_ms: 0
+    max_ms: 50
+    target_share: 0.6
+    rate_per_1k_rps: 300
+  - name: warm
+    min_ms: 50
+    max_ms: 200
+    target_share: 0.3
+    rate_per_1k_rps: 150
+  - name: cold
+    min_ms: 200
+    max_ms: 2000
+    target_share: 0.08
+    rate_per_1k_rps: 40
+  - name: burst
+    min_ms: 2000
+    max_ms: 999999
+    target_share: 0.02
+    rate_per_1k_rps: 10
+limits:
+  sampler_cpu_pct: 0.6
+  max_daily_replays: 500
+  replay_concurrency_limit: 8
+```
+
+Replay and investigation workflow (runbook)
+
+1. Alerting triggers
+   - Typical alert: runtime.alerts.microburst_rate_increase > 5% sustained for 1m or runtime.alerts.p99_increase > 20%.
+   - Pager owners: runtime-oncall@redwood (see oncall rota).
+2. Immediate triage (10 minutes)
+   - Check the sampler dashboard (Dash: "Samplerd / Strata Coverage") and verify sample-rate per bucket.
+   - Run query: "SELECT count(*) FROM replay_catalog WHERE cluster='{{cluster}}' AND created_at > now()-1h GROUP BY strata" to confirm index coverage.
+3. If samples exist: schedule shadow replay
+   - Use CLI: profctl schedule-replay --cluster {{cluster}} --replay-id <catalog-id> --kernel-trace=full --timeout=30m
+   - Monitor prof-run logs and kernel callgraph output (s3://redwood-profiles/{cluster}/replays/{id}/).
+4. If no representative samples and microburst persists: escalate to active capture
+   - Toggle transient capture in samplerd: curl -X POST https://samplerd.internal/api/v1/force_capture -d '{"duration_ms":60000, "rate":1000}' (requires oncall credentials).
+   - After capture, persist traces and follow step 3.
+5. Post-replay analysis
+   - Compare kernel invocation histograms (metric: profiler.kernel.invocation_dist) to baseline. If a new kernel path exceeds baseline by >3x, create an incident topic and assign to kernel-team.
+
+Troubleshooting checklist and common findings
+
+- Issue: Low coverage of cold bucket despite p99 alerts
+  - Check: samplerd's latency attribution window (default 5s). Increase to 30s if tail is dominated by queued spikes.
+  - Check: request.signature cardinality — very high cardinality masks common signals. Apply signature normalisation (drop per-user identifiers).
+- Issue: Replay queue saturating prof-run
+  - Check: replay_concurrency_limit; throttle scheduler and increase max_daily_replays only with approval from SRE and cost owners.
+- Issue: High IO cost from storing full traces
+  - Mitigation: switch to sketch-level capture for hot bucket and full capture for cold/burst buckets. See cost-correlation playbook.
+
+Metrics and dashboards to monitor
+
+- runtime.request.latency_p50 / p95 / p99 (per-route)
+- samplerd.coverage.hot/warm/cold/burst (percentage of requests observed vs expected)
+- replay.catalog_fill_rate (entries/sec)
+- prof-run.concurrency (current replays)
+- profiler.kernel.invocation_dist (histogram by kernel id)
+
+Example Grafana query (p95 by strata)
+
+```
+sum by (strata) (histogram_quantile(0.95, sum(rate(runtime_request_latency_bucket[5m])) by (le,strata)))
+```
+
+Rollout and change control
+
+- Feature flag gating: sampling.stratified.enabled (default: true in prod). New samplerd releases must ship behind this flag.
+- Staged rollout plan:
+  1. Canary: enable on 2 pilot runtime nodes (1% of traffic) for 24h.
+  2. Gradual: 10% -> 25% -> 50% -> 100% over 48–72h while monitoring sampler_cpu_pct and p99.
+  3. Revert policy: immediate disable if profiler.concurrency > 90% or cluster p99 increases > 15% sustained for 10m.
+
+Privacy and customer-sensitive data handling
+
+- By default traces are redacted: prompt and user content are hashed and not stored in plain text. Replay artifacts for private deployments are disabled unless allow_private_replay=true and customer has signed the profiling data addendum.
+
+Ownership and contacts
+
+- Primary owner: Aisha Patel (runtime-profiling)
+- Secondary: Marco Ortega (sre-inference)
+- Kernel escalation: kernel-team@redwood
+- Oncall: runtime-oncall@redwood
+
+Appendix A — Quick CLI cheat sheet
+
+- Inspect samplerd status: curl -sS https://samplerd.internal/api/v1/status | jq .
+- List replay catalog entries: replayctl list --cluster eu-west-1-runtime-1 --since 1h
+- Schedule replay: profctl schedule-replay --cluster eu-west-1-runtime-1 --replay-id 12345 --kernel-trace=full
+
+Appendix B — Example incident timeline (sample)
+
+- 00:00 Alert fires for p99 increase (runtime.alerts.p99_increase).
+- 00:05 Triage: verify sampler coverage; samples available in cold bucket.
+- 00:10 Schedule shadow replay and begin prof-run capture.
+- 00:30 Replay completes; profiler shows new kernel path with NVLink stalls during KV cache refill.
+- 01:00 Patch queued: kernel-team rolls a hotfix that adjusts batch-slicing heuristics.
+
+Related reading
+
+- Continuous profiling strategy (see: continuous-runtime-profiling-strategy-2026)
+- Cost correlation sampling playbook (see: variance-driven-sampling-and-cost-correlation-playbook-2026)
+- Execution contracts and fallback design (see: execution-contracts-and-stable-fallbacks-2026)
+
+Change log
+
+- 2026-03-02 (Aisha Patel) Initial publish of SLS playbook and microburst sampler design.
+- 2026-07-14 (Aisha Patel) Added replay concurrency limits and privacy handling for private deployments.
+- 2026-11-15 (Marco Ortega) Clarified rollout/revert thresholds and added CLI examples.

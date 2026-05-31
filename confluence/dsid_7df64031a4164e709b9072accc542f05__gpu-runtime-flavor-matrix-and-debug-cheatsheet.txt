@@ -1,0 +1,129 @@
+GPU runtime flavor matrix and debugging cheatsheet
+
+Summary:
+This page documents the canonical runtime 'flavors' used by the GPU fleet at Redwood Inference and provides a compact troubleshooting & debugging cheatsheet for oncall and engineering. It is intended for infra engineers, SREs, and service owners who need quick, prescriptive actions during incidents or performance regressions.
+
+Goals:
+- Provide an easy-to-scan matrix to choose the correct runtime flavor for a workload.
+- Capture common failure modes and first-line mitigations.
+- Surface relevant metrics, CLI commands, and telemetry panels to examine.
+- Reduce time-to-diagnosis for capacity and performance incidents.
+
+Audience:
+- infra engineers operating GPU pools
+- service owners tuning model-serving deployments
+- oncall SREs responding to latency/cost incidents
+
+Runtime flavors (summary table):
+| Flavor | Primary use case | Key constraints | Typical models | Default scale profile | Notes |
+|---|---|---|---|---|---|
+| low-latency | Interactive chat, low p99 latency | small batch size, high priority | LLaMA-2-13B, chat-variants | 8 replicas, fast-eviction disabled | Prefers prewarmed pools, KV cache enabled |
+| cost-optimized | Batch embeddings, offline evals | high batch size, relaxed p99 | emb-models, quantized 7B | autoscale with spot-friendly preemption | Use 4-bit quantized kernels, aggressive batching |
+| high-throughput | Streaming video/voice transcription | large sequence length, steady throughput | decoder-only long-context | large NPU-backed nodes | tuned kernel selection for long seq |
+| fractional-gpu | Multi-tenant multiplexing | best-effort isolation | small-to-medium models | high consolidation ratio | Use MIG or MPS depending on node family |
+| deterministic | Regulatory/PII workflows | fixed runtime, no preemption | curated models pinned to version | dedicated capacity | No dynamic kernel experimentation |
+
+Selection guidance (short):
+- If 95th/99th p95 latency SLOs matter and user-visible latency must be < 150ms: choose low-latency.
+- If you can accept higher tail latency and aim to minimize $/token: choose cost-optimized.
+- For high sequence-length workloads (>= 4096 tokens typical), use high-throughput flavor.
+- For mixed tenant workloads that must share nodes: use fractional-gpu with strict cgroup and network egress limits.
+
+Key configuration knobs per flavor (reference):
+- Batch size / max_tokens_per_request
+- KV cache warmup policy (none / partial / aggressive)
+- Quantization profile (fp16 / int8 / 4-bit)
+- Kernel selection overrides (auto / perf-priority / stability-priority)
+- Prewarm pool size and eviction tolerance
+- Node type selection tag (e.g., a100-40, h100-80, gtx-fractional)
+
+Operational runbook (triage checklist):
+1) Validate scope and severity
+   - Confirm which service(s) and customers are affected. Capture request IDs, routes, and model version.
+   - Check status page and ongoing incidents. If multi-region, note region(s).
+2) Quick triage (first 5 minutes)
+   - Query the model-serving trace dashboard (Console > Per-route traces) for failed requests and p99 latency trends.
+   - Run:
+     - CLI: rwoodctl monitor traces --route <route> --since 15m
+     - kubectl get pods -n inference --selector=route=<route> -o wide
+   - Check node-level signals: GPU utilization, memory alloc frac, CUDA OOMs.
+     - PromQL examples:
+       - avg_over_time(nvidia_gpu_utilization[5m]) > 0.75
+       - increase(cuda_oom_events[1h]) > 0
+3) Common causes & first actions
+   - Cause: sudden p99 spike with normal avg
+     - Action: verify small-batch queueing and head-of-line blocking. Temporarily reduce max_batch_wait_ms or increase concurrency per replica.
+     - If persistent, failover route to a slightly smaller model variant (configured in smart routing).
+   - Cause: slow steady slowdown and increasing GPU memory pressure
+     - Action: check for KV cache growth from large context workloads. If KV cache misconfiguration, evict or shrink cache size. Restart pods with KV_CACHE_TRIM=aggressive.
+   - Cause: OOMs or CUDA driver errors
+     - Action: drain offending node, rotate pods to other nodes. If driver errors, escalate to kernel/driver team and open infra ticket with node logs.
+   - Cause: preemption/spot churn causing capacity holes
+     - Action: re-route critical traffic to dedicated or low-latency pools. Adjust autoscaler to temporarily prefer on-demand nodes for SLO-critical routes.
+4) Mitigations to apply (short commands and examples)
+   - Temporarily reduce batch latency tuning: POST /internal/configs/<route> {"max_batch_wait_ms": 5} (use console or rwoodctl)
+   - Force route to fallback model: rwoodctl routes promote-fallback --route <route> --fallback <model-id>
+   - Evict KV cache on a set of pods: kubectl exec -n inference <pod> -- /bin/sh -c 'curl -sS localhost:8080/admin/kv/evict?policy=trim'
+   - Scale up prewarm pool: terraform apply -var 'prewarm_count=12' -target=module.prewarm_pool["<flavor>"]
+
+Debugging checklist (detailed):
+- Observability: open console panels
+- Per-model token rate (tokens/sec)
+- Per-node GPU mem usage and memory fragmentation (cuda_mem_frag)
+- RPC queue depth and per-replica concurrency
+- Error logs with stack traces (model runtime / serving runtime)
+- Node-level:
+- ssh to node (bastion) -> sudo journalctl -u nvidia-docker -f
+- nvidia-smi -q -d MEMORY,UTILIZATION
+- check driver version: nvidia-smi | grep 'Driver Version'
+- Kernel oops? dmesg | tail -n 200
+- If MIG configured, verify slice health: nvidia-smi mig -l
+- Pod-level:
+- kubectl top pod -n inference <pod>
+- kubectl logs -n inference <pod> -c runtime --since=10m | grep -i error
+- Check env vars: kubectl exec -n inference <pod> -- printenv | egrep 'KV_CACHE|BATCH|KERNEL'
+
+SLOs and alerting guidance (what to look for):
+- p50/p90/p99 generation latency per route (SLO targets defined per product route)
+- tokens_per_second per model (throttling risk if token rate > configured token throughput for node type)
+- GPU memory headroom < 10% for > 3 minutes -> page oncall
+- CUDA OOM events > 0 in 15 minutes -> immediate mitigation (drain node)
+- Preemptions > 3 in 10 minutes per availability zone -> route-critical traffic away
+
+Example Terraform snippet (flavor mapping):
+# flavor -> node type mapping (example)
+module "gpu_node_pools" {
+  source = "git::ssh://git@repo/infra-modules.git//gpu-pool"
+  name_prefix = "flavor-low-latency"
+  node_type   = "a100-40"
+  prewarm_count = 8
+  taints = ["flavor=low-latency:NoSchedule"]
+}
+
+Diagnostic escalation matrix:
+- Level 0: oncall SRE uses runbook above. If mitigations restore service within 15m, close incident with brief RCA note.
+- Level 1: engage runtime engineers (kernel-and-scheduling) if kernel overrides or quantization kernels suspected.
+- Level 2: engage infra/hardware if node-level driver/kernel issues, persistent OOMs, or thermal events.
+- Level 3: paging to exec if widespread multi-region outage.
+
+Post-incident hygiene
+1. Annotate incident in paging system with flavor used and mitigations applied.
+2. Create a short RFC if changes to default flavor config are required (e.g., reduce default batch wait from 20ms to 5ms).
+3. Add a regression test to nightly perf-suite if the incident was reproducible via an eval set.
+
+Owner and contacts
+- Primary owner: infra-serving (oncall) — see team rota in People Ops.
+- Runtime flavor steward: Marcus Lee (runtime team) — for kernel and quantization profile changes.
+- Capacity owner: Anika Rao (capacity & fleet) — for autoscaler and prewarm pool adjustments.
+
+Appendix: quick commands
+- rwoodctl list flavors
+- rwoodctl flavor describe low-latency
+- kubectl get pods -n inference --selector=flavor=low-latency
+- terraform plan -var 'flavor=low-latency'
+
+Revision history:
+- 2024-08-15: created by Jordan Patel
+- 2025-11-03: updated with fractional-gpu MIG guidance and Terraform example (Anika Rao)
+
+If anything on this page is unclear, open a PR against this doc or ping the infra-serving channel with the 'doc:runtime-flavors' tag.

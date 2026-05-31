@@ -1,0 +1,191 @@
+Cross-tenant memory isolation and eviction architecture
+
+Summary
+-------
+This document specifies the design, operational controls, and rollout plan for cross-tenant memory isolation and eviction behavior in the Redwood serving runtime. It describes how the runtime prevents noisy-tenant memory interference, how eviction decisions are made across shards and KV cache layers, and how we expose controls and telemetry needed by SRE, runtime, and platform teams.
+
+Goals
+-----
+- Prevent one tenant from causing sustained tail-latency regression for other tenants due to KV cache or GPU memory pressure.
+- Keep P50/P90/P99 latency SLO impact to <5% of baseline for co-located tenants under typical noisy-tenant scenarios.
+- Provide deterministic, configurable eviction policies that are observable and testable.
+- Enable graceful backpressure and routing fallbacks before OOM or hard failures.
+
+Non-goals
+---------
+- This document does not replace per-tenant billing or quota systems.
+- Does not alter kernel scheduling primitives (see kernel-and-scheduling/ for those specs).
+
+TL;DR
+------
+We use a multi-layered approach: a lightweight Admission Controller at the request ingress, a per-shard Eviction Manager for GPU DRAM and host-side KV cache, and a cross-shard Memory Arbiter that enforces tenant-level soft quotas, watermark percentiles, and priority-aware eviction windows. The system prefers targeted KV prefix eviction and request-level throttling over full-model eviction.
+
+High-level architecture (text diagram)
+------------------------------------
+- Request Ingress (Edge) -> Admission Controller -> Request Router -> Shard (Serving Runtime)
+- Inside Shard: Kernel Executor, KVCache Local (shard-level), Eviction Manager, Local Telemetry Agent
+- Global: Memory Arbiter (central control-plane process in the runtime control-plane cluster), Routing Fallback Service, Observability Backends
+
+Components and responsibilities
+-------------------------------
+- Admission Controller
+  - Enforces in-flight request caps per-tenant at the edge (configurable).
+  - Requests exceeding soft in-flight caps receive a 429 with a tenant-specific retry-after.
+  - Integrates with rate-limiter and per-tenant priority flags (internal/external).
+
+- Eviction Manager (per-shard)
+  - Tracks memory usage by tenant and by object class (KV entries, activations pinned in GPU, feature buffers).
+  - Maintains LRU-RW hybrid lists for KV entries (LRU for cold, reference-count-safe eviction for hot prefixes).
+  - Supports targeted eviction hints from the Memory Arbiter (e.g., "evict tenant X prefixes 10MB/step").
+
+- Memory Arbiter (control-plane process)
+  - Aggregates shard-level metrics and makes cross-shard tenant quota decisions.
+  - Enforces tenant-level memory windows: soft and hard watermarks expressed in percent of allocated GPU host/DRAM capacity.
+  - Issues prioritized eviction commands and recommendation signals to Admission Controller and Routing Fallback Service.
+
+- Routing Fallback Service
+  - Maintains model-variant / region fallback chains and gradually routes requests away from overloaded shards before hard eviction.
+
+Metric and SLO definitions
+--------------------------
+- Memory watermarks
+  - shard.memory.host.soft: 70% (default) - triggers aggressive local KV eviction for least-recently-used tenant entries.
+  - shard.memory.host.hard: 90% (default) - prevents new allocations; trips OOM protection path and triggers cross-shard eviction.
+
+- Latency SLOs (per-tenant, per-route)
+  - p50 target: baseline (no change)
+  - p90 target: +5% of baseline during noisy-tenant events
+  - p99 target: +10% of baseline during noisy-tenant events
+
+- Eviction thresholds and actions
+  - When shard.host.memory >= soft watermark: Eviction Manager evicts KV suffixes up to (soft_reclaim_target) default 15% of host memory over 60s window.
+  - When shard.host.memory >= hard watermark: Eviction Manager escalates to Memory Arbiter; Arbiter instructs routing fallback and tenant-level throttles.
+
+Eviction policy hierarchy
+-------------------------
+1. KV prefix eviction (least impact): target cold prefixes belonging to noisy tenant; reclaim host memory used by cached KV tokens.
+2. Host-memory pooled buffer reclamation: free ephemeral feature buffers, temporary allocations.
+3. GPU activation spilling (if configured): spill to host memory in controlled window.
+4. Kernel preemption and request-level throttling: slow or pause new high-cost requests for offending tenant.
+5. Hard fail (OOM): last resort, abort long-running requests and generate incident.
+
+Config table (example YAML snippet)
+----------------------------------
+shard_memory_policy:
+  soft_watermark_percent: 70
+  hard_watermark_percent: 90
+  soft_reclaim_target_percent: 15
+  soft_reclaim_window_seconds: 60
+  eviction_order: ["kv_prefix", "host_pool", "spill_to_host", "throttle_requests"]
+  tenant_priorities:
+    enterprise_tier: high
+    free_tier: low
+  admission_controller_limits:
+    per_tenant_inflight_default: 100
+    per_tenant_inflight_burst: 200
+
+Operational sequences
+---------------------
+- Normal pressure event (example timeline)
+  1. Shard host memory reaches 72% (soft watermark crossed).
+  2. Eviction Manager computes per-tenant cost and identifies tenant T1 as heavy contributor (40% of incremental usage).
+  3. Eviction Manager evicts T1 cold prefixes; reclaims 12% host memory in 45s.
+  4. Memory Arbiter observes success; no routing change requested.
+
+- Sustained noisy tenant (escalation)
+  1. Shard reaches 91% host memory (hard watermark).
+  2. Eviction Manager signals Arbiter with tenant breakdown and recent eviction rate.
+  3. Arbiter instructs Routing Fallback Service to divert new T1 traffic to warm spares (if available) and lowers T1 admission controller in-flight cap by 60% (configurable).
+  4. If routing not possible, Arbiter issues cross-shard eviction to reclaim from other shards where T1 also has cached state, up to reclaimed target.
+  5. If reclaiming fails within escalation window (default 120s), Arbiter triggers a partial throttle and emits an alert to oncall.
+
+Telemetry and alerts
+--------------------
+Essential metrics (per-shard and aggregated):
+- shard.memory.host.used_bytes
+- shard.memory.host.total_bytes
+- shard.eviction.rate_entries_per_sec
+- tenant.memory.delta_bytes (sliding window)
+- admission.inflight.per_tenant
+- routing.fallback.count
+
+Indicative alerts:
+- memory.shard.hard_watermark_exceeded (critical)
+- eviction.rate.high (warning) - sustained evictions beyond reclamation target for >60s
+- tenant.noisy.detected (info -> pager after 120s if persists)
+
+Tracing and logs
+---------------
+- Eviction decisions must include trace context and tenant reason codes: EVICT_REASON={kv_prefix, host_pool, spill, throttle}.
+- Span pattern: EvictionManager->MemoryArbiter->RoutingFallback with propagation of request identifiers and affected-tenant ids.
+- Logs should include before/after memory snapshots (host/gpu) and reclaimed bytes per action.
+
+Runbook: noisy-tenant incident triage (summary)
+------------------------------------------------
+1. Pager fires for memory.shard.hard_watermark_exceeded.
+2. Oncall: examine shard.memory.host.* metrics and tenant.memory.delta_bytes to identify top contributors.
+3. If eviction rate is low and memory continues climbing: run targeted eviction probe: 
+   a. curl -XPOST https://runtime-admin/shard/{id}/evict -d '{"tenant":"T1","bytes":10485760}'
+   b. Observe eviction.rate_entries_per_sec and memory.used_bytes for reclamation.
+4. If reclamation insufficient: ask Arbiter to route new T1 traffic to fallback pool: `POST /arbiter/route-override` with reason=NOISY_TENANT.
+5. If routing/fallback unavailable, manually reduce Admission Controller in-flight for tenant T1.
+6. Open an incident with tenant owner and runtime team if sustained >30m.
+
+Runbook CLI examples
+--------------------
+- Evict 10MB of tenant prefixes on shard 23\\n  curl -XPOST https://runtime-admin/shard/23/evict \\
+    -H 'Content-Type: application/json' \\
+    -d '{"tenant":"tenant-123","bytes":10485760,"mode":"kv_prefix"}'
+
+- Query top tenant contributors for last 5m
+  curl https://telemetry.internal/api/top-tenants?shard=23&window_seconds=300
+
+Rollout and testing plan
+------------------------
+- Canary (week 0-2): enable soft watermarks (50%->70%) on 5% of shards running low-traffic test workloads. Observe eviction.delta and p99 latency.
+- Extended Canary (week 2-6): enable cross-shard Arbiter recommendations and routing fallbacks for the same canary cohort.
+- Gradual rollout (week 6-12): increase to 50% then to 100% after thresholds met.
+- Stress test: run synthetic noisy-tenant scenarios using synthetic-chaos-stress-profiles harness (see benchmarking-and-perf-suite for profile definitions).
+
+Testing checklist
+-----------------
+- Unit tests for eviction manager correctness (LRU invariants, refcount-safe evict).
+- Integration tests for Arbiter messages and admitted routing fallbacks.
+- Load tests with mixed-tenancy at 2x production QPS.
+- Chaos tests: simulate shard loss and verify Arbiter fallback does not over-evict other tenants.
+
+Ownership and contact points
+---------------------------
+- Design owner: Elena Morales (runtime-architecture)
+- Primary implementer: Kernel & Eviction Team (eng-serving-runtime/kernel-and-scheduling)
+- Oncall action owner: Eng SRE (eng-sre)
+- Escalation path: runtime-team -> eng-sre -> infra-plat -> CTO oncall
+
+Known limitations and risks
+--------------------------
+- Cross-shard reclamation requires consistent per-tenant keys to be colocated; for some customers with sharded KV keys we may not reclaim evenly.
+- Aggressive eviction of cached KV prefixes can increase downstream embedding / prompt reconstruction cost and may regress accuracy for some prompt-heavy workloads.
+- Admission control throttles can cause client-side retries; we rely on client retry-backoff to avoid spinning.
+
+Appendix: schema for eviction command (JSON)
+------------------------------------------
+{
+  "shard_id": "string",
+  "tenant": "string",
+  "bytes": "int64",
+  "mode": "kv_prefix|host_pool|spill|throttle",
+  "dry_run": "bool (optional)",
+  "trace_id": "string"
+}
+
+References
+----------
+- eng-serving-runtime/known-issues/kvcache-shard-skew-quantization-interaction-2026 (for skew scenarios)
+- eng-serving-runtime/benchmarking-and-perf-suite/synthetic-chaos-stress-profiles-2026 (chaos tests)
+- eng-serving-runtime/kernel-and-scheduling/preemption-aware-batch-slicing-spec-2026 (kernel interactions)
+
+Change log
+----------
+- 2025-11-12: Initial draft by Elena Morales.
+- 2026-01-08: Added Arbiter escalation windows and clearer telemetry fields (reviewer: Marcus Chen).
+- 2026-02-14: Finalized rollout plan and runbook steps; published.

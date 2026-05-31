@@ -1,0 +1,214 @@
+Operator-focused telemetry partitioning and lightweight agent playbook
+
+Overview
+--------
+This playbook describes a low-risk, operator-focused approach to partitioning runtime telemetry for cost attribution and operator workflows. It prescribes a lightweight in-namespace agent pattern, concrete dashboard and alert definitions, and an operational rollout plan. The intent is to make cost signals actionable for operators while keeping cardinality and storage growth under control.
+
+Goals
+-----
+- Provide operators with per-tenant and per-model cost telemetry that explains high-cost events within 5 minutes of occurrence.
+- Keep high-cardinality labels out of hot Prometheus collections; use a partitioned timeseries + event-log pattern.
+- Ensure safe rollout with feature flag, manual operator guardrails, and gradual backfill.
+
+Scope
+-----
+- Applies to ingested runtime metrics (token counts, model selection, KV cache hits, batch sizes) and derived cost estimates.
+- Does NOT change billing pipelines or accounting ledgers; cost outputs are advisory and tagged as "estimated".
+- Targets hosted and Dedicated clusters initially; Private on-prem adoption follows after 2 quarters.
+
+Owner and responsibilities
+-------------------------
+- Platform Observability: primary owner for dashboards and PromQL/monitoring query templates.
+- Platform Operators: responsibility for agent rollout, runbook execution, and incident mitigations.
+- Runtime Team: owns the telemetry schema and cardinality budget.
+- Cost Insights team (cross-functional): validates cost model and sampling heuristics.
+
+Data model and partitioning strategy
+----------------------------------
+Summary: emit low-cardinality base metrics to the central Prometheus (or Cortex) and stream detailed per-tenant events to a partitioned event store (ClickHouse/BigQuery). Use a deterministic shard key (region:model_family:customer_bucket) to keep partition counts bounded.
+
+Key labels retained in central metrics (low cardinality):
+- region
+- model_family (e.g., gptx-1, redwood-rlf)
+- environment (prod/staging)
+- tenant_bucket (small integer bucket derived from tenant_id, see bucketing rules)
+
+High-cardinality labels streamed as events:
+- tenant_id (raw)
+- api_key_id
+- model_variant_id
+- request_id
+- input_token_count, output_token_count
+
+Bucketing rules (operator-facing):
+1) Hash tenant_id into 256 buckets: bucket = fnv32(tenant_id) % 256.
+2) For high-spike tenants (>= 95th percentile cost in a week) create an exception and route to a dedicated partition.
+3) Limit partition count per region to 512.
+
+Metrics, dashboards and example queries
+-------------------------------------
+Essential metrics exposed in central Prometheus (name conventions):
+- runtime_request_rate_total{region,model_family,tenant_bucket} (counter)
+- runtime_token_output_total{region,model_family,tenant_bucket} (counter)
+- prefix_kv_cache_hit_ratio{region,model_family} (gauge)
+- runtime_p95_latency_ms{region,model_family} (histogram/summary)
+- runtime_batch_size_avg{region,model_family} (gauge)
+
+Example PromQL panels (for an operator dashboard):
+- Global token burn rate (tokens per minute): rate(runtime_token_output_total[2m])
+- Top model families by token rate (last 5m): topk(10, sum by (model_family) (rate(runtime_token_output_total[5m])))
+- Tenant-bucket cost estimate (5m window): sum by (tenant_bucket) (rate(runtime_token_output_total[5m]) * on(model_family) group_left(cost_per_token_cents) cost_per_token_cents)
+
+Note: cost_per_token_cents is maintained as a separate time series with model_family label and updated via a config pipeline.
+
+Detailed event store queries (examples for ClickHouse / BigQuery for root-cause):
+- Query: find spikes where tenant_id emitted > 1M tokens in 15 minutes.
+  SELECT tenant_id, SUM(output_token_count) as tokens_15m
+  FROM runtime_events
+  WHERE ingest_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 15 MINUTE)
+  GROUP BY tenant_id
+  HAVING tokens_15m > 1000000
+  ORDER BY tokens_15m DESC
+
+- Query: model_variant churn during spike: SELECT model_variant_id, COUNT(*) FROM runtime_events WHERE tenant_id = 'T-123' AND ingest_time BETWEEN X AND Y GROUP BY model_variant_id ORDER BY 2 DESC
+
+Alerting strategy and concrete rules
+----------------------------------
+We recommend two alert tiers: operator-actionable and escalation. All alerts include a "cost impact" estimate field using the central token-rate metric multiplied by cost_per_token.
+
+Recommended alert definitions (examples):
+1) tenant-bucket-token-spike
+- Trigger: tenant_bucket token rate > 10x baseline (baseline = rolling median of last 6 hours) for 5 minutes.
+- Severity: warning
+- Operator action: check event store for tenant_id; if spike is legitimate, tag as "expected-burst" for 24 hours; otherwise follow mitigation.
+
+2) steady-high-cost-tenant
+- Trigger: tenant_bucket 24h cost estimate > $2,000 and growth rate > 30% versus previous 24h.
+- Severity: ticket
+- Operator action: open cost investigation ticket with Cost Insights and notify solutions engineering.
+
+3) cardinality-budget-exceeded
+- Trigger: distinct label count for tenant_bucket or model_variant exceeds configured threshold for region.
+- Severity: critical
+- Operator action: throttle ingestion for detailed events to 10% sampling and notify Runtime Team.
+
+Runbook: incident triage workflow (operator-facing)
+------------------------------------------------
+1) Detect: alert fires with link to operator dashboard and top-10 suspect buckets.
+2) Quick triage (5 minutes): check cost estimate, top models, recent deploys, and customer-initiated bulk uploads.
+3) If spike is unexplained, escalate to mitigation: temporarily reduce detailed-event sampling to 1% for affected tenant_bucket and enable token-rate circuit-breaker for tenant_bucket (see controls below).
+4) If spike is due to deploy or test traffic, tag the incident and update customer-facing runway.
+5) After stabilization, schedule postmortem and re-run backfill for sampled windows to reconstruct full detail (backfill plan below).
+
+Mitigation controls (operator knobs)
+----------------------------------
+- sampling_rate_override{tenant_bucket}: reduces detailed-event stream percentage.
+- token_rate_soft_limit{tenant_bucket}: when exceeded, responses switch to reduced batch-size policy and operator message is injected for customer-facing routes.
+- dedicated-tenant-route: route tenant to a lower-cost model variant until human review.
+
+Agent pattern and deployment guide
+--------------------------------
+Rationale: a small, single-purpose agent running in each runtime namespace collects request metadata and forwards events to the event store. It avoids embedding high-card labels in central metrics and provides resilient buffering.
+
+Agent responsibilities:
+- Read minimal request context from request router (request_id, model_variant_id, tenant_id hash)
+- Compute derived fields (tenant_bucket, estimated_cost)
+- Emit central low-card metrics via PushGateway or metrics bridge
+- Batch and forward detailed events to ClickHouse/GCS with backpressure and retry logic
+
+Lightweight agent example (conceptual YAML for k8s DaemonSet):
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: telemetry-agent
+  namespace: runtime-ops
+spec:
+  selector:
+    matchLabels:
+      app: telemetry-agent
+  template:
+    metadata:
+      labels:
+        app: telemetry-agent
+    spec:
+      containers:
+      - name: agent
+        image: ghcr.io/redwood/telemetry-agent:stable-2026-01
+        env:
+          - name: EVENT_STORE_ENDPOINT
+            value: https://clickhouse.internal:8443
+          - name: BUCKET_COUNT
+            value: "256"
+        resources:
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+
+Operational safety notes:
+- Agent must support a dry-run mode that only logs events (no forwarding) for 48 hours during rollout.
+- Agents must honor global operator feature-flag (platform.telemetry.partitioning.enable) toggles.
+
+Backfill and sampling plan
+-------------------------
+- During rollout, store sampled events at 10% by default for 7 days. After 2 weeks, increase to 25% for tenants identified as high variance.
+- Backfill strategy: for an incident window where sampling was active, reconstruct full counts by scaling sampled totals by 1/sampling_rate and validating against central token counters. Backfill requires coordination with Cost Insights to avoid double-counting.
+
+Rollout checklist (safe gate steps)
+----------------------------------
+1) Merge telemetry schema changes behind feature flag.
+2) Deploy agent in dry-run mode to a canary region and collect logs for 48 hours.
+3) Enable forwarding for 5% sampling in canary region for 72 hours.
+4) Validate dashboards and verify cardinality metrics remain within targets.
+5) Increase to 10% sampling account-wide and enable tenant_bucket partitioning.
+6) After 30 days, raise sampling for selected tenants and enable automated backfill pipelines.
+
+SLOs and operational thresholds
+------------------------------
+- Freshness: cost estimate panels must reflect new tokens within 5 minutes (95th percentile).
+- Accuracy: estimated cost error vs backfilled ground truth <= 6% for 95% of tenant-week pairs.
+- Cardinality: distinct tenant_bucket*model_family series should not exceed 50k per region.
+
+Observability of the observability system
+---------------------------------------
+Key health signals to surface about the system itself:
+- agent_forwarder_retry_rate
+- event_store_ingest_lag_seconds (95th)
+- partition_storage_growth_bytes
+- sampling_rate_applied_by_tenant_count
+
+Retrospective and post-rollout review items
+------------------------------------------
+- Run a 6-week retrospective after account-wide rollout. Focus questions:
+  * Did operators reduce time-to-meaningful-action for cost incidents?
+  * Were there unexpected cardinality bursts or tagging mismatches?
+  * Was the cost estimate model adequate for large model-variant changes?
+- Collect anonymized operator feedback via a short survey and incorporate into Q3 roadmap.
+
+Roadmap and follow-ups (next 12 months)
+--------------------------------------
+- Q1: Add automatic anomaly scoring for tenant spikes using a lightweight ML model in the event pipeline.
+- Q2: Replace manual bucketing with adaptive buckets (merge/split) based on tenant behavior.
+- Q3: Extend agent to on-prem packages and provide an optional local event-backfill utility for air-gapped customers.
+- Q4: Integrate cost telemetry with account management UI and automated usage caps.
+
+Appendix: quick operator commands and queries
+-------------------------------------------
+- Force sampling override for bucket 42 (CLI):
+  redwood-platformctl telemetry sampling set --bucket 42 --rate 0.01 --reason "emergency-throttle"
+
+- Inspect recent high-cost tenants (promql): topk(20, sum by (tenant_bucket) (rate(runtime_token_output_total[15m])))
+
+- Example incident template to open a ticket:
+  Summary: Unexplained token spike for tenant_bucket 42 on 2026-01-14
+  Impact: Estimated $3,200 in 15 minutes
+  Immediate action taken: sampling rate reduced to 1%, token_rate_soft_limit applied
+  Owner: oncall-platform-operators
+
+Contact and escalation
+----------------------
+- Platform Observability oncall: #platform-observability (Slack)
+- Runtime escalation: runtime-leads@redwood.ai
+- Cost Insights: cost-insights@redwood.ai
+
+This playbook should be reviewed quarterly and updated with lessons from postmortems and operator feedback.

@@ -1,0 +1,141 @@
+synthetic-sla-fuzzing-and-canary-validation-playbook-2025
+
+SUMMARY
+This playbook describes a repeatable, operator-friendly procedure for running synthetic SLA fuzzing and canary validation against platform services that affect inference performance and cost (examples: frontend-router, inference-proxy, kv-prefix-cache, batch-scheduler). The goal is to detect regressions in tail latency, cost-per-token, and cache efficacy before rolling changes broadly, and to validate rollback behavior automatically.
+
+Scope
+- Applies to platform control-plane and runtime-facing services: frontend-router, inference-proxy, batch-scheduler, prefix-cache-service.
+- Intended audiences: platform operators, release engineers, SRE oncall, and feature owners.
+
+When to use
+1) Pre-production canary for major runtime or routing changes.
+2) Nightly synthetic fuzzing to detect slow regressions or cost anomalies.
+3) As part of postmortem verification after a degradation incident.
+
+Prerequisites
+- Canary environment with representative small tenant set and telemetry ingestion enabled.
+- Grafana dashboard and Alertmanager wiring to oncall. See Appendix for dashboard IDs.
+- Access to the synthetic runner service (k8s cronjob: synthetic-fuzzer) and credentials to the canary tenant.
+- Ownership: release owner must be assigned and tagged in the canary job.
+
+Key SLOs and thresholds used by this playbook
+- Frontend P99 request latency: target <= 120ms, warning at 160ms, critical at 300ms.
+- Inference-proxy downstream P99 (per-token generation latency): target <= 40ms/token for short contexts (<= 512 tokens), warning at 60ms, critical at 120ms.
+- KV Prefix cache hit-rate: target >= 85%, warning < 75%, critical < 60%.
+- Token cost delta vs baseline: warning if +10%, critical if +25% relative to most recent stable baseline.
+
+Procedure: Canary validation run (operator-led)
+1) Prepare canary baseline
+   a) Tag the latest stable model/service image in the registry: e.g., docker tag gcr.io/redwood/inference-proxy:stable canary-baseline.
+   b) Ensure telemetry retention window covers the next 24–72 hours.
+   c) Record baseline metrics snapshot (see CLI below).
+
+   Example CLI (prometheus snapshot):
+   curl -sS 'http://prometheus:9090/api/v1/query?query=avg_over_time(http_server_requests_seconds_sum{job=\"frontend-router\"}[30m])' | jq .
+
+2) Deploy candidate to canary slice
+   a) Deploy the candidate image to the canary k8s deployment: kubectl -n canary set image deployment/inference-proxy inference-proxy=registry/redwood/inference-proxy:pr-1234
+   b) Wait for rolling update to complete and pods to be Ready. kubectl -n canary rollout status deploy/inference-proxy
+
+3) Kick off the synthetic fuzzing job
+   a) Use synthetic-fuzzer service UI or CLI to start a 2-hour run with the following scenario mix: 60% short-chat (<= 128 tokens), 30% long-completion (avg 800 tokens), 10% burst-heavy (100 concurrent flows).
+   b) Tag run metadata: release=pr-1234, operator=<your-email>, test-suite=canary-sla-fuzz.
+
+4) Monitor live metrics (first 30 minutes critical)
+   a) Observe P50/P95/P99 for frontend-router and inference-proxy.
+   b) Watch cache hit-rate and token-cost gauge.
+   c) Validate no error spike (5xx rate).
+
+   PromQL quick checks:
+   - Frontend P99 latency:
+     histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{job=\"frontend-router\"}[5m])) by (le))
+   - Inference-proxy per-token latency (approx):
+     (sum(rate(inference_token_duration_seconds_sum{job=\"inference-proxy\"}[1m])) by (instance)) / (sum(rate(inference_tokens_generated_total{job=\"inference-proxy\"}[1m])) by (instance))
+   - KV prefix cache hit rate:
+     sum(rate(kv_prefix_cache_hits_total[5m])) / (sum(rate(kv_prefix_cache_hits_total[5m])) + sum(rate(kv_prefix_cache_misses_total[5m])))
+
+5) Automated validation gates (must pass to proceed to broader rollout)
+   - No critical alerts fired for the canary slice within the 2-hour run.
+   - P99 latencies for all services must be below warning thresholds for the 95% of the run windows (rolling 5m).
+   - Cache hit-rate must not drop > 10 percentage points vs baseline.
+   - Token cost delta must be < +10% over baseline.
+
+Rollback and emergency stop
+- If automated gates fail OR any critical alert fires:
+  1) Execute synthetic-fuzzer stop: kubectl -n canary delete job synthetic-fuzzer-run-<id> or use UI stop.
+  2) Scale canary back to baseline image: kubectl -n canary set image deployment/inference-proxy inference-proxy=registry/redwood/inference-proxy:canary-baseline
+  3) If traffic was shifted, immediately re-route to stable: k8s serviceSelector patch or traffic-router apply --route canary=0
+  4) Create a high-priority incident and tag oncall. Follow incident playbook: /confluence/eng-platform/oncall-and-incident-response/incident-process.
+
+Post-run validation and artifacts
+- Required artifacts to attach to the rollout ticket:
+  - Synthetic run ID and metadata, CSV of raw request traces, 5-minute histogram snapshots, Prometheus snapshot link, Grafana dashboard link.
+  - Short summary: pass/fail, top 3 anomalies (latency, error, cost), operator notes.
+
+Dashboarding and alert guidance
+- Create a temporary canary dashboard by cloning Runtime Overview and scoping variables to namespace=canary. Include: P50/P95/P99 panels, cache hit-rate, token cost trend, 5xx rate, and synthetic-run health panel.
+- Suggested Alertmanager rules on canary namespace (examples):
+  - name: CanaryFrontendP99High
+    expr: histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{job=\"frontend-router\",namespace=\"canary\"}[5m])) by (le)) > 160
+    for: 10m
+    labels: {severity: warning, team: platform}
+  - name: CanaryTokenCostSpike
+    expr: increase(token_cost_cents_total{namespace=\"canary\"}[30m]) / increase(token_cost_cents_total{namespace=\"baseline\"}[30m]) > 1.10
+    for: 15m
+    labels: {severity: warning, team: platform}
+
+Runbook snippets: operator checklist
+1) Start run: synthetic-fuzzer start --suite canary-sla-fuzz --duration 120m --mix short:60,long:30,burst:10 --tag release=pr-1234
+2) Watch core panels for first 15m. If P99(frontend) > 300ms or 5xx rate > 1% -> STOP.
+3) If stop triggered, collect profiles: curl -s http://profiling-service/capture?pod=inference-proxy-abc123 > /tmp/profile.pb.gz
+4) Escalate to runtime team and open postmortem. Include link to run artifacts.
+
+Nightly synthetic-fuzz schedule (recommended)
+- Run length: 2 hours between 02:00–06:00 UTC.
+- Mix: 50% short, 35% medium, 15% long.
+- Auto-fail criteria: any critical alert OR token cost > +25% vs nightly baseline.
+- Operators will receive a digest each morning with top anomalies.
+
+Retrospective triggers
+- Any run that fails gates should produce a 1-page retro within 72 hours. The retro should include: root cause hypothesis, action items (owner+ETA), metrics delta snapshot, and any model/input changes correlated with the run.
+
+Ownership and SLAs
+- Release owners: accountable for running the canary and reviewing artifacts.
+- Platform SRE:负责维护 synthetic-fuzzer and canary dashboards, own alert rules.
+- Escalation path: platform oncall -> runtime lead -> infra manager.
+
+Appendix: Example queries and dashboard links
+- Dashboard IDs (canary clones): runtime_overview_canary_v2 (grafana/g/abcd123/runtime-overview-canary)
+- PromQL snippets (copy/paste ready):
+  - p99_frontend: histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{job=\"frontend-router\",namespace=\"canary\"}[5m])) by (le))
+  - cache_hit_rate: sum(rate(kv_prefix_cache_hits_total{namespace=\"canary\"}[5m])) / (sum(rate(kv_prefix_cache_hits_total{namespace=\"canary\"}[5m])) + sum(rate(kv_prefix_cache_misses_total{namespace=\"canary\"}[5m])))
+
+- Example synthetic-fuzzer YAML job fragment:
+  apiVersion: batch/v1
+  kind: Job
+  metadata:
+    name: synthetic-fuzzer-run-<id>
+    namespace: canary
+  spec:
+    template:
+      spec:
+        containers:
+        - name: fuzzer
+          image: registry/redwood/synthetic-fuzzer:stable
+          args: ["--suite","canary-sla-fuzz","--duration","120m","--mix","short:60,long:30,burst:10"]
+        restartPolicy: Never
+
+Notes and best practices
+- Keep canary slices small but representative: at least 3 pods per service and a mix of hot cache keys.
+- Use stable baselines taken within 72 hours to avoid drift.
+- Automate artifact collection to reduce human error. The synthetic-run should upload traces to artifact-store and create a Prometheus snapshot link.
+- Periodically (quarterly) review thresholds and delta percentages with product and cost teams — token economics change rapidly.
+
+Contact and escalation
+- Platform SRE Slack: #platform-sre (urgent: @platform-oncall)
+- Synthetic-fuzzer owner: maya.chen@redwood.ai
+- Runtime lead: arjun.patel@redwood.ai
+
+Change log
+- 2025-11-12: Initial draft by Maya Chen.
+- 2026-02-03: Added automated validation gates and PromQL snippets; tightened P99 thresholds after Q4 analysis.

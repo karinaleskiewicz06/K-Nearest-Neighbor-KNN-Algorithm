@@ -1,0 +1,148 @@
+GPU job failure-injector and scheduler robustness manual
+
+Summary:
+
+This document describes the GPU Job Failure-Injector (GJFI) and an operational playbook for validating scheduler robustness. It covers design, safe execution procedures, configuration templates, observable signals, typical experiment matrices, and rollback controls. The intended audience is runtime engineers, SREs, and test owners who run scheduled or ad-hoc resilience validation on the serving runtime.
+
+Objectives:
+- Validate scheduler decisions under realistic failure modes (GPU device errors, NVLink degradation, driver stalls, container OOM, kernel timeouts).
+- Measure SLA impact (tail latency, error rate, throughput) for degradation scenarios.
+- Confirm graceful degradation and fallback routing behavior across model variants and capacity tiers.
+- Provide reproducible experiment artifacts and safety gates for production-adjacent testing.
+
+Scope and guarantees:
+- Scope: production-like staging fleets, can be used in controlled production with approval.
+- Guarantees: all injections are reversible; the injector uses non-destructive signals (cgroup throttles, simulated driver fault via kernel module toggle, network packet blackhole) where possible. Permanent hardware damage is out-of-scope and explicitly avoided.
+
+Ownership and contacts:
+- Owner: Runtime Resilience Team (runtime-resilience@redwood.ai)
+- Primary on-call: Marcus Nguyen (runtime-sre)
+- Safety reviewer: Lin Zhao
+
+High-level architecture of the GJFI tool:
+- Controller (gjfictl): orchestrates experiments and applies injection recipes to target nodes/groups.
+- Injector agent (gjfi-agent): lightweight daemon that executes local manipulations (cgroup memory/CPU caps, kill/pause tasks, iptables rules, soft-unbind NVLink path).
+- Measurement harness: integrates with our benchmarking suite to replay request traces and collect metrics (latency distributions, kernel queue lengths, KV cache miss rate).
+- Audit & rollback: every action is recorded in Experiment Log (JSON), and rollback is an atomic two-step: stop injection and rewarm caches.
+
+Key failure modes covered (short descriptions):
+1) Synthetic GPU stall: pause CUDA kernels for X ms using driver shim to simulate transient stall.
+2) NVLink packet loss: drop a percentage of packets on nvlink path to simulate inter-GPU slowdown.
+3) Device OOM simulation: throttle cgroup memory to provoke eviction and GPU memory pressure.
+4) Driver watchdog wake: toggle GPU watchdog controls to force a soft-reset path.
+5) Host-level IO saturation: stress block device and observe scheduling queuing side-effects.
+6) Network ingress blackhole: drop or delay incoming RPCs to scheduler node to simulate partial control-plane partition.
+
+Safety controls and preconditions (must be satisfied before any experiment):
+1) Approval: Test plan must be approved in RFC linked in Experiment Log and signed off by on-call owner.
+2) Canary target: Run on dedicated canary pool (label: canary-fidelity) unless explicit prod approval.
+3) Capacity headroom: Ensure >20% spare capacity in the region; otherwise abort.
+4) Alerting: Temporary SLO overrides are set and a high-priority alert channel (pager) is configured.
+5) Time window: Run during a low-traffic window unless testing production failover behavior.
+6) Automated kill-switch: experiment controller must be reachable and can stop injection within 10s.
+
+Experiment catalog and matrix (example):
+- Variables: injection_type, intensity (low/medium/high), duration, target_pool, traffic_profile (spiky/steady/chatty).
+
+Sample experiment table (CSV-style):
+| id | injection_type | intensity | duration | target_pool | expected_primary_metric |
+| E100 | synthetic_gpu_stall | low | 120s | canary-fidelity | p99_latency +10% |
+| E101 | nvlink_loss | medium | 5m | multi-gpu-inference | throughput -15% |
+| E102 | device_oom | high | 2m | memory-tight-pool | error_rate +5% |
+| E103 | network_blackhole | medium | 3m | control-plane-nodes | fallback_routing_occurs |
+
+Observability checklist (metrics & traces to collect):
+- Application: p50/p90/p99 latency, success_rate, tokens_per_sec (per model variant)
+- Runtime internals: kernel_queue_depth, GPU_busy_fraction, kvcache_miss_rate, batch_size_distribution
+- Network: rpc_latency, retransmit_rate, connection_errors
+- Host: OOM_kills, dmesg watchdog entries, GPU_reset_count
+- Logs: experiment_id tag attached to all emitted traces and logs.
+
+CLI quick-start examples:
+- Dry-run: gjfictl plan --recipe nvlink_loss --intensity medium --targets label:canary-fidelity --trace replay:latest --dry-run
+- Execute: gjfictl run --recipe synthetic_gpu_stall --intensity low --duration 120s --targets nodepool:canary-fidelity --notify oncall@redwood.ai
+- Abort: gjfictl abort --experiment E101 --reason "observed p99 > 3x baseline"
+
+Recipe YAML example (safe default):
+---
+experiment_id: E200-safe-nvlink
+recipe: nvlink_loss
+intensity: low
+duration_seconds: 180
+target_selector: label==canary-fidelity
+metrics_to_sample: [p99_latency, throughput, kernel_queue_depth]
+safety_controls:
+  max_error_rate: 0.02
+  max_p99_increase_pct: 25
+  abort_on: [node_oom, gpu_reset]
+---
+
+Run procedure (step-by-step):
+1) Prepare: create RFC summarizing goal, acceptance criteria, and rollback steps. Add reviewers and obtain approval.
+2) Baseline: capture a 15-minute baseline run with traffic replay and collect metric snapshots.
+3) Dry-run: execute plan in dry-run mode (controller validates targets and resources).
+4) Execute: run experiments at low intensity for short durations with active monitoring.
+5) Observe & record: collect trace bundles and update Experiment Log immediately.
+6) Scale intensity: if results are stable and within acceptance, step intensity to medium/high per matrix.
+7) Post-check: run a 10m warmup phase to rehydrate kvcache, and check for lingering resource pressure.
+8) Report: publish findings to the RFC thread and mark experiment closed with tags.
+
+Rollback and remediation playbook:
+- Immediate abort: gjfictl abort --all --reason "safety threshold exceeded". The controller runs rollback hooks in parallel: remove iptables, restore cgroup limits, re-enable driver paths.
+- Cache warmup: run a short warm replay of representative traffic with reduced concurrency to re-populate KV cache and warm CUDA kernels.
+- Diagnostic capture: collect kernel logs, /var/log/nv-hostmanager, and a focused sample of traces for causal attribution.
+
+Acceptance criteria examples (example for E100):
+- p99 latency increase <= 10% for 5 consecutive minutes during the injection window.
+- No increase in client-visible 5xx rate above 0.5%.
+- Kernel queue depth transient spike < 2x baseline and recovers within 120s of rollback.
+
+Common failure signatures and suggested remediation:
+- Symptom: persistent p99 elevation after rollback.
+  - Likely cause: cache eviction or kernel memory leak.
+  - Remediation: run targeted rewarm with small batch sampling, escalate to runtime-dev if no recovery in 15m.
+- Symptom: increase in GPU_reset_count.
+  - Likely cause: driver instability at this firmware level.
+  - Remediation: mark node as quarantined and schedule firmware rollback; inform hardware team.
+- Symptom: controller cannot reach gjfi-agent on multiple targets.
+  - Likely cause: control-plane partition or agent crash.
+  - Remediation: use host-level ssh multiplex to run rollback script and redeploy agent.
+
+Test artifacts and reproducibility:
+- Every experiment must include: experiment_id, recipe YAML, baseline metrics snapshot, trace bundle (min 10k requests or 15 minutes), and a roll-forward/rollback transcript.
+- Store artifacts under: s3://redwood-experiments/{experiment_id}/
+
+Integration with benchmarking and perf-suite:
+- The measurement harness plugs into the replay engine used by the benchmarking suite. Use replay labels like replay:prod-sample-2027 to run realistic traces.
+- Post-experiment analysis uses the perf-suite notebook templates in /notebooks/resilience-analysis to produce p99 deltas and heatmaps.
+
+Release notes and versioning for GJFI:
+- v1.0 (2026-06-10): initial rollout, supports cgroup throttles, iptables blackholes, and synthetic kernel stalls.
+- v1.1 (2026-11-12): NVLink loss simulation via shim, audit log schema v2, automated kill-switch.
+- v2.0 (2027-01-12): safe production mode, scheduler API hooks for non-invasive metadata tagging, improved rollback performance.
+
+Appendix A: Example experiment output (trimmed):
+{
+  "experiment_id": "E101",
+  "status": "aborted",
+  "reason": "p99 exceeded threshold",
+  "metrics": {"p99_latency": "480ms (baseline 140ms)", "throughput": "85% of baseline"}
+}
+
+Appendix B: Quick checklist before running in production-adjacent fleets:
+- RFC with reviewers: yes
+- Canary pool allocated: yes
+- Pager configured: yes
+- Automated rollback tested: yes
+- Experiment id reserved: yes
+
+Related pages and references:
+- Kernel scheduler policy language (link internal)
+- Runtime fallback and degradation playbook (see runbooks directory)
+
+Document history:
+- 2026-06-10: created by Asha Patel (v1.0)
+- 2026-11-12: NVLink support added (v1.1)
+- 2027-01-18: production-safe mode & scheduler hooks documented (v2.0)
+
+End of document.

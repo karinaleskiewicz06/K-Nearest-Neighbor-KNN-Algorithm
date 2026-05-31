@@ -1,0 +1,176 @@
+KVCache Chaos Validation and Reconciliation Manual
+
+Overview
+
+This document defines the validation, chaos experiments, and reconciliation playbook for the KVCache subsystem in the serving runtime. It is intended to give on-call engineers, SREs, and runtime owners a prescriptive set of experiments and verification steps to catch, reproduce, and remediate KV cache consistency issues that can affect fidelity, tail latency, and customer-facing correctness.
+
+Background and Motivation
+
+- The KVCache holds per-session and per-shard prefix state used to accelerate autoregressive decoding.
+- Incorrect eviction, stale reads, or shard re-assignment can produce hallucinations, token repetition, or increased generation latency while silently degrading quality.
+- We run periodic chaos validation to: surface rare race conditions, validate reconciliation logic, and ensure safe rollouts of kernel/scheduler changes that affect warmstart paths.
+
+Scope
+
+- Subsystem: kvcache-manager, kvcache-shard-proxy, runtime-dispatcher, and scheduler-adaptor.
+- Environments: staging and canary production clusters only. Do NOT run destructive experiments on global production without coordinating with Platform Ops and Customer Success.
+- Tests covered here: eviction race, stale-read windows, shard-migration replay, partial-ack loss, and reconciliation under GC pressure.
+
+Ownership and Contacts
+
+- Primary owner: eng-serving-runtime/runtime-team (oncall: #runtime-oncall).
+- Secondary: eng-sre (page: /confluence/eng-sre/incident-review).
+- Pager escalation: follow oncall rota; if experiment impacts SLAs, notify SRE lead.
+
+Service-level verification (SLOs to monitor during experiments)
+
+- Tail P95 generation latency for canary model: must remain < 150 ms (baseline).
+- Token-quality regression: measured by prompt-set A->B BLEU-like eval; target: no >1.5% degradation vs baseline.
+- Error rate: RPC error rate <= 0.1% for the test window.
+
+Before you start (prechecks)
+
+1. Ensure a clean baseline snapshot: collect 10 minutes of production-like traffic replay into the staging cluster using shadow-proxy.
+2. Confirm toggle flags: kvcache-reconciliation enabled, eviction-delay-ms default set (see sample config).
+3. Notify stakeholders and schedule a 60-minute maintenance window for canary.
+4. Validate observability: dashboards loaded, tracing enabled, and trace-sampler set to 100% for mirrored traffic.
+
+Validation matrix (tests, intent, success criteria)
+
+- Eviction race injection
+  - Intent: simulate overlapping eviction and read to detect stale-pointer windows.
+  - Injection: pause kvcache-shard-proxy apply loop for X ms while allowing reads.
+  - Success: no incorrect token sequences in generation corpus; no RPC panics; reconciliation loop repairs state within 500 ms.
+
+- Stale-read window
+  - Intent: verify upper bounds on how long a stale entry can be served.
+  - Injection: insert artificial network latency between dispatcher and shard proxy (200-800 ms).
+  - Success: stale-read count <= 0.05% of requests; each stale read triggers a reconciliation event annotated in traces.
+
+- Shard migration replay
+  - Intent: ensure kvcache warmup when a shard moves nodes during a canary rollout.
+  - Injection: schedule a controlled shard eviction and immediate reassignment.
+  - Success: warmstart hit-rate recovers to >90% within 30 seconds and no QoS regressions observed.
+
+- Partial-ack loss and backpressure
+  - Intent: detect the dispatcher behaviour when partial ACKs are lost and retry semantics cause duplication or reordering.
+  - Injection: drop 30% of ACK packets from shard proxy for 10 seconds.
+  - Success: no duplicate token emission; dispatcher metrics show retry spikes but bounded.
+
+- GC pressure reconciliation
+  - Intent: measure reconciliation under memory compaction/fragmentation events.
+  - Injection: trigger memory compaction on a subset of GPU nodes and force minor GC on node-side components.
+  - Success: no unbounded latency; reconciliation completes within configured window and produces a summary trace.
+
+Runbook: step-by-step experiment procedure (example: Eviction Race)
+
+1. Preparation (10 min)
+   - Load the test corpus (see Appendix A) via shadow-replay into staging.
+   - Start baseline traces: `curl -X POST https://internal-telemetry/api/start-snapshot -d '{"name":"kvcache-e2e-eviction-YYYYMMDD"}'`
+   - Ensure alerting temporarily muted for the canary namespace.
+2. Start experiment (5 min)
+   - Deploy the chaos job in namespace `runtime-chaos-staging` with label `experiment=eviction-race` using the script below.
+   - Command (example): `kubectl apply -f kvcache-eviction-pause-job.yaml -n runtime-chaos-staging`
+3. Observe (10 min)
+   - Monitor dashboards: KVCache Recon Events, dispatcher.rpc.errors, generation.tail-latency.
+   - Run the automated verifier: `./tools/kvcache-checker --replay-id kvcache-e2e-eviction-YYYYMMDD --asserts eviction-no-regression`
+4. Reconciliation validation (5 min)
+   - Verify reconciliation logs: search traces for `reconcile::success` and `reconcile::duration_ms < 500`.
+   - If reconciliation fails, execute manual reconciliation: `kubectl exec -it kvctl -- /bin/kvctl reconcile --shard <shard-id>`
+5. Teardown and post-checks (10 min)
+   - Remove chaos resources and allow systems to stabilize for 5 minutes.
+   - Collect traces and export telemetry: `scripts/export-traces.sh kvcache-e2e-eviction-YYYYMMDD`
+   - Run diff analyzer: `python tools/compare-generation-corpora.py baseline.json after.json`
+
+Automated harness sample (k8s job manifest snippet)
+
+# kvcache-eviction-pause-job.yaml (snippet)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kvcache-eviction-pause-001
+spec:
+  template:
+    spec:
+      containers:
+      - name: pause-eviction
+        image: internal/chaos:kvcache-v1
+        args: ["--target=kvcache-shard-proxy","--pause-ms=400","--shard-selector=region=canary"]
+      restartPolicy: Never
+
+Validator CLI examples
+
+- Check for stale reads:
+  ./tools/kvcache-checker --mode stale-read-detect --window 60 --threshold 0.0005 --trace-output stale-read-traces.json
+- Aggregate warmstart hit-rate:
+  ./tools/metric-agg --metric warmstart.hit_rate --group-by shard_id --window 30s
+
+Observability and queries
+
+- Critical dashboards (links internal):
+  - KVCache Health Overview: /dashboards/kvcache-health
+  - Recon & Warmstart: /dashboards/kvcache-recon
+  - Dispatcher Effects: /dashboards/dispatcher-impact
+
+- Recommended metric queries (PromQL-like):
+  - Stale reads per minute:
+    sum(increase(kvcache_stale_reads_total[1m])) by (shard_id)
+  - Recon duration 99th:
+    histogram_quantile(0.99, sum(rate(kvcache_reconcile_duration_seconds_bucket[5m])) by (le))
+  - Warmstart hit-rate:
+    1 - sum(rate(kvcache_miss_total[1m])) / sum(rate(kvcache_request_total[1m]))
+
+Instrumentation and trace expectations
+
+- Every request touching KVCache must produce a trace span: `kvcache.access` with tags: shard_id, session_id, op=(read|write|evict), outcome=(hit|miss|stale|error).
+- Recon spans: `kvcache.reconcile` must include `reconcile.reason` and `reconcile.result`.
+- Traces of failed reconciliation must attach a `reconcile.snapshot` file reference for offline analysis.
+
+Failure modes and immediate remediation (short triage)
+
+- Symptom: Continuous `reconcile::failure` spikes with duration > 2s across shards  Remediation: scale kvcache-reconciler replicas up by 2, enable debug logging, and pause any non-essential canary traffic.
+- Symptom: Duplicate token emission observed in generation samples  Remediation: immediately disable dispatcher-retry for the affected shard group and run `kvctl reconcile --repair-duplicates` then escalate.
+- Symptom: Slow warmstart recovery (>60s) after migration  Remediation: increase warmstart prefetch parallelism and re-run shard-warmup script; follow with postmortem.
+
+Rollout gating and acceptance criteria
+
+- For any kernel, scheduler, or reconcilation code change that touches kvcache paths, the change must pass:
+  1) Automated chaos validation in staging (all tests pass).
+  2) Canary run with reduced traffic: warmstart hit-rate drop <= 10%, no token-quality regression >1.0%.
+  3) No new `reconcile::failure` alerts for 24 hours post-canary.
+
+Post-test report template (deliverables)
+
+- Title
+- Date and experiment id
+- Environment and cluster
+- Test matrix results (pass/fail + short notes)
+- Key telemetry artifacts (links to dashboards, trace-snapshot ids)
+- Actions required (bug, mitigation, rollout decision)
+
+Appendix A: Test corpus and generator
+
+- A curated set of 2k prompts that represent session seeds for product features (chat, summarization, completion). Stored at: s3://redwood-test-corpora/kvcache/2026-q1/{baseline.json,edgecases.json}
+- Generator invocation:
+  python tools/generate-replay-corpus.py --profiles chat,short-complete --size 2000 --out baseline.json
+
+Appendix B: Sample config (kvcache manager)
+
+# yaml snippet for kvcache manager
+reconciliation:
+  enabled: true
+  concurrency: 8
+  max_reconcile_duration_ms: 1000
+eviction:
+  default_ttl_ms: 600000
+  backlog_pause_ms: 50
+
+References and related pages
+
+- Runtime reconciliation design spec: /confluence/eng-serving-runtime/runtime-architecture/execution-stitching-and-fallback-orchestration-2026
+- Session lifecycle & kvcache guidelines: /confluence/eng-serving-runtime/runbooks/session-lifecycle-kvcache-consistency-guidelines-2024
+
+Change log
+
+- 2026-02-10: Created by Asha Patel (initial draft).
+- 2026-09-15: Added GC pressure experiment and updated reconciliation thresholds (A. Patel).

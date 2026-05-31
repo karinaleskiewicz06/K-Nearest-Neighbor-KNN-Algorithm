@@ -1,0 +1,126 @@
+ADR: request watermarking and SLO-preserving shedding
+
+Summary
+-------
+This ADR establishes 'request watermarking' as the runtime protocol and a coordinated shedding policy to preserve tail latency SLOs under high-load or degraded GPU capacity. Watermarking attaches lightweight budget and fidelity metadata to each inference request at the API edge, enabling downstream runtime actors (scheduler, KV cache, and model router) to make deterministic, SLO-aware shedding and fidelity decisions.
+
+Motivation
+----------
+Redwood serves heterogeneous workloads with strict 99th/99.9th percentile latency SLOs on shared GPU pools. When capacity is constrained (bursting, partial GPU failures, or noisy neighbors) indiscriminate admission control or FIFO shedding causes disproportionate user impact and cascading quality regressions. We need a deterministic, observable, and composable mechanism that: 
+- Encodes client intent and budget on each request so runtime components can make compatible decisions.
+- Allows graceful fidelity tradeoffs (quantization, early-exit, partial responses) while respecting per-route SLOs.
+- Makes shedding decisions auditable and reversible during rollouts.
+
+Decision
+--------
+We adopt a three-part standard: watermark envelope, runtime contract hooks, and shedding policy matrix.
+1) Watermark envelope: every request entering the API edge must include (or be annotated with) a transparent watermark header: X-RW-WM with a compact base64-encoded payload. The payload fields (ASCII JSON encoded, size limit 256 bytes) are:
+   - v: "1" (string)
+   - budget_ms: maximum service budget in milliseconds (stringified int, e.g., "200")
+   - fidelity_hint: one of ["full", "reduced", "graceful"]
+   - priority_tier: one of ["standard","priority","system"]
+   - trace_id: tracing UUID for correlation
+Example header: X-RW-WM: eyJ2IjoiMSIsImJ1ZGdldF9tcyI6IjIwMCIsImZpZGVsaXR5X2hpbnQiOiJm...
+
+2) Runtime contract hooks: components must honor watermark fields as follows:
+   - Edge router: validates watermark and maps missing fields to defaults (budget_ms=300, fidelity_hint="full", priority_tier="standard"). Reject malformed watermarks (400) but include explanation in response headers.
+   - Scheduler: treats budget_ms as a soft deadline; when current-queue tail + estimated exec > budget_ms, consult shedding matrix.
+   - Model router/quantization layer: uses fidelity_hint to decide available optimizations (e.g., apply int8 quant for "reduced", early-exit for "graceful").
+   - KV cache and prefix cache: may serve stale/partial prefixes if fidelity_hint != "full" and must annotate responses with X-RW-WM-RES state.
+
+3) Shedding policy matrix: deterministic rules that combine priority_tier and observed load to pick one of: 
+   - Accept (normal processing)
+   - Degrade (apply fidelity optimizations)
+   - Partial (return cached/partial response with explicit flag)
+   - Reject (429 or 503 depending on downstream error)
+Rules (example):
+   - If priority_tier==priority => Accept if estimated tail < budget_ms + 50ms; otherwise Degrade.
+   - If priority_tier==standard => Degrade when queue tail > 0.6 * budget_ms; Partial if > budget_ms; Reject if > 2 * budget_ms.
+   - System traffic bypasses shedding except in catastrophic overload.
+
+Tradeoffs considered
+------------------
+- Pros: Deterministic and auditable shedding, improved 99/99.9 percentile behavior, enables adaptive fidelity rather than blunt rejections, and consistent client-visible signals for quality.
+- Cons: Adds header parsing and small computational cost at edge; compatibility required across private deployments (private control plane must opt-in); risk of clients relying on fidelity_hint semantics for unintended behavior.
+
+Operational details and rollout plan
+----------------------------------
+1) Schema and validation: implement watermark encoder/decoder libraries in Go/Python/Node. Schema v1 is intentionally minimal.
+2) Backwards compatibility: requests without X-RW-WM are treated as budget_ms=300,fidelity_hint=full,priority=standard.
+3) Staged rollout:
+   - Week 0: Library released and feature-flagged on staging. Synthetic traffic tests verify metric changes.
+   - Week 1: Canary rollout to 10% of edge nodes. Monitor SLOs and X-RW-WM-RES flags.
+   - Week 2-3: 50% rollout with aggressive telemetry.
+   - Week 4: Global rollout.
+4) Emergency rollback: disable watermark enforcement at the edge (feature flag), edge will continue to accept requests and map defaults.
+
+Configuration table (defaults and service-level overrides)
+-----------------------------------------------------
+| key | default | explanation | owner |
+|------|---------|-------------|-------|
+| default_budget_ms | 300 | Default soft budget applied at edge for unmarked requests | api-router-team |
+| fidelity_policy_priority | ["full","reduced"] | Allowed fallback ladder for priority tier | runtime-team |
+| standard_degrade_threshold_pct | 60 | Percent of default_budget_ms at which we start degrading standard tier | runtime-scheduler |
+| reject_multiplier | 2.0 | multiplier on budget_ms beyond which we reject (standard) | runtime-scheduler |
+
+Monitoring and alerts
+---------------------
+Key metrics to publish (per-route and per-tenant):
+- rw.watermark.incoming.count
+- rw.watermark.parsed.failure.count
+- rw.shedding.action.count (labeled by action=Accept/Degrade/Partial/Reject)
+- rw.latency.p99, rw.latency.p999 (compare with budget_ms quantiles)
+- rw.fidelity.applied.count (type=quant/int8/early-exit/partial-cache)
+
+Alerts:
+1) P99 latency > budget_ms target for 5m AND increase in Degrade+Partial actions > 15% -> P1 page to runtime oncall.
+2) Watermark parse failure rate > 1% -> P2 to api-router.
+
+Client / API guidance
+---------------------
+- SDKs will include helper to encode watermarks and a validator for common mistakes.
+- Customers are encouraged to set budget_ms for latency-sensitive routes and use priority tiers sparingly.
+- Documented examples: short synchronous chat completions should set budget_ms 150-250ms for 99th percentile on hosted, embeddings can be higher.
+
+Testing and compatibility
+-------------------------
+- Unit tests for encoder/decoder, property tests for budget rounding.
+- Integration tests: synthetic traffic with mixed priorities asserting deterministic shedding fingerprints.
+- Long-running chaos test: randomly induce GPU preemption and verify that shedding actions preserve SLOs better than baseline.
+
+Security and privacy considerations
+----------------------------------
+- Watermark payload contains no customer PII by design. trace_id is ephemeral and used only for telemetry correlation; it must not be stored in logs beyond 30 days unless linked to an incident ticket.
+- For private deployments: watermark enforcement can be disabled by configuration, but we strongly recommend enabling it for consistent behavior.
+
+Open issues and future work
+--------------------------
+- v2 schema: compressed binary encoding to reduce header size and permit cryptographic signing for tamper resistance.
+- Explore exposing an explicit API for clients to query expected budget_ms for a route (helpful for dynamic clients).
+- Per-tenant adaptive budgets based on historical p99 consumption.
+
+Owners and contact
+------------------
+- Document owner: Priya Natarajan (runtime team)
+- Implementation owner: Runtime scheduler and api-router teams (shared)
+- Oncall escalation: see eng-sre runbook for runtime shedding (linked in related_pages).
+
+References
+----------
+- See 'runtime-workload-signatures-and-slo-derivation-playbook' for deriving budget_ms per route.
+- Related ADRs: request-hedging decision lattice; progressive degradation playbook.
+
+Appendix: example X-RW-WM codec (pseudocode)
+--------------------------------------------
+1) Python encode:
+   import json, base64
+   payload = json.dumps({"v":"1","budget_ms":"200","fidelity_hint":"reduced","priority_tier":"standard","trace_id":"123e4567-e89b-12d3-a456-426614174000"})
+   header = base64.urlsafe_b64encode(payload.encode()).decode()
+
+2) Edge decode validation rules:
+   - parse base64 -> json, ensure v=="1"
+   - budget_ms must be int between 50 and 10000
+   - fidelity_hint must be one of allowed set
+   - priority_tier must be known
+
+This ADR is intentionally prescriptive at the schema and contract boundary while leaving algorithmic scheduling and exact thresholds for the runtime-team to refine with experiments.

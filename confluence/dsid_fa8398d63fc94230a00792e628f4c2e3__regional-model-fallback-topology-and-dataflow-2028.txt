@@ -1,0 +1,177 @@
+Regional model fallback topology and dataflow
+
+Summary
+
+This document describes a recommended architecture and operational playbook for regional model fallback and variant routing for Redwood Private deployments. The goal is to provide predictable latency, maintain quality (model fidelity), and provide failover paths when regional capacity or hardware constraints prevent use of a primary model variant. This is intended for customers running multi-AZ or multi-region VPC/private deployments where model-level routing, quantization fallbacks, and tenant affinity matter for SLAs.
+
+Scope and audience
+
+- Audience: Platform engineers who operate Private deployments and SREs responsible for tenant-level SLAs.
+- Scope: architecture, dataflow, configuration matrix, day-2 operational runbook, upgrade and rollback notes, customer pre-install requirements and acceptance tests.
+
+High-level goals
+
+1. Keep tail latency within SLOs when primary model nodes are degraded.
+2. Preserve output quality by routing to appropriate model variants (quantized, sharded, or smaller families) with known quality deltas.
+3. Provide predictable failure modes and automated rollback paths.
+
+Overview of components
+
+- Control plane (customer-managed in Private): routes requests according to routing policy, enforces tenant affinity, and holds model catalog with quality profiles.
+- Regional inference pools: GPU pools in each region/AZ providing runtime instances (hot model variants).
+- Model catalog and variant metadata: lists variants (e.g., fp16, int8-q4, llama2-13B, llama2-7B-quant), expected perf/quality profiles and compatibility matrix.
+- Fallback policy engine: lightweight policy service co-located with control plane that evaluates capacity signals and decides fallback targets.
+- Traffic proxy (sidecar or edge gateway): implements routing decisions and performs KV cache locality checks.
+- Telemetry and gating: fine-grain metrics for latency, error rates, model-quality regressions (per-prompt evaluation hooks).
+
+Architecture diagram (text)
+
+Diagram (logical):
+
+Control Plane (Customer) --> Fallback Policy Engine --> Traffic Proxy / Edge Gateway --> Regional Pool A (primary hot models)
+                                                                    \u21a1
+                                                                    Regional Pool B (fallback model variants)
+
+Dataflow: request path and decision points
+
+1) Ingress: tenant request arrives at edge gateway. Tenant token and route metadata are inspected.
+2) Affinity check: proxy queries control plane for tenant affinity mapping (if tenant pinned to a region or pool). If pinned, proxy enforces preferred target.
+3) Capacity evaluation: proxy fetches recent pool capacity/health (staleness <= 2s). If preferred target reports saturation, proxy invokes fallback policy engine.
+4) Policy decision: fallback engine uses an ordered policy (explicit priority list) and selects next-compatible variant that meets the candidate SLO. Decision factors: latency headroom, quality delta threshold, per-tenant SLAs, model size compatibility (KV cache mismatch risk).
+5) Routing and KV transfer: if routing to a different model family, proxy will invalidate or rebuild KV prefix. If routing to a compatible variant in same family (quantized variant), proxy sends request with a header indicating `x-rw-fallback-reason` and `x-rw-model-variant`.
+6) Execution and telemetry: inference runtime executes and returns response; telemetry exported (latency, token counts, quality hooks). If quality-monitoring detects regression for pinned eval prompts, an alert is raised and automatic rollback can be initiated.
+
+Fallback policy examples
+
+- Priority list entry example (ordered):
+  1. Same model family, higher quantization (fp16 -> int8-q4) if quality delta <= 2.5 ROUGE points and latency preserved.
+  2. Smaller model in same family (13B -> 7B) if latency improvement required and customer SLAs allow model swap.
+  3. Remote-region hot model with cross-region latency penalty + priority degradation header to caller.
+  4. Throttle / reject with explanatory error (HTTP 503) when no fallback meets constraints.
+
+Configuration matrix (table-like)
+
+- Use the following table when mapping primary -> fallback variants: 
+
+| Primary variant | Allowed fallback variants | Max quality delta (per-eval) | Max added latency | KV cache migration required? | Ownership |
+|----------------|--------------------------|-----------------------------|-------------------|------------------------------|-----------|
+| rw-llama2-13b-fp16 | rw-llama2-13b-int8-q4, rw-llama2-7b-fp16 | 2.5 | +40ms | yes (if family changes) | runtime-team |
+| rw-llama2-70b-fp16 | rw-llama2-13b-fp16, remote-70b-fp16 | 4.0 | +120ms | yes | runtime-team |
+| open-rw-retrieval-ensemble | degraded-retrieval-only | 1.0 | +80ms | no | infra-search |
+
+(Notes: the table above should be implemented as a configuration in the model catalog YAML; values shown are examples and must be tuned per-customer.)
+
+Operational runbook: regional capacity outage (step-by-step)
+
+1) Detection: alert fires if regional pool utilization > 92% sustained for 30s OR median tail latency > target by 30% for 1 minute.
+2) Automated action (first 30s): fallback engine marks pool as `degraded` and starts routing according to priority list for new requests. Ongoing requests are permitted to finish on primary nodes for up to 60s.
+3) KV cache best-effort: proxy will attempt to reuse cached prefix if compatible variant exists; otherwise payload is served cold from fallback.
+4) Telemetry: emit `fallback.invoked` and `fallback.variant` tags on traces; increment per-tenant fallback counters.
+5) Escalation (manual): if fallback rate > 10% of requests for a tenant for > 5 minutes, page SRE/Platform (pager rota) and product owner.
+6) Recovery: when regional pool reports healthy for 120s and quality checks are green, control plane will gradually re-route traffic back to primary with linear ramp (25% every 30s) and KV prewarm for ramped traffic.
+
+Upgrade and rollback guidance (runtime / model catalog)
+
+- Pre-upgrade validation: run the acceptance tests (listed below) against a canary pool with production-like traffic shape.
+- Upgrade strategy: staged canary (5% traffic), small-batch canary (25%), progressive roll (50% -> 100%). During canary phases, fallback policy must be disabled to avoid masking regressions — use explicit route pinning to canary nodes.
+- Rollback triggers:
+  - Quality regression: per-eval metric change exceeds threshold (configurable per-model).
+  - Latency regression: P95 increases > 2x baseline for canary.
+  - Error rate: >1% increase in 5xx for canary.
+- Automated rollback steps (if triggered):
+  1. Pause rollout and disable new traffic assignment to the failing revision.
+  2. Re-route existing new sessions back to previous revision; allow existing requests to finish.
+  3. Run post-rollback smoke tests.
+  4. Create incident and attach timeline and metrics.
+
+Customer pre-install requirements checklist
+
+- Minimum network: 10 Gbps between controller nodes and GPU pools; cross-region connectivity must have < 70ms RTT for regional failover topologies.
+- Time sync: NTP within 100ms across control plane and inference pools.
+- KMS: a supported KMS for model encryption keys; KMS network egress allowed from control plane.
+- Storage: shared model store (S3-compatible) with versioned model artifacts; min throughput 200 MB/s for cold model loads in target region.
+- Hardware: list example (per capacity estimate):
+  - Primary pool (per 1000 qps target): 8 x A100-80GB or 24 x H100-80GB (density depends on model family).
+  - Fallback pool: mixed GPU class or CPU-only workers for small models.
+
+Acceptance tests (smoke + quality)
+
+1) Latency smoke: synthetic traffic at target qps with p50/p95 measured within expected envelope.
+2) Model fidelity: run canonical prompt set (50 prompts) and compute ROUGE/EM deltas vs baseline.
+3) KV cold-start behavior: validate cold path < 1s additional to baseline for small model families.
+4) Failover simulation: induce pool saturation and verify fallback was invoked and telemetry emitted.
+
+Example model catalog fragment (YAML snippet)
+
+```yaml
+models:
+  - id: rw-llama2-13b-fp16
+    family: rw-llama2-13b
+    variants:
+      - id: rw-llama2-13b-fp16
+        q: fp16
+      - id: rw-llama2-13b-int8-q4
+        q: int8-q4
+    fallback_policy:
+      - target: rw-llama2-13b-int8-q4
+        max_quality_delta: 2.5
+      - target: rw-llama2-7b-fp16
+        max_quality_delta: 3.5
+```
+
+Security and compliance considerations
+
+- KMS usage: all model artifacts and runtime keys must be encrypted at rest; ensure KMS rotation policies are applied and audited.
+- Audit logs: fallback decisions (policy triggers, variant selected) must be recorded in audit log with tenant id, request id, and timestamp for post-mortem and compliance.
+- Data residency: cross-region fallback may violate residency constraints; policies must mark tenants as `no_cross_region_fallback` when required.
+
+Monitoring and SLAs (suggested metrics and alerts)
+
+- Metrics to emit: fallback_rate (per-tenant), fallback_variant_distribution, p50/p95 latency by variant, kv_cache_hit_rate, model_quality_score (periodic eval).
+- Alert thresholds (examples):
+  - P95 latency > target * 1.4 for > 2 minutes -> P1.
+  - fallback_rate > 10% for tenant > 5 minutes -> P2 and page oncall.
+  - model_quality_score drop > configured threshold -> P1.
+
+Operational notes and pitfalls
+
+- Avoid over-aggressive fallback: frequent flip-flopping (thundering fallbacks) is worse than graceful throttling. Use hysteresis and minimum degradation windows (recommend 30s).
+- KV migration cost: changing family often implies KV incompatibility — pre-warm strategies are critical for conversational workloads.
+- Telemetry cardinality: per-tenant per-variant metrics can explode cardinality; sample intelligently and aggregate at the routing-policy level.
+
+Appendix A — Sample CLI commands
+
+- Query pool health (example):
+  ```bash
+  rwctl pool status --pool regional-a --format json
+  ```
+
+- Force route pinning to canary (use when testing):
+  ```bash
+  rwctl routing pin --tenant tenant-123 --model rw-llama2-13b-fp16 --target canary-pool
+  ```
+
+Appendix B — Acceptance test script outline
+
+1) provision-canary.sh (deploy small canary pool)
+2) run-latency-smoke.py (generate traffic and capture metrics)
+3) run-fidelity-checks.py (compute ROUGE vs baseline)
+4) teardown-canary.sh
+
+Related pages and references
+
+- See also: Federated control plane reference (design notes on policy distribution).
+- Day-2 playbooks: tenant burst forecast and guardrails.
+
+Owners and contact
+
+- Architect: Mariana Lopez (platform infra)
+- Runtime owner: Ethan Walker
+- SRE contact: Ravi Patel
+
+Change log
+
+- 2026-02-15: initial draft
+- 2026-03-01: updated operational thresholds and added YAML snippets
+
+End of document

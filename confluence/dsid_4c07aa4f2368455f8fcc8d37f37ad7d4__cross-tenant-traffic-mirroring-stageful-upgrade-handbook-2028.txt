@@ -1,0 +1,164 @@
+Cross-tenant traffic mirroring and stageful upgrade handbook
+
+Summary:
+This handbook describes a stageful upgrade pattern for private (VPC and on‑prem) deployments that uses cross‑tenant traffic mirroring to validate new runtime or model variants at scale while limiting blast radius. The approach is intended for upgrades that touch the serving runtime, model binaries, or networking proxies where end‑to‑end behavior (latency, cache interactions, correctness) must be validated under production load before full promotion.
+
+Goals:
+- Validate correctness and performance of a candidate runtime/model under real traffic without impacting production traffic correctness.
+- Detect regressions in latency, error rate, and KV cache consistency early.
+- Provide low‑latency rollback and forensics paths.
+- Standardize operator steps, metrics, and automation hooks so upgrades are repeatable and auditable.
+
+When to use this playbook:
+- Large upgrades to the serving runtime, kernel scheduling, or model quantization where unit tests and staging traffic are insufficient.
+- When customer tenants have strong isolation demands but allow mirrored requests for verification.
+- For multi‑tenant Dedicated or Private deployments where tenant state and KV caches are sensitive.
+
+Roles & ownership:
+- Upgrade Lead (owner): engages stakeholders, runs the rollout automation, approves promotion.
+- Field Operator: executes CLI steps on customer/private clusters and validates telemetry.
+- Observability Owner: monitors dashboards and triages alerts during mirror window.
+- Security/Compliance: approves evidence package for customer or audit requests.
+- Owner contacts and escalation: see team roster page (internal link).
+
+Prerequisites checklist (must pass before mirror window):
+1) Planning and approvals: upgrade plan in PRD; customer signoff when required.
+2) Backup and snapshot: KV snapshot (s3://redwood-private/backups/tenant-<id>/pre-upgrade-<ts>) verified checksum.
+3) KMS/HSM: active key access for signing and encrypted telemetry.
+4) Observability: blue/green dashboards deployed, log retention policy 30d, jaeger traces enabled.
+5) Network: path MTU and BGP routing for mirror overlay validated between control plane and customer VPC.
+6) Capacity: 20% headroom reserved for mirrored load.
+7) Canary policy YAML reviewed and stored in vault.
+
+Architecture overview (textual diagram):
+- Production path: client -> customer edge proxy -> redwood ingress (tenant routing) -> runtime pool (current) -> KV cache -> GPUs -> response -> client.
+- Mirror path (no client impact): sample of requests duplicated at the edge proxy and sent to a mirrored runtime pool running the candidate artifact. Responses from the mirrored pool are recorded but not returned to the client. A sidecar collector attaches trace IDs and stores response deltas in the verification pipeline.
+
+Key tradeoffs and constraints:
+- Mirrored runs increase token and GPU cost; cap mirroring to 3–10% per tenant by default.
+- Some non‑idempotent requests must be sanitized: mutate operations should be replay‑blocked or translated to dry‑run mode.
+- KV cache warming differences may bias latency measurements; include a cache‑warming substage.
+
+Metrics and SLOs to monitor (minimum set):
+- request_success_rate (per tenant): target >= 99.5%; trigger rollback if drop > 0.5 percentage points over 15m.
+- p95_inference_latency: baseline delta <= +20% or +80ms whichever is smaller.
+- p99_inference_latency: baseline delta <= +30% or +150ms.
+- kv_cache_hit_rate: no more than 10 percentage point regression compared to baseline.
+- correctness_regression_rate (semantic mismatch score from comparators): must remain < 0.25%.
+- trace_error_count / 1m: any spike to > 5x baseline requires immediate pause and investigation.
+
+Dashboard and alert references:
+- Mirror Upgrade Overview dashboard: dash‑ids: /dashboards/upgrade-mirror-overview (internal).
+- KV health panel: /dashboards/kv-health.
+- Canary correctness panel: /dashboards/canary-correctness.
+- Alerts: ALERT_UPGRADE_LATENCY_REGRESSION, ALERT_UPGRADE_ERROR_SPIKE, ALERT_KV_DRIFT.
+
+Traffic mirroring policy (example YAML):
+---
+apiVersion: redwood.io/v1
+kind: TrafficMirrorPolicy
+metadata:
+  name: tenant-123-mirror-2028-01
+spec:
+  tenantId: "tenant-123"
+  samplePercent: 2.5
+  sanitize: true # rewrite non-idempotent ops to dry-run
+  safeHeaders: ["x-rw-trace", "x-rw-tenant"]
+  mirrorTarget: "runtime-pool/candidate-v2"
+  observationSink: "obs-s3://mirror-evidence/tenant-123/2028-01"
+  kvConsistencyCheck: true
+  metricsNamespace: "upgrade/tenant-123"
+---
+Notes: samplePercent should rarely exceed 5% in initial windows.
+
+Stageful upgrade workflow (recommended cadence and actions):
+Stage 0 — Prep and dry run (owner: Upgrade Lead):
+- Create upgrade artifact and sign.
+- Run offline unit and integration tests; attach test report to the plan.
+- Create a controlled test job that replays 1 hour of production traces into a staging cluster.
+
+Stage 1 — Shadow warmup (0–30 minutes):
+1. Deploy candidate to an isolated runtime pool labeled candidate-v2 with zero inbound traffic.
+2. Warm candidate caches with synthetic rerun based on recent traffic samples (command: redwoodctl warm --tenant tenant-123 --source sample-bucket://replays/last-24h).
+3. Validate resource stability: CPU, GPU, GPU‑memory pressure within normal bands.
+
+Stage 2 — Mirroring window (30–180 minutes):
+1. Enable TrafficMirrorPolicy with samplePercent 1–3% via redwoodctl apply -f mirror-policy.yaml.
+2. Verify mirrored traces are arriving in observationSink within 60s.
+3. Run automated comparators: token-level diff, structured-output equality and semantic similarity (script: infra/upgrade/comparator-run.sh --tenant tenant-123 --window 15m).
+4. Observe dashboards and watch for ALERT_* triggers. Maintain Slack channel #upgrade-tenant-123 for real-time comms.
+
+Stage 3 — Ramp and extended validation (3–12 hours):
+1. If Stage 2 metrics are green, increment samplePercent to 5–8% and repeat comparisons.
+2. Run longitudinal tests for KV drift: run kv-diff-tool --from=primary --to=candidate --threshold=0.1% every hour.
+3. Confirm no customer‑perceived errors and p95/p99 latencies within SLO deltas.
+
+Stage 4 — Promotion (operator decision):
+- If all checks pass for 12h and reviewers signoff, proceed with canary promotion: route 10% of actual traffic to candidate (blue/green route) and continue monitoring. Promotion to 100% should be automated only after 24–72 hours of stable canary behaviour.
+
+Rollback triggers and immediate actions (fast path):
+- Any ALERT_UPGRADE_ERROR_SPIKE or correctness_regression_rate >= 0.25% over 5m: pause mirroring and initiate rollback.
+- Latency regression beyond p99 threshold for two consecutive 5m windows: pause and investigate.
+- KV inconsistency above threshold: immediate rollback and evidence collection.
+Immediate rollback steps (operator):
+1. redwoodctl mirror pause --policy tenant-123-mirror-2028-01
+2. redwoodctl promote rollback --target current-stable --reason "auto-trigger-<alert-id>" --evidence "obs-s3://mirror-evidence/tenant-123/2028-01"
+3. Notify stakeholders via #upgrade-ops and the customer point-of-contact.
+4. Kick off evidence package collection: infra/upgrade/collect-evidence.sh --tenant tenant-123 --window last-2h --out /tmp/evidence-tenant-123.tgz
+5. If rollback fails or partial, escalate to SRE oncall and follow the rollback escalation matrix.
+
+Forensics and evidence capture (post pause/rollback):
+- Preserve mirrored request traces, candidate responses, and comparator diffs.
+- Save KV snapshots from both candidate and primary runtimes.
+- Record orchestration events (k8s events, pod restarts) and network packet captures if requested.
+- Place collected evidence into the customer evidence store and mark in the upgrade ticket.
+
+Automation hooks and recommended scripts: (examples)
+- infra/upgrade/comparator-run.sh (token-compare + semantic-similarity)
+- infra/upgrade/kv-diff-tool (consistent snapshot-based diff)
+- infra/upgrade/mirror-policy-generator.py (translates upgrade plan variables into TrafficMirrorPolicy YAML)
+- redwoodctl (admin CLI): commands used above are available to authorized operator roles only.
+
+Testing checklist (pre‑promotion):
+- [ ] Mirror traces arrive within 60s of enabling policy.
+- [ ] comparator-run exit code 0 for 95% of sample set.
+- [ ] no ALERT_* firing for 60m at samplePercent 3%.
+- [ ] KV drift <= threshold for 3 consecutive measurements.
+- [ ] Security scan on candidate binary passed (signature verified).
+
+Post-promotion validation and cleanup:
+- Continue telemetry monitoring for 72 hours at full load.
+- If stable, remove mirror policy and archive evidence with tags: tenant, artifact-id, upgrade-id, date.
+- Run a retrospective and attach an incident or success summary to the ticket.
+- Update the runbook with notes and new guardrail thresholds if lessons learned justify changes.
+
+Appendix A — Sample CLI snippets:
+- Apply mirror policy: redwoodctl apply -f mirror-policy.yaml --namespace tenant-123
+- Pause mirroring: redwoodctl mirror pause --policy tenant-123-mirror-2028-01
+- Collect evidence: infra/upgrade/collect-evidence.sh --tenant tenant-123 --since 2h --out /tmp/evidence.tgz
+- Promote rollback: redwoodctl promote rollback --target current-stable --reason "auto-trigger-ALERT_UPGRADE_ERROR_SPIKE"
+
+Appendix B — Minimal customer requirements table (summary):
+| Requirement | Minimum | Rationale | Owner |
+|------------|---------|-----------|-------|
+| Admin VPN access | Allowlist IPs for field operator | Needed to run redwoodctl and collect evidence | Customer/Field Ops |
+| Bandwidth for mirroring | 2–10% additional egress | Mirrors increase egress and token costs | Customer network team |
+| KMS access | Signing key escrow or delegations | Used to validate candidate binary signatures | Security |
+| Observability sink | s3 or compatible with 60s ingestion lag | Necessary to store mirrored evidence | Platform Observability |
+
+Appendix C — Known limitations and mitigations:
+- Non‑replayable requests: ensure policy.sanitize=true to convert write operations to dry‑run.
+- Cold KV cache skew: include warmup stage and compare both warm and cold request slices.
+- High cost for large tenants: limit samplePercent and extend observation window rather than raise samplePercent.
+
+Contact and escalation matrix (short):
+- Upgrade Lead: priya.nambiar@redwood.ai
+- SRE oncall: pagerduty #12345
+- Observability owner: janelle.park@redwood.ai
+
+Revision history:
+- 2027-11-02: Drafted initial pattern and checklist (Priya N.)
+- 2027-12-08: Add KV drift tooling and comparator scripts (Marco A.)
+- 2028-01-15: Hardened rollback triggers and added automation hooks (Priya N.)
+
+End of document.

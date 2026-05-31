@@ -1,0 +1,165 @@
+buildkite-gpu-test-slicing-and-queueing-strategy
+
+Overview
+
+Purpose: Provide an operationally rehearsed strategy for slicing large CI/Eval workloads across heterogeneous GPU pools, using Buildkite as the orchestrator and Terraform-managed instance pools. This doc standardizes pipeline patterns, cost-aware queueing, and defensive runbook steps to reduce flakiness, limit noisy-neighbor interference, and keep CI billing within budget targets.
+
+Audience
+- Infra engineers who maintain GPU CI agents and provisioning modules
+- SREs running CI reliability/SLIs
+- ML engineers designing large eval jobs and test shards
+
+Background and motivation
+- We run large-scale model evals and integration tests in CI that consume heterogeneous GPUs (A100, H100, older T4 pools). Historically we saw: 
+  - Long queue times during bursts (nightly evals), causing missed gating windows.
+  - Noisy neighbor interference when large eval shards land on small-instance pools.
+  - Cost surprises from unconstrained parallelism across on-demand vs spot pools.
+- This strategy codifies a reproducible pattern: (1) slice work by expected GPU memory + seq-length, (2) tag shards with pool affinity, (3) use Buildkite priority queues + dynamic throttles, (4) surface telemetry and cost signals to gates.
+
+Scope and non-goals
+- In scope: Buildkite pipeline design, agent tagging, Terraform pool module knobs, Prometheus metrics & alerting, runbook for common CI failures.
+- Out of scope: deep kernel/runtime optimizations (see eng-serving-runtime docs) and cloud account billing export design (finance owns raw billing).
+
+High-level architecture
+- Components:
+  - Buildkite pipelines: orchestrates steps; each shard is a Buildkite job with metadata tags (gpu_class, estimated_vram_mb, priority).
+  - Agent autoscaler: listens to queue length + shard tags; scales pools created by terraform modules (module/gpu-pool).
+  - Pool types: spot-hetero, reserved-low-latency, eval-warmpool. Pools expose labels to Buildkite agents.
+  - Cost controller: lightweight service that caps concurrent shards per cloud account and pool class based on daily budgets.
+  - Observability: Prometheus (queue_length, agent_free_slots, shard_failure_rate), Grafana dashboards, and cost-export metrics.
+
+Design details
+1) Test slicing rules (shard affinity)
+- Shard metadata keys set by job authors (examples in pipeline template):
+  - gpu_class: high-memory | general | preemptible
+  - estimated_vram_mb: integer (approx 12000 for 12GB), used for placement heuristics
+  - seq_profile: short | medium | long (guides runtime selection)
+  - cost_tag: dev | nightly | critical
+- Slicing heuristic algorithm (pseudocode):
+  1. Bucket tests by estimated_vram_mb descending.
+  2. Fit shards into node-class capacity (e.g., H100-80GB => 4x20GB shards).
+  3. Prefer packing many small shards onto general pools, reserve high-memory pools for long/large shards.
+
+2) Buildkite pipeline patterns
+- Use a canonical pipeline template `pipelines/gpu-sharded.yml` (checked into infra repo). Template enforces:
+  - Step-level `agents` selectors that match `queue: gpu-<pool-name>` and pass metadata via environment variables.
+  - Automatic job timeout (default 3 hours) and soft-cancellation hook to checkpoint work for long-running shards.
+  - Priority assignment (0=highest, 5=lowest) derived from `cost_tag`.
+- Example snippet (YAML encoded as a template):
+  - name: "eval: shard {{shard_id}}"
+    command: ./run_eval.sh --shard {{shard_id}}
+    agents:
+      queue: "gpu-{{ gpu_class }}-queue"
+      vram: "{{ estimated_vram_mb }}"
+    env:
+      SHARD_ID: "{{ shard_id }}"
+      SEQ_PROFILE: "{{ seq_profile }}"
+    timeout_in_minutes: 180
+
+3) Agent & Terraform module expectations
+- Terraform module: `module/gpu-pool` exposes inputs:
+  - instance_type (string), gpu_type (string), vram_mb (number), min_size (number), max_size (number), preemptible_policy (none|spot|spot-with-fallback).
+  - tags: map -> must include `buildkite_queue` and `pool_class`
+- Buildkite agent bootstrap installs `redwood-gpu-agent` with a local cache dir for container layers and model artifacts. Agent registers with queue = `buildkite_queue` tag.
+
+4) Autoscaling and throttles
+- Autoscaler makes decisions from two signals: queue_depth_per_priority and free_slot_estimate. Scaling policy:
+  - scale_up if avg_queue_per_minute > 2 for 3 consecutive mins and free_slots < 10%
+  - scale_down after 15m idle with >50% free_slots and no high-priority jobs pending
+- Cost-aware cap: each cloud account has a soft concurrency cap (daily burn budget). The cost controller will reject scale_up calls if projected spend breaches the cap; rejected requests are recorded and surfaced to infra-alerts.
+
+5) Priority queueing and backpressure
+- Implement Buildkite priority queues by mapping job priority into separate queue names: `gpu-high-priority`, `gpu-default`, `gpu-low-priority`. Agents join one or more queues depending on pool class.
+- Backpressure mechanism: when cost-controller flags over-spend, it flips pool `accept_low_priority` to false via a feature-flag toggle and registry entry in Redis. The autoscaler and buildkite worker bootstrap read this flag.
+
+Telemetry and SLOs
+- Metrics to export:
+  - buildkite_queue_length{queue,priority}
+  - agent_free_slots{pool,instance_type}
+  - shard_success_rate{pipeline,shard_type}
+  - avg_wait_time_seconds{cost_tag}
+  - daily_gpu_hours{pool_class}
+- SLOs (CI gating):
+  - 95th percentile queue wait for `critical` pipelines <= 2 minutes (goal)
+  - shard success rate >= 99% over rolling 24h for non-nightly tests
+  - daily spot-preemption rate < 6% for spot pools (target)
+- Alerts (Prometheus Alertmanager):
+  - P1: buildkite_queue_length{queue=~"gpu-.*",priority="0"} > 5 for 10m -> page oncall-sre
+  - P2: shard_success_rate < 95% for 30m -> notify infra-team slack channel #gpu-ci-failures
+  - P3: daily_gpu_hours{pool_class="preemptible"} > budget_limit -> notify cost-ops
+
+Operational runbook (common failure modes)
+1) Symptom: suddenly increased queue times for critical pipelines
+- Possible causes: warm pool exhausted, autoscaler failed, control-plane errors, network egress congestion.
+- Immediate steps:
+  1. Check Grafana dashboard `CI > GPU Queue Overview` for queue depth and pool free_slots.
+  2. Inspect autoscaler logs in logging cluster `cluster-autoscaler/gpu-ci` for scale action failures.
+  3. If autoscaler is healthy but pools are empty: run `terraform apply` with `force_warmpool_replenish=true` for relevant pool module (use canary account first).
+  4. If cloud API rate limits present, open support case with cloud provider and temporarily reroute low-priority queues to a reserved pool for critical tests.
+  5. Post-incident: run the root cause checklist and file a bubble-up ticket to infra backlog.
+
+2) Symptom: elevated shard OOMs on general pools
+- Steps:
+  1. Use Buildkite job metadata to correlate `estimated_vram_mb` to actual OOM events in agent logs (`/var/log/redwood/agent.log`).
+  2. If mismatch > 20% across recent run, update the slicing heuristic constants in `tools/shard-packer` and trigger a canary pipeline to validate.
+  3. Temporarily move failing tests to `gpu-high-memory` queue while rolling out packer fix.
+
+3) Symptom: autoscaler declined scale due to cost cap
+- Steps:
+  1. Confirm decline event in Cost Controller (service logs).
+  2. If burst is legitimate (production eval), infra-sre can request temporary uplift by opening an approval flow in PagerDuty runbook (requires finance approval via #cost-ops).
+  3. Otherwise, reslice workload and reduce parallelism by lowering concurrency variable in pipeline (ENV: MAX_PARALLEL_SHARDS).
+
+Testing and rollout plan
+- Unit test coverage: `tools/shard-packer` must have synthetic workload tests validating fit decisions across instance types.
+- Integration: a canary pipeline runs every merge into `main` that deploys a new terraform module with `min_size=1` and runs a representative shard set against canary pools.
+- Gradual rollout: promote module changes using `i canary -> canary-stable -> autobump` pattern, validating metrics after each stage (15m observation windows).
+
+Terraform examples
+- Minimal pool module instantiation (example):
+  module "gpu_pool_eval_general" {
+    source = "terraform/modules/gpu-pool"
+    instance_type = "nvidia-a100-40gb"
+    gpu_type = "A100-40GB"
+    vram_mb = 40960
+    min_size = 2
+    max_size = 40
+    preemptible_policy = "spot-with-fallback"
+    tags = {
+      buildkite_queue = "gpu-general-queue"
+      pool_class = "general"
+    }
+  }
+
+Policy and cost guardrails
+- Naming and tagging: every GPU pool must include tags: `buildkite_queue`, `owner`, `cost_center`, `pool_class`. This enables automated cost attribution and chargebacks.
+- Budget policy: pools in `preemptible` class have a per-account daily cap and are subject to immediate throttling if predicted spend > budget.
+
+Ownership and contacts
+- Primary owner: infra-ci (team alias)
+- Escalation path: oncall-sre -> infra-head -> cloud-ops (listed in team wiki)
+- Slack channels: #gpu-ci-failures (alerts), #gpu-ci-ops (operations), #cost-ops (billing exceptions)
+
+Appendices
+A. Helpful CLI snippets
+- Force replenish warm pool (terraform workspace must be `ci`):
+  export TF_WORKSPACE=ci
+  terraform apply -var="force_warmpool_replenish=true" -target=module.gpu_pool_eval_general
+
+- Inspect Buildkite queue via API (example):
+  curl -H "Authorization: Bearer $BUILDKITE_TOKEN" https://api.buildkite.com/v2/organizations/redwood/pipelines/{pipeline}/jobs?state=running
+
+B. Troubleshooting checklist for release engineers
+- Validate that shard metadata keys are present and conform to the expected schema.
+- Confirm agent image has latest `redwood-gpu-agent` (sha-tag).
+- Ensure cost-controller is reporting the current caps (service endpoint `/v1/caps`).
+
+C. References
+- Related infra modules: /confluence/eng-infra/terraform-and-iac/gpu-lease-ledger-and-claim-module.json
+- CI gating playbook: /confluence/eng-infra/ci-cd-and-build/gpu-ci-gating-and-iac-contracts-playbook.json
+
+Change log
+- 2025-02-10: Initial draft by Aisha Patel.
+- 2025-04-02: Added cost controller pattern and priority queue mapping (review comment from Liam Chen).
+- 2025-08-12: Expanded runbook with autoscaler diagnostic steps and Terraform example.
+

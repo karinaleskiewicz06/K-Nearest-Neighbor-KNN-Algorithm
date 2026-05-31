@@ -1,0 +1,163 @@
+Operational Workload Simulator and Signature Guide
+
+Overview
+
+This document describes the Operational Workload Simulator (OWS): a deterministic, configurable engine used by the eng-serving-runtime team to emulate customer traffic shapes, infer kernel-scheduler interactions, and produce telemetry signatures that feed the benchmarking and autotune pipelines. The OWS is intended for performance experiments, release validation, and as a canonical source of workload descriptors for replay across clouds and local sandboxes.
+
+Goals
+
+- Provide a small set (~8) of canonical workload signatures that cover >90% of production request shapes for text-generation and chat routes.
+- Produce reproducible latency/cost buckets for CI and release verification.
+- Emit annotated traces and kernel-hint suggestions to accelerate scheduling experiments.
+- Be lightweight and portable: runnable in developer sandboxes and CI runners.
+
+Workload signature taxonomy
+
+Each signature is a compact descriptor summarizing the request distribution we want the runtime to see. Signatures are identified by id, human name, and a short rationale. Use the signature ids in experiments and report names.
+
+Signature table (canonical set)
+
+| id | name | request mix | mean tokens | percentile shape | primary risk | use case |
+|----|------|-------------|-------------|------------------|--------------|----------|
+| sig-llow | Low-latency chat (short-turn) | 90% chat-turn / 10% gen | 32 | tight (P99 ~ P95*1.2) | tail latency | UI chat, assistants |
+| sig-lburst | Burst small prompts | 70% tiny / 30% small | 16 | spiky | scheduler warmstart | bot spiking behavior |
+| sig-synth | Long generation seq | 100% generation | 1024 | heavy tail | memory pressure | document generation, summarization |
+| sig-mix1 | Mixed enterprise | 50% chat / 30% embed / 20% gen | 128 | bi-modal | KV cache churn | multi-tenant enterprise |
+| sig-embed | Embeddings heavy | 95% embed requests | 256 | narrow | throughput saturation | embedding pipelines |
+| sig-prefetch | Stateful prefetched | 60% chat with KV hints | 64 | moderate | stale KV warmup | sessionized agents |
+| sig-lowq | Low-quality cheap tokens | 100% short gen | 8 | narrow | over-batching | telemetry sampling |
+| sig-noisy | Erratic unseen shapes | random mix | mixed | unpredictable | kernel thrash | chaos testing |
+
+Simulator architecture (high level)
+
+- Input: YAML workload descriptor (example below) describing arrival process, request templates, sequence lengths, and KV-cache locality.
+- Orchestration: single binary (owsctl) schedules clients and records per-request metadata.
+- Execution modes: local (single process), distributed (controller + worker), and CI-mode (deterministic RNG seeds).
+- Outputs: time-series of latency percentiles, per-token cost estimate, kernel selection log, and full trace bundles (zip of trace.json + kernel-events.csv).
+
+Workload descriptor (example YAML)
+
+-- sample-workload.yaml --
+name: long-document-summaries
+id: sig-synth
+seed: 20260201
+arrival:
+  distribution: poisson
+  lambda: 0.8  # requests/sec per client
+clients: 8
+templates:
+  - type: generation
+    model_variants: ["rw-7b-q4f16", "rw-7b-fp16"]
+    length:
+      distribution: lognormal
+      mu: 6.9  # exp(mu) ~ 1000 tokens
+    temperature: 0.0
+kv_locality: low
+session_affinity: false
+metrics_to_emit: [latency, kernel_hints, kv_miss_rate]
+
+Kernel-hint mapping and guidance
+
+The simulator emits a preliminary kernel_hint bundle that maps observed sequence-length histograms + concurrency to recommended kernel profile names. Use these hints to seed experimental scheduler policies or to annotate A/B runs. The guideline for interpreting hints is: 
+
+- Hint level: "suggest" | "caution" | "avoid"
+- Key signals used: mean_seq_len, tail_seq_len (P95/P99), kv_cache_hit_ratio, avg_concurrency, burst_index (max RPS / mean RPS)
+
+Example kernel hint CSV (excerpt)
+
+signature_id,mean_seq,P95_seq,kv_hit,avg_conc,burst_index,hint_level,recommended_profile
+sig-synth,1024,2048,0.23,4,3.4,suggest,large-tile-qkv-fusion
+sig-llow,32,48,0.88,16,1.3,avoid,large-batch-optimizations
+
+Mapping rules (summary)
+
+- If mean_seq > 512 and kv_hit < 0.4 -> prefer memory-efficient kernels, enable fragmented-kv-eviction.
+- If avg_conc > 12 and burst_index < 2 -> enable continuous-batching aggressive slice.
+- If burst_index > 3 and kv_hit > 0.7 -> warmstart fast-path kernels and prefetch KV.
+
+Running experiments (step-by-step)
+
+1. Prepare environment: export OWS_ARTIFACT_DIR=/tmp/ows-runs && mkdir -p $OWS_ARTIFACT_DIR
+2. Pick signature YAML: examples/sig-llow.yaml
+3. Run locally for quick smoke: ./owsctl run --profile local --config examples/sig-llow.yaml --out $OWS_ARTIFACT_DIR/sig-llow-20260218
+4. For distributed: ./owsctl controller --config cluster-controller.yaml & then ./owsctl worker --join-controller http://controller:9000 --config examples/sig-synth.yaml
+5. After run completes, generate report: ./owsctl report --input $OWS_ARTIFACT_DIR/sig-llow-20260218 --format html --output report-sig-llow.html
+
+Repeatability and CI integration
+
+- Use deterministic seeds in CI-mode; the runner will assert histogram equivalence (within tolerance) vs baseline.
+- Baseline artifacts are stored in s3://redwood-bench-baselines/ows/ and referenced by signature id and git sha. CI job will fail on >5% regression in P99 latency for P50 traffic.
+
+Telemetry emitted and acceptance criteria
+
+Essential emitted signals:
+- latency_p50/p95/p99 (ms)
+- per_token_cost_estimate (USD/token)
+- kernel_profile_distribution (counts)
+- kv_cache_hit_rate
+- gpu_utilization and mem_peak (MB)
+- trace_bundle_url
+
+Acceptance criteria for pre-release smoke (recommended):
+- P50 change from baseline: < 2%
+- P95 change from baseline: < 5%
+- P99 change from baseline: < 10%
+- Per-token cost delta: < 7% (absolute) or flagged for review
+- Kernel-profile shift: no more than 2 suggested-profile changes for sig-llow and sig-embed
+
+Experiment matrix and result naming
+
+- Always include signature id + model variant + kernel-profile + run-seed in artifact names, e.g.: sig-synth__rw-7b-q4f16__large-tile-qkv-fusion__s20260201.zip
+- Suggested matrix dimensions: signature x model_variant x concurrency x kernel_profile x quant_mode
+
+Telemetry interpretation and correlation playbook (short)
+
+1. Start with latency regressions: correlate P99 spikes with kernel_profile_distribution shifts and kv_cache_hit_rate drops.
+2. If kernel events indicate repeated kernel load/unload, check burst_index and device memory fragmentation traces.
+3. For throughput regressions, correlate GPU utilization vs avg_concurrency and queue_depth histograms.
+4. For cost regressions, inspect per_token_cost_estimate and kernel time breakdown (attention vs decoder vs memcpy).
+
+Troubleshooting checklist
+
+- Symptom: Unexpected P99 increase in local runs
+  1) Confirm deterministic seed and workload descriptor unchanged
+  2) Check kernel_profile distribution in trace bundle; look for sudden "fallback" profile usage
+  3) Inspect worker logs for OOMs / driver warnings
+  4) Run with -v debug and attach sampling profiler: ./owsctl run --profile local --config X --debug-sampler
+
+- Symptom: Different behavior in distributed vs local
+  1) Verify clock skew and controller/worker time sync
+  2) Confirm number of clients and threadpool sizes match (controller overrides matters)
+  3) Check network latency histogram between controller and workers; high controller latency can artificially increase burst_index
+
+Ownership and lifecycle
+
+- Owning team: eng-serving-runtime (benchmarking subteam)
+- Primary owner: Maya Patel (author)
+- Secondary owners: Diego Martinez (kernel experiments), Priya Singh (profiling/telemetry)
+- Review cadence: Quarterly; bump major versions for simulation model or schema changes.
+
+Change log (high level)
+
+- 2025-11-12: v0.1 created (initial canonical signatures and runner CLI)
+- 2026-01-20: v0.2 added distributed controller, kernel-hint CSV output
+- 2026-02-18: v0.3 tightened CI acceptance thresholds and stabilized P95 baseline comparison
+
+Appendices
+
+Appendix A — Common config flags
+--threads N          # client threads per worker
+--deterministic true # enable deterministic RNG
+--emit-trace true    # create per-request trace bundles
+
+Appendix B — Minimal example: quick local smoke
+1) git checkout main && git pull origin main
+2) ./owsctl run --profile local --config examples/sig-lowq.yaml --out /tmp/ows-quick
+3) ./owsctl report --input /tmp/ows-quick --format text
+
+Appendix C — Contact and escalation
+- Slack: #eng-serving-runtime-bench (primary channel)
+- Pager: eng-sre on-call for infra issues (see oncall roster)
+- Pager escalation path: bench-owner -> runtime-sre -> infra-team
+
+If you are adding a new workload signature, add a short rationale, expected badge (latency/cost vs baseline), and at least one representative production trace id in the related_pages field.

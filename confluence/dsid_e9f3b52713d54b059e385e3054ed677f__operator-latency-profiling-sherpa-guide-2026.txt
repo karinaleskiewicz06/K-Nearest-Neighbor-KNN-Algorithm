@@ -1,0 +1,135 @@
+Operator Latency Profiling Sherpa Guide
+
+Overview
+--------
+This guide is a step-by-step Sherpa for platform operators and service owners to diagnose and remediate latency regressions (especially tail latency spikes) affecting LLM inference paths. It focuses on pragmatic, reproducible checks, prioritized by impact and time-to-evidence, and includes commands, dashboards, and escalation boundaries. Use this guide during on-call, post-incident analysis, and pre-rollout smoke testing.
+
+Goals
+- Reduce median and 95/99p investigation time by providing a repeatable checklist.
+- Surface likely causal subsystems quickly (runtime, batching agent, KV prefix cache, model workers, scheduler).
+- Provide clear remediation actions and ownership for rapid rollback or mitigation.
+
+Scope and assumptions
+- Applies to production clusters (hosted & dedicated) running the Redwood runtime (service names below).
+- Assumes operator has access to internal dashboards, pprof access to worker processes, and kubectl/helm for cluster tasks.
+- This is not a deep kernel-level troubleshooting guide; escalate to eng-infra for hardware-level issues.
+
+Quick reference: SLOs and thresholds
+- Request latency SLOs (frontend-observed): median < 80ms, p95 < 250ms, p99 < 600ms.
+- Tokenization/transform step target: p95 < 50ms.
+- KV cache hit-rate target: >= 92% for steady-state text-generation workloads.
+- Batching latency budget (time-in-queue): p95 < 40ms, p99 < 150ms.
+- Operator escalation threshold: p99 > 900ms for > 10 minutes or sudden sustained p95 increase of >2x.
+
+Immediate Triage (first 10 minutes)
+1) Confirm alert context
+   - Which SLI triggered (api-route, model, region)? Capture alert ID and graph snapshot.
+2) Validate scope: systemic vs tenant
+   - Check platform-telemetry -> "request-rate-by-tenant" dashboard for correlated spikes.
+   - If isolated to a tenant, warn Customer Success and consider soft-quota or tenant priority reroute.
+3) High-level health checks (run these in parallel)
+   - kubectl get pods -n runtime | egrep "runtime|batching-agent|model-worker|router" (look for CrashLoop, OOM, restart spikes).
+   - curl -fsS https://internal-health/runtime/ready || echo "runtime ready failed"
+   - grafana: open "operator-latency-sentinel" dashboard (panel: p99 by component).
+
+Investigation checklist (10–45 minutes)
+A. Ingest & routing layer
+   - Inspect request-router: check routing-rates, imbalance across regions.
+   - Commands:
+     - kubectl logs deploy/request-router -n runtime --tail=200 | grep -i "slow-route"
+     - curl -sS "https://router-metrics.internal/_prometheus?query=histogram_quantile(0.99, sum(rate(request_latency_bucket[1m])) by (le,route))"
+   - Look for changes in routing policy, sudden fanout to non-local model variants, or upstream DNS latencies.
+
+B. Batching & queueing
+   - Check batching-agent: time-in-queue distribution, pending-queue-length.
+   - Run: kubectl exec -n runtime deploy/batching-agent -- /bin/sh -c 'socat - UNIX-CONNECT:/tmp/agent.sock; echo stats' (or check /metrics endpoint).
+   - If time-in-queue p95 > 2x baseline, consider: increasing batch flush frequency, enabling fast-path small-batch policy, or temporarily reducing max-batch-size.
+
+C. KV prefix cache & cache-coherency
+   - Inspect kv-prefix-cache hit-rate and eviction churn.
+   - Recommended queries:
+     - curl -sS https://kv-cache.internal/metrics | grep "hit_rate"
+   - If hit_rate < 85% and eviction_rate high: investigate cache shard imbalance (see operator-guide: kv-shard-rebalance).
+
+D. Model worker stalls & GPU scheduling
+   - Check model-worker pprof: top goroutines, blocking syscalls.
+   - Commands (example): kubectl port-forward svc/model-worker 6060:6060 -n runtime & then curl http://localhost:6060/debug/pprof/goroutine?debug=2 > goroutines.txt\   - Inspect GPU scheduler logs for preemption events or high kernel queuing times.
+   - If GPU queue length high: verify autoscaler metrics and burst policy. Consider temporary scale-up of worker-pool or moving heavy tenants to dedicated pool.
+
+E. Telemetry and sync anomalies
+   - Check telemetry-proxy latencies and ingestion backpressure.
+   - If observability ingestion lags, the graphs may under-report; use raw traces (zipkin/jaeger) for last 5 minutes.
+
+Evidence-gathering commands (copyable)
+- Top-level SLI snapshot (via internal CLI): rdxctl metrics fetch --workspace prod --range 15m --metrics request_latency_p50,request_latency_p95,request_latency_p99,kv_hit_rate\- kubectl: kubectl get pods -n runtime --show-labels -o wide | egrep "runtime|model-worker|batching-agent"\- pprof snapshot: kubectl exec -n runtime deploy/model-worker -- curl -sS localhost:6060/debug/pprof/profile?seconds=10 > /tmp/profile.pb\- coredump check: for i in $(kubectl get pods -n runtime -o name | grep model-worker); do kubectl logs $i -n runtime | tail -n 200 | sed -n '1,200p' >> /tmp/worker-$i.log; done
+
+Common root causes and mitigations
+- Root cause: sudden increase in long prompts causing KV cache cold-starts
+  - Mitigation: enable aggressive prefix warming for affected model-route; add temporary cache-prefetch rule; notify model-onboarding team to examine quantization or signature changes.
+- Root cause: model-worker OOMs after recent model rollout
+  - Mitigation: rollback model version to previous stable variant; pin routes to stable model until a patch; open a release incident.
+- Root cause: batching-agent backlog due to increased concurrency from new PLG experiment
+  - Mitigation: add temporary soft-throttle on experimental tenant; increase batching-agent replicas; tune batching flush interval.
+- Root cause: GPU scheduler preemption during infra maintenance windows
+  - Mitigation: enable priority-affinity for production pools; postpone non-critical maintenance; coordinate with infra to add warm nodes.
+
+Short-term mitigations (ordered by operator preference)
+1) Canary rollback (if recent deploy suspected). Steps: find deploy, run 'kubectl rollout undo deploy/<svc> -n runtime --to-revision=<rev>' and monitor p99 for 10m.
+2) Tenant soft-throttle: apply tenancy-priority annotation to route to reduce concurrency for noisy tenant.
+3) Increase batch-agent replicas: helm upgrade runtime --set batchingAgent.replicas+=2 --namespace runtime.
+4) Temporary routing to a cheaper but lower-capacity model variant as graceful degradation.
+
+Post-incident: required artifacts
+- Short incident summary (200–400 words) in the incident tracker including timeline, hypothesis, mitigation, verification steps.
+- Attach: pprof profiles, 10m range of request traces, KV cache metrics, deploy diffs.
+- Credit: list of oncall, responders, and reviewers.
+
+Runbook table: operator commands & KPIs
+- Check cluster health:
+  - Command: kubectl get pods -n runtime --field-selector=status.phase!=Running\  - KPI: pod restarts per minute < 0.1
+- Snapshot latency:
+  - Command: rdxctl metrics fetch --range 5m --metrics request_latency_p95,request_latency_p99\  - KPI: p99 < 600ms (escalation if > 900ms)
+- KV cache:
+  - Command: curl -sS https://kv-cache.internal/metrics | grep "hit_rate"\  - KPI: hit_rate >= 0.92
+
+Ownership and escalation matrix
+- First responder: platform-operators (rotation: platform-oncall@redwood.com).
+- Service owner for runtime, batching-agent, request-router: eng-platform runtime team (pager: #eng-platform-runtime).
+- Model worker and quantization issues: eng-serving-runtime (pager: #eng-serving-runtime).
+- Infra / GPU scheduling: eng-infra (pager: #eng-infra-ops).
+- When to escalate to SRE lead: p99 > 1200ms for > 30 minutes or evidence of cross-region capacity collapse.
+
+Roll-forward checklist (if mitigation requires config changes)
+1) Validate change in staging with a synthetic workload that matches production token-distribution.
+2) Create canary with 5% traffic for 10 minutes and observe p95/p99.
+3) If stable, incrementally expand to 25% then 100% with monitoring hooks.
+4) If regression observed, execute rollback and run postmortem.
+
+Prevention and roadmap items (owner: eng-platform)
+- Telemetry: add a lightweight real-time heatmap of time-in-queue per tenant (Q3 2026).
+- Runtime: support per-tenant cache affinity to reduce cross-tenant eviction churn (Q4 2026).
+- Automation: build a preflight synthetic check on every model rollout that validates kv-cache hit-rate and batch-time-budgets.
+
+Appendix A: Useful dashboards and links
+- operator-latency-sentinel (Grafana) — top-level p99 by component and route.
+- batching-agent-queue-length (Grafana) — time-in-queue histogram.
+- kv-cache-shard-health (Grafana) — hit_rate, eviction_rate, shard skew.
+- model-worker-pprof (internal) — one-click pprof capture.
+
+Appendix B: Example escalation message (Slack snippet)
+- Subject: [P0] Production p99 latency spike — runtime (us-west-2)
+- Body: "p99 latency 1.2s (baseline 420ms) since 14:18 UTC. Affected routes: /v1/generate (gpt-2-16k). Evidence: high batching time-in-queue p95=320ms, kv hit_rate=78%, model-worker restarts x3 in last 6m. Actions taken: increased batching-agent replicas by 2, started pprof capture on model-worker-6, opened rollback for gpt-2-16k to rev 42. Paging: @eng-platform-runtime, @eng-serving-runtime, @eng-infra"
+
+Appendix C: Contact & handoff template
+- On-call summary: 1–2 sentence root cause hypothesis.
+- Evidence attached: links to pprof, traces, deploy diff.
+- Action items: list of follow-ups, responsible owner, estimated ETA.
+
+Related playbooks and docs
+- Service-level runbook: /confluence/eng-platform/runbooks/platform-operator-handbook-degraded-kv-prefix-cache-2026
+- Latency SLI onboarding: /confluence/eng-platform/dashboards-and-alerts/platform-observability-sli-onboarding-playbook-2026
+
+Notes and changelog
+- 2025-11-03 (Asha Patel): initial draft and collection of operator commands.
+- 2026-02-14 (Asha Patel, reviewers: Mateo Ruiz, Lin Zhao): added GPU scheduler troubleshooting and escalation matrix.
+

@@ -1,0 +1,168 @@
+Tenant Resource Accounting and Cost Reconciliation Playbook
+
+Summary
+-------
+Purpose: This playbook documents Redwood’s recommended design, telemetry, automated processes, and manual checks for tenant-level resource accounting and monthly cost reconciliation for Private deployments (VPC and on‑prem). It is intended to reduce billing drift, provide repeatable audit evidence, and enable fast operational response when tenant usage does not match exported charge data.
+
+Scope and audience
+------------------
+- Audience: SREs, Platform Engineers, Field Operations, Customer Success (billing support), and Solutions Engineers during onboarding.
+- Scope: Tenant CPU/GPU tokenization and inference accounting, KV cache hits, batching credits, network egress, and model-variant cost deltas for Private (VPC/on‑prem) customers. This playbook does NOT cover Redwood Hosted metering.
+
+Context and motivation
+----------------------
+Private deployments run inference inside a customer-controlled environment. Because compute and telemetry paths vary (e.g., local prometheus vs. remote exporter, intermittent egress, or proxying through customer-controlled gateways), discrepancies between runtime-tracked usage (what the runtime reports) and billing exports (what Redwood invoices or shows in Console) can arise. Typical causes:
+- Clock drift and time-window misalignment between agents and the billing pipeline.
+- Partial or duplicate export batches due to retries and idempotency misconfiguration.
+- Missing attribution when tenant requests get routed to shared resources without correct tenant headers.
+- Quantization/variant selection: runtime may substitute a cheaper model and record one model-id while the export pipeline used another identifier.
+
+Goals and measurable objectives
+------------------------------
+- Reconciliation accuracy: monthly discrepancy <= 0.5% across all chargeable dimensions (tokens, GPU-minutes, KV-cache-savings).
+- Detection latency: alerts for > 0.2% divergence within 48 hours of occurrence.
+- Evidence readiness: one-click export of reconciliation report (CSV + human-readable summary) for any customer within 72 hours.
+
+Owner and escalation
+--------------------
+- Primary owner: eng-sre (billing telemetry)
+- Secondary owners: eng-platform (exporter & model router), customer-success (billing inquiries)
+- Tiered escalation: on-call SRE -> Billing Telemetry Lead -> Platform Engineering -> Legal/Finance (if financial exposure > $5k/month)
+
+Architecture overview (components involved)
+-----------------------------------------
+- Inference runtime (agent): emits per-request usage events (tenant_id, request_id, model_id, tokens_in, tokens_out, gpu_ms, batch_id, timestamp) to local telemetry buffer.
+- Billing Exporter (billing-exporter): a service (k8s Deployment) that reads local buffer, enriches events with rate tables, and pushes line-items to Redwood Control Plane / secure S3 export.
+- Model Router: handles model variant selection; must annotate events with model_variant_id and pricing_tier.
+- Accounting Pipeline: downstream jobset in Control Plane that aggregates exports into per-tenant daily CSVs and writes canonicalization artifacts to the reconciliation DB.
+- Observability stack: Prometheus (metrics), Loki (logs), Grafana dashboards, and an S3 bucket of daily exports.
+
+Minimum product and infra requirements (table)
+--------------------------------------------
+| Requirement | Minimum spec / expectation | Why it matters |
+|-------------|---------------------------|-----------------|
+| Time sync | NTP or systemd-timesyncd configured on all nodes (max skew 2s) | Aligns windows used by exporter and runtime to avoid attribution mismatches |
+| Persistent export storage | Secure S3 / object-store reachable from control plane | Durable copies for audits |
+| KMS access | Billing-exporter must be able to use customer KMS (if enabled) or Redwood KMS proxy | Prevents leakage of cleartext cost data |
+| Export idempotency key | billing-exporter must include export_id + chunk_seq in payload | Prevents duplication on retries |
+| Tenant header enforcement | model-proxy must inject and validate Tenant-ID headers | Ensures correct attribution |
+
+Operational telemetry and metrics
+--------------------------------
+Required metrics (Prometheus) that must be emitted by the inference runtime and billing-exporter:
+- inference_requests_total{tenant_id, model_variant_id, outcome=(ok|fail)}
+- inference_tokens_in_total{tenant_id, model_variant_id} (counter)
+- inference_tokens_out_total{tenant_id, model_variant_id} (counter)
+- inference_gpu_ms_total{tenant_id} (counter)
+- kv_cache_hits_total{tenant_id} and kv_cache_misses_total{tenant_id}
+- billing_export_lines_total{tenant_id, status=(queued|sent|failed)}
+- billing_export_bytes_total{tenant_id}
+- billing_export_send_latency_seconds (histogram)
+
+Suggested PromQL examples
+- Daily token delta (tokens recorded by runtime vs. exported lines):
+  sum by (tenant_id) (increase(inference_tokens_out_total[24h])) - sum by (tenant_id) (increase(billing_export_tokens_out_total[24h]))
+- Export success rate (24h):
+  sum(increase(billing_export_lines_total{status="sent"}[24h])) / sum(increase(billing_export_lines_total[24h]))
+
+CSV export format (canonical daily item)
+-------------------------------------
+Fields (header order):
+- export_date, tenant_id, line_item_id, model_variant_id, tokens_in, tokens_out, gpu_ms, kv_cache_hits, kv_cache_misses, batch_count, rate_applied_usd_per_token, line_total_usd, export_id, chunk_seq, timestamp_utc
+Example row:
+"2026-06-01","tenant-789","line-1523","gptx-8q8-v2",12345,9876,4523,120,30,12,0.0112,110.24,"export-20260601",1,"2026-06-01T00:05:12Z"
+
+Reconciliation process (automated + manual)
+-----------------------------------------
+1) Automated nightly reconciliation job (reconcile-job k8s CronJob, owner: eng-platform):
+   - Input: last 24h runtime counters (prometheus), latest export CSVs from S3, pricing tables from /config/pricing/*.yaml.
+   - Steps: normalize time windows into UTC day buckets, perform per-tenant aggregation, compute delta columns (runtime - exported), flag deltas where absolute(delta)/max(runtime, exported) > 0.5%.
+   - Output: reconciliation report (CSV + JSON summary) stored under s3://redwood-private-recon/{date}/reconciliation-{date}.zip and a short summary posted to #recon-alerts slack channel.
+
+2) First responder checklist (SRE billing on-call):
+   - Review Slack summary and open reconciliation dashboard.
+   - If divergence per tenant < 2% and total $ delta < $250, note and watch; otherwise escalate.
+   - Run quick checks: check billing-exporter pod logs (kubectl logs), check for recent restarts (kubectl get pods -o wide), validate time sync (chronyctl tracking / timedatectl status).
+
+3) Manual deep-dive steps (when divergence > thresholds):
+   - Fetch runtime sample traces for affected tenant_id: use tracing query: trace_filter(tenant_id="TENANT-XYZ", days=3).
+   - Compare request_id-level lines between runtime events and export CSV for a 1-hour window around peak. Use the supplied script: utils/recon/compare_lines.py --tenant TENANT-XYZ --window 1h --export s3://...
+   - Inspect model-router logs for variant substitution and annotate mismatches (model_variant_id mismatches).
+
+Alerting and thresholds
+-----------------------
+- Recon divergence alert (P1): any tenant with absolute reconciliation delta > 10% for a billing day AND dollar exposure > $1,000 -> Pager to SRE on-call.
+- Recon divergence alert (P2): any tenant with absolute delta between 2%–10% -> Slack + email to Billing Telemetry and CS owner.
+- Export failure rate > 1% in 24h -> Pager.
+
+Runbook: resolution patterns and remedial actions
+------------------------------------------------
+Pattern: Duplicate lines in export (symptom: exported bytes > runtime and duplicate line_item_id)
+- Cause: idempotency key not being sent or storage path misconfigured causing retries to appear as new lines.
+- Remediation: Verify billing-exporter uses export_id + chunk_seq; check S3 for duplicates; run de-dup job: utils/recon/dedupe_export.py --prefix s3://...; redeploy billing-exporter with corrected env var BILLING_EXPORT_ID_STRATEGY=export_id_chunkseq.
+
+Pattern: Missing lines for specific model variant (symptom: runtime tokens show model_x heavy use but exported model_x lines = 0)
+- Cause: model-router not tagging events or model mapping table mismatch.
+- Remediation: Patch model-router to include model_variant_id header; if mapping table is stale, apply hotfix: kubectl apply -f /manifests/model-mapping-hotfix.yaml (owner: eng-serving-runtime).
+
+Pattern: Time drift causing small deltas (symptom: per-day window mismatch with a consistent 3-10s offset)
+- Cause: Containers missing NTP sync or host-level drift.
+- Remediation: Restart timesyncd, apply chrony config, and backfill with aligned window selection in reconciliation job.
+
+Acceptance and rollout guidance for billing-exporter upgrades
+-----------------------------------------------------------
+- Canary strategy: 1% of nodes in a small customer staging pool, 10% for 24h, then 100% (canary windows: 24h/24h/6h). Feature flag: EXPORTER_ENFORCE_CHUNK_IDS (default: false).
+- Migration compatibility: billing-exporter v2 must accept the v1 export payload and emit a compat header (X-Export-Compatibility: v1-compat).
+- Backout plan: keep previous deployment manifest with image tag pinned for quick rollback. If reconciliation delta increases above 2% post-upgrade, roll back immediately.
+
+Customer onboarding checklist (recon-specific)
+--------------------------------------------
+1) Confirm tenant identifiers: provide canonical Tenant-ID mapping sheet (tenant name -> tenant_id).
+2) Validate network egress to Redwood export endpoint (if using control-plane aggregation) or S3 write permissions.
+3) Ensure KMS policies allow exporter to encrypt line-items.
+4) Run a 48-hour pilot with mirror mode: billing exporter runs in dry-run and posts CSVs to s3://customer-proofs/ for customer validation.
+
+Minimum acceptance tests (pre-handoff)
+- Mirror parity test: run 24h with billing_exporter in mirror mode and confirm exported token totals within 0.5% of runtime counters.
+- Idempotency test: simulate failed uploads and retries; confirm final exported CSV has no duplicate line_item_id and dedupe logic succeeds.
+- Time window test: skew host clock by +/- 3s and validate reconciliation windows still align.
+
+Audit evidence and report generation
+----------------------------------
+- Required artifacts for financial audit: daily export zip, reconciliation CSV, reconciliation run logs, Prometheus snapshot for the day, and the pricing table used (pricing YAML).
+- Location: s3://redwood-private-recon/{date}/ (retention: 540 days).
+- On-demand report: utils/recon/generate_audit_package.py --tenant TENANT-XYZ --start 2026-05-01 --end 2026-05-31 -> produces a signed bundle with checksums.
+
+Preventative controls and engineering recommendations
+---------------------------------------------------
+- Enforce tenant header at edge (NGINX filter or Envoy policy) to prevent misattribution.
+- Use monotonic counters for tokens and GPU-ms to avoid negative deltas on counter resets.
+- Submit pricing changes via a PR to /config/pricing with audit trail and effective_at field; reconciliation job should log the effective pricing table used.
+- Implement request-level sampling (1/1000) that includes request_id and full attribution; keep samples for 30 days for deep-dive correlational analysis.
+
+Appendix: quick debugging commands and snippets
+------------------------------------------------
+- Check billing-exporter status:
+  kubectl -n redwood get deploy billing-exporter -o wide
+  kubectl -n redwood logs deploy/billing-exporter --tail=200
+- PromQL: list tenants with >0.5% delta in last 48h:
+  topk(50, abs(sum(increase(inference_tokens_out_total[48h])) by (tenant_id) - sum(increase(billing_export_tokens_out_total[48h])) by (tenant_id)) / (sum(increase(inference_tokens_out_total[48h])) by (tenant_id) + 1e-6))
+- SQL: reconcile sample query (Postgres reconciliation DB):
+  SELECT tenant_id, runtime_tokens, exported_tokens, (runtime_tokens - exported_tokens) as delta, (runtime_tokens - exported_tokens)::float / NULLIF(runtime_tokens,0) as delta_ratio FROM daily_recon WHERE date = '2026-06-01' ORDER BY abs(delta_ratio) DESC LIMIT 50;
+
+Notes and known limitations
+--------------------------
+- This playbook assumes the customer allows outbound TLS to Redwood export endpoints or provides an S3-compatible bucket accessible by billing-exporter. Air-gapped installs require secure shipment of daily manifests and a signed upload process (see onprem-packaging documents for evidence transfer patterns).
+- Extremely short requests (sub-10-token) can amplify relative deltas; rollup and smoothing rules are applied in the reconciliation job to reduce noise.
+
+Change log
+----------
+- 2026-02-15: Playbook created (Leah Nguyen).
+- 2026-04-10: Added PromQL examples and export CSV format (Marco Silva).
+- 2026-06-03: Refined thresholds and added canary rollout windows for billing-exporter (Priya Desai).
+
+Owners and contacts
+-------------------
+- Billing Telemetry (primary): eng-sre-billing@redwood.example.com
+- Platform exports (secondary): eng-platform@redwood.example.com
+- Customer Success escalation: cs-billing@redwood.example.com

@@ -1,0 +1,169 @@
+Micro-Fission Resilience Playbook for Long-Running Inference
+
+Summary
+-------
+This playbook defines the Micro-Fission pattern for improving resilience and predictability of long-running or variable-latency inference requests. Micro-Fission splits a single logical inference transaction into deterministic micro-tasks that can be scheduled, retried, and observed independently and then reassembled into a final response. The goal is to reduce tail latency exposure, improve GPU utilization stability, and make graceful degradation explicit for the API layer.
+
+Motivation
+----------
+- Long context or streaming generation requests have high tail variance and can monopolize kernels and KV caches.
+- Traditional monolithic request handling reduces observability and complicates retry/fallback logic.
+- A structured fission model exposes intermediate checkpoints for caching, partial results, and fallback substitution.
+
+Scope
+-----
+This doc applies to Redwood-hosted inference services and Dedicated runtimes. It covers:
+- API contract implications for clients and SDKs
+- Runtime policies (scheduling, batching, cache affinity)
+- Observability and SLO changes required
+- Rollout procedure and rollback plan
+It does NOT change model semantics or internal model weights; it is an orchestration pattern layered above the serving runtime.
+
+Definitions
+-----------
+- Micro-Task: a deterministic segment of work extracted from a logical request (e.g., prefix-encode, decode-window-1, reranker-batch).
+- Reassembly Unit: the process that orders and stitches micro-task outputs into a final response.
+- Cohort Kernel: a kernel selection tuned to a micro-task type.
+
+Architecture Overview
+---------------------
+1) API surface changes
+- New optional parameter: fission: boolean / object
+  - When enabled, the platform may return partial streaming chunks with explicit micro-task IDs.
+  - Versioning: fission behavior is behind v-explicit/1.0 flag until fully validated.
+
+2) Runtime flow (high level)
+- Ingress -> Request classifier -> Micro-task generator -> Scheduler -> Kernel pool (cohort) -> KV/cache update -> Reassembly -> Response stream.
+
+3) Caching and affinity
+- Prefix results and KV cache entries created by micro-tasks are annotated with micro-task lineage tags to allow safe reuse across related requests.
+
+Operational SLOs and Metrics
+---------------------------
+Table: Key SLOs and thresholds
+| Metric | Target | Alert threshold | Owner | Notes |
+|-------|--------:|----------------:|:-----|:-----|
+| 95th latency (end-to-end, fission-enabled) | <= 1500ms | > 2200ms | runtime-team | Measures reassembly + slow micro-tasks |
+| Micro-task median execution | <= 80ms | > 300ms | kernel-team | Per-cohort metric |
+| Reassembly failure rate | <= 0.1% | > 0.5% | runtime-team | Includes mismatch and ordering errors |
+| Partial-result cache hit rate | >= 12% | < 6% | infra-team | Expected to grow with usage |
+
+Recommended Metrics (telemetry tags)
+- telemetry.micro_task.type (string)
+- telemetry.micro_task.id (UUID)
+- telemetry.reassembly.latency_ms (int)
+- telemetry.kv.lineage_tag (string)
+
+Fallback and Degradation Strategies
+----------------------------------
+Priority order when a micro-task fails or a cohort is saturated:
+1. Retry micro-task on alternate cohort (hedged retry) - up to 2 additional attempts with jitter.
+2. Substitute with lower-fidelity micro-task (shorter decode window, quantized kernel).
+3. Serve a cached partial result with well-documented attenuation note in response.
+4. Return graceful degradation payload: {"degraded": true, "reason_code": "fission_saturated"} with human-friendly message.
+
+API Contract Examples
+---------------------
+- Example request (JSON):
+```json
+{
+  "model": "rw-instruct-1",
+  "input": "<long prompt...>",
+  "fission": {"enabled": true, "max_micro_tasks": 8}
+}
+```
+- Example streaming chunk (server-to-client):
+```json
+{ "micro_task_id": "m-4f2a", "sequence_index": 3, "partial": "...token chunk...", "is_final": false }
+```
+Clients MAY opt-out of fission by omitting the fission field; default behavior remains monolithic until rollout completes.
+
+Runtime Configuration Examples
+------------------------------
+YAML sample for scheduler policy (cohort-shim):
+```yaml
+scheduler:
+  cohorts:
+    - name: prefix-encode
+      concurrency_limit: 200
+      kernel_hint: small-batch-fast-attn
+    - name: decode-window
+      concurrency_limit: 80
+      kernel_hint: decode-quantized
+  hedging:
+    max_retries: 2
+    jitter_ms: 25
+  reassembly:
+    queue_size: 1000
+    reorder_window_ms: 120
+```
+Command to observe reassembly queue depth via CLI: 
+```
+redwoodctl runtime reassembly-stats --service inference-core --window=5m
+```
+
+Observability Guidelines
+------------------------
+- Every micro-task MUST emit a start and stop span. Spans MUST include lineage_tag and cohort name.
+- Traces longer than 2s should be sampled at 100% for the first week after rollout.
+- Create a derived SLI: percentage of requests with >0 micro-task hedged retries; use to detect cohort pressure.
+
+Runbook: Incident triage for elevated reassembly failures
+------------------------------------------------------
+1. Pager fires when reassembly failure rate exceeds 0.5% over 5m.
+2. On-call engineer:
+   - Check reassembly queue depth: redwoodctl runtime reassembly-stats --window=5m
+   - Inspect micro-task cohort latencies: observability dashboard "MicroFission Cohorts"
+   - If single cohort is hot: scale cohort concurrency_limit or shift traffic to alternate cohort (runtime-service /admin/route-adjust).
+3. If KV lineage mismatch observed: rollback latest runtime release (see Rollback).
+4. Post-incident: run end-to-end test suite (tools/micro-fission-e2e) and attach traces to incident ticket.
+
+Rollout Plan
+------------
+1. Canary: enable fission for 1% of internal traffic (dev and beta customers). Monitor 95th latency, reassembly failure, and partial-result cache hit rate for 72h.
+2. Gradual ramp: 1% -> 5% -> 20% -> 50% over successive stable windows (72h each).
+3. Full opt-in: enable by default for new requests; existing customers must opt into fission for now.
+4. Validation gates before each step:
+   - No increase > 15% in 95th latency versus baseline
+   - Reassembly failure rate < 0.2%
+   - Observability sampling shows correct lineage propagation for 100 sampled traces
+
+Rollback Procedure
+- Immediate: disable fission global flag and return to monolithic handler.
+- If rollback fails: 1) reduce cohort concurrency limits; 2) toggle hedging off; 3) scale additional kernels offline.
+
+Ownership and Contacts
+----------------------
+- Runtime architecture: Samir Patel (runtime-team)
+- Kernel & cohort tuning: Marcus Delgado (kernel-team)
+- Observability & telemetry: Priya Nambiar (eng-platform)
+- Product steward: Elena Park (product)
+
+Related Safety and Compliance Notes
+----------------------------------
+- All partial outputs used for caching must be tagged and purged according to data-retention policies. See security-and-compliance/audit-logging for retention windows.
+- Fission does not change PII handling obligations; any stage that persists intermediate results must obey tenant encryption and KMS rules.
+
+References and Follow-ups
+-------------------------
+- Add an automated test in benchmarking-and-perf-suite: micro-fission-loadtest-100k (owner: eng-serving-runtime/perf).
+- Related reading: "Adaptive KV coordinator and eviction contract" and "sequence-length-aware-kernel-selection".
+
+Appendix: Example wire-level partial-result envelope (compact)
+```json
+{
+  "mt_id": "m-4f2a",
+  "lineage": ["req-11a","mt-2b"],
+  "payload": "base64(...)",
+  "cohort": "decode-window",
+  "metadata": {"tokens": 32, "quality_score": 0.92}
+}
+```
+
+Revision history
+----------------
+- 2026-02-10: Initial draft (Arielle Chen)
+- 2026-03-22: Added hedging policy and config examples (Marcus Delgado)
+- 2026-07-12: Finalized SLO table and rollout gates (Priya Nambiar)
+
+End of document.

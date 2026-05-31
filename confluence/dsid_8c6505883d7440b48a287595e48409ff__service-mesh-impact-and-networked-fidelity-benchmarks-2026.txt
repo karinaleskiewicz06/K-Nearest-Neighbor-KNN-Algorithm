@@ -1,0 +1,153 @@
+Service-mesh impact and networked-fidelity benchmarks
+
+Overview
+
+This document captures the rationale, experiment design, sample configurations, and runbook for benchmarking how different service-mesh and network topologies affect inference fidelity and operational SLOs. It is intended for engineers running distributed Redwood Private or Dedicated clusters where network pathing (sidecars, mTLS, mesh proxies, ingress controllers) may interact with runtime components (frontends, routers, model shards, kvcache, and tracing).
+
+Why this matters
+
+- Network pathing can add microsecond-to-millisecond tail latency that changes batching behaviour and kernel scheduling decisions.
+- Proxies and sidecars may buffer, reorder, or aggregate requests which alters sequence arrival patterns and therefore KV cache hit rates and generation quality for stateful chat sessions.
+- mTLS and service-mesh observability can introduce CPU overhead on nodes hosting lightweight services and affect co-located scheduler performance.
+
+Scope
+
+- Topologies: direct (no mesh), mesh sidecar (Envoy-like), ingress+mesh (gateway + sidecar), and cross-region overlay.
+- Workloads: interactive chat (median tokens 40, tail 1024), streaming token-by-token generation, and bulk embeddings (batched).
+- Hardware: A40/RTX/T4 pools and mixed GPU pools used in Dedicated clusters.
+- Not covered: model-level quantization effects (handled in quantization-profiles).
+
+Success criteria / SLOs
+
+- Median generation latency (token emission) delta vs direct baseline <= 8% for interactive workloads.
+- 95th percentile latency delta <= 20% for streaming workloads.
+- KV cache hit-rate deviation <= 3 percentage points.
+- Fidelity regressions: BLEU/ROUGE-like drops or hallucination-rate increases must be <= 1.5% absolute vs baseline for canary pass.
+
+Experiment design
+
+1) Controlled variables
+   - Same model binary and runtime kernels across runs.
+   - Fixed token budget and prompt corpus (prompt-sets-and-benchmarks corpus v2026-09).
+   - Identical request surface (headers, chunking, streaming flags).
+
+2) Independent variables
+   - Network topology (direct, sidecar, ingress+sidecar, overlay).
+   - TLS on/off (and session reuse policy).
+   - Proxy concurrency and buffer sizes.
+   - Placement variants: co-located sidecar on GPU node vs sidecar on separate infra node.
+
+3) Metrics collected (minimum set)
+   - Service-level: median, p95, p99 for request latency; queue length; dropped requests.
+   - Runtime-level: per-kernel execution time, kernel scheduling latency, kv cache hit rate, batch size distribution.
+   - Network-level: RTT distribution, sidecar CPU/memory, open connections, TLS handshake rate.
+   - Fidelity: token-level log-prob deltas, output differences against golden responses, hallucination rate, semantic-similarity score.
+
+Environment matrix (example)
+
+| Test ID | Topology | TLS | Proxy CPU | Node placement | Notes |
+|---------|----------|-----|----------:|----------------|-------|
+| T01     | direct   | off | 0%       | none           | baseline |
+| T02     | sidecar  | on  | 10%      | co-located     | typical small mesh sidecar CPU cgroup 10% |
+| T03     | ingress+sidecar | on | 12%  | gateway on infra node | gateway does TLS termination + routing |
+| T04     | overlay cross-region | on | 15% | mixed | simulates inter-region hops (~20-40ms) |
+
+Benchmark harness and step-by-step procedure
+
+1) Provisioning
+   - Use the workload-sim tool (internal) to instantiate traffic replay. Example: 
+     ./workload-sim --corpus=prompt-sets/chat-2026.json --qps=250 --shape=poisson --seed=202602 --streaming=true --out=run-T02
+
+2) Deploy topology
+   - Direct: disable sidecar injection and point frontend to runtime service.
+   - Sidecar: enable mesh injection; apply sidecar resource limits using sidecar-cgroup.yaml (sample below).
+   - Ingress+sidecar: install gateway config and route to mesh; enable TLS passthrough vs termination variants.
+
+3) Run baseline and experiments
+   - Run baseline (T01) for 60 minutes to warm caches and collect stable metrics.
+   - For each topology, run 3 x 30-minute trials. Restart the runtime between each trial to reinitialize KV cache when testing cold-cache effects.
+
+4) Data collection and verification
+   - Export telemetry to the benchmarking S3 bucket with tags: topology, trial, seed, model-version.
+   - Verify trace correlation IDs are preserved end-to-end. If trace sampling removes tail events, increase sampling to 100% for test windows.
+
+Sample sidecar resource YAML (sidecar-cgroup.yaml)
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sidecar-cgroup
+data:
+  CPU_LIMIT: "100m"
+  CPU_REQUEST: "50m"
+  BUF_SIZE: "65536"
+
+Network measure snippets
+
+- To measure RTT and handshake overhead: 
+  time curl -w "RTT:\t%{time_connect}\tTLS: %{time_appconnect}\n" -o /dev/null -s https://runtime-host/api/gen
+
+- To surface out-of-order or reordering statistics we use tcpdump + reorder-detector: 
+  sudo tcpdump -i eth0 -w /tmp/run-T02.pcap &
+  ./reorder-detector --pcap /tmp/run-T02.pcap --out /tmp/reorder-summary.json
+
+Interpretation guide
+
+- Small median deltas with large p99 deltas typically indicate buffering/queueing inside proxies or gateway resource saturation.
+- A decreased KV cache hit rate with identical prompt distribution indicates request reordering or session affinity breakage: check sticky-session configuration and cookie/session-id propagation.
+- Token-level log-prob deltas correlated with increased per-token latency usually point to batching changes (smaller effective batches) or kernel time-slicing; reconcile with batch-size histograms.
+
+Example analysis queries
+
+- Query: p99 latency by topology and kernel-version: 
+  SELECT topology, kernel_version, percentile(latency_ms, 99) FROM inference_traces WHERE run_tag = 'T02' GROUP BY topology, kernel_version
+
+- Query: kv cache hit rate drop traces and session-affinity mismatch: 
+  SELECT session_id, kv_hit, request_ts FROM kv_cache_events WHERE run_tag='T03' ORDER BY request_ts DESC LIMIT 1000
+
+Runbook: when networked topology causes production regressions
+
+1) Detection: automated canary monitors should flag the fidelity alert (>=1% absolute drop in semantic-similarity) or SLO breach.
+2) Immediate mitigation (0-15 minutes):
+   - Reduce proxy buffer sizes and disable request aggregation on the gateway: set BUF_SIZE=16384 and reload gateway.
+   - If sidecar CPU is saturated, enable automatic sidecar eviction policy for canary cohort.
+3) Secondary actions (15-60 minutes):
+   - Repoint traffic to the direct path (bypass mesh) for the affected cohort. Use routing policy: 
+     curl -X POST https://controlplane/api/route-adjust -d '{"match":"account:1234","route":"direct"}'
+   - If session-affinity is broken, rotate to sticky-session fallback using jwt-subject header as affinity key.
+4) Post-incident analysis (>60 minutes):
+   - Re-run the controlled experiments to reproduce and capture kernel-level traces. Document config deltas and upload to the benchmark bucket.
+
+Ownership and contacts
+
+- Primary owner: eng-serving-runtime perf team (Ava Martínez).
+- On-call contact: runtime-sre@redwood.ai.
+- Escalation: Priya Rao (Runtime Platform), Oliver Singh (SRE).
+
+What to log and attach to tickets
+
+- Benchmark run tags and S3 path.
+- Topology YAMLs and k8s manifests used.
+- Pcap and reorder-summary if reordering suspected.
+- Kernel trace slices (timestamps aligned with trace IDs).
+
+Limitations and caveats
+
+- This harness assumes uniform client-side TLS termination where applicable. Real client diversity (mobile vs server) can show different handshake and multiplexing behavior.
+- Overlay cross-region tests must account for background internet noise; use VPC-peered emulation where possible.
+
+Next steps and proposed improvements
+
+- Add a synthetic jitter injector to emulate tail network spikes and observe scheduler response.
+- Automate a compare-committee that runs fidelity checks in CI when gateway or sidecar versions are changed.
+- Integrate result dashboards into the Redwood Console benchmarks view so product owners can see topology sensitivity when evaluating Dedicated/Private options.
+
+Appendix: quick checklist for running a gated canary
+
+1) Confirm model-version pinned and binary checksum matches baseline.
+2) Run baseline T01 for 1 hour and archive metrics.
+3) Run mesh topology trials (T02/T03) with same seed and warmup.
+4) Run fidelity checks against golden corpus and send results to reviewers.
+5) If failures observed, follow the runbook above and open a postmortem ticket with attachments.
+
+End of document

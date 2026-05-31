@@ -1,0 +1,190 @@
+Optimization Config diff engine + semantic validation (2026-02)
+
+Overview
+Optimization Configs are immutable, versioned JSON payloads used by the control plane to drive runtime behavior (batching, caching, and quantization). To make safe apply/rollback operationally safe, we maintain:
+1) a deterministic, human-friendly diff between two versions, and
+2) semantic validators that detect dangerous or invalid changes before rollout.
+
+This page documents the current (2026-02) diff format, validation semantics, and rule catalog used by:
+- Optimization Config Service (/validate and /apply)
+- Console diff view and gating UX
+- Rollout controller policy decisions
+
+What changed since the original ENG-4822 implementation
+- Batching bounds are now capability-aware: the control plane applies conservative global limits AND enforces per-hardware maxima from runtime capability snapshots.
+- Cache shard limits were increased (256 -> 512) to support higher-parallelism Dedicated fleets, with added guardrails for oversharding.
+- Quantization validation now supports a "staged" profile state for limited preview rollouts (flagged), while keeping "promoted" as the default requirement for customer-facing applies.
+- Diff redaction rules are now explicit allow/deny lists instead of a broad regex-only approach to reduce accidental over-redaction.
+
+Goals
+- Prevent high-risk or invalid config changes from being applied (especially at large blast radius).
+- Provide deterministic diff output for Console, audit logs, and rollout policy.
+
+Non-goals
+- Approval workflows and change management policy (handled by rollout controller + org processes).
+- Auto-fixing configs (we validate and explain only).
+
+Definitions
+- "Prev" = currently active config version for a target scope.
+- "New" = proposed config version being validated/applied.
+- "Scope" = where the config is applied (tenant, region, deployment mode, shard set, etc.).
+
+Deterministic diff engine
+Input
+- config_version_a (prev JSON as stored)
+- config_version_b (new JSON as stored)
+
+Output
+- Stable ordering with recursive key sorting.
+- Path-based changes using JSON Pointer internally (RFC6901), rendered as dotted paths for UI.
+- Change type: add | remove | modify.
+- Old/new values stringified with size caps.
+- Optional per-change risk annotation (low | medium | high) using a field registry.
+
+Ignored / non-functional fields
+- The diff engine ignores known non-functional metadata fields by default:
+  - description
+  - labels
+  - ui_notes
+(If these fields become operationally meaningful in the future, they must be removed from the ignore list and added to the risk registry explicitly.)
+
+Unknown / forward-compat fields
+- Unknown fields are diffed and surfaced; they do not cause validation failure.
+- Unknown fields default to medium risk until registered (rollout policy may still gate on medium-risk deltas depending on scope).
+
+Arrays
+- If an array is order-insensitive (explicitly marked in the registry), the diff is computed as a set keyed by a stable key (e.g., regions keyed by region_id).
+- Otherwise, arrays are diffed by index.
+
+Redaction
+- Redaction is applied at diff rendering time only (the stored config remains unchanged).
+- Redaction uses:
+  - an explicit list of redacted paths (preferred), plus
+  - a fallback heuristic for keys containing secret/token/api_key/private_key.
+- Redacted values are rendered as "REDACTED" while keeping the path and change type.
+
+Diff summary
+The service produces a diff_summary for consumers that do not want to parse the full diff:
+- counts: added/removed/modified
+- risky_paths: list of high-risk (and optionally medium-risk) paths
+
+Semantic validation
+Validators run during:
+- /validate (preflight)
+- /apply (re-validation to avoid TOCTOU issues when referenced entities change)
+
+Validator contract
+Each validator is a pure function:
+(new_config, prev_config, context) -> errors[], warnings[], annotations[]
+
+Context includes:
+- deployment_mode (Hosted | Dedicated | Private)
+- model_id
+- tenant_id
+- region
+- runtime_capabilities snapshot (from runtime catalog)
+- feature_flags
+- apply_scope (e.g., canary shard vs full region)
+
+Error and warning requirements
+- Every message must include a stable rule_id (e.g., VAL-BATCH-001).
+- Message text must be stable and searchable; avoid including large payloads.
+
+Batching validators
+Hard bounds (errors)
+- VAL-BATCH-001: max_concurrent_sequences must be within [1, 4096].
+- VAL-BATCH-002: target_queue_delay_ms must be within [0, 250].
+- VAL-BATCH-003: max_batch_tokens must be within [1024, 262144] AND <= runtime_capabilities.max_batch_tokens for the selected hardware class.
+  - Note: runtime capability maxima vary by GPU and kernel; control plane rejects values above the capability snapshot rather than relying on runtime clamping.
+
+Relationship constraints (errors)
+- VAL-BATCH-004: max_batch_tokens must be >= max_sequence_length + safety_margin_tokens.
+  - safety_margin_tokens default: 256 (subject to runtime overrides via capabilities).
+- VAL-BATCH-005: If continuous_batching.enabled is true, scheduler must be one of: rw-continuous, rw-continuous-v2.
+
+Warning-level checks (warnings)
+- VAL-BATCH-101: Increasing max_batch_tokens by >2x vs prev is a warning (throughput/stability risk).
+- VAL-BATCH-102: Setting target_queue_delay_ms < 5ms is a warning (throughput collapse risk).
+
+Cache validators
+Compatibility (errors)
+- VAL-CACHE-001: prefix_cache.enabled cannot be true unless runtime_capabilities.prefix_cache_supported is true for the model family.
+- VAL-CACHE-002: cache.max_kv_cache_gb must be <= node allocation cap for the deployment mode.
+  - Hosted/Dedicated: cap derived from fleet profile.
+  - Private: cap derived from declared node profile (or rejected if unknown).
+- VAL-CACHE-003: cache.shard_count must be a power of two and <= 512.
+- VAL-CACHE-004: cache.shard_count must not exceed runtime_capabilities.recommended_cache_shards (warning if exceeded; error if > 2x recommended).
+
+Cross-field constraints (errors)
+- VAL-CACHE-005: If prefix_cache.enabled is true, cache.key must include model_id and tokenizer_hash to avoid cross-version poisoning.
+
+Warning-level checks (warnings)
+- VAL-CACHE-101: Disabling cache when prev enabled emits a warning with expected p95 impact callout.
+- VAL-CACHE-102: Enabling cache for long-context models without eviction_policy set is a warning.
+
+Quantization profile validators
+Reference integrity (errors)
+- VAL-QUANT-001: quant.profile_id must exist.
+- VAL-QUANT-002: For customer-facing applies, the profile state must be "promoted".
+  - Exception: "staged" is allowed only when feature flag quant_allow_staged_profiles is enabled AND apply_scope is canary-only.
+- VAL-QUANT-003: quant.profile_id must be compatible with model_id:
+  - architecture
+  - tensor parallelism degree
+  - weights format
+
+Quality / rollout guardrails (warnings or errors depending on scope)
+- VAL-QUANT-101: If profile_id changes vs prev, mark as HIGH RISK.
+  - Canary-only scope: warning requiring evaluation gate configuration.
+  - Larger scopes (region-wide or tenant-wide): error unless evaluation gate is configured for the apply.
+
+Private deployment nuance (errors)
+- VAL-QUANT-004: If deployment_mode == Private and quant.profile_source == remote, reject by default.
+  - Override: allow only with feature flag private_allow_remote_quant_artifacts AND an explicit allow_remote_artifacts setting in the apply request.
+
+API surface expectations (service-level)
+/validate response must include:
+- ok: boolean
+- errors[]: blocking
+- warnings[]: non-blocking
+- diff_summary: counts + risky_paths
+
+Notes:
+- Exact JSON payload shape is owned by the Optimization Config Service API page; this document defines semantic expectations and required fields.
+
+Risk registry
+We maintain a registry mapping:
+- field path -> risk level
+- field path -> diff mode (set vs list)
+- field path -> redaction rule
+
+Default guidance
+- quant.profile_id: high risk
+- cache.key, cache.max_kv_cache_gb: high risk
+- batching.max_batch_tokens: medium/high depending on delta magnitude and scope
+
+Operational considerations
+- /apply must re-resolve referenced entities (quant profile metadata and runtime capabilities) to avoid stale validation.
+- Diff value rendering must cap lengths to prevent log blowups.
+- All rule_ids must be unique and stable; changing semantics requires either a new rule_id or a clear deprecation note.
+
+Testing requirements
+- Unit tests for diff stability:
+  - reordered maps
+  - null vs missing
+  - arrays (set vs list modes)
+  - redaction behavior
+- Unit tests for each validator rule including warning vs error boundaries.
+
+Ownership
+- Primary owner: Eng Platform (Control Plane)
+- Runtime capability source of truth: Serving Runtime Catalog
+- Console consumers: Product Engineering (Console)
+
+Release / rollout
+- Initial implementation landed in control-plane-2026.01.
+- Updates described on this page shipped in control-plane-2026.02.
+
+Appendix: Rule ID index (current)
+Batching: VAL-BATCH-001..005, VAL-BATCH-101..102
+Cache: VAL-CACHE-001..005, VAL-CACHE-101..102
+Quant: VAL-QUANT-001..004, VAL-QUANT-101

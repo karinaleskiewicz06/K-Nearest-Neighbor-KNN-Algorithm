@@ -1,0 +1,150 @@
+Runtime Inference Cost Model and Simulation Workbook
+
+Overview
+
+Purpose
+This workbook documents the inference cost model used by the runtime team, the accompanying simulation harness, and practical runbooks for diagnosing cost regressions. It ties together kernel scheduling behavior, profiling signals, and benchmarking inputs so engineers can reason about per-request unit economics and make configuration decisions that respect latency SLOs.
+
+Scope
+- Serving runtime cost components: GPU compute, memory, CPU-side batching, KV-cache hit behavior, overheads (RPC, serialization).
+- Interaction surface with kernel scheduler (preemption, slot accounting, slice sizing).
+- Guidance for running simulations, interpreting results, and a short incident triage procedure for cost regressions.
+
+Intended audience
+- Runtime engineers tuning kernel parameters
+- SREs and capacity planners validating reserved capacity sizing
+- Product/Finance engineers reconciling unit economics with pricing models
+
+Owner and SLAs
+- Document owner: Asha Patel (runtime-performance)
+- Reviewers: Miguel Rios, Tara Singh, Luca Moretti
+- Target cadence: review after any major scheduler change or model-variant onboarding; mandatory update if unit cost deviates by >10% for 3 consecutive production days.
+
+Principles and assumptions
+1) Costs are additive along a critical path, with caching and batching providing multiplicative reductions for token-level work.
+2) Latency SLOs are primary constraints; cost optimizations must not increase p95 beyond target without explicit approval.
+3) Simulations should mirror production traffic mixes (session lengths, model variants, priority classes).
+
+Core cost model (conceptual)
+TotalCost(request) = ComputeCost(tokens, model_variant, quant_profile) + MemoryShareCost(request_share) + SchedulingOverhead(request_profile) + IOOverhead
+Where:
+- ComputeCost = sum over slices (GPU_time(slice) * GPU_cost_per_second)
+- MemoryShareCost = (allocated_memory_fraction * GPU_hour_cost) amortized over active sessions
+- SchedulingOverhead = context-switch and preemption penalties (measured via kernel telemetry)
+- IOOverhead = network + serialization (measured at ingress/egress proxies)
+
+Example: per-token compute estimate (pseudocode)
+- base_flops_per_token = model_variant.flop_estimate * quant_scale
+- gpu_time_per_token = base_flops_per_token / effective_kernel_throughput
+- ComputeCost(tokens) = gpu_time_per_token * tokens * GPU_COST_SEC
+
+Key telemetry signals (metrics)
+- gpu_kernel_time_seconds (per kernel type)
+- slice_wait_time_seconds (time a request waits in scheduler queue)
+- preemption_count{request_id}
+- kvcache_hit_ratio (session-scoped)
+- batch_size_distribution (time-windowed histogram)
+- tokens_generated_per_request
+
+Kernel scheduling interactions
+- Slot accounting: scheduling config exposes two knobs — slot_capacity and fair_share_weight. The effective GPU_time_per_request is a function of allocated slot_size and slice_duration.
+- Preemption penalties: empirically measured as additional 8–40ms depending on model state size and KV cache reconciliation. Use the preemption_penalty table below for planning.
+
+Preemption penalty table (typical values)
+| scenario | measured penalty (ms) | notes |
+|---|---:|---|
+| small model (<=2B) | 8–12 | lightweight kernel reloads |
+| medium (2B–13B) | 15–25 | shard rebind + lightweight KV reconciliation |
+| large (>=70B) | 30–40 | memory copy + kernel reinitialization costs |
+
+Profiling and data collection playbook
+1) Collect: enable the continuous micro-trace sampler for 10% of production traffic for 6 hours (see sampling flags below).
+2) Aggregate: reduce traces by kernel signature, request class, and model variant. Export to the performance data lake with tags: runbook=cost-simulation, trigger={upgrade, regression, experiment}.
+3) Sanity checks: assert kvcache_hit_ratio variance < 5% across replicas and batch_size_distribution stdev < 2 tokens for single-model experiments.
+
+Sampler CLI snippet
+```
+runtimectl sampling set --policy proportional --rate 0.10 --tags runbook=cost-simulation --duration 6h
+runtimectl trace export --filter "tag=runbook:cost-simulation" --output s3://redwood-perf/cost-sim/2026-02-01
+```
+
+Benchmarking suite: inputs and canonical workloads
+- Canonical mixes: interactive-chat (short sessions, many small requests), assistant-batch (long sessions, many tokens with few concurrent sessions), embedding-bursts (short CPU-heavy requests).
+- For each mix, define: session_length_distribution, tokens_per_request_distribution, concurrency_profile, priority_mix.
+
+Sample workload YAML (used by the simulator)
+```
+name: interactive-chat-v1
+concurrency: 120
+session_length_dist: {type: pareto, alpha: 1.5, min: 3, max: 200}
+tokens_per_request_dist: {type: lognormal, mu: 2.2, sigma: 1.1}
+priority_mix: {standard: 0.85, premium: 0.12, system: 0.03}
+model_variants: [{name: rdl-13b-fp16, share: 0.6}, {name: rdl-6b-q4, share: 0.4}]
+```
+
+Running a simulation (worked example)
+1) Prepare profiles: export kernel-throughput hints and kvcache hit maps for the target model variants.
+2) Configure simulator: point to the workload YAML and the metric sinks for GPU_time and scheduling traces.
+3) Run: runtimectl simulate --workload interactive-chat-v1 --duration 4h --seed 42 --output results/json/interactive-chat-v1-4h.json
+4) Postprocess: generate cost breakdown and p95 latency charts via scripts/sim-report.py
+
+Interpreting simulation outputs (priorities)
+- Primary: p95 latency across the standard priority band must remain <= configured p95_slo (e.g., 120ms).
+- Secondary: per-token unit-cost reduction versus baseline; flag >10% regressions.
+- Tertiary: preemption frequency and tail of slice_wait_time.
+
+Regression triage runbook (cost increase >10%)
+1) Confirm: reproduce with the same simulator seed and at least 2 independent runs.
+2) Isolate variable: switch off recent kernel changes (rollback to previous kernel image) and re-simulate. If cost returns to baseline, schedule a kernel revert and open a high-priority patch.
+3) Profile differential: run full micro-trace on the top 5 slowest kernels; compute delta in gpu_kernel_time_seconds.
+4) Fix options (choose one): adjust slot_capacity downward to reduce preemption, increase slice_duration to improve kernel amortization, or pin to a quantized variant. Document chosen mitigation in the incident tracker.
+
+Quick mitigation template (to paste in incident ticket)
+- Symptom: measured per-token compute increase of +12% during interactive-chat workload.
+- Immediate action taken: reduced slot_capacity from 32 -> 24 on pool gpu-pool-us-west-2-a.
+- Expected impact: reduce preemption by ~18%, estimated unit-cost return ~7% within 10 minutes.
+- Owner: runtime-oncall (pager duty)
+
+Known issues and caveats
+- KV cache cold-starts in bursty onboarding: observed when a large fraction (>30%) of traffic is new sessions. Simulation underestimates cold start cost unless kvcache_fill_latency is included. Workaround: warm-fill by routing a small fraction of sessions to a prewarm pool.
+- Nonlinear quantization interactions: q4->q3 transitions can change kernel selection heuristics, causing unexpected kernel fallout. When evaluating quantization savings, run the simulator with kernel_hint_override to match the kernel mapper.
+- Edge-case: undersized slice_duration combined with high-priority churn leads to starvation for medium-length requests. Detectable by increased slice_wait_time spike at 99.9p.
+
+Table: Recommended simulation fidelity levels
+| fidelity | when to use | config notes |
+|---|---|---|
+| low | early design estimates | 5% sampling, single-region, analytical kernel model |
+| medium | pre-rollout validation | 10% sampling, 2 regions, empirical kernel profiles |
+| high | release candidate | 25% sampling, full trace replay, multi-tenant mixes |
+
+Appendix A — Example JSON output (trimmed)
+```
+{
+  "workload": "interactive-chat-v1",
+  "duration_s": 14400,
+  "results": {
+    "p95_latency_ms": 118.4,
+    "unit_cost_per_1000_tokens_usd": 0.72,
+    "kvcache_hit_ratio": 0.82,
+    "preemption_rate_per_hour": 3.6
+  }
+}
+```
+
+Appendix B — Scheduler knobs cheat sheet
+- slot_capacity (int): max concurrent slices per GPU. Lower => less multiplexing, fewer preemptions, but higher idle time. Default 32.
+- slice_duration_ms (int): target runtime of a slice before yielding. Higher => better kernel amortization, worse latency for small requests. Default 64ms.
+- fair_share_weight (map): per-priority weight used by the slot allocator. Example: {premium: 2.0, standard: 1.0, system: 4.0}.
+
+Appendix C — References and related pages
+- See benchmarking suite: /confluence/eng-serving-runtime/benchmarking-and-perf-suite/mixed-workload-slo-simulation-suite-2026
+- Runtime decision surfaces: /confluence/eng-serving-runtime/runtime-architecture/runtime-decision-graph-and-observed-behaviour-catalog-2026
+- For kernel telemetry schema: /confluence/eng-serving-runtime/team-wiki/kernel-telemetry-annotation-guidelines-2025
+
+Change log
+- 2026-01-12: initial draft (Asha Patel).
+- 2026-01-20: added sampling CLI and preemption penalty table (reviewers: Miguel Rios).
+- 2026-02-18: updated simulation fidelity guidance and regression-runbook (Tara Singh).
+
+Contact
+For questions or help running simulations, ping #runtime-cost-sim on Slack or contact Asha Patel (asha@redwood.ai).

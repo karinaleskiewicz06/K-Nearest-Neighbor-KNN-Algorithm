@@ -1,0 +1,145 @@
+Predictive Eviction and Local Cache Coordination PRD
+
+Summary:
+This PRD describes the design, requirements, and rollout plan for a Predictive Eviction and Local Cache Coordination feature intended for Redwood's serving runtime and hybrid cache coordinator. The feature reduces token-serving cost and tail latency by proactively evicting low-value KV-caches and coordinating local caches across nodes to avoid redundant population of large context prefixes.
+
+Background and motivation:
+- Problem: High-memory KV caches on GPUs and edge proxies consume GPU/host memory and CPU cycles for cold-start population. Bursty workloads cause redundant population of the same prefixes on many hosts, increasing overall token cost and creating cache thrash under capacity pressure.
+- Observations: 1) Prefix reuse follows long-tail distributions by tenant and route. 2) Some prefixes are high-value (frequently reused across requests) while others are low-value (rarely revisited). 3) Reactive eviction policies (LRU/TTL) are insufficient under dynamic demand patterns and multi-node redundancy.
+- Outcome: A predictive, workload-aware eviction policy plus coordination primitives will lower aggregate memory use, reduce repeated prefix population work, and improve p50/p95 token latency while keeping p99 acceptable.
+
+Goals (what success looks like):
+1) Reduce aggregate KV-population work by >= 25% for multi-tenant workloads with >10K qps traffic patterns in 90-day A/B tests.
+2) Reduce average per-token GPU memory churn (bytes written/evicted per minute) by 30%.
+3) P50 generation latency improvement of 10–20% for representative benchmark workloads.
+4) Keep p99 latency regressions <= 5% relative to baseline.
+5) Maintain correctness: no loss of model outputs, proper prefix isolation by tenant, and deterministic fallback to non-coordinated caches on partition.
+
+Non-goals / out of scope:
+- End-to-end distributed model state sync (beyond cache metadata coordination).
+- Full replacement of existing LRU TTL eviction, which remains a local fallback.
+
+Key user stories:
+- As an SRE, I want the system to automatically reduce redundant KV prefix population during global bursts so overall cluster costs decrease without manual tuning.
+- As a platform engineer, I want visibility into predicted vs actual cache evictions to tune policies per tenant.
+- As a customer using Dedicated capacity, I want predictable latency even when other tenants burst; ability to opt into coordinated eviction policies via per-tenant config.
+
+Success metrics (telemetry):
+- Metric definitions (to be implemented):
+  - kv_cache_populations_total (count) — how many times a node created a new prefix entry
+  - kv_shared_population_reduction_pct (gauge) — estimated fraction of avoided redundant populations due to coordination
+  - kv_eviction_bytes_per_min (gauge) — bytes evicted per minute per node
+  - predict_eviction_accuracy (ratio) — fraction of predictions that matched subsequent reuse within prediction window
+  - per_route_p50/p95/p99_latency_ms (histograms) — generation latency broken down by route
+
+Detailed requirements:
+1) Predictive eviction engine (PEE)
+  - Input signals: recent prefix hit counts, tenant/route identity, sequence-length distribution, request inter-arrival times, model variant, and explicit TTL hints from request metadata.
+  - Output: eviction score per prefix (floating point), predicted reuse window, and confidence.
+  - Constraints: model must run within 2ms on CPU cores reserved for runtime control plane or as an inference kernel on small accel when available.
+  - Training: online exponentially-weighted aggregator with periodic batch retrain to incorporate global cross-node statistics. No PII stored.
+
+2) Local coordination protocol (LCP)
+  - Purpose: exchange compact prefix metadata among nodes in the same shard/scheduling domain to avoid N redundant prefix population events.
+  - Messages: prefix_summary (top-k prefix hashes + size + score), population_intent (node, prefix_hash, estimated work), acknowledgement.
+  - Networking: piggyback meta on existing control plane RPCs; support gossip fallback across nodes in the shard. Messages must be <= 4KB per interval by default.
+  - Failure modes: if networks partition, nodes revert to local policy and mark coordination state stale for 30s.
+
+3) Policy control and per-tenant opt-in
+  - Default: enabled for hosted routes with >5 qps sustained and >1MB median prefix churn.
+  - Enterprise/Dedicated: per-tenant toggle in tenant config; allow SLA-based override to prefer latency over cost.
+  - Config knobs: prediction_window_seconds, coordination_interval_seconds, top_k_prefixes, aggressive_mode boolean.
+
+4) Observability
+  - Dashboards: coordinated-population-rate, avoided-population-count, eviction-by-tenant/route, prediction-accuracy heatmap.
+  - Traces: annotate request traces with cache decision tags (EVICT_PREDICTIVE, COORD_POPULATED, LOCAL_FALLBACK).
+  - Alerts: prediction_accuracy < 25% for 15m, avoided_population_count drop >50% after rollout, coordination RPC error rate > 0.5% sustained.
+
+Compatibility and constraints:
+- Must work with existing KV cache formats and not require model re-compilation.
+- Must integrate with both Hosted and Dedicated runtime variants; on-prem/private installations can disable LCP for air-gapped networks.
+- Memory overhead for metadata should not exceed 1% of node memory by default.
+
+High-level architecture:
+- PEE microservice: lightweight process colocated with node control plane (or shared across shard). Responsible for scoring prefixes and serving prediction queries.
+- Coordination agent: runs in node control plane, exchanges prefix_summary periodically, and arbitrates population intent.
+- Population arbiter: when node receives an intent for a high-value prefix, it may postpone local population for coordination_grace_ms to allow the designated node to populate and serve via remote KV fetch (or via fast replication).
+- Fallbacks: LRU/TTL local eviction and immediate population when remote access fails.
+
+Configuration example (YAML):
+
+ppe:
+  enabled: true
+  prediction_window_seconds: 60
+  min_prefix_hit_threshold: 3
+  cpu_reserved_millis: 50
+
+coordination:
+  enabled: true
+  interval_ms: 250
+  top_k_prefixes: 128
+  max_message_size_bytes: 4096
+  partition_stale_seconds: 30
+
+tenant_overrides:
+  tenant_id: example-tenant-123
+  enabled: true
+  aggressive_mode: false
+
+API and interface contracts:
+- Control plane RPCs (proto snippets):
+  message PrefixSummary { repeated bytes prefix_hash = 1; repeated uint32 sizes = 2; repeated float scores = 3; }
+  service Coordination { rpc PublishPrefixSummary(PrefixSummary) returns (Ack); rpc DeclarePopulationIntent(PopulationIntent) returns (Ack); }
+- Local API: CacheManager.Evict(prefix_hash, reason), CacheManager.FetchRemote(prefix_hash)
+
+Rollout plan:
+1) Canary: deploy PEE disabled, LCP stub active in 5% of shards. Collect telemetry for false positives, message sizes, and failure modes (2 weeks).
+2) Soft-enable predictive scoring (no enforcement) on selected tenants: surface decision suggestions in dashboard (4 weeks).
+3) Opt-in tenants: enable enforcement for low-risk internal tenants and run 4-week A/B experiments comparing cost and latency.
+4) Gradual ramp to default for hosted routes after success criteria met; Dedicated tenants remain opt-in until SLA gating removed.
+
+Migration and data retention:
+- Retain prefix-level telemetry for 90 days in compressed aggregates. Raw logs truncated to 7 days.
+- On upgrade, nodes will continue serving previous caches and begin publishing metadata; no cache clearing required.
+
+Security and privacy considerations:
+- Prefix hashes must be HMACed with tenant-scoped key before exchange to prevent cross-tenant inference.
+- Avoid including user content in metadata; only include cryptographic prefix identifiers and sizes.
+
+Operational playbook (runbook snippets):
+1) Symptom: coordination RPC error rate spike
+   - Step 1: Check coordination agent logs: kubectl logs coordination-agent -n runtime --since=1h
+   - Step 2: Verify control plane connectivity to shard; restart agent if transient errors persist
+   - Step 3: If >30% shards affected, flip coordination.enabled = false via feature flag manager and notify SRE oncall
+2) Symptom: p99 latency regression after enabling enforcement
+   - Step 1: Rollback enforcement for affected tenant (tenant_overrides.enabled = false)
+   - Step 2: Investigate prediction_accuracy and avoided_population_count on dashboard
+
+Open questions and tradeoffs:
+- Should coordination rely on centralized leader election per shard or a gossip-first protocol? (tradeoff: consistency vs message overhead)
+- How aggressive should remote fetch serving be vs letting local population happen? (tradeoff: latency vs bandwidth/cost)
+- Is 4KB message cap reasonable for edge proxies; require tuning for low-bandwidth environments.
+
+Ownership and timeline:
+- Product lead: Ravi Patel
+- Engineering owners: Kai Nguyen (runtime), Imani Ortega (coordination), Mateo Silva (telemetry)
+- Target MVP: feature-gated beta by 2028-11-01, GA for Hosted by 2029-02-15 (subject to metrics).
+
+Appendix: example trace annotation (JSON):
+{
+  "request_id": "r-abc123",
+  "route": "generate:chat",
+  "cache_decision": "COORD_POPULATED",
+  "prefix_hash": "hmac:xxxx",
+  "prediction_confidence": "0.87",
+  "population_saved": "true"
+}
+
+References:
+- /confluence/eng-serving-runtime/kernel-and-scheduling/prefix-kv-cache-management
+- /confluence/product-docs/design-specs/hybrid-cache-coordinator-design-spec-2029-06-15
+
+Revision history:
+- 2028-07-19: Drafted by Ravi Patel
+- 2028-07-27: Incorporated feedback from runtime team; added API contracts
+- 2028-08-02: Updated rollout plan and telemetry definitions

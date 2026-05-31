@@ -1,0 +1,164 @@
+NUMA-aware shard placement and eviction playbook
+
+Summary
+
+This runbook documents operational guidance for NUMA-aware shard placement and memory-eviction policies in the Redwood serving runtime. It covers detection heuristics, automated mitigation steps, manual remediation, configuration examples, and rollout/testing guidance. The goal is to minimize cross-NUMA penalties, reduce fragmentation, and keep tail latency within SLOs while maintaining high GPU utilization.
+
+Scope
+
+- Applies to: runtime-controller, shard-manager, allocator-service, and kvcache-proxy on Dedicated and Private deployment modes.
+- Not in scope: host-level OS tuning (see eng-infra docs), model compilation changes.
+
+Background
+
+On multi-socket hosts (NUMA), naive shard placement can cause memory and DMA traffic to cross NUMA nodes. This increases per-token latency variability and can degrade throughput under high contention. Additionally, long-running allocations for cached KV pages can fragment GPU device memory, causing allocation failures or expensive evictions. The runtime uses a NUMA-aware allocator and a shard-placement policy (shard-manager) to prefer local-device memory, but real workloads plus autoscaling/rolling updates can create suboptimal states.
+
+SLO impact and thresholds
+
+- Tail P99 generation latency increase of > 15% sustained over 5 minutes is considered a critical degradation.
+- Remote NUMA traffic ratio > 10% (measured by allocator.remote_access_ratio) sustained > 5m triggers investigation.
+- Free contiguous device memory < 2 GiB per GPU (fragmentation-related) increases risk of allocation failures.
+- KV cache eviction rate > 30% of incoming requests in a 10-minute window indicates thrashing.
+
+Detection (alerting and metrics)
+
+Primary signals to monitor (metric names are internal):
+- runtime.shard_manager.placement_skew (higher = more cross-node placements)
+- allocator.remote_access_ratio (0..1)
+- gpu.memory_contiguous_free_bytes and gpu.memory_free_bytes
+- kvcache.evictions_per_minute and kvcache.hit_ratio
+- runtime.latency.p99_generation_ms (per host and per shard)
+
+Alerting guidance (example rule):
+1) Alert: NUMA-cross-traffic-high
+- Condition: allocator.remote_access_ratio > 0.10 for 5m
+- Severity: Sev2
+- Runbook: this document
+
+2) Alert: Fragmentation-risk
+- Condition: gpu.memory_contiguous_free_bytes < 2 GiB AND gpu.memory_free_bytes < 6 GiB for 3m
+- Severity: Sev1 if accompanied by generation tail-latency regression
+
+Automated mitigations (safe, low-risk)
+
+The runtime includes two automated controls that should be attempted before manual intervention:
+
+1) Soft rebalancing (preferred): shard-manager triggers within-host move of ephemeral shards to align with NUMA-local GPUs. This is rate-limited (default: 1 move/host per 30s) and preserves active KV caches when possible.
+- How to trigger manually:
+  - rtsctl shard-manager rebalance --host <HOSTNAME> --mode soft
+  - Expected outcome: placement_skew drops within 60-120s; minor increase in RPCs while pages are migrated.
+
+2) Eviction-policy switch: adjust kvcache policy from LRU to size-aware aging for high fragmentation windows. This reduces the chance of evicting hot prefixes during high pressure.
+  - How to trigger manually:
+    - kubectl -n runtime exec deploy/kvcache-proxy -- /bin/sh -c '\"curl -s -X POST http://localhost:8080/config -d '{\\\"policy\\\":\\\"size_aging\\\"}'\"'
+  - Expected outcome: temporary drop in hit_ratio during redistribution, lower eviction-per-minute after 2–3 minutes.
+
+Manual remediation steps (ordered by risk)
+
+1) Verify scope and gather diagnostics (owner: runtime-oncall)\- Collect metrics:
+  - rtsctl diagnostics --host <HOSTNAME> --output json > /tmp/diag-<HOSTNAME>.json\  - kubectl -n runtime exec deploy/allocator-service -- curl -s http://localhost:8080/metrics | grep -E 'remote_access_ratio|memory_contiguous_free_bytes'\  - nvidia-smi --query-gpu=memory.free --format=csv -l 1 (on host node)
+
+2) Attempt soft rebalancing if placement_skew > 0.12\  - rtsctl shard-manager rebalance --host <HOSTNAME> --mode soft\  - Observe metrics for 2 minutes. If placement_skew falls and latency stabilizes, monitor for 30 minutes.
+
+3) If fragmentation persists (contiguous_free_bytes remains low): perform targeted cache compaction on least critical model shards. Compaction marks cold cache pages and attempts to coalesce allocations.\  - Command (safe window required): kubectl -n runtime exec deploy/allocator-service -- /bin/sh -c 'curl -X POST http://localhost:8080/allocator/compact?shard=<SHARD_ID>'\  - Owners: shard-team oncall.
+
+4) Controlled restart of allocator container (medium risk): restart only the allocator-service on affected node to force allocator to rebuild allocation map. This is disruptive to in-flight allocations; perform during low-traffic windows or under autoscale-protected shards.\  - kubectl -n runtime rollout restart deploy/allocator-service --field-selector spec.nodeName=<NODE>\  - Validate after restart: check kvcache.hit_ratio, memory metrics, generation latency.
+
+5) Host-level fallback (high risk): cordon & drain node, reprovision with tuned NUMA affinity (see host profile below) then bring back into pool. This should be coordinated with infra and SRE.
+
+Quick reference: allowed operators for remediation
+- Soft rebalancing: runtime-oncall, shard-team
+- Cache policy toggles: runtime-oncall, platform-ops
+- Allocator restart: runtime-oncall, infra (if host-affinity changes required)
+
+Configuration examples
+
+1) Shard-manager policy (yaml snippet):
+
+```
+shardManager:
+  placementPolicy: NUMA_AWARE
+  rebalance:
+    enabled: true
+    rateLimitPerHost: 2 # moves per minute
+    thresholdPlacementSkew: 0.08
+```
+
+2) Allocator tuning (yaml snippet):
+
+```
+allocator:
+  numaAllocation: true
+  contiguousAllocationThresholdBytes: 2147483648 # 2 GiB
+  compaction:
+    enabled: true
+    intervalSeconds: 600
+```
+
+3) KV cache policy toggle (curl example):
+
+```
+curl -X POST http://kvcache-proxy.runtime.svc.cluster.local:8080/config \
+  -H 'Content-Type: application/json' \
+  -d '{"policy":"size_aging","min_resident_shards":2}'
+```
+
+Rollout and testing guidance
+
+- Canary: any changes to placementPolicy or allocator compaction defaults must be canaried on 5% of hosts for 72 hours with telemetry collection enabled (placement_skew, remote_access_ratio, p99 latency).
+- Load test: validate with bench-runner workload types: prefix-heavy chat (long KV life), short-completion burst (high allocation churn). Expected metrics: no >10% regression in p99 generation latency and no more than 5% drop in throughput.
+- Experiment tagging: annotate canary hosts with tag runtime.experiment=<ticket-id> so metrics are scoped.
+
+Common root causes and notes
+
+- Autoscaler-induced reshuffles: frequent scaling up/down can leave small fragments scattered across GPUs. Mitigation: increase scale cooldown and rely on soft rebalancing.
+- Batch-locality mismatch: large batching windows can amplify cross-NUMA penalties for a single shard. Tune batching thresholds per instance type.
+- Long-lived memory allocations (large KV objects) may prevent compaction; enable size-aware eviction for those models.
+
+Operational playbook for recurring regression
+
+If the same host exhibits fragmentation every 24h:
+1) Tag host and open infra ticket referencing host-profile and kernel version.
+2) Run a weekly compaction job on low-traffic window.
+3) Evaluate driver/kernel upgrades if remote_access_ratio persists after compaction.
+4) Consider placement blacklist for particular instance types in our fleet where NUMA topology is known to be misreported.
+
+Ownership and escalation path
+
+- Primary: runtime-serving (oncall) — first-response, execute soft mitigations.
+- Secondary: shard-management team — run compaction, rebalance policies, tuning.
+- Tertiary: infra / SRE — node reprovisioning, kernel/driver changes.
+- Escalation: if Sev1 for >30 minutes, page engineering manager for runtime-serving and infra manager.
+
+Appendix: diagnostics commands and sample outputs
+
+1) placement_skew quick check:
+```
+rtsctl metrics get runtime.shard_manager.placement_skew --host <HOSTNAME>
+# output: 0.14
+```
+2) allocator metrics slice:
+```
+kubectl -n runtime exec deploy/allocator-service -- curl -s http://localhost:8080/metrics | grep -E '(remote_access_ratio|memory_contiguous_free_bytes|memory_free_bytes)'
+# remote_access_ratio 0.18
+# memory_contiguous_free_bytes 1234567890
+# memory_free_bytes 5284824320
+```
+3) compact command (dry-run mode first):
+```
+curl -X POST http://allocator.runtime.svc.cluster.local:8080/allocator/compact?shard=<SHARD_ID>&dry_run=true
+# returns: {"compaction_candidate_pages": 124, "estimated_free_after": 3526878720}
+```
+
+Related reading
+
+- Runtime shard topology (internal): /confluence/eng-serving-runtime/runtime-architecture/runtime-op-pathways-and-shard-topology-2024
+- KV cache behavior and policies: /confluence/eng-serving-runtime/benchmarking-and-perf-suite/kv-cache-benchmarks-2025
+- GPU kernel latency investigation playbook: /confluence/eng-serving-runtime/profiling-playbook/gpu-kernel-latency-investigation-playbook-2024
+
+Revision history
+
+- 2025-06-03: Created (Jordan Li)
+- 2025-11-12: Added automated mitigation commands and canary guidance (Maya Chen)
+- 2026-02-10: Expanded thresholds, added fragmentation-risk alert rules, and updated compaction API examples (Priya Nair)
+

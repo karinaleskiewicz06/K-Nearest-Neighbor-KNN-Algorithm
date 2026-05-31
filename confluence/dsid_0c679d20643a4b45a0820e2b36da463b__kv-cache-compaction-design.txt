@@ -1,0 +1,475 @@
+KV Cache Compaction Improvements — Design Doc (Runtime 1.22)
+
+h1. Overview
+This document proposes KV cache compaction + tier-aware eviction for Redwood’s serving runtime to reduce GPU memory fragmentation and mitigate burst-driven tail latency (p95/p99) during sustained decode workloads with mixed sequence lengths.
+
+The design adds:
+* A measurable definition of *fragmentation* for the KV arena
+* A compaction mechanism (incremental, budgeted) integrated with the scheduler
+* A safe eviction strategy (tier-aware LRU + pinned-session handling)
+* Feature flags / kill-switches for staged rollout and rapid disable
+* Observability standards (metrics + tracing) and rollout guardrails
+
+h2. Context and problem statement
+The runtime maintains a GPU-resident KV cache for active sequences (and optionally cached prefixes). Under mixed prompt lengths and high churn, long-lived allocations + frequent frees can create holes in the allocator arena. Over time, the allocator may fail to find contiguous blocks for new KV pages, causing:
+* Increased allocator overhead (free-list scanning, defragment bookkeeping)
+* Opportunistic evictions at high pressure moments
+* Copy/relocation work occurring at inopportune times
+* Worst case: OOM/forced request shedding or large p99 latency spikes
+
+We see the most pronounced issues in:
+* Bursty chat traffic (many short sessions, some long sessions)
+* Mixed decode lengths, long-running streams, and frequent cancellations
+* Dedicated pools with high utilization and limited headroom
+
+h2. Goals
+* Reduce memory fragmentation in the KV arena without harming steady-state throughput.
+* Reduce tail latency under burst traffic (p95/p99) and mixed length distributions.
+* Add an eviction policy that is safe (correctness), observable (metrics), and configurable (tier/model/profile).
+* Provide guardrails: compaction budgets/limits, backpressure integration, and kill-switches.
+
+h2. Non-goals (initial release)
+* Customer-facing configuration UI in Console (flags/config only).
+* Major kernel rewrites unrelated to KV movement (minimal copy/pack kernels allowed).
+* Changing the semantic contract of KV residency (i.e., no “approximate” KV).
+
+h2. Stakeholders / owners
+* Tech lead (KV): Omar El-Sayed
+* Allocator/compaction: Samir Qureshi
+* Scheduler integration: Sofia Ivanova
+* Architecture/correctness: Noah Patel
+* Observability standards: Allison Grant
+* SRE guardrails/rollout: Sean Gallagher, Rafael Mendes
+* Kernels (if needed): Hiro Tanaka, Grace Kim, Yuki Sato
+
+h1. Current KV allocation model (as of runtime 1.21)
+h2. High-level model
+* KV is stored in a GPU “arena” split into fixed-size pages (per layer, per head layout), allocated per sequence.
+* A sequence holds a list of pages per layer (or a compact per-seq structure pointing into per-layer slabs, depending on model profile).
+* Allocation is primarily driven at two points:
+  # Prefill: reserve initial KV pages proportional to prompt length
+  # Decode: allocate more pages as tokens append
+* Free occurs when:
+  * Sequence completes
+  * Sequence is cancelled
+  * Sequence is evicted due to memory pressure
+
+h2. Allocator details (simplified)
+* Arena is sized per GPU and model profile (varies by hosted tier / dedicated pool).
+* Free space is tracked in a free-list keyed by contiguous ranges of pages.
+* Allocation uses “first-fit”/“best-fit-ish” heuristics tuned for speed.
+* Coalescing occurs on free where adjacent ranges are merged.
+
+h2. Why fragmentation happens
+Fragmentation emerges because allocation requests are not uniform:
+* Mixed sequence lengths: some sequences grow slowly, others rapidly
+* Long-lived sessions: hold pages for long time, forcing new allocations to fit around them
+* High churn: frees create holes that are too small for subsequent requests
+* Cancellation edge cases: mid-decode cancellation can free non-uniformly across layers, increasing small holes
+
+Net result: free space exists but is split into many small ranges, increasing allocator overhead and raising the probability of forced eviction or OOM when new contiguous ranges are needed.
+
+h1. Definitions and fragmentation measurement
+We standardize the following key terms (see metrics standard page for canonical names):
+
+h2. Key terms
+* *Arena bytes*: total bytes managed by KV allocator for a model profile.
+* *Free bytes*: total bytes currently free.
+* *Largest free span*: the largest contiguous free range.
+* *Fragmentation ratio*: 1 - (largest_free_span_bytes / free_bytes), with 0 meaning perfectly contiguous free space.
+
+Notes:
+* We compute this per device and per model profile (and, where feasible, per pool).
+* We also track “free spans count” (count of free ranges) as a secondary indicator.
+
+h2. Health thresholds (initial)
+These are starting points and will be tuned via canary:
+* Warn: fragmentation_ratio > 0.55 AND free_bytes > 2 GB
+* Critical: fragmentation_ratio > 0.70 AND free_bytes > 1 GB
+
+Rationale: fragmentation is only actionable if meaningful free space exists; otherwise pressure is “real” and eviction may be required.
+
+h1. Proposed design
+We propose a two-part approach:
+* Compaction: relocate KV pages to reduce fragmentation, performed incrementally with budgets.
+* Eviction: tier-aware eviction when pressure is high and compaction cannot recover sufficient contiguous space quickly.
+
+The compaction mechanism is integrated with the scheduler to avoid decode stalls and to allow backpressure/guardrails.
+
+h2. Design principles
+* Correctness first: relocation must preserve per-seq KV content and ordering.
+* Budgeted work: bound compaction by *time* and/or *bytes moved* per scheduling cycle.
+* Avoid tail spikes: do not perform large relocation inside latency-sensitive decode inner loops.
+* Observable: export metrics + tracing spans to correlate compaction/eviction with tail latency.
+* Safe-by-default: feature flags + kill-switch + staged rollout.
+
+h1. Compaction mechanism
+h2. What we compact
+We compact at the granularity of allocator “pages” (or blocks) used for KV storage. Compaction moves live pages to earlier (lower) addresses in the arena to create larger contiguous free spans.
+
+We do not attempt to change the logical layout of KV within a page; we only relocate pages and update indirections.
+
+h2. Preconditions / invariants
+During relocation we must preserve:
+* A sequence’s KV pointer table must not point to freed/moved pages.
+* Reads during decode must see a consistent view of the KV pointers.
+* Cancellation/free racing with relocation must not leak pages or double-free.
+
+We enforce these with:
+* A per-sequence “relocation lock” (logical lock in scheduler state; not a heavy mutex).
+* A relocation state machine (see kv-cache-memory-layout-overview page).
+* A two-phase commit for relocation:
+  1) Copy live page(s) to new location
+  2) Atomically swap pointer(s)
+  3) Release old page(s) back to free-list
+
+h2. Incremental compaction (primary)
+Incremental compaction runs as a small step each scheduler cycle, bounded by budgets.
+
+Algorithm sketch:
+1) Determine if compaction should run:
+   * fragmentation_ratio above threshold
+   * free_bytes above minimum actionable free
+   * allocator under “pressure soon” or “pressure now” signals (see integration)
+2) Choose relocation candidates:
+   * Prefer sequences with pages scattered across many spans
+   * Prefer low-priority tiers first (Hosted Free/Dev > Hosted Pro > Dedicated)
+   * Avoid sequences marked as pinned or “latency critical”
+3) Choose destination:
+   * Allocate a contiguous target span near the “front” of the arena
+   * If no contiguous destination exists, compaction step becomes no-op
+4) Copy pages:
+   * Use GPU memcpy/pack kernel as appropriate
+   * Update indirections
+5) Update allocator metadata and emit metrics
+
+Budgets:
+* bytes_moved_budget_per_tick (default varies by tier)
+* time_budget_per_tick_ms (hard cap)
+
+A step stops when any budget is exhausted or when scheduler enters a latency-critical boundary.
+
+h2. Background compaction (secondary; optional)
+We support an optional background compaction worker thread that can perform additional relocation when:
+* The scheduler indicates the system is in a low-utilization window
+* Or when a pool is in “stabilize” mode after a burst
+
+This worker is strictly lower priority than request processing and must also respect global budgets. Initial rollout will keep background compaction disabled by default; incremental compaction is the primary mechanism.
+
+h2. Compaction triggers
+We trigger compaction when any of the following are true:
+* fragmentation_ratio > trigger_threshold
+* free_span_count > span_count_threshold
+* allocator_failures_recent > 0 (failed allocations that required fallback/eviction)
+* tail_latency_guardrail engaged (SRE signal; see guardrails doc)
+
+We also include hysteresis to avoid oscillation:
+* Trigger on threshold_high; stop when below threshold_low.
+
+h2. Candidate selection and fairness
+We maintain a small priority queue of candidate sequences. Each sequence is scored by:
+* scatter_score (number of spans touched)
+* bytes_to_compact (estimated)
+* tier_weight (lower tiers more eligible)
+* pinned_penalty (pinned sequences typically ineligible)
+
+We also enforce fairness:
+* No single sequence can consume > X% of a tick budget.
+* Round-robin across candidates to avoid starvation.
+
+h2. Kernel requirements
+Most moves can use device-to-device memcpy. For some layouts (paged KV with interleaved head dimension), we may need a lightweight pack kernel to maintain alignment/coalescing.
+
+Initial plan:
+* Start with memcpy for page-aligned moves.
+* Add pack kernel only if benchmarks show significant regression due to misalignment or if page strides require transformation.
+
+h1. Eviction policy
+Compaction reduces fragmentation but cannot create memory out of thin air. When true memory pressure exists (or compaction cannot quickly produce a contiguous span), we must evict.
+
+h2. Policy summary
+We implement tier-aware LRU eviction at the sequence level:
+* Evict whole sequences (freeing all KV pages for that sequence).
+* Prefer evicting:
+  * Lower-tier traffic first (e.g., Hosted Free/Dev)
+  * Older/idle sequences (LRU by last_token_timestamp)
+  * Sequences not marked pinned
+
+We do not evict partial layers or partial KV for a sequence in the initial release.
+
+h2. Pinned sessions and correctness
+Some sessions are pinned:
+* Dedicated customer pinned sessions (contractual / product requirements)
+* Internal canary/test sessions
+
+Pinned sessions are ineligible for eviction unless:
+* emergency_oom_mode is enabled (explicit, off by default)
+* and SRE oncall flips the kill-switch policy (see runbook)
+
+h2. Prefix cache interaction
+If prefix caching is enabled for a model profile:
+* Prefix cache entries are separately tracked and are more evictable than active sequences.
+* Under pressure we evict prefix cache entries before evicting active sequences.
+* Compaction does not move prefix cache entries in v1 unless they share the same arena; if shared, they participate as low-priority candidates.
+
+h2. Customer-facing behavior
+Eviction of an active sequence manifests as:
+* Request error (e.g., RESOURCE_EXHAUSTED) or retryable overload signal depending on caller type
+* Or graceful degradation if routing can retry on a different replica/region (when enabled)
+
+We will not silently drop tokens.
+
+h1. Scheduler integration
+The scheduler is the control point to ensure compaction does not cause tail latency spikes.
+
+h2. Integration points
+We integrate compaction into scheduler phases:
+* End of prefill phase: safe window to do small relocation steps
+* Decode boundary between token steps: only if budget is tiny and queue depth is low
+* After completion/cancellation processing: coalesce + small compaction step
+
+h2. Budget enforcement
+Budgets are enforced by the scheduler, not solely within allocator code:
+* The scheduler provides a per-tick budget context:
+  * time_budget_ms
+  * bytes_budget
+  * max_sequences_to_touch
+* The allocator/compactor must check the context and return early.
+
+This is intentional to keep latency control centralized and consistent with other runtime maintenance tasks.
+
+h2. Backpressure and overload signals
+When overload is detected:
+* Prefer shedding new work over doing heavy compaction.
+* Compaction should enter “stabilize” mode:
+  * perform minimal work required to prevent allocator failure
+  * rely on eviction if needed
+
+Signals:
+* queue_depth_high
+* decode_utilization_high
+* p99_latency_rising
+* allocator_failures_recent
+
+h2. Safety: cancellation and concurrent events
+Cancellation can race with relocation. We handle with:
+* Sequence state transitions guarded by scheduler state machine.
+* Relocation “epoch” per sequence:
+  * cancellation waits for relocation swap to complete or aborts relocation at a safe point
+* Allocator operations must be idempotent for the old page free after pointer swap.
+
+We will add targeted stress tests for cancellation during relocation (see validation plan).
+
+h1. Configuration and feature flags
+All controls are runtime config flags (no Console UI in v1).
+
+h2. Feature flags (names are internal; subject to config registry constraints)
+* runtime.kv_compaction.enabled (default: off initially)
+* runtime.kv_compaction.mode = off | incremental | incremental_plus_background
+* runtime.kv_compaction.trigger_fragmentation_ratio_high (default: 0.70)
+* runtime.kv_compaction.trigger_fragmentation_ratio_low (default: 0.55)
+* runtime.kv_compaction.min_actionable_free_bytes (default: 2GiB hosted; 1GiB dedicated)
+* runtime.kv_compaction.bytes_budget_per_tick (default: hosted 128MiB; dedicated 256MiB)
+* runtime.kv_compaction.time_budget_per_tick_ms (default: hosted 0.35ms; dedicated 0.50ms)
+* runtime.kv_compaction.max_sequences_per_tick (default: 2)
+
+Eviction:
+* runtime.kv_eviction.enabled (default: on; existing behavior refined)
+* runtime.kv_eviction.policy = tier_aware_lru_v1
+* runtime.kv_eviction.allow_evict_pinned (default: off)
+* runtime.kv_eviction.prefer_prefix_cache_first (default: on)
+
+Kill-switch:
+* runtime.kv_compaction.kill_switch (default: false)
+  * When true: disables compaction immediately and blocks new relocation steps.
+
+h2. Tier defaults (proposal)
+* Hosted Free/Dev:
+  * compaction enabled after canary
+  * smaller budgets to minimize latency risk
+  * aggressive eviction permitted (non-pinned only)
+* Hosted Pro:
+  * compaction enabled after hosted subset validation
+  * slightly higher budgets
+* Dedicated:
+  * compaction enabled last
+  * higher budgets allowed, but stronger guardrails on eviction (pinned sessions common)
+
+Final defaults will be set after benchmark + canary results (see experiment tracker).
+
+h1. Observability
+We add:
+* Metrics
+* Tracing spans
+* Dashboards and alerts (SRE-owned)
+
+h2. Metrics (high level)
+Allocator health:
+* kv_allocator_fragmentation_ratio
+* kv_allocator_free_bytes
+* kv_allocator_largest_free_span_bytes
+* kv_allocator_free_span_count
+* kv_allocator_allocation_failures_total
+
+Compaction activity:
+* kv_compaction_bytes_moved_total
+* kv_compaction_time_ms_total
+* kv_compaction_steps_total
+* kv_compaction_aborted_steps_total
+
+Eviction:
+* kv_evictions_total{reason,tier}
+* kv_evicted_bytes_total{tier}
+* kv_eviction_candidates_scanned_total
+
+Correlations:
+* Export exemplars linking compaction spans to latency traces.
+
+h2. Tracing
+We add spans around:
+* compaction_step
+* relocation_copy
+* relocation_pointer_swap
+* eviction_selection
+* eviction_execute
+
+Each span includes attributes:
+* model_profile
+* gpu_id
+* bytes_moved
+* sequences_touched
+* fragmentation_ratio_before/after (sampled)
+
+h1. Performance and correctness validation
+h2. Benchmark plan
+We extend the benchmark suite with scenarios designed to induce fragmentation:
+* Mixed prompt lengths (p50 short, p90 long)
+* High churn (frequent cancellations)
+* Long-lived decode sessions (streaming)
+* Bursty arrival patterns (traffic spikes)
+
+KPIs:
+* p50/p95/p99 latency (prefill and decode)
+* throughput (tokens/s/GPU)
+* fragmentation_ratio time series
+* compaction_bytes_moved and overhead
+* eviction rate
+
+Acceptance criteria (initial):
+* No more than 1–2% steady-state throughput regression at equivalent load.
+* p99 tail latency improvement in burst/mixed-length scenarios, or at minimum elimination of the worst spikes.
+* Compaction overhead stays within budget, with no sustained scheduler stalls.
+
+h2. Correctness and stress tests
+Add/extend tests:
+* Cancellation during relocation (including repeated cancel/retry)
+* Concurrent completion + eviction
+* Long-running sessions with intermittent backpressure
+* Adversarial patterns: alternating small/large allocations to maximize fragmentation
+
+h2. Failure modes and mitigations
+* Decode stalls due to heavy compaction:
+  * Mitigation: strict scheduler-enforced budgets, disable background compaction by default
+* Copy overhead increases GPU utilization:
+  * Mitigation: limit bytes moved; tune thresholds; add pack kernel only if needed
+* Pointer swap race leading to incorrect KV:
+  * Mitigation: relocation state machine + invariants + stress tests + tracing
+* Increased evictions:
+  * Mitigation: compaction first when actionable; tier-aware eviction; prefix cache evicted first
+
+h1. Rollout plan
+We will follow staged rollout with explicit guardrails and rollback triggers.
+
+h2. Stage 0 — Internal dev & perf lab
+* Enable compaction in controlled benchmarks and staging clusters.
+* Validate metrics dashboards and trace exemplars.
+* Validate cancellation stress tests.
+
+Exit criteria:
+* Benchmarks meet acceptance criteria.
+* No correctness regressions.
+
+h2. Stage 1 — Internal canary (small %)
+* Enable on a small internal canary pool.
+* Watch:
+  * p99 decode latency
+  * allocator_failures
+  * bytes_moved/time_ms per tick
+  * eviction spikes
+
+Rollback criteria:
+* p99 sustained regression beyond guardrail for > N minutes
+* allocator_failures increase significantly
+* suspected correctness issue (immediate disable)
+
+h2. Stage 2 — Hosted subset (tier-limited)
+* Enable for a subset of Hosted (starting Free/Dev, then Pro).
+* Tight budgets; aggressive monitoring.
+
+h2. Stage 3 — Dedicated pools (opt-in, then default)
+* Start with one dedicated pool with known burst issues.
+* Allow per-customer override via config registry.
+
+h2. Communications
+* Runtime release note (Runtime 1.22) includes:
+  * What changed
+  * What metrics to monitor
+  * How to disable (oncall)
+* Support/CS enablement:
+  * How to interpret p99 improvements and eviction errors
+
+h1. Rollback / kill-switch plan
+Oncall/SRE can disable compaction within minutes via:
+* runtime.kv_compaction.kill_switch = true
+* runtime.kv_compaction.enabled = false
+
+Expected behavior on disable:
+* No new relocation steps start.
+* In-progress relocation steps complete or safely abort at a barrier.
+* Allocator continues without compaction (existing behavior).
+
+If eviction policy changes contribute to incidents, we can revert eviction policy to previous behavior via:
+* runtime.kv_eviction.policy = legacy
+
+h1. Alternatives considered
+* Full stop-the-world defragmentation:
+  * Rejected due to unacceptable tail latency impact.
+* Pure eviction-only strategy:
+  * Rejected because it increases customer-visible errors and is avoidable when free space exists but is fragmented.
+* Changing to a completely different allocator (buddy allocator / slab by size classes):
+  * Deferred; more invasive, higher migration risk.
+
+h1. Open questions
+* Do we need a pack kernel for specific KV layouts (e.g., interleaved heads) to avoid alignment regressions?
+* What is the best default fragmentation trigger per model profile (7B vs 70B) given very different KV footprints?
+* Should we expose compaction controls in Console for Dedicated customers in a later release?
+* How should we treat cross-replica routing retries when an active sequence is evicted (product behavior vs pure infra behavior)?
+
+h1. Appendix: Pseudocode (illustrative)
+Compaction step (simplified):
+1) if !enabled or kill_switch: return
+2) if fragmentation_ratio < low_threshold: return
+3) budget = scheduler.get_compaction_budget()
+4) candidates = allocator.select_candidates(max_sequences_per_tick)
+5) for seq in candidates:
+   a) if budget.exhausted(): break
+   b) if seq.pinned: continue
+   c) plan = allocator.plan_relocation(seq)
+   d) if plan.none: continue
+   e) bytes_moved = relocate(plan, budget)
+   f) allocator.commit(plan)
+   g) emit metrics
+
+Eviction (simplified):
+1) if allocation fails or free_bytes < min_free_bytes:
+2) evict prefix cache entries first (if enabled)
+3) if still pressure:
+4) select seq by tier-aware LRU, excluding pinned
+5) evict seq, emit reason and tier
+
+---
+Changelog:
+* 2026-01-23: Initial draft (O. El-Sayed)
+* 2026-02-02: Added scheduler budgeting section + trigger hysteresis (S. Ivanova)
+* 2026-02-09: Updated metrics list + tracing attributes (A. Grant)
+* 2026-02-16: Added tier defaults + rollback criteria aligned with SRE guardrails (S. Gallagher)

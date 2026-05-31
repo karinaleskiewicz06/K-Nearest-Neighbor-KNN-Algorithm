@@ -1,0 +1,184 @@
+Sequence runway sampling and batch fidelity playbook
+
+Summary
+
+This playbook defines the Sequence Runway sampling method and operational guidance for measuring the interaction between request sequence-length distributions and batching fidelity. Sequence Runway is a structured sampling technique intended to produce representative micro-batches for performance profiling, kernel-sensitivity analysis, and fidelity regression detection across production-shaped traffic.
+
+Why we built this
+
+- Traditional uniform sampling under-represents transitions between short and long prefix lengths that trigger kernel path changes (attention tiling, KV cache hotness, quantized kernels).
+- Ad-hoc sampling can miss edge cases where batch packing semantics significantly change per-token latency and model quality.
+- Sequence Runway makes those transitions first-class, enabling repeatable benchmarking, better kernel hinting, and targeted mitigations (prefetching, backpressure tuning, or model-variant routing).
+
+Goals
+
+1. Provide a repeatable protocol for generating micro-batches that exercise kernel breakpoints and batching boundary cases.
+2. Surface fidelity regressions introduced by batching or quantized-variant fallbacks.
+3. Produce telemetry artifacts (trace + kernel tags + per-token latencies) consumable by the profiling pipeline and the benchmarking suite.
+
+Scope and non-goals
+
+- In scope: sampling and experiment protocol for online traffic replay, local synthetic corpus generation, expected telemetry schema, runbook for interpreting results.
+- Out of scope: model architecture changes, kernel implementation guidance beyond suggested mitigations, client-side prompt engineering.
+
+Ownership and contacts
+
+- Primary owner: eng-serving-runtime Profiling Team
+- Runbook contact: Aisha Kapoor (author) — pager: #runtime-profiling
+- Secondary reviewers/experts: Mikhail Petrov (kernel), Samira Chen (benchmarks)
+
+Definitions
+
+- Sequence runway: an ordered set of request samples grouped by prefix length bands that intentionally create boundary transitions inside a micro-batch.
+- Band: a contiguous interval of sequence lengths (e.g., [1-8], [9-64], [65-256]).
+- Micro-batch: a single server batch observed by the runtime containing multiple requests.
+- Fidelity regression: measurable drop in model output quality attributable to batching, kernel-variant fallback, or quantization.
+
+Sampling design (high level)
+
+1) Traffic characterization
+
+- Collect 24–72 hours of request metadata (sequence_length, model_variant, route, client_tier) sampled at 0.5–1% to create a baseline histogram.
+- Produce an empirical CDF and identify elbow points and kernel breakpoints (see reference: sequence-length-scaling-and-kernel-breakpoints).
+
+2) Band selection
+
+- Choose 4–6 bands covering the observed distribution: very-short, short, medium, long, xlong. Example bands: [1-8], [9-64], [65-256], [257-1024].
+- For each band, compute target sample counts proportional to traffic volume but inject additional samples at band boundaries (10% of total samples) to stress transitions.
+
+3) Runway construction
+
+- A runway is an ordered list: B1 -> B1 -> B2 -> B2 -> B3 -> B3 -> B2 -> B4, where each Bx represents a sample drawn from band x. Orders should be designed to:
+  - Create short->long and long->short transitions.
+  - Trigger KV cache cold/warm boundaries (e.g., repeated prefixes then sudden long continuation).
+
+4) Micro-batch packing
+
+- Pack samples into micro-batches using the same runtime packing policy used in production (e.g., sequence-length-first packing or round-robin across routes).
+- Ensure some micro-batches intentionally violate ideal packing to exercise admission controllers and preemption.
+
+Config example (YAML)
+
+---
+experiment_name: "sequence-runway-q2-2026"
+bands:
+  - name: very_short
+    range: [1, 8]
+    weight: 0.30
+  - name: short
+    range: [9, 64]
+    weight: 0.45
+  - name: medium
+    range: [65, 256]
+    weight: 0.20
+  - name: long
+    range: [257, 1024]
+    weight: 0.05
+boundary_injection: 0.10
+runways_per_round: 200
+micro_batch_size_target: 8
+lines_of_workload_per_run: 5000
+---
+
+CLI example to generate runways (profiling toolkit v0.7+):
+
+$ ri-profile generate-runway --config ./runway-config.yaml --out ./runways/seq-runway-2026.ndjson
+
+Format notes
+
+- Output is NDJSON where each record contains: sample_id, prompt_hash, sequence_length, band, model_hint, expected_kernel_variant.
+- Telemetry pipeline expects trace_id and batch_id populated per request to correlate server-side traces.
+
+Telemetry and traces to collect
+
+- Per-request: client_route, token_count, sequence_length, model_variant, kernel_hint, packing_slot, admission_decision, queue_time_ms, start_time, end_time, per_token_latencies (list), top_kernel_tags.
+- Per-batch: batch_id, batch_size, slot_shape (vector of sequence lengths), packing_policy, aggregate_queue_time_ms, kernel_variant_distribution.
+
+Benchmarks and evaluation matrix
+
+- Run each runway against the following matrix:
+  - Model variants: fp16, 8-bit-quant, dynamic-bf16-fallback
+  - Scheduler policies: sequence-first, fairness-governor, priority-decode
+  - Admission thresholds: 90th percentile latency SLO target breakers (e.g., 200ms, 500ms)
+
+Evaluation metrics (primary)
+
+- Per-token p90 and p99 latency shift relative to shadow baseline.
+- Kernel-sensitivity-index: proportion of tokens that executed on a non-primary kernel path.
+- Fidelity delta: BLEU/ROUGE/embedding-distance on deterministic prompts where applicable.
+- Batch packing inefficiency: wasted slot ratio (empty tokens inside batch).
+
+Operational runbook: when you get anomalous results
+
+1) Symptom: p99 per-token latency increased by >15% vs baseline and coincides with an increased kernel-sensitivity-index.
+2) Quick triage:
+  - Check batch_id rollups to see if specific micro-batch shapes are correlated.
+  - Inspect kernel tags in traces for slow kernels or unexpected fallbacks.
+  - Query admission logs for increased preemption or queue spikes.
+
+3) Mitigations (iterative):
+  - Short-term: Reduce micro_batch_size_target by 25% on a canary pool; enable conservative admission for affected routes.
+  - Medium-term: Enable KV prefetching for runways that show cold-cache stalls.
+  - Long-term: Work with kernel team to fuse or optimize frequently hit kernel paths; consider model-variant routing to a lower-latency kernel for latency-sensitive customers.
+
+4) Recovery checklist:
+  - Roll back any runtime admission tuning if it increases error rates.
+  - Re-run a focused runway that isolates the offending band to validate a fix.
+  - Open a postmortem if fix required >1 hour of mitigation or customer impact occurred.
+
+Rollout matrix and experiment safety
+
+- Start with lab-only runs using recorded traffic in the sandbox cluster.
+- Canary on a non-customer-delta production shard (10% of traffic) with elevated tracing enabled.
+- If canary passes for 24 hours with no >5% p99 drift and no fidelity delta >0.5 relative units, expand to 50% then 100%.
+- Always include automatic circuit-breaker to abort experiments on: error-rate increase >0.5pp, p99 drift >20%, or kernel OOMs.
+
+Example query snippets
+
+- Identify boundary-heavy micro-batches:
+  SELECT batch_id, COUNT(*) AS batch_size, ARRAY_AGG(sequence_length ORDER BY sequence_length DESC) AS shape
+  FROM profiler_batches
+  WHERE experiment = 'sequence-runway-q2-2026'
+  GROUP BY batch_id
+  HAVING MAX(sequence_length) - MIN(sequence_length) > 200
+  ORDER BY batch_size DESC
+
+- Kernel-sensitivity aggregation:
+  SELECT kernel_tag, COUNT(*) as tokens, PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY per_token_latency_ms) as p99_latency
+  FROM request_traces
+  WHERE experiment = 'sequence-runway-q2-2026'
+  GROUP BY kernel_tag
+  ORDER BY tokens DESC
+
+Troubleshooting examples
+
+- If traces show KV cache thrashing:
+  - Confirm sequence ordering for runway (repeated short prefixes followed by long 'continuation' requests).
+  - Increase boundary_injection to reproduce consistently.
+  - Monitor GPU memory allocation and KV hotness metrics; if hotness low, consider session affinity or sticky routes.
+
+- If fidelity deltas appear only for quantized variant:
+  - Run a deterministic prompt set with and without batching to measure delta.
+  - If batching introduces delta, test an isolated run with micro_batch_size_target=1 to attribute cause.
+
+Artifacts and outputs to save per-experiment
+
+- NDJSON of runways, raw trace archive (gzipped), batch rollups CSV, kernel-tag summary CSV, evaluation fidelity report, and the experiment config YAML.
+
+Related pages and references
+
+- See: sequence-length-scaling-and-kernel-breakpoints (benchmarking) for breakpoints mapping.
+- See: entropy-aware-tail-sampling-and-replay-playbook for tail sampling techniques.
+
+Appendix: quick checklist before launching a production runway
+
+1. Confirm telemetry retention for trace archives is 30 days.
+2. Ensure profiler agent version >= 0.7 is deployed on canary pool.
+3. Verify model_variant and kernel_hint fields are present in traces.
+4. Create experiment ticket and link SLO gates and rollback owner.
+
+Document history
+
+- 2026-03-15: Created by Aisha Kapoor.
+- 2026-04-08: Added CLI examples and YAML template (reviewer: Mikhail).
+- 2026-06-01: Expanded runbook and rollout matrix (reviewer: Samira).

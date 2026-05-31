@@ -1,0 +1,150 @@
+Multi-tenant GPU affinity and IaC contracts
+
+Summary
+-------
+This document describes the design, Terraform module contract, operational runbook, and CI/CD integration for multi-tenant GPU affinity and placement decisions in Redwood's shared GPU pools. The goal is to give teams a small, auditable API and IaC contract to express placement intent (affinity, anti-affinity, reservation windows), while preserving cluster utilization and predictable fairness.
+
+Why this exists
+----------------
+- Rapid on-call incidents and capacity contention exposed that ad-hoc node labels and per-team scripts lead to inconsistent placement and costly preemptions.
+- A formalized affinity contract reduces noisy neighbor impact and enables automated capacity decisions (spot fallback, burst routing).
+- The contract enables CI/CD gating for changes that affect placement logic (kernel builds, node taints, quota changes).
+
+Design overview
+---------------
+1) Placement primitives (user-facing)
+   - affinity_groups: Stable group IDs teams use to assert preferred colocation (e.g., model-serve, eval-batch).
+   - anti_affinity_tags: Lightweight tags to split tenants that must not share the same host for latency/isolation reasons.
+   - reservation_window: Optional short-term reservation (start, end) for large eval runs. Reservations consume soft credits and are capped.
+   - qos_profile: {"latency" | "throughput" | "best_effort"} used by autoscaler to select pool and batching parameters.
+
+2) Placement engine responsibilities
+   - Map placement primitives to a small set of node selectors and runtime flags (CUDA_VISIBLE_DEVICES wiring, MIG partitions when available).
+   - Prefer nodes with warmed caches for latency profiles; prefer fractional multiplexing nodes for best_effort.
+   - Trigger fallbacks: spot -> reserved -> cross-region burst based on policy and customer tier.
+
+3) IaC contract (Terraform module)
+   - Single module: redwood_gpu_tenant_affinity
+   - Module responsibilities: validate inputs, create cluster role bindings for the tenant's placement service account, register the affinity_group with the central placement-controller, emit Terraform outputs consumed by other modules (node_selector, taint_signature, reservation_id).
+
+Module usage example (Terraform)
+--------------------------------
+```hcl
+module "image-eval-affinity" {
+  source = "git::ssh://git@repo.internal/infra/iac-modules.git//redwood_gpu_tenant_affinity"
+
+  tenant_id        = "team-image-eval"
+  affinity_groups  = ["eval-warm-cache", "gpu-a"]
+  anti_affinity    = ["model-serve-critical"]
+  qos_profile      = "throughput"
+  reservation_secs = 3600
+  allowed_regions  = ["us-west-2"]
+}
+```
+
+Module outputs (consumed downstream)
+------------------------------------
+- node_selector = map(string) (e.g., {"gpu_pool":"frac-multiplex-1"})
+- taint_signature = string (taint key-value that other modules use to place pods)
+- reservation_id = string (used by billing/credits)
+
+Configuration table (key inputs and constraints)
+------------------------------------------------
+| input                | type     | description / constraints |
+|----------------------|----------|---------------------------|
+| tenant_id            | string   | unique short id; max 32 chars |
+| affinity_groups      | list     | free-form groups; prefer 1-3 values |
+| anti_affinity        | list     | tag names; system enforces at-most 5 |
+| qos_profile          | string   | one of latency/throughput/best_effort |
+| reservation_secs     | int      | <= 86400 (24h); default 0 |
+| allowed_regions      | list     | subset of supported regions |
+
+Implementation notes for runtime team
+------------------------------------
+- Placement-controller (service) will expose API /v1/placements and a light CRD PlacementRequest used by on-cluster agents.
+- Internal canonical mapping table maps qos_profile -> pool selector -> batcher config. Keep mappings in a single YAML file under ops/config/placement-mappings.yaml and version it.
+- For MIG-enabled nodes, the controller may prefer 1g/2g partitions for latency profiles; ensure partitioning script is idempotent.
+
+CI/CD integration
+------------------
+- Module changes must pass: unit tests, terratest that verifies outputs, and an integration staging apply against the sandbox cluster.
+- We gate placement-controller upgrades with a staged rollout pipeline: canary to a single region (us-west-2), smoke tests for aff/anti-aff behavior, then gradual rollout to additional regions.
+- PR checklist for module authors:
+  1) Add a terratest that covers invalid inputs (long tenant_id, overlapping reservations).
+  2) Add a post-apply verification job that performs a simulated placement via the controller API.
+  3) Update the placement-mappings.yaml and add a mapping migration script if semantics change.
+
+Operational runbook (quick actions)
+-----------------------------------
+Situation: tenant reports placement failures (pods pending with "No nodes available" or unexpected preemptions)
+
+Immediate steps:
+1) Identify tenant and placement request: curl -s http://placement-controller.internal/v1/placements?tenant=team | jq .
+2) Check corresponding Terraform outputs: terraform workspace show; terraform state show module.image-eval-affinity | grep node_selector
+3) Check node pool capacity: grafana/dashboard/gpu-pools -> look for pool utilization > 92% or unschedulable pods.
+4) If pool utilization is high and tenants are latency QOS, run: 
+   - Temporarily bump reserved credits (ops CLI): ops-gpu credit adjust --tenant team-image-eval --add 200
+   - If preemptions spike, switch spot fallback off for affected tenant: ops-placement update --tenant team-image-eval --spot-fallback false
+5) For reservation misuse or stale reservations, reclaim: ops-reserve reclaim --reservation-id <id> --reason stale
+
+Escalation path:
+- Pager to infra-oncall if provisioning time > 10m or more than 3 tenants affected.
+- SRE lead to be notified for cross-region failover initiation.
+
+Metrics, alerts and SLOs
+------------------------
+Primary metrics to emit from placement-controller:
+- placement_request_latency_ms (p95 < 250ms)
+- placement_fail_rate (>= 5% for 5m fires pager)
+- pool_utilization_percent (per-pool; warn at 80%, critical at 92%)
+- reservation_conflict_count (any spike > 10/min triggers investigation)
+
+Alert thresholds (recommended)
+- pager: placement_fail_rate > 5% sustained for 5 minutes 
+- page: pool_utilization_percent > 92% for any production pool for 3 minutes
+- ticket: placement_request_latency_p95 > 500ms for 30 minutes
+
+Billing and credits
+-------------------
+- The Terraform module returns reservation_id which the billing pipeline uses to debit tenant soft credits.
+- Soft credits are intended for short-term evaluation; long-running or abused reservations auto-escalate to finance review if usage > 72 hours aggregate in 7 days.
+
+Testing and chaos plan
+---------------------
+- Test harness includes synthetic workloads to validate affinity and anti-affinity semantics under load.
+- Periodic chaos job simulates node preemption and asserts fallback paths work (spot -> reserved -> cross-region).
+
+Ownership and rollout plan
+--------------------------
+- Owner: infra/gpu-platform team (primary: @aachen).
+- Review cadence: Placement mappings are reviewed quarterly and before major model-serving launches.
+- Rollout steps:
+  1) Merge module changes to main and run terratest in sandbox.
+  2) Canary apply in us-west-2 with a single non-critical tenant.
+  3) Smoke tests: allocation, reservation, anti-affinity validation.
+  4) Expand to 3 additional tenants and monitor metrics for 48 hours.
+  5) Full rollout with staged region expansion.
+
+Appendix: sample diagnostic commands
+------------------------------------
+- List active reservations for tenant: ops-reserve list --tenant team-image-eval
+- Query placement controller for mapping used: curl -s http://placement-controller.internal/v1/mapping?qos=throughput | jq .
+- Force a re-evaluate for a pending pod: kubectl annotate pod <pod> placement.re-eval=true --overwrite
+
+Appendix: module inputs / outputs reference (compact)
+----------------------------------------------------
+Inputs: tenant_id, affinity_groups, anti_affinity, qos_profile, reservation_secs, allowed_regions, service_account_email
+Outputs: node_selector, taint_signature, reservation_id, placement_binding_id
+
+Related reading
+---------------
+- GPU allocation fairness and preemption strategy (link internal)
+- GPU provisioning immutable state and DR playbook (link internal)
+
+Revision history
+----------------
+- 2025-09-12: Initial draft (Avery Chen)
+- 2025-10-04: Added CI/CD gating rules and terratest checklist (Samantha Ortiz review)
+- 2026-01-10: Clarified reservation reclaim rules and added escalation thresholds (Ravi Patel review)
+
+If you are implementing a new affinity group or changing qos mappings, open a design doc and tag infra/gpu-platform for review before making Terraform changes.

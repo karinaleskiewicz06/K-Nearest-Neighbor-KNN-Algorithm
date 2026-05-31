@@ -1,0 +1,322 @@
+Kernel Auto-Selection v2 — Design
+
+h1. Kernel Auto-Selection v2 — Design
+
+*Owner:* Yuki Sato (Runtime Kernels)
+*Design leads:* Hiro Tanaka (Kernels), Noah Patel (Architecture/perf correctness)
+*Primary stakeholders:* Sofia Ivanova (Scheduling), Lena Fischer (Workload regime characterization), Omar El-Sayed (tail-latency/observability), Marcus Reed (perf validation), Ethan Park (control-plane gates)
+
+h2. 1) Summary
+Kernel auto-selection v2 ("selector v2") updates the Serving Runtime kernel selection logic to be explicitly keyed on:
+1) *Model family/architecture* (e.g., Llama-family vs Mistral-family vs Qwen-family vs Gemma-family)
+2) *Sequence length regime* (prefill/decode characteristics and buckets)
+3) *GPU type/SKU* (A100/H100/L40S + variants, incl. MIG where applicable)
+
+The intent is to reduce *p95/p99 latency* and improve *throughput stability* across heterogeneous fleets while preserving:
+- Correctness (no numerical/caching correctness regressions)
+- Determinism (same inputs -> same selection decision)
+- Operational safety (fast rollback + overrides)
+
+Selector v2 ships behind feature gates, with allowlist/denylist controls by model + GPU SKU + region.
+
+h2. 2) Motivation / Problem Statement
+Selector v1 has grown organically and primarily selects kernels using a limited feature set (mostly model size + a coarse prefill/decode heuristic). This has resulted in:
+- Mis-selections in long-context workloads (tail latency spikes when a kernel is optimal for short prompts but degrades for large prefill)
+- SKU sensitivity (kernels that are stable on H100 may regress on L40S; some A100 variants differ in optimal kernel choice)
+- Hard-to-debug incidents (selection decisions are not sufficiently observable per request; hard to reproduce in staging)
+- Rollout friction (lack of targeted controls increases blast radius)
+
+Selector v2 makes feature extraction explicit, selection rules auditable, and fallbacks guaranteed.
+
+h2. 3) Goals and Non-Goals
+h3. Goals
+- *Performance:* reduce p95/p99 latency and reduce variance in decode throughput across mixed workloads.
+- *Stability:* prevent tail latency spikes from long-context misclassification.
+- *Safety:* safe fallbacks when a kernel is unavailable, unstable, or unsupported for a given GPU SKU / driver / model.
+- *Determinism & replayability:* selection decisions must be reproducible and stable given identical inputs and config.
+- *Observability:* emit per-request selection decision telemetry with bounded overhead.
+- *Operational controls:* feature-gated rollout and hot-reloadable allow/deny lists.
+
+h3. Non-Goals
+- Learning-based kernel selection (out of scope for v2; see ADR-017 for rationale).
+- Changing the scheduler policy itself (selector consumes scheduler hints; scheduling remains authoritative for batching/placement).
+- Automatic kernel compilation at request time (selector only chooses among registered kernels / precompiled variants).
+
+h2. 4) Current Behavior (Selector v1)
+Selector v1 (simplified):
+- Inputs: model identifier, estimated prefill length, estimated max output tokens, some runtime flags.
+- Behavior:
+  - Picks one attention kernel family (e.g., flash-attn vs baseline) and a small set of fused ops if enabled.
+  - Performs minimal hardware branching ("H100" vs "other") and relies on defaults for most SKUs.
+  - Has implicit fallbacks spread across multiple call sites.
+- Gaps:
+  - No explicit model-family classification; model variants can land in the wrong bucket.
+  - Coarse seq-length logic (short/long threshold) does not handle mixed workloads.
+  - Limited per-request traceability.
+
+h2. 5) Proposed Approach (Selector v2)
+Selector v2 is a *rule-based* decision engine with:
+- A normalized feature vector extracted from request + model metadata + hardware metadata.
+- A kernel registry mapping (model_family, gpu_sku, seq_bucket, op_set) -> candidate kernels.
+- A deterministic decision procedure that produces:
+  - chosen_kernel_set (attention + fused ops package)
+  - fallback_reason (if not using preferred kernel)
+  - selection_version (for audit/replay)
+
+h3. 5.1 High-level architecture placement
+Selection occurs at *plan construction* time (before execution), after:
+- model is resolved (including version pin)
+- hardware runtime reports GPU properties
+- scheduler provides optional workload hints
+
+Selection result is cached (bounded) by:
+(model_id, model_revision, gpu_sku_norm, driver_norm, seq_bucket, selector_config_hash)
+
+h2. 6) Inputs and Feature Signals
+h3. 6.1 Model family / architecture classification
+We introduce a model-family classifier that produces:
+- model_family: {llama, mistral, qwen, gemma, other}
+- architecture_tags: list (e.g., rope_variant, gqa/mqa, kv_head_count, hidden_size bucket)
+
+Primary sources:
+- model manifest (preferred)
+- runtime introspection of model config (fallback)
+
+Notes:
+- Classification must be deterministic and stable across model aliases.
+- For unknown models, family=other and we default to conservative kernels.
+
+h3. 6.2 Sequence length regime and buckets
+We bucket requests using a combination of:
+- prefill_tokens_est (prompt length)
+- decode_tokens_est (expected output / max_tokens)
+- optional scheduler_hint: observed_workload_seq_histogram
+
+Define seq_bucket (initial):
+- S: prefill <= 256
+- M: 257–2048
+- L: 2049–8192
+- XL: > 8192
+
+Additionally define workload_mode:
+- prefill_heavy (prefill dominates)
+- decode_heavy (decode dominates)
+- mixed/unknown
+
+Guardrail:
+- If prefill_tokens_est is missing/unknown, bucket="unknown" and select a safe baseline kernel.
+
+h3. 6.3 GPU SKU normalization
+We normalize GPU identity into gpu_sku_norm and capability tags:
+- gpu_family: {a100, h100, l40s, other}
+- sm_version: e.g., 80, 90
+- hbm_gb (rounded bucket)
+- mig_profile (if MIG enabled; otherwise "none")
+- driver_norm + cuda_norm (coarse versions for known-unstable blocks)
+
+Normalization rules (initial):
+- Treat A100 40GB vs 80GB as same family but different hbm bucket for memory-sensitive kernels.
+- For MIG: include profile string (e.g., "1g.10gb") to avoid selecting kernels requiring larger shared resources.
+
+h2. 7) Kernel Registry and Candidate Generation
+h3. 7.1 Registry structure
+The registry provides candidates per (op, model_family, gpu_sku_norm, seq_bucket):
+- attention_kernels: ordered list
+- kv_cache_kernels: ordered list
+- fused_ops_package: ordered list
+
+Each candidate has metadata:
+- supports: {model_tags, gpu_tags, seq_constraints}
+- stability: {ga, canary, experimental, blocked}
+- constraints: {min_driver, max_driver, requires_mig=false, max_prefill_tokens}
+
+h3. 7.2 Candidate generation
+For each op category:
+1) Filter kernels by hard constraints (support + version blocks).
+2) Sort by preference order (rule-based, per GPU family and seq bucket).
+3) Return candidate list + rationale.
+
+h2. 8) Decision Logic
+Selector v2 is deterministic and rule-based. At a high level:
+
+*Step A — Extract features*
+- model_family, architecture_tags
+- seq_bucket, workload_mode
+- gpu_sku_norm, driver_norm, cuda_norm
+
+*Step B — Build candidates*
+- For attention: preferred list for (model_family, gpu_family, seq_bucket)
+- Apply denylist blocks (kernel_id, gpu_sku_norm, driver_norm, model_id)
+
+*Step C — Choose*
+- Choose the first candidate that passes constraints and is not blocked.
+- If none pass, fall back to baseline.
+
+*Step D — Emit selection record*
+- selected_attention_kernel_id
+- selected_fused_ops_package_id
+- candidate_ids (possibly sampled)
+- feature vector (redacted/hashed where needed)
+- selection_version + config_hash
+
+h3. 8.1 Example rule sketch (illustrative)
+- If gpu_family=h100 and seq_bucket in {S,M} and model_family in {llama,mistral,qwen}:
+  - prefer attention=flashattn_v2_sm90
+- If seq_bucket in {L,XL}:
+  - prefer attention=paged_attn_smXX_longctx (if supported) else flashattn_v2 with longctx parameters
+- If gpu_family=l40s:
+  - prefer attention=flashattn_v2_sm89_tuned (if stable) else baseline_attn
+
+(Concrete kernel IDs and tuning parameters are maintained in the registry; the selector references them by stable ID.)
+
+h2. 9) Fallback Hierarchy (Safety First)
+We formalize a single fallback hierarchy to remove implicit, distributed fallbacks.
+
+h3. 9.1 Fallback precedence
+If preferred kernel is unavailable/blocked/unsupported, fall back in this order:
+1) Same kernel family, conservative parameters (e.g., disable aggressive tiling)
+2) Alternate high-performance kernel validated for SKU (e.g., flash-attn -> paged-attn or vice versa, per registry)
+3) Baseline attention implementation (reference path) with conservative fused ops disabled
+4) Emergency safe mode: baseline attention + disable non-essential fusions + force safe KV cache behavior
+
+h3. 9.2 Reasons for fallback (telemetry enum)
+- KERNEL_NOT_REGISTERED
+- KERNEL_BLOCKED_BY_DENYLIST
+- GPU_UNSUPPORTED
+- DRIVER_BLOCKED
+- SEQ_BUCKET_UNSUPPORTED
+- MODEL_TAG_UNSUPPORTED
+- VALIDATION_GATE_NOT_PASSED (e.g., kernel marked canary-only)
+
+h3. 9.3 Guarantee
+Selector v2 must always produce a valid executable plan if the runtime supports the model at all. If the model is unsupported, fail early with an explicit error (do not loop through kernels).
+
+h2. 10) Determinism Guarantees
+Determinism is a hard requirement for debugging and for Dedicated/Private customers.
+
+h3. 10.1 Deterministic selection definition
+Given the same:
+- model_id + model_revision
+- request-derived features (prefill_tokens_est, decode_tokens_est) and scheduler hints (if enabled)
+- normalized hardware identity (gpu_sku_norm, driver_norm, cuda_norm)
+- selector_config (including allow/deny lists)
+
+…the selector must return the same selection result.
+
+h3. 10.2 Guardrails to enforce determinism
+- Feature extraction must be pure (no time-based or random inputs).
+- Candidate ordering must be stable and not depend on hash-map iteration.
+- All config inputs used for selection must be captured in selector_config_hash.
+- If scheduler hints are used, the hint must be a stable, serialized snapshot value (not a moving pointer).
+
+h3. 10.3 Replay
+We define a “selection replay record” that can be captured (sampled) and replayed locally:
+- feature vector
+- kernel registry snapshot version
+- selector_config_hash
+- resulting kernel IDs
+
+h2. 11) Observability and Telemetry
+h3. 11.1 Required per-request fields (sampled)
+- selector_version (e.g., "v2")
+- selection_config_hash
+- model_id, model_family
+- gpu_sku_norm, driver_norm, cuda_norm
+- seq_bucket, workload_mode
+- selected_attention_kernel_id
+- fallback_reason (if any)
+
+h3. 11.2 Optional fields (more aggressively sampled)
+- candidate_kernel_ids
+- candidate_filter_reasons (top-N)
+- selection_latency_us (selector evaluation overhead)
+
+h3. 11.3 Sampling and overhead
+- Default sampling: 0.1% per route/model, with ability to increase temporarily during canary/debug.
+- Hard cap: do not exceed 1% by default in Hosted; Dedicated/Private adjustable via config.
+- Selector evaluation time budget: p50 < 50µs, p99 < 200µs on control path (excludes registry load).
+
+h2. 12) Configuration, Feature Gates, and Overrides
+h3. 12.1 Feature gate
+- Flag: runtime.kernel_selector.v2.enabled
+- Scope: {global, region, pool, model}
+- Evaluation order: model override > pool > region > global
+
+h3. 12.2 Allowlist / denylist
+- Allowlist: enable v2 only for specified model families/models during rollout.
+- Denylist: block specific (kernel_id, gpu_sku_norm, driver_norm, model_id) combinations.
+- Hot reload: supported with bounded propagation time (target < 2 minutes) and explicit audit log.
+
+h3. 12.3 Manual pinning (debug/emergency)
+- CLI/runtime flag: --force_attention_kernel=<kernel_id>
+- CLI/runtime flag: --dump_kernel_selection
+Pinning must:
+- bypass the selector for the pinned op
+- still validate hard constraints (fail fast if truly incompatible)
+
+h2. 13) Performance / Correctness Validation Plan (Design-level)
+See benchmark matrix page for full coverage. At a design level, v2 requires:
+- Microbench: selector overhead and kernel switch overhead bounds
+- Macrobench: end-to-end p95/p99 latency and throughput across:
+  - model families: Llama/Mistral/Qwen/Gemma
+  - seq buckets: S/M/L/XL with mixed distributions
+  - GPU SKUs: A100/H100/L40S (+ common variants)
+
+Pass/fail gates (initial, subject to SRE review):
+- No correctness regressions (golden output + KV cache invariants)
+- Error rate not worse than v1 (p99 + absolute threshold)
+- p99 latency regression budget: <= 1% overall; any per-bucket regression > 3% requires explicit signoff + denylist or rule adjustment
+
+h2. 14) Risks and Mitigations
+- *Risk: long-context misclassification leads to tail spikes.*
+  - Mitigation: conservative thresholds; XL bucket forced safe kernels; add explicit longctx guardrail; canary focused on long-context routes.
+
+- *Risk: GPU SKU normalization misses a variant (e.g., cloud naming mismatch).*
+  - Mitigation: normalization unit tests with known SKU strings; log raw GPU name in debug traces; default to safe kernels on unknown SKU.
+
+- *Risk: telemetry cardinality blow-up.*
+  - Mitigation: stable normalized GPU strings; sample candidate lists; limit tag dimensions; review with Observability team.
+
+- *Risk: nondeterminism due to scheduler hints.*
+  - Mitigation: treat hints as optional; require snapshot serialization; fallback to request-derived estimates.
+
+h2. 15) Open Questions
+1) *Seq bucket thresholds:* Are the S/M/L/XL thresholds appropriate across our customer mix, especially for summarization and RAG workloads?
+2) *Mixed workload handling:* Should we bias selection toward prefill-heavy safety when scheduler hints indicate a long-tail of XL prompts?
+3) *MIG support policy:* Do we treat MIG as a first-class sku_sublabel in all environments or disallow v2 by default on MIG until coverage improves?
+4) *Driver/CUDA blocks:* What is the minimal safe set of driver_norm blocks at launch (avoid overblocking and losing perf gains)?
+5) *Registry ownership and update cadence:* Who owns the steady-state updates of kernel preference ordering (Kernels vs Perf/Evals vs Release Eng), and how do we gate changes?
+6) *Cache key stability:* Are we comfortable with caching decisions by (seq_bucket) only, or do we need additional bucketing by decode_tokens_est for certain kernels?
+
+h2. 16) Appendix: Pseudocode (selector)
+{code}
+function select_kernels_v2(request, model, hw, scheduler_hint, config):
+  feats = extract_features(request, model, hw, scheduler_hint)
+  cfg_hash = hash(config.selector_rules, config.allowlist, config.denylist)
+
+  candidates = registry.get_candidates(
+      model_family=feats.model_family,
+      gpu_sku=feats.gpu_sku_norm,
+      seq_bucket=feats.seq_bucket)
+
+  candidates = apply_denylist(candidates, feats, config.denylist)
+
+  for k in candidates.attention:
+    if supports(k, feats) and passes_gates(k, config):
+      selected = k
+      reason = "NONE"
+      break
+
+  if selected is null:
+    selected = registry.get_baseline_attention()
+    reason = "FALLBACK_BASELINE"
+
+  emit_telemetry_sampled(feats, selected, candidates, reason, cfg_hash)
+  return selected
+{code}
+
+h2. 17) Changelog
+- 2026-01-14: Initial draft (Yuki Sato)
+- 2026-02-03: Added explicit determinism + replay requirements (Noah Patel review)
+- 2026-02-12: Added SKU normalization rules + MIG notes (Isabella Rossi input)
+- 2026-02-21: Updated fallback reason taxonomy + telemetry sampling guidance (Omar El-Sayed, Allison Grant)

@@ -1,0 +1,167 @@
+Burst Hedging Credit Orchestrator and Terraform Adapter
+
+Summary
+-------
+This document describes the design, Terraform adapter, operational controls, and runbook for the Burst Hedging Credit Orchestrator (BHCO): an infrastructure service that smooths short-term tenant egress and GPU burst demand by assigning time-limited credits, applying hedging policies, and exposing a Terraform-adaptable interface for account-level constraints. BHCO reduces allocation oscillation, prevents noisy-burst tenant impact, and enables predictable cost accounting for multi-tenant GPU/egress bursting.
+
+Context and motivation
+----------------------
+- Problem: sudden tenant spikes (CI runs, eval floods, traffic surges) cause immediate allocation of burst capacity and egress which results in higher unit costs, noisy-neighbor SLO violations, and frequent preemptions.
+- Goal: provide a centralized hedging layer that creates short-lived, revocable credits for burst requests and enforces policy (rate, ceiling, attenuation) without blocking normal steady-state provisioning.
+- Non-goals: replacing quota system for long-term budgeting, handling legal billing disputes, or serving as a replacement for tenant-level rate limiting in application logic.
+
+Design overview
+---------------
+1) Components
+   - BHCO control-plane service ("burst-orchestrator") — central policy engine with a small state store (tenant ledgers).
+   - Tenant-side shim (sidecar or shared agent) — exchanges tokenized credit requests with orchestrator and applies local fallback.
+   - tf-module-burst-adapter (Terraform module) — binds tenant account metadata, SLAs, and guardrails into BHCO policies during onboarding.
+   - Metrics bridge and billing exporter — emits per-tenant credit_alloc, credit_used, credit_revoke, and hedging_ratio metrics.
+
+2) Key behavior
+   - Credits are issued as short-lived tokens (TTL default 300s) tied to a burst window id.
+   - Policy inputs: tenant tier, historical burst rate, last-24h expenditure, preemption tolerance, region affinity.
+   - Hedging policy: attenuation factor a in [0.0,1.0] applied to requested burst size; BHCO will try to satisfy a*requested up to a soft ceiling.
+   - Safety nets: global emergency cap, per-tenant dry-run mode, grace-credit pool for customer success escalations.
+
+SLOs and observability
+----------------------
+- SLO for policy decision latency: 95th percentile BHCO RPC decision < 250ms.
+- Credit issuance success rate: >= 99.5% (non-revoked during TTL) under normal load.
+- Alerting thresholds: credit_revoke rate > 1% in 5m, hedging_ratio < 0.4 for >10% of tenants in 10m.
+- Dashboards: per-account credits issued/consumed, eviction/revoke counts, allocator saturation heatmap, average decision latency.
+
+Terraform module API (tf-module-burst-adapter)
+---------------------------------------------
+The Terraform module below is a simplified example showing recommended inputs and outputs. The module wraps RBAC bindings, account labels, and policy attachments so environment teams can opt-in safely.
+
+Example usage (HCL):
+
+module "burst_adapter_myproduct" {
+  source = "git::git@github.com:redwood-infra/bhco-terraform-modules.git//burst-adapter"
+
+  account_id             = "acct-myproduct-42"
+  tenant_tier            = "standard"
+  burst_ceiling_mb       = 10240            # tenancy-wide egress ceiling for burst windows (MB)
+  burst_window_seconds   = 300              # default TTL for issued credits
+  attenuation_target     = 0.6              # default hedging attenuation factor
+  allow_grace_credit     = true            # enable grace pool for critical customers
+  region_affinity        = ["us-west-2"]
+
+  tags = {
+    team = "myproduct-platform"
+    owner = "team-myproduct@redwood.ai"
+  }
+}
+
+Module outputs:
+- policy_id (string) — identifier attached to tenant in BHCO.
+- tf_resource_record (string) — cloud provider binding reference for auditing.
+
+Terraform design notes
+----------------------
+- Module should be used only in the account owner terraform workspace. It creates an "attachment" resource via BHCO API (POST /policies) and stores the policy_id in remote state.
+- The module includes lifecycle prevent_destroy = true for policy resources when labels indicate production.
+- We recommend running a nightly drift-checker that reconciles policy_id bindings across accounts and reports unbound resources.
+
+CI/CD and promotion flow for policy changes
+------------------------------------------
+1) Author submits Terraform change to repository with the module usage. Include policy intent in PR description (why attenuation changed, risk assessment).
+2) CI runs static plan checks and policy-linting: ensure attenuation in [0.2,0.9], ceiling limits consistent with billing tier.
+3) Stage apply to sandbox account which has a simulated BHCO backed by chaos harness. Verify emitted metrics and non-blocking behavior.
+4) Canary rollout: apply to a single low-impact production tenant with 6-hour monitoring window.
+5) Full rollout: two-step apply (business hours), with oncall alerted and auto-rollback job available for 30 minutes post-apply.
+
+Preflight checks (automated):
+- Plan must include change justification tag.
+- New attenuation must not decrease by >0.25 without manual review.
+- CI must validate a realtime telemetry snapshot after apply in sandbox.
+
+Operational runbook (quick reference)
+------------------------------------
+Severity levels assume multi-tenant impact.
+
+1) High (S1): BHCO control plane outage or decision latency > 1s causing mass failsafe allocations
+   - Step 1: Acknowledge in PagerDuty channel "infra-bhco" and post to #oncall-status.
+   - Step 2: Run emergency circuit: curl -X POST https://internal-bhco/api/v1/emergency-capacity/enable -d '{"reason":"control-plane-failure"}' -H "Authorization: Bearer $SRE_TOKEN"
+   - Step 3: Toggle global hedging to dry-run mode: gcloud secrets versions access latest --secret="bhco-toggle" | jq '.policy = "dry-run"' | bhcoctl apply -f -
+   - Step 4: If latency persists > 10 minutes, fail open the local shim by applying the config: kubectl -n inference patch configmap burst-shim --patch '{"data":{"hedge_mode":"open"}}'
+   - Postmortem: label incident with tags bhco, outage, must-review-quorum.
+
+2) Medium (S2): Increased credit_revoke rate or hedging_ratio anomalies
+   - Step 1: Check metrics dashboard and correlate with deploy window.
+   - Step 2: Identify tenants with spike: query billing_exporter: sum by (tenant_id) (increase(credit_revoke[5m]))
+   - Step 3: For top-affected tenant, set temporary override: bhcoctl tenant override set --tenant $TENANT --attenuation 0.8 --ttl 600
+   - Step 4: Notify CS/AE if customer visible impact.
+
+3) Low (S3): Single-tenant drift between Terraform state and BHCO binding
+   - Step 1: Run: bhco-reconcile --tenant $TENANT --expected-policy $POLICY_ID
+   - Step 2: If reconciliation fails, create a plan to re-attach via TF workspace and request manual apply.
+
+Troubleshooting checklist
+-------------------------
+- BHCO decision latency troubleshooting: check kafka backlog (topic: bhco-decisions), redis replication lag, and pod-level CPU pinned queues.
+- Unexpected revocations: check for global emergency cap or a sudden global scale-down event (look at cloud-allocator metrics).
+- Billing anomalies: cross-check credit_used with billing_exporter and meter samples from edge-proxy.
+
+Safety and rollbacks
+--------------------
+- Critical policy parameters guarded by a five-person approval for production attenuation changes > 0.25 and ceilings > $10k/month estimated.
+- Automatic safety rollback: CI job monitors post-apply signals for 30 minutes and will revert Terraform apply if any SLO breaches.
+
+Migration plan for legacy policies
+----------------------------------
+- Phase 1: Inventory existing burst controls via inventory-exporter and tag candidates for BHCO onboarding.
+- Phase 2: Create parallel policies in BHCO in dry-run mode and collect telemetry for 72h.
+- Phase 3: Gradual cutover: enable enforcement on 1% -> 10% -> 50% -> 100% windows with rollback gates.
+
+Ownership, contacts and escalation path
+-------------------------------------
+- Service owner: Elena Park (infra/allocator team) — elena.park@redwood.ai
+- Primary oncall: allocator-sre rotation (see /confluence/eng-sre/slo-and-error-budgets)
+- Tier-2 engineering: Marcus Liu, Priya Natarajan
+- CS escalation: customer-success-platform@redwood.ai
+
+Appendix: example bhcoctl and API snippets
+-----------------------------------------
+# Issue a credit (curl example)
+curl -s -X POST https://internal-bhco/api/v1/credits 
+  -H "Authorization: Bearer $TF_SERVICE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id":"acct-myproduct-42","requested_mb":5120,"region":"us-west-2","purpose":"ci-burst"}'
+
+# Sample module output (JSON)
+{
+  "policy_id": "p-0a1b2c3d",
+  "tf_resource_record": "arn:aws:iam::123456789:role/bhco-attacher"
+}
+
+# Recommended HCL lint rules (examples)
+- attenuation_target must be a float between 0.2 and 0.9.
+- burst_ceiling_mb must be <= tenant_planned_ceiling_mb (enforced by a pre-apply check).
+
+Frequently asked questions
+--------------------------
+Q: Will BHCO change billing semantics?
+A: BHCO emits billing_exporter metrics that are ingested into the billing pipeline. It does not change metering but provides more granular attribution for short-term credits.
+
+Q: Can I bypass BHCO for critical workloads?
+A: You can request grace credits for vetted customers. Bypass requires manual approval and will be flagged in billing and audit logs.
+
+Q: What happens during cross-region failover?
+A: BHCO policies include region_affinity and will prefer local credits; if region is down, it will attempt cross-region allocations subject to increased attenuation.
+
+Related artifacts
+-----------------
+- Git repo: git@github.com:redwood-infra/bhco.git (service)
+- TF modules: git@github.com:redwood-infra/bhco-terraform-modules.git//burst-adapter
+- Monitoring dashboards: infra/bhco/credits-overview (Grafana)
+- Billing exporter docs: infra/metrics/billing-exporter.md
+
+Change log
+----------
+- 2024-02-14: Initial design and prototype TF module (Elena Park).
+- 2024-09-03: Added attenuation guards and CI preflight rules (Marcus Liu).
+- 2025-11-07: Formalized runbook and added emergency circuit examples; updated SLOs (Elena Park).
+
+End of document

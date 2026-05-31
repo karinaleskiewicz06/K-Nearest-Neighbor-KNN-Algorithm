@@ -1,0 +1,366 @@
+Runbook: KMS decrypt / envelope decryption failures
+
+## Purpose
+This runbook helps on-call engineers diagnose and mitigate **KMS decrypt / envelope decryption failures** affecting Redwood Hosted, Dedicated, and Private deployments. It covers:
+- Symptoms and impact assessment
+- Dashboards/metrics to consult
+- Log and trace queries
+- Common root causes (permissions, throttling, timeouts, wrong key ID, rotation/cutover issues)
+- Mitigation steps and safe rollbacks
+- Escalation and communications
+
+This runbook assumes we use the standardized KMS wrapper and error taxonomy (see ADR-007).
+
+---
+
+## Scope & definitions
+**Envelope encryption (simplified):**
+- A data encryption key (DEK) encrypts payloads at rest/in storage.
+- The DEK is encrypted (wrapped) by a key encryption key (KEK) in a cloud KMS/HSM.
+- At read time, services call KMS to decrypt/unwrap the DEK, then decrypt the payload.
+
+**What counts as a KMS decrypt failure incident:**
+- Any sustained increase in failures for KMS operations: `Decrypt`, `UnwrapKey`, `GenerateDataKey`, or equivalent provider APIs.
+- Any change causing **new writes to become unreadable** (cryptographic mismatch) or widespread request failures due to KMS dependency health.
+
+**Primary affected components (typical):**
+- Control plane: secrets/config decrypt, credential hydration, rotation state reads
+- Data plane: decrypting tenant secrets, per-request credential unwrap, cache warmups
+- Private installer/operator flows: preflight KMS validations
+
+---
+
+## Impact: what users see
+Common external symptoms:
+- Elevated 5xx from API/gateway (especially during auth/config fetch)
+- Model requests failing early before inference begins
+- Private operators reporting decrypt errors when bringing up the control plane or scaling
+
+Common internal symptoms:
+- Spike in `error_category=AccessDenied|Throttling|Timeout|InvalidCiphertext|NotFound`
+- KMS circuit breaker opening (reduced KMS call volume but elevated failures)
+
+Severity guide (use judgment):
+- **SEV-1:** Broad production impact in a major region or large customers; read-path failures for many tenants; sustained >5 minutes.
+- **SEV-2:** Degraded but mitigatable via traffic shifting/fallback; or isolated to one service / smaller region.
+- **SEV-3:** Single customer / single Private deployment with actionable misconfig.
+
+---
+
+## Immediate actions (first 5 minutes)
+1) **Confirm scope:** Hosted vs Dedicated vs a single Private customer.
+2) **Check if this is a platform-wide KMS issue:** look for a correlated spike across services/regions.
+3) **Stabilize before deep debugging:** if error rate is high and rising, prioritize mitigations that reduce blast radius (traffic shift, backpressure, circuit breaker mode).
+4) **Start an incident channel** if SEV-1/2 and assign roles (IC, Comms, Scribe).
+
+---
+
+## Dashboards & alerts
+Primary dashboards (Observability Pack):
+- **KMS Dependency Health**: latency and errors by `service`, `env`, `region`, `operation`, `provider`.
+- **KMS Circuit Breaker**: open/half-open/closed state; rejects by service.
+- **API Request Failures**: 5xx by route and upstream dependency (KMS tagged).
+
+Key metrics (standardized):
+- `redwood.kms.requests_total{service,env,region,operation,provider}`
+- `redwood.kms.errors_total{service,env,region,operation,error_category,provider}`
+- `redwood.kms.latency_ms{service,env,region,operation,provider}` (histogram)
+- `redwood.kms.retry_attempts_total{service,env,region,operation}`
+- `redwood.kms.circuit_breaker_state{service,env,region}` (0=closed, 1=half-open, 2=open)
+
+Alert interpretation (common):
+- **High error rate:** `errors_total / requests_total` > 1% for 5m (page)
+- **Timeout spike:** p95 `latency_ms` > 250ms for 10m (ticket/page depending on env)
+- **CB open:** circuit breaker opens for >2 minutes in prod (page if affecting read-path)
+
+---
+
+## Triage workflow
+### Step 1: Identify failing operation and error category
+From the KMS dashboard, capture:
+- `operation`: Decrypt vs GenerateDataKey vs DescribeKey, etc.
+- `error_category`: AccessDenied, NotFound, Throttling, Timeout, InvalidCiphertext, ProviderUnavailable, Unknown
+- Affected `service` and `region`
+
+Notes:
+- **Decrypt failures** break reads and often cause immediate 5xx.
+- **GenerateDataKey failures** often break writes/rotations and may have delayed customer impact.
+
+### Step 2: Determine if it’s a provider outage vs configuration/regression
+Signals pointing to provider degradation:
+- Many services affected simultaneously in one region
+- High timeouts/throttling without code deploys
+- Cloud status page indicates KMS issues
+
+Signals pointing to config/regression:
+- One service (or one new deploy) shows elevated errors
+- Errors are AccessDenied/NotFound/InvalidCiphertext and correlate with a config change or rotation cutover
+
+### Step 3: Check recent changes
+Look for:
+- Recent deploys touching KMS wrapper, retry budgets, caching, or rotation flags
+- Terraform/IAM policy changes (runtime role vs rotation role separation)
+- Key rotation cutover toggles / dual-read window changes
+
+If you suspect a recent change is causal, prep rollback while continuing triage.
+
+---
+
+## Log queries (structured logs)
+All KMS wrapper logs should include fields:
+- `kms.operation`, `kms.key_id` (redacted/normalized), `kms.provider`
+- `error_category`, `error_code`, `http_status`
+- `retry_attempt`, `timeout_ms`, `request_id` (provider request ID when available)
+- `trace_id`, `span_id`
+
+### Example queries (adjust to your log platform)
+**1) Top error categories in the last 15m**
+- Filter: `message:"KMS request failed" env:prod`
+- Group by: `service, region, kms.operation, error_category`
+
+**2) AccessDenied errors (often IAM/principal issues)**
+- Filter: `error_category:AccessDenied env:prod`
+- Show fields: `service, region, principal, kms.key_id, error_code`
+
+**3) InvalidCiphertext (often key mismatch / wrong key version / bad ciphertext)**
+- Filter: `error_category:InvalidCiphertext env:prod`
+- Correlate with: rotation cutover events and deploy time
+
+**4) Throttling / rate exceeded**
+- Filter: `error_category:Throttling env:prod`
+- Check: `retry_attempt` distribution and request volume by service
+
+**5) Timeouts**
+- Filter: `error_category:Timeout env:prod`
+- Check: `timeout_ms` and `latency_ms` (did we hit our client cap?)
+
+---
+
+## Trace queries (distributed tracing)
+Look for spans named (convention):
+- `kms.decrypt`, `kms.generate_data_key`, `kms.describe_key`
+
+Useful breakdowns:
+- p95 span duration by `service` and `region`
+- error rate by `error_category`
+- dependency map: which endpoints are blocked on KMS
+
+Tip: If the circuit breaker is open, traces may show short-circuit errors with minimal latency; this is expected and helps protect upstream.
+
+---
+
+## Common root causes & mitigations
+### A) AccessDenied (IAM / permissions / wrong principal)
+**Symptoms**
+- `error_category=AccessDenied` spikes for one service or one Private customer.
+- Often follows IAM/role change, new key ARN, or cross-account setup.
+
+**Likely causes**
+- Runtime principal missing `kms:Decrypt` on key
+- Key policy does not trust the role
+- Wrong account/region key ARN configured
+- Private deployment: installer validated key exists, but runtime role differs from installer role
+
+**Mitigation**
+1) Confirm which principal is failing (log field `principal` or service identity).
+2) Validate key ARN/ID configured for the service/environment.
+3) For Hosted/Dedicated: coordinate with **Eng-Infra** to confirm IAM policy attachment and key policy.
+4) For Private: use the operator guide “Permissions matrix” and re-run preflight if available.
+5) If immediate recovery needed and allowed:
+   - **Temporary fallback** (if configured) to read-only mode for affected paths, or shift traffic away from the failing service/region.
+
+**Do not**
+- Do not broaden IAM policies permanently to `kms:*` or `Resource:*` to “fix quickly”. Use break-glass only with explicit approval and time-bound expiry.
+
+**Escalate**
+- Security Engineering (for key policy / compliance implications): Marcus Lin or on-call Security.
+- Infra (for IAM module/role attachments): Jordan Lee / Bruno Silva.
+
+---
+
+### B) NotFound / wrong key ID / key disabled or pending deletion
+**Symptoms**
+- `error_category=NotFound` or provider error like `NotFoundException`, `InvalidArn`, `KeyNotFound`.
+- Typically isolated to a deployment/region or recent config change.
+
+**Likely causes**
+- Config points to wrong key ID/ARN (typo, wrong region)
+- Key disabled, scheduled for deletion, or missing alias
+- Cross-region replication assumption incorrect
+
+**Mitigation**
+1) Verify configured key identifier in the affected service config.
+2) Check whether key is enabled and in the expected region/account.
+3) Roll back the config change if it coincides with the incident.
+4) For Private: instruct customer/operator to validate key existence and enablement; re-run installer preflight report.
+
+**Escalate**
+- Platform Control Plane (config and policy): Ethan Park / Benji Okafor.
+- Private Deployments for customer ops: Vivek Kulkarni.
+
+---
+
+### C) Throttling (rate limiting) / quota exhaustion
+**Symptoms**
+- `error_category=Throttling` increases; latency may climb due to retries.
+- Often correlated with load spikes, retry storms, or reduced caching effectiveness.
+
+**Likely causes**
+- Increased call volume (new feature path calling KMS per request)
+- Retry amplification during partial KMS degradation
+- Prefix/KV/material cache disabled or too aggressive TTL invalidation
+- Provider account quota insufficient for peak traffic
+
+**Mitigation (in order)**
+1) **Confirm if KMS circuit breaker is functioning** (it should prevent storms).
+2) Reduce KMS load:
+   - Shift traffic away from the affected region (if multi-region active).
+   - Enable/raise backpressure limits (service-specific) to stop request pileups.
+   - Ensure batching/caching is enabled where intended (do not extend caching beyond allowed boundaries; see ADR-007).
+3) Reduce retries:
+   - Lower retry budget or enable “fail fast” mode if user-visible impact is preferable to cascading failures.
+4) Engage infra to confirm KMS quotas and request a temporary increase if needed.
+
+**Verification**
+- Throttling errors fall within 10–15 minutes.
+- Overall 5xx decreases; p95 latency returns to baseline.
+
+---
+
+### D) Timeouts / provider outage / network path issues
+**Symptoms**
+- `error_category=Timeout` across multiple services in a region.
+- p95/p99 `redwood.kms.latency_ms` elevated.
+
+**Likely causes**
+- Cloud KMS service incident
+- Regional networking degradation between compute and KMS endpoint
+- Client timeout set too low for current conditions (less common; verify against guardrails)
+
+**Mitigation**
+1) Check cloud provider status and internal networking dashboards.
+2) **Traffic shift** to a healthy region if supported and data residency allows.
+3) Confirm circuit breaker opens as designed (avoid retry storms).
+4) If the incident is provider-driven and prolonged:
+   - Declare incident and communicate expected behavior (degraded mode / partial unavailability).
+   - Prioritize customer comms and workarounds (e.g., pause non-critical jobs that call KMS heavily).
+
+**Escalate**
+- SRE lead (IC support): Sean Gallagher / Rafael Mendes
+- Platform networking if suspected: SRE to page Infra as needed
+
+---
+
+### E) InvalidCiphertext / key material mismatch (rotation/cutover issues)
+**Symptoms**
+- `error_category=InvalidCiphertext` appears after rotation/cutover or config change.
+- Often concentrated on reads of older data or in one environment.
+
+**Likely causes**
+- Cutover toggled without dual-read window (or dual-read misconfigured)
+- Wrong key version referenced for decrypt
+- Cache contains stale key metadata/material boundaries (should be bounded; see recent caching semantics changes)
+
+**Mitigation (treat as high risk)**
+1) **Stop the bleeding:**
+   - Pause further cutover actions.
+   - If a recent change introduced this, roll back immediately.
+2) Ensure **dual-read/dual-decrypt window** is enabled where supported (ADR-008):
+   - Temporarily allow decrypt with both old and new key versions.
+3) Flush/refresh affected caches if explicitly safe and supported.
+4) Validate with a known-good ciphertext sample (from staging/prod canary tooling) before resuming cutover.
+
+**Escalate immediately**
+- Security Engineering (cryptographic correctness): Marcus Lin / Hanae Suzuki
+- Control plane owners (rotation flags/state): Ethan Park
+
+---
+
+## Degraded mode guidance (availability vs strictness)
+When KMS is failing, we prioritize preventing cascading outages while preserving security guarantees.
+
+Allowed degraded behaviors (depending on service/path):
+- Fail fast on decrypt for non-critical background jobs (avoid backlog)
+- Rate-limit or shed load on endpoints that would otherwise retry
+- Use circuit breaker to short-circuit repeated KMS attempts
+
+Not allowed:
+- Bypassing encryption/decryption checks
+- Persisting plaintext secrets or logging sensitive material
+- Extending cache lifetimes beyond the boundaries defined in the key management standard
+
+If uncertain, page Security Engineering.
+
+---
+
+## Private deployments: operator/customer coordination
+If the issue is isolated to a Private customer:
+1) Request the **installer preflight validation report** (latest run).
+2) Ask for:
+   - Key ARN/ID (redacted as needed), region, and cloud account/project
+   - The runtime principal identity (role/service account)
+   - Exact error message with `error_category` and provider request ID
+3) Use the troubleshooting matrix in the Private operator guide:
+   - AccessDenied: policy/key policy mismatch
+   - NotFound: wrong region/key ID
+   - Timeout: VPC endpoints / routing / DNS
+
+Support handoff:
+- If an active customer ticket exists, link the incident channel to Support and ensure we capture final remediation steps.
+
+---
+
+## Escalation matrix
+Page/notify based on suspected root cause:
+- **SRE (incident leadership + mitigations):** on-call SRE; Sean Gallagher (readiness)
+- **Security Engineering (permissions, key policy, rotation correctness):** Marcus Lin / Hanae Suzuki
+- **Platform Control Plane (flags/config/rotation state):** Ethan Park / Benji Okafor
+- **Infra/IAM/Terraform modules:** Jordan Lee / Bruno Silva
+- **Private Deployments (customer ops + installer behavior):** Vivek Kulkarni
+- **Observability standards / dashboard issues:** Allison Grant / Nadia Rahman
+
+If SEV-1: engage exec sponsor per on-call policy.
+
+---
+
+## Communication guidelines
+- Include in the incident channel:
+  - Impacted regions/services
+  - Error category breakdown and leading hypothesis
+  - Mitigations applied (traffic shift, config rollback, CB state)
+  - Next update time
+- If customer-facing impact:
+  - Coordinate with Support/CS for customer messaging
+  - Avoid sharing sensitive identifiers (full key ARNs, ciphertext samples)
+
+---
+
+## Verification & recovery checklist
+Before closing:
+- KMS error rate back to baseline (or below alert threshold) for at least 30 minutes
+- Circuit breaker state returns to stable closed (or expected behavior documented)
+- No ongoing customer tickets or recurring errors in logs
+- If rotation-related: dual-read window and cutover flags in a safe state; confirm rollback/cutover recorded in audit logs
+
+---
+
+## Post-incident follow-ups (within 2 business days)
+- File/attach:
+  - Timeline, metrics screenshots, and the final root cause
+  - Links to relevant PRs/config diffs and audit log events (rotation toggles)
+- If retry/throttle amplification occurred:
+  - Create a task to adjust retry budgets/guardrails and add a regression test
+- If a new failure mode was discovered:
+  - Update the failure-mode test matrix and add coverage in CI/staging
+
+---
+
+## Appendix: quick mapping from provider errors to our taxonomy
+- AccessDenied / Unauthorized -> `error_category=AccessDenied`
+- ResourceNotFound / NotFound / InvalidArn -> `error_category=NotFound`
+- ThrottlingException / RateExceeded -> `error_category=Throttling`
+- DeadlineExceeded / context deadline / socket timeout -> `error_category=Timeout`
+- InvalidCiphertext / BadDecrypt -> `error_category=InvalidCiphertext`
+- ServiceUnavailable -> `error_category=ProviderUnavailable`
+
+If logs show `error_category=Unknown` for a common provider error, file an issue for wrapper mapping updates (see ENG-4822).

@@ -1,0 +1,183 @@
+GPU fleet incident simulation templates and telemetry-capture playbook
+
+Overview
+
+This page collects a set of reproducible incident-simulation templates and the minimal telemetry-capture contract we require when running GPU-fleet/egress/kv-cache incident simulations. It is intended for infra oncall, SRE, and any engineer running chaos or preflight tests against GPU pools. The goal is to make simulations fast to stand up, consistently instrumented, and easily analyzable so that results can be compared across releases and Terraform/IaC changes.
+
+Scope
+
+- Applies to: GPU fleet (hosted and dedicated), tenant egress and NAT fabric, distributed KV cache, and autoscaler/operator components.
+- Not in scope: customer private deployments (use private-deployments/offline-sim template).
+
+Goals
+
+1. Provide templates to simulate common production incidents (preemptive drains, sudden egress saturation, KV-cache loss, kernel regression) with clear inputs and expected outputs.
+2. Define a telemetry-capture contract (metrics, traces, logs) so all runs are comparable.
+3. Describe CI/CICD integration patterns and a Terraform-driven harness to provision ephemeral simulation environments.
+
+Quick summary of recommended SLOs to validate during sims
+
+| Component | Primary SLO | Acceptable degradation window | Alert threshold during sim |
+|---|---:|---:|---:|
+| Inference endpoint (p99 latency) | < 150 ms | 5m | >250ms sustained 3m |
+| Token throughput (per-tenant) | >= 85% baseline | 10m | <60% baseline 2m |
+| KV cache hit-rate | > 90% | 10m | <70% 2m |
+| Egress packet loss (path) | < 0.1% | 2m | > 0.5% 1m |
+
+Roles & ownership
+
+- Simulation owner: person who schedules the run, responsible for safety and postmortem.
+- Telemetry owner: observability engineer who ensures dashboards and retention.
+- IaC owner: terraform module author who provides the ephemeral environment configuration.
+- Oncall: production oncall notified before high-risk sim.
+
+Required approvals for high-risk runs
+
+1. Notify production oncall and SRE lead at least 48 hours in advance.
+2. Obtain sign-off from the IaC owner and telemetry owner.
+3. Run low-risk dry-run in a shadow tenancy at least 24 hours prior.
+
+Telemetry-capture contract (minimal required streams)
+
+Collect the following artifacts for every run and upload them to the run bucket (s3://redwood-sim-runs/<run-id>/):
+
+- Raw Prometheus metric snapshot (prometheus/metrics-<run-id>.prom).
+- Tracing spans (jaeger/trace-<run-id>.json or otlp).
+- Aggregated pod-level logs (logs/pods-<run-id>.ndjson).
+- Autoscaler decisions and events (autoscaler/events-<run-id>.json).
+- Terraform plan and applied state (iac/plan-<run-id>.txt, iac/state-<run-id>.tfstate).
+- A 1–2 page executive summary (meta/summary-<run-id>.md).
+
+Minimum metrics to scrape (PromQL-friendly names)
+
+- inference_request_duration_seconds_bucket{service="inference"}
+- inference_tokens_generated_total{model,tenant}
+- kv_cache_hit_total{shard} and kv_cache_miss_total{shard}
+- tenant_egress_bytes_total{tenant,region} and egress_packet_loss_ratio{path}
+- kube_pod_container_status_ready and kube_pod_container_resource_requests_cpu_cores
+- autoscaler_decision_count_total and autoscaler_scaled_replicas
+
+Example PromQL snippets to include in post-run report
+
+- p99 latency: histogram_quantile(0.99, sum(rate(inference_request_duration_seconds_bucket[5m])) by (le))
+- token throughput per tenant: sum(rate(inference_tokens_generated_total[1m])) by (tenant)
+- kv cache hit rate: sum(rate(kv_cache_hit_total[5m])) / (sum(rate(kv_cache_hit_total[5m])) + sum(rate(kv_cache_miss_total[5m])))
+
+Simulation scenario templates
+
+1) Preemptive warm-pool drain
+- Objective: validate eviction/backfill behavior and cold-start latency impact.
+- Inputs: drain N nodes in warm pool (N configurable), staggered 30s between drains.
+- Expected checks: backfill latency < 60s for replacement nodes; p99 latency degradation <= 2x for <=5m.
+
+2) Tenant egress saturation
+- Objective: exercise egress shaping and NAT gateway failover.
+- Inputs: synthetic tenant load that increases egress by 10x for 10m, introduce 20% packet loss on primary path.
+- Expected checks: graceful fallover to secondary path within 90s; no silent request loss.
+
+3) KV cache fragmentation and partial loss
+- Objective: test KV reconstruction and consistency under pod restarts and partial disk failure.
+- Inputs: restart 30% of KV pods in one shard, inject disk read errors for 2 minutes.
+- Expected checks: cache warmup completes within target window; no request-level 5xx spike beyond configured tolerance.
+
+4) Quantized kernel regression (perf test)
+- Objective: detect latency regressions introduced by new kernel builds.
+- Inputs: deploy candidate kernel to a canary subset (10% of pool) and route 25% of cross-region traffic to canary.
+- Expected checks: reject if canary p99 > baseline p99 + 20ms for 10m.
+
+Runbook: staging a simulation (Terraform + CI integration)
+
+1. Create a run ticket with a unique run-id: sim-<owner>-<yyyymmdd>-<short>. Example: sim-ava-20260201-egress-01.
+2. Clone the simulation IaC repo and update variables:
+
+```hcl
+module "sim_env" {
+  source = "git::ssh://git@repo/internal-sim-iac.git//modules/gpu-sim?ref=main"
+  cluster_name = "sim-${var.run_id}"
+  region = "us-west-2"
+  gpu_pool_size = 8
+  tenant_profiles = ["synthetic-heavy-egress"]
+}
+```
+
+3. terraform plan -var "run_id=${RUN_ID}" -out plan.tfplan && terraform apply plan.tfplan
+4. Wait for telemetry pipeline to confirm metrics ingestion (watch /api/sim/ingest-status/<run-id>).
+5. Execute the scenario driver (kubectl job apply -f <driver-yaml>) or invoke the chaos CLI: `chaosctl run --scenario egress-surge --run-id <run-id> --duration 10m`.
+6. During the run, capture a continuous Prometheus scrape and traces. If anything violates the safety gate (see below), abort using the kill-switch documented in the next section.
+
+Safety gates and automated aborts
+
+- If production oncall reports impact within the region, abort immediately.
+- Instrumented automatic abort if primary production API p99 increases by > 50% and token throughput drops by > 40% outside the sim tenancy.
+- Automated kill-switch: `chaosctl abort --run-id <run-id>` will trigger graceful teardown and create a preservation snapshot of stateful components.
+
+Example kill-switch command
+
+```bash
+# abort and snapshot state
+chaosctl abort --run-id sim-ava-20260201-egress-01 --snapshot
+```
+
+Post-run analysis checklist (deliverables)
+
+- Upload artifacts to s3://redwood-sim-runs/<run-id>/ (see Telemetry-capture contract).
+- Populate standardized postmortem template with: objective, environment, commands run, hypothesis, observed outcomes, metric graphs, and recommended action items.
+- Run automated comparison aggregator to compute delta vs baseline: `sim-compare --baseline latest-stable --run <run-id> --output reports/<run-id>-delta.json`.
+
+Automated comparison asserts (examples)
+
+- p99 delta assertion: fail if canary_p99 / baseline_p99 > 1.15 for more than 5m.
+- kv-cache hit rate: fail if drop > 15% relative for more than 3m.
+
+Observability and dashboards
+
+- Folder: Dashboards/Simulations/GPU-Fleet-<run-id> will be automatically created by the run harness. Dashboards should include: p50/p95/p99 latency, token throughput, node-level GPU utilization, cache hit/miss, egress path stats, autoscaler events timeline.
+- Pack standard Grafana panel queries into the run artifacts. Example query for p99: `histogram_quantile(0.99, sum(rate(inference_request_duration_seconds_bucket[5m])) by (le))`
+
+Run artifacts retention policy
+
+- Raw artifacts: retain for 90 days.
+- Summaries and deltas: retain for 365 days.
+
+CI pipeline integration pattern
+
+- For kernel and inference-runtime PRs: add a pipeline stage that spins up a small sim (gpu_pool_size=4) and runs the quantized-kernel regression scenario for 10 minutes. Fail the PR if automated comparison asserts fail.
+- Store the terraform plan and apply output as artifacts so IaC diffs are auditable.
+
+Common troubleshooting checklist
+
+1. No metrics appearing in the run bucket: verify agent tokens, check collector logs, restart collector job.
+2. Traces missing: ensure sampled traces are being forwarded to otlp/jaeger and check network egress for the sim cluster.
+3. Autoscaler not reacting: validate kube-metrics-adapter, check RBAC on sim namespace, and inspect autoscaler events JSON.
+
+Safety and deconfliction calendar
+
+- Register high-risk sims in the infra calendar at least 48 hours in advance. Include run-id, expected blast radius, and rollback owner.
+- Maintain a weekly slot for low-risk canary sims (Wednesdays 03:00-06:00 PT).
+
+Appendices
+
+A. Example minimal artifact naming convention
+- prometheus_metrics-<run-id>.prom
+- traces-<run-id>.otlp.json
+- logs-pods-<run-id>.ndjson
+- autoscaler-events-<run-id>.json
+- terraform-plan-<run-id>.txt
+
+B. Helpful CLI snippets
+
+```bash
+# submit a sim run and tail status
+export RUN_ID=sim-ava-20260201-egress-01
+chaosctl submit --scenario preempt-drain --run-id $RUN_ID --notes "warm-pool drain validation"
+chaosctl status --run-id $RUN_ID --follow
+```
+
+C. Related pages
+- confluence:eng-infra/runbooks/gpu-chaos-day-experimentation-catalog-and-runbook
+- confluence:eng-infra/runbooks/kv-cache-reconstruction-and-eviction-resilience-runbook
+- confluence:eng-infra/terraform-and-iac/gpu-provisioning-immutable-state-and-disaster-recovery
+
+If you are preparing a simulation for a customer-facing Dedicated or Private environment, duplicate this template into the private-deployments space and coordinate with the customer success and security teams for any additional confidentiality constraints.
+
+Owner: Ava Martinez (infra-sim)

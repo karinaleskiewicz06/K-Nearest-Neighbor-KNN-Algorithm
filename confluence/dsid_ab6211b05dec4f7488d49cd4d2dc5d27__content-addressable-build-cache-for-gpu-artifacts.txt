@@ -1,0 +1,190 @@
+Content-addressable build cache for GPU artifacts
+
+Overview
+=======
+
+This document defines the design, operational runbook, and rollout plan for a content-addressable build cache (CAS) optimized for large GPU artifacts (container layers that include model weights, precomputed sharded checkpoints, and compiled kernels). The goal is to reduce CI runtime, cut cross-region egress, and deduplicate storage across Services that build or pull GPU images and model bundles.
+
+Why we need a CAS for GPU artifacts
+----------------------------------
+- GPU images and build artifacts frequently contain multi-GB model weights and compiled kernels; naive caches are wasteful.
+- Deterministic, content-addressable storage enables fine-grained deduplication and fast re-use across CI jobs, image promotion stages, and private deployment packaging.
+- Integrates with BuildKit / kaniko / bazel and our existing image promotion pipeline to speed canaries and reduce flakiness caused by long pulls.
+
+Scope and non-goals
+-------------------
+- In scope: container layers, OCI blobs, model tarballs (.pt/.bin/.safetensors), compiled .so kernel blobs, build metadata (manifest JSON).
+- Out of scope: runtime KV caches (prefix KV cache in runtime), per-request KV caches, and ephemeral test artifacts.
+
+Design summary
+==============
+1) Storage architecture
+- Primary blob store: S3 bucket with lifecycle tiering (Standard -> Infrequent -> Glacier Deep Archive for >180 days).
+- Metadata index: DynamoDB table keyed by content-hash (sha256) with attributes: size_bytes, content_type, reference_count, last_accessed, locations (region list).
+- Signed temporary URLs (STS) for direct download by runners and image pushers.
+
+2) Content addressing and namespace
+- Content address = sha256 digest of the blob (OCI-style), stored as hex string without algorithm prefix.
+- Namespaces use service prefixes for ACL and billing (e.g., gpu-images/, model-bundles/).
+
+3) Security and access control
+- PutObject requires role: platform-build-pusher with KMS encryption.
+- Read requires role: platform-build-runner or a signed pre-signed URL.
+- All objects encrypted with customer-managed key CMK-redwood-builds.
+- IAM policy templates and a reference terraform module are provided.
+
+4) Integration points
+- GitHub Actions (self-hosted runners) and Buildkite will use a shared cache client to push/pull by digest.
+- BuildKit supports --export-cache and --import-cache with s3 cache exporter using CAS digests.
+- Bazel rules will be adapted to publish large outputs to the CAS using a small wrapper.
+
+Operational requirements and SLOs
+================================
+- Availability: 99.95% for metadata lookup (Dynamo + cache), 99.9% for blob access in each region with multi-AZ S3 endpoints.
+- Latency targets: metadata lookup P50 < 15ms, P95 < 80ms. Signed URL generation P95 < 120ms.
+- Capacity: cache must support 20k unique pulls/day at steady state; peak throughput target 2 GB/s across the fleet.
+
+Metrics to emit (minimum)
+- cas.metadata.lookup.latency_ms.p50/p95
+- cas.blob.get.throughput_bytes/s and cas.blob.put.throughput_bytes/s
+- cas.put.success_rate, cas.get.hit_rate (digest present), cas.eviction.rate
+- artifact.reference_count distribution and large_blob_count (>1GB)
+
+Data model / example table
+-------------------------
+| Field | Type | Description | Example |
+| sha256 | string | Key (content address) | 3f2d...a9b4 |
+| size_bytes | int | Size of blob | 2147483648 |
+| content_type | string | mime / extension | application/vnd.oci.image.layer.v1+tar |
+| reference_count | int | Number of logical refs | 12 |
+| last_accessed | iso8601 | Last read timestamp | 2024-12-08T14:22:00Z |
+
+Terraform / IaC components
+==========================
+- Module: infra/cas/s3-bucket (creates bucket, lifecycle, kms binding)
+- Module: infra/cas/dynamodb-index (table schema, autoscaling, ttl)
+- Module: infra/cas/iam (roles: platform-build-pusher, platform-build-runner, monitoring-readonly)
+- Module: infra/cas/edge-proxy (Lambda@Edge or CloudFront signed URL handler)
+
+Example Terraform usage snippet
+```hcl
+module "cas_s3" {
+  source = "git::ssh://git@repo/internal-modules.git//cas/s3-bucket?ref=v1.2.0"
+  bucket_name = "redwood-cas-gpu-artifacts"
+  kms_key_id  = aws_kms_key.cas_builds.arn
+  lifecycle_rules = [
+    { id = "tier-to-ia", enabled = true, days = 30, transition = "STANDARD_IA" },
+    { id = "archive", enabled = true, days = 180, transition = "GLACIER" }
+  ]
+}
+```
+
+CI pipeline examples
+====================
+- BuildKit (recommended for container images):
+  - Export cache by digest: 
+    buildctl build --frontend dockerfile.v0 --local context=. --local dockerfile=. \
+      --export-cache type=s3,ref=s3://redwood-cas-gpu-artifacts/cache,mode=max,compress=true
+  - Import cache: 
+    buildctl build --import-cache type=s3,ref=s3://redwood-cas-gpu-artifacts/cache
+
+- GitHub Actions snippet (push artifact):
+```yaml
+- name: Compute digest and upload to CAS
+  run: |
+    DIGEST=$(sha256sum model.tar.gz | awk '{print $1}')
+    aws s3 cp model.tar.gz s3://redwood-cas-gpu-artifacts/model-bundles/${DIGEST} --sse aws:kms --storage-class STANDARD
+    aws dynamodb put-item --table-name cas-index --item '{"sha256": {"S": "'${DIGEST}'"}, "size_bytes": {"N": "'$(stat -c%s model.tar.gz)'"}}'
+```
+
+Rollout plan (phased)
+=====================
+1) Alpha (infrateam only) — 2 weeks
+   - Deploy CAS components in dev region, wire BuildKit on 2 self-hosted runners.
+   - Run a synthetic workload with prebuilt large blobs to validate throughput.
+2) Beta (platform CI + image promotion) — 4 weeks
+   - Enable for GPU image builds and the image promotion pipeline.
+   - Measure cache hit rate and change runner configs.
+3) Gradual production rollout by service — 6–8 weeks
+   - Onboard services with the highest artifact churn first (serving-runtime, eng-serving-runtime).
+   - Disable service-level caches only after CAS reach >= 70% hit rate for that service.
+
+Rollback criteria
+- If cas.get.hit_rate < 40% after 7 days for a newly onboarded service OR metadata lookup error rate > 1% we will pause rollout for that service and revert runners to local ephemeral caches.
+
+Runbook: common incidents
+========================
+1) Large blob not found after promotion
+- Symptoms: image promotion fails with 404 when pulling a layer by digest.
+- Immediate actions:
+  1. Check metadata entry in DynamoDB for the digest: aws dynamodb get-item --table-name cas-index --key '{"sha256":{"S":"<digest>"}}'
+  2. If missing, check S3 for the object key path. If present, reinsert metadata with the original size and location.
+  3. If blob missing from S3 and promotion succeeded earlier, escalate to infra-data for possible accidental deletion. Restore from snapshot if available.
+- Owner: infra-cas-pager (oncall).
+
+2) High eviction or low hit rate
+- Symptoms: hit_rate drops below 50% and eviction rate > threshold.
+- Actions:
+  1. Query reference_count distribution to find hot vs cold objects.
+  2. Increase hot-object retention TTL in Dynamo table for top-100 objects.
+  3. If storage pressure is sustained, run emergency lifecycle transition adjustments or add short-term S3 capacity in target region.
+- Owner: eng-infra oncall.
+
+3) DynamoDB throttling (metadata lookup errors)
+- Symptoms: cas.metadata.lookup.errors spike; builds fail intermittently.
+- Actions:
+  1. Confirm autoscaling targets and CloudWatch alarms. Temporarily increase read capacity using scaling policy or on-call console.
+  2. Enable local memcached/LRU in the CAS edge proxy to absorb bursty reads.
+  3. Investigate runaway clients (CI loops) and throttle.
+
+Operational playbook snippets
+===========================
+- Monitor rules (CloudWatch / Prometheus):
+  - Alert: CAS-MetadataErrors if cas.metadata.lookup.errors > 0.5% for 5m.
+  - Alert: CAS-HitRate if cas.get.hit_rate < 45% for 15m.
+  - Alert: CAS-S3-Error if 5xx rate > 0.2%.
+
+- Maintenance tasks (weekly):
+  1. Review top 50 largest objects and confirm ownership & retention justification.
+  2. Recompute reference_count by scanning promotion logs and build manifests.
+  3. Validate KMS key rotation plan and re-encryption pipeline in staging.
+
+Testing checklist before service onboarding
+========================================
+- End-to-end push/pull for a 2GB model tarball with digest verification.
+- Simulated 50 concurrent pulls from 10 runners to validate signed URL generation and S3 throttling behavior.
+- Failure inject: remove a blob object to ensure runbook steps restore or fail safely.
+
+Ownership and contacts
+======================
+- Owner (system): infra-cas-team@redwood.ai
+- Pager: infra-oncall (Slack #infra-oncall)
+- Implementation lead: Maya Chen
+
+Appendix A — IAM policy examples
+===============================
+- Minimal put policy:
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": ["s3:PutObject","kms:Encrypt"], "Resource": ["arn:aws:s3:::redwood-cas-gpu-artifacts/*","arn:aws:kms:...:key/..."] }
+  ]
+}
+```
+
+Appendix B — glossary
+======================
+- CAS: content-addressable store where content is keyed by digest.
+- Hot object: artifact with reference_count in the top 1% for the last 30 days.
+- Promote: promotion workflow that marks an artifact as used by a release and increments reference_count.
+
+Appendix C — migration notes from local runner caches
+======================================================
+- For each repository, add a small migration job in CI that computes digests for existing cache entries and pushes any missing large artifacts to CAS. Do not delete local caches until CAS hit rate > 80% for that repo for 14 days.
+
+Document history
+================
+- 2024-05-02: initial draft by Maya Chen
+- 2024-08-10: added Terraform modules and lifecycle rules (reviewer: Liam O'Neill)
+- 2025-01-12: finalized rollout plan and SLOs (reviewer: Priya Kapoor)

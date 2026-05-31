@@ -1,0 +1,155 @@
+Adaptive Circuit Breakers and Backpressure Playbook
+
+Summary:
+
+This playbook describes the recommended design, config, and operational procedures for adaptive circuit breakers and backpressure controls across Redwood’s platform services. It focuses on runtime mechanisms that prevent cascading failures, preserve SLOs, and allow graceful degradation under overload (hosted API, routing proxy, and dedicated pools). The guidance is implementation-agnostic and includes concrete config examples for the runtime router (routerd), the gateway (api-gw), and the worker pools (inference-worker).
+
+Goals:
+- Prevent resource exhaustion and cross-tenant impact during transient spikes.
+- Maintain P95 latency SLOs for high-priority routes while allowing lower-priority traffic to be shed.
+- Provide clear on-call procedures and observability to debug breaker events.
+
+Scope and applicability:
+- Applies to: routerd, api-gw, inference-worker, batch-processor services.
+- Not covered here: client-side retry libraries (see eng-developer-experience/sdk-guides).
+
+Principles:
+1) Fast fail for non-critical work: short-circuit low-value requests to protect core SLOs.
+2) Signal-driven adjustment: use latency, error-rate, queue-depth, and GPU memory pressure as input signals.
+3) Backoff + shed, not block: prefer shedding or queuing with timeouts over blocking threads indefinitely.
+4) Observability first: every breaker state change must produce annotated metrics/events and a short diagnostic payload.
+
+Design patterns and configurations:
+
+A. Adaptive circuit breaker (recommended default)
+- Behavior: monitor a sliding window for each route/tenant. When error-rate or latency exceeds configured thresholds, transition through CLOSED -> OPEN -> HALF_OPEN with cooldown and progressive probing.
+- Signals: 95th latency over 10s window, 5xx ratio over 1m window, queue depth over 90th percentile, GPU OOM events.
+- Ownership: routerd team owns route-level breaker behavior. inference-worker owns worker-level local breakers.
+
+B. Token-based backpressure with priority buckets
+- Behavior: maintain token buckets per priority class (high, normal, low). Requests consume tokens; when empty, the system rejects or queues based on policy. Tokens replenish at a configurable rate based on real-time throughput targets.
+- Use cases: burst absorption for PL/partner traffic, shaping free-trial tiers.
+
+C. Opportunistic shedding and graceful fallback
+- Strategy: on resource pressure, first shed low-priority and non-idempotent scheduled work (e.g., async embeddings for enrichment jobs), then reject best-effort requests with clear error code. For critical requests, switch to a smaller model variant or cached prefix if available.
+
+Config reference (routerd / api-gw sample table):
+
+| Component | Key | Default | Rationale |
+|-----------|-----|---------|-----------|
+| routerd | breaker.window_seconds | 60 | Sliding window for error/latency aggregation |
+| routerd | breaker.latency_p95_ms | 1200 | Trigger OPEN when P95 exceeds this value |
+| routerd | breaker.error_ratio | 0.12 | Trigger OPEN when >=12% of requests are 5xx |
+| routerd | breaker.cooldown_seconds | 45 | How long OPEN state lasts before HALF_OPEN probing |
+| api-gw | tokens.high.rate_per_s | 1000 | Replenish rate for high-priority bucket |
+| inference-worker | local.breaker.max_concurrent | 16 | Max concurrent requests per worker process |
+| inference-worker | gpu.memory_pressure_threshold_pct | 78 | Start rejecting large sequences at this GPU usage |
+
+(Represented above as a text table for quick copy into Confluence.)
+
+Example YAML (routerd adaptive breaker snippet):
+
+config:
+  breakers:
+    - name: route-default
+      scope: route
+      window_seconds: 60
+      latency_p95_ms: 1200
+      error_ratio: 0.12
+      cooldown_seconds: 45
+      probe_rate: 5 # allow 5 requests during HALF_OPEN
+
+Token bucket example (api-gw):
+
+buckets:
+  high:
+    rate_per_s: 1000
+    burst: 200
+  normal:
+    rate_per_s: 400
+    burst: 80
+  low:
+    rate_per_s: 40
+    burst: 10
+
+Operational metrics to emit (minimum):
+- breaker.state{component,route,tenant} -> {CLOSED,OPEN,HALF_OPEN}
+- breaker.events_total{reason,component,route,tenant} -> counter of transitions
+- queue.depth{component,route,priority} -> gauge
+- rejected.requests_total{component,route,reason,priority} -> counter
+- tokens.available{component,bucket} -> gauge
+- p95_latency_ms{component,route} -> histogram
+
+Alerting guidance (example alerts):
+1) Critical: route-level OPEN for > 2m AND p95_latency_ms > 2x SLO -> Pager (S1), page on-call platform SRE.
+2) High: repeated breaker.OPEN transitions (>5 times in 10m) for a single tenant -> Pager (S2) to tenant-owner and platform SRE.
+3) Medium: tokens.available for high bucket < 10% for > 3m -> Email/Slack to platform-runbooks channel.
+
+Alert rule examples (PromQL-like pseudocode):
+- S1_alert: sum by(route)(breaker_state_open_seconds{component=\"routerd\"} > 120) and avg_over_time(p95_latency_ms[2m]) > (2 * route_slo_p95_ms)
+- S2_alert: increase(breaker_events_total{reason=\"open\"}[10m]) > 5
+
+Runbook: immediate steps for S1 (high-severity open breaker with high latency)
+1) Triage & scope:
+   - Check the breaker dashboard for the affected route -> note affected tenants and request patterns.
+   - Run: curl -s \"http://metrics.internal/api/v1/query?query=breaker.state{route=\\\"<route>\\\"}\" | jq .
+2) Identify dominant signal:
+   - If p95 latency spike: check worker CPU/GPU usage and queue depth.
+   - If error-rate spike: inspect recent deploys for the service and recent routing config changes.
+3) Immediate mitigation (pick one based on cause):
+   - Temporarily scale inference-worker pool by +20% (if capacity available): kubectl scale deploy/inference-worker --replicas=$(current+20%)
+   - If scaling not feasible, flip route to fallback model variant: POST /internal/router/v1/route/<route>/override {\"model\":\"small-llama-quant\"}
+   - If tenant-specific runaway, apply tenant-level rate-limit: curl -X POST https://api.internal/tenant-limits -d '{\"tenant\":\"<id>\",\"qps\":50}'
+4) Reduce blast radius and restore normal flow:
+   - Increase breaker.cooldown_seconds by 2x for the affected route for 15 minutes (temporary config patch).
+   - Re-enable progressive probing after system metrics return to healthy ranges.
+5) Post-incident verification:
+   - Verify p95 latency and error rate back under SLO for 10 minutes.
+   - Record the mitigation chosen and the timestamped steps in the incident ticket.
+
+Runbook: S2 (repeated opens for a single tenant)
+1) Identify tenant: list active keys in the period and rate-limit historical QPS.
+2) If abuse or misconfiguration suspected, apply hard token drop for that tenant and notify the CS/Enterprise success team.
+3) Offer immediate remediation: revert recent client changes, suggest exponential backoff, or route to dedicated capacity if on Dedicated plan.
+
+Testing and rollout guidance:
+- Canary config changes: push breaker changes to canary region (eu-west-1-canary) for 24h with synthetic traffic that simulates 3x normal burst.
+- Load test cases: run the following harness target: tools/loadtest/backpressure-harness --scenario=burst-with-poor-client-retries --duration=600s --tenants=20
+- Chaos experiments: simulate worker OOM and network latency to verify that token buckets and breakers respond as expected.
+
+KPI and postmortem checklist (for any breaker-triggered incident):
+- Duration of OPEN state (per route).
+- Number of customers affected and breakdown by tier.
+- Mitigation time-to-first-action.
+- Which mitigation restored p95 under SLO.
+- Code/config change that prevented recurrence.
+
+Design trade-offs and alternatives considered:
+- Full synchronous backpressure (blocking) vs token-shedding: blocking achieves higher fairness for in-flight requests but can exhaust threads; we choose token-shedding to protect shared pools.
+- Conservative breaker thresholds vs aggressive thresholds: conservative reduces false positives but increases risk of overload; we default to conservative for critical routes and more aggressive for low-priority traffic.
+
+Ownership and contacts:
+- Primary owners: Platform Runtime (routerd + api-gw) — Platform team (oncall: platform-oncall rotation).
+- Secondary owners: Serving Runtime (inference-worker) — Serving team.
+- Pager escalation: platform-sre -> serving -> engineering manager.
+
+Related artifacts and links:
+- routerd config reference: /confluence/eng-platform/systems-and-services/routerd-config-reference-2025
+- Load-test harness: /confluence/eng-platform/runbooks/platform-gameday-exercise-automation-and-scripting-playbook-2026
+- SDK guidance for client-side retries: /confluence/eng-developer-experience/sdk-guides/retry-and-idempotency
+
+Appendix: quick diagnostics commands
+- Check breaker states by route:
+  curl -s \"http://metrics.internal/api/v1/query?query=breaker.state\" | jq -r '.data.result[] | [ .metric.route, .value[1] ] | @tsv'
+- Inspect queue depth per component:
+  curl -s \"http://metrics.internal/api/v1/query?query=queue.depth{component=\\\"inference-worker\\\"}\" | jq .
+- Temporarily set route override (example):
+  curl -X POST -H 'Content-Type: application/json' -u $ADMIN_TOKEN https://api.internal/router/v1/override \\
+    -d '{\"route\":\"/v1/generate\",\"override_model\":\"small-llama-quant\",\"expires_in_s\":900}'
+
+Revision history:
+- 2025-10-15: Created by Maya Alvarez (initial draft).
+- 2025-11-02: Added token bucket examples and alert rules (review: Ravi Patel).
+- 2026-02-12: Expanded runbooks and added GPU memory pressure guidance (review: Lena Cho).
+
+End of document.

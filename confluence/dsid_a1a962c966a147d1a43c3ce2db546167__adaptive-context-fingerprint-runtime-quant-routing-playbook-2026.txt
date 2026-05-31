@@ -1,0 +1,161 @@
+Adaptive Context Fingerprint and Runtime Quant Routing Playbook
+
+Overview
+
+This playbook documents the design, probes, and operational procedures for the Adaptive Context Fingerprint subsystem and its companion Runtime Quant Routing service. The goal is to enable safe, latency-aware routing between quantized model variants at inference time based on a lightweight fingerprint of request context and live telemetry.
+
+Intended audience
+- Applied ML engineers
+- Serving runtime engineers
+- Oncall/eval teams responsible for rollouts and regression triage
+
+Goals and success criteria
+- Reduce per-token cost by routing up to 35% of eligible requests to 4-bit or mixed-precision variants without exceeding a 0.8 point coherence delta (on our coherence scoring metric) for any critical slice.
+- Maintain tail latency P95 <= 120ms for the primary low-latency path; allow P95 <= 220ms on fallback non-latency-critical routes.
+- Detect and automatically rollback quant routing within 10 minutes of detecting a fidelity regression above configured thresholds.
+
+Scope
+- Applies to text-generation and chat endpoints served by the runtime service 'inference-gateway' and the quant manager 'quant-router'.
+- Not in scope: full model conversion tooling (handled by model-onboarding), dataset-level retraining, or private deployment networking restrictions (see eng-private-deployments docs).
+
+Key concepts and definitions
+- Context Fingerprint: a lossy, fixed-size descriptor derived from request metadata + prompt embedding sketch used to quickly cluster similar requests for routing decisions.
+- Coherence Score: an internal metric (0-100) that measures output semantic consistency against an anchored reference for a slice. Lower is worse.
+- Eligibility Predicate: deterministic checks (length, tokens, function-calls, persona flags) to opt out of quant routing.
+
+Design overview
+1) Lightweight fingerprinting: compute a 256-bit fingerprint per request at the API ingress. Fingerprint inputs: prompt token summary (first 256 bytes and last 256 bytes), intent tag, embedding sketch (64-d float quantized to 8-bit), and call_mode flag.
+2) Fingerprint-to-slice mapping: fingerprint bucketization using locality-sensitive hashing (LSH) produces slice_id. Each slice_id maps to a routing policy containing preferred model variants and fallback chains.
+3) Runtime quant routing decision: the quant-router evaluates slice-level telemetry (recent coherence delta, latency heatmap, token-rate) + request-level predicate to select a target variant: full-fp32, mixed-precision-8, mixed-quant-4, or cache-hit reuse.
+4) Safety gates: pre-checks enforce that any request containing attachments, function calls, or privileged customer data is routed to full-fp32.
+
+Telemetry signals and thresholds
+- coherence_delta_rolling_mean (slice, 1h): trigger > 0.8 points 
+- coherence_outlier_ratio (slice, 30m): trigger > 0.03 (3%)
+- p95_latency (variant, 10m): soft limit > 220ms; hard limit > 300ms (immediate fallback)
+- token_error_rate (variant, 10m): trigger > 0.005 (0.5%)
+- kv_cache_miss_rate (slice, 5m): trigger > 0.2 for latency-sensitive paths
+
+Eligibility rules (ordered checks)
+1) If request contains function-calls -> route to full-fp32.
+2) If request.customer_tier == "enterprise-sensitive" -> route to full-fp32.
+3) If prompt_length > 8192 tokens -> route to full-fp32.
+4) If request has strong negative-safety-flag -> route to full-fp32.
+5) Else consult slice routing policy.
+
+Probe synthesis and evaluation strategy
+- Purpose: create targeted synthetic probes that exercise the coherence and latency boundaries of a slice under quant variants without exposing production traffic.
+- Probe types:
+  - Minimal-context probes: short prompts that check token-level fluency and function-call behavior.
+  - Long-context probes: sequences designed to stress KV cache and attention patterns (8k–32k token equivalents).
+  - Persona fidelity probes: anchored Q/A pairs where answers must match gold-standard responses within a semantic threshold.
+
+- Probe cadence: generate 200 probes per slice for a new quant profile; schedule nightly against a shadow cluster.
+- Scoring and acceptance: metric suite returns coherence_delta, hallucination_rate, token-level edit distance, and latency. A profile is acceptable if coherence_delta <= 0.5 and hallucination_rate <= 0.01 across critical slices.
+
+Runtime routing policy schema (human-readable table)
+| field | description | example |
+|---|---|---|
+| slice_id | logical fingerprint bucket | slice_2026_04_ml_readme |
+| primary_variant | preferred runtime variant | model-v2-mp8 |
+| fallback_chain | ordered list of variants | [model-v2-mp8, model-v2-q4, model-v2-fp32] |
+| latency_class | low | low / medium / high |
+| coherence_budget | allowed delta from baseline | 0.8 |
+| rollout_steps | canary percentages | 1,5,20,50,100 |
+
+Example routing YAML (applied to quant-router):
+
+```yaml
+# runtime routing policy example
+slice_id: slice_2026_reviewer_help
+primary_variant: model-v2-q4
+fallback_chain: [model-v2-q4, model-v2-mp8, model-v2-fp32]
+latency_class: low
+coherence_budget: 0.6
+rollout_steps: [1, 5, 20, 50, 100]
+telemetry_checks:
+  coherence_delta_threshold: 0.6
+  p95_latency_soft: 220ms
+  max_token_error_rate: 0.005
+```
+
+Rollout and promotion workflow (for a new quant profile)
+1) Author prepares quant-profile artifact and baseline evaluation report. Upload to artifact store 'quant-artifacts'.
+2) Create a promotion MR with attached probe results and slice map. Tag reviewers: runtime, eval, SRE.
+3) Stage shadow rollout: 100% of probes + 0.5% of mirrored production traffic on 'shadow-quant' cluster for 24 hours. Monitor telemetry.
+4) Canary rollout: apply routing policy to 1% production traffic for 2 hours -> if stable expand to 5% for 4 hours -> 20% for 8 hours -> 50% for 24 hours -> 100% after 48 hours of stability.
+5) Automated rollback triggers if any soft threshold is exceeded for more than 2 consecutive windows or a hard threshold is exceeded once.
+
+Monitoring and alerts
+- primary dashboards:
+  - Quant routing health (per-slice coherence_delta, p95_latency, token_error_rate)
+  - Variant capacity and queue depth (model-serve-pool dashboards)
+  - Probe acceptance and parity heatmap (probe-runner)
+- Alerting rules (examples):
+  - P1: coherence_delta_rolling_mean > 1.2 for > 10m -> PagerDuty escalation to oncall-eval + runtime.
+  - P2: p95_latency > 300ms for any low-latency slice -> page oncall-sre.
+  - P3: token_error_rate > 0.01 for 5m -> slack alert to #quant-ops and create auto-incident.
+
+Triage and rollback playbook (quick steps)
+1) Acknowledge alert and identify affected slice(s) from dashboard.
+2) Switch routing policy to next-safe fallback (immediate API call to quant-router): PATCH /routing/slices/{slice_id} -> set primary_variant = fallback_chain[2] (usually FP32).
+3) Re-run targeted probe set to confirm mitigation within 10 minutes.
+4) Open regression triage ticket with dataset and probe artifacts attached. Assign to eval-oncall.
+5) If no mitigation, escalate to Model Onboarding + Runtime Kernel team.
+
+Configuration and operational parameters (table)
+| parameter | default | purpose |
+|---|---:|---|
+| fingerprint_ttl_seconds | 300 | time window to reuse cached slice mapping |
+| probe_batch_size | 200 | number of synthetic probes per slice on shadow runs |
+| coherence_rollback_threshold | 0.8 | coherence delta that triggers rollback steps |
+| canary_step_durations | 2h | duration per canary step (overridable) |
+| shadow_mirror_percentage | 0.5 | percent of production traffic mirrored to shadow cluster |
+
+Safety considerations and known limitations
+- Fingerprint collisions: LSH bucketization can group semantically distinct prompts; maintain conservative coherence budgets for high-cardinality buckets.
+- Cold-start slices: new slices without sufficient probe history default to conservative routing (mp8 -> fp32) until N=200 probes collected.
+- Privacy: fingerprint must not retain raw prompt text. Use hashed sketches only. Compliance checked in 'probe-privacy-audit' job.
+
+Operational ownership
+- Product: Applied ML (owner: Aisha Patel) - responsible for probe definition and acceptance criteria.
+- Runtime: Serving Runtime team (owner: Liam Zhang) - responsible for quant-router, routing API, and kernel-level performance.
+- SRE: Oncall SRE (owner: Rosa Méndez) - responsible for alerting, capacity, and rollback orchestration.
+
+Related artifacts and links
+- Quant artifact registry: s3://redwood-quant-artifacts/
+- Probe generator repo: git@github.com:redwood/probe-fabricator
+- Routing API spec: /confluence/eng-serving-runtime/api-standards/routing-api-spec-2025
+
+Appendix A — Example probe JSON (one sample)
+```json
+{
+  "probe_id": "probe_slice_2026_01_0001",
+  "type": "long-context",
+  "prompt": "<redacted sketch>",
+  "expected_anchor_embedding_hash": "e3b0c442...",
+  "assertions": {
+    "coherence_delta_max": 0.5,
+    "max_latency_ms": 220
+  }
+}
+```
+
+Appendix B — Fast CLI commands
+1) Force-set routing policy for a slice (useful during triage):
+   curl -X PATCH -H 'Authorization: Bearer $TOKEN' -d '{"primary_variant":"model-v2-fp32"}' https://api.redwood.internal/routing/slices/slice_2026_reviewer_help
+
+2) Launch probe-run for a slice on shadow cluster:
+   ./probe-runner --slice slice_2026_reviewer_help --profile long-context --target shadow-quant --batch-size 200
+
+Change log
+- 2026-01-12: Created playbook (A. Patel).
+- 2026-02-10: Added explicit probe privacy note and increased default probe_batch_size to 200 (L. Zhang).
+- 2026-03-02: Finalized rollout percentages and added canary duration guidance (R. Méndez).
+
+Contact and escalation
+- Oncall-eval: #oncall-eval (Slack)
+- Oncall-runtime: #oncall-runtime (Slack)
+- PagerDuty: redwood-quant-routing
+
+End of document

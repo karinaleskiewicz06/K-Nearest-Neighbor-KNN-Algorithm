@@ -1,0 +1,177 @@
+GPU reservation signal protocol
+
+Summary
+
+This document defines the GPU Reservation Signal Protocol (GRSP) — a lightweight, idempotent reservation and release signaling layer used by tenant services, the capacity allocator, and the Terraform operator that manages warm pools and reserved slices. GRSP standardizes guardrails for short-lived soft reservations, long-term commitments, and operator-driven reclamation so infra teams can reason about fairness, billing, and rollout semantics across accounts and regions.
+
+Why this exists
+
+- Current ad-hoc reservation calls are a source of eviction cascades, billing surprises, and terraform drift.
+- GRSP provides clear signal semantics so: allocation is reversible, metrics are auditable, and TF operator manifests express intent (not imperative state).
+
+Scope
+
+- Applies to Redwood-managed GPU fleets and warm pools across public cloud regions.
+- Affects: tenant requesters (eval jobs, CI, hosted customers), the capacity allocator service (allocator-api), and the tf-gpu-operator.
+- Out of scope: spot price selection logic, model-level scheduling decisions, and edge-local offload.
+
+Terminology
+
+- Reservation token: an opaque string returned by the allocator to the requester. Tokens are idempotent and short-lived by default (TTL).
+- Soft reservation: short TTL (default 15m) with high likelihood of preemption. Used for interactive evals/CI.
+- Hard reservation: longer TTL (hours/days) with billing lock and priority. Requires commit via long-reserve API.
+- Slice: an operator-managed allocation unit (set of GPUs + network egress quota) that maps to a Terraform resource when pinned.
+
+Protocol overview (high level)
+
+1) Request path: requester -> allocator-api -> (optionally) tf-gpu-operator to pin slice
+2) Response: {\n   status: granted|deferred|rejected,\n   token: <reservation-token> (when granted),\n   ttl: seconds,\n   pool_hint: pool-id,\n   preempt_score: 0.0-1.0\n}
+3) Release path: requester releases token via /reservations/release or token expires.
+4) Reclamation: operator may convert a soft reservation into a reclaimable lease if under pressure, emitting events and metrics.
+
+Core invariants (must hold)
+
+- Idempotency: calling the same reservation request (same request_id header) must return the same token or the same definitive failure.
+- Time-bounded occupancy: every granted token has an associated TTL. Renewals require a separate renew call.
+- Operator determinism: tf-gpu-operator only creates Terraform resources when a token is promoted to a pinned reservation and after passing admission checks.
+- Auditability: all reservation events are logged to audit-log service and mapped to billing records.
+
+API examples
+
+Request (short interactive reservation):
+
+curl -X POST https://allocator.redwood.internal/v1/reservations -H 'Authorization: Bearer $TOKEN' -H 'Content-Type: application/json' -d '\n{\n  "request_id": "ci-5678-20250201",\n  "gpu_count": 1,\n  "duration_hint_sec": 900,\n  "priority": "interactive",\n  "egress_bytes_hint": 200000000\n}\n'
+
+Response (granted):
+
+{\n  "status": "granted",\n  "token": "rsv::us-west-2::abc123",\n  "ttl": 900,\n  "pool_hint": "warmpool-usw2-highmem-1",\n  "preempt_score": 0.12\n}
+
+Promotion to pinned (tenant wants a stable slice that the operator will manage):
+
+curl -X POST https://allocator.redwood.internal/v1/reservations/promote -d '{"token":"rsv::us-west-2::abc123","commit_hours":24}'
+
+Terraform operator contract (spec + manifest example)
+
+Design principles for the operator: the tf-gpu-operator must treat token promotion as the only signal that creates persistent TF-managed resources. It must be reconciler-safe and tolerate duplicate events.
+
+Sample CRD / operator manifest fragment (yaml):
+
+---
+apiVersion: infra.redwood.ai/v1alpha1
+kind: GPUReservationSlice
+metadata:
+  name: demo-tenant-slice-001
+spec:
+  reservationToken: "rsv::us-west-2::abc123"
+  gpuCount: 1
+  pinned: true
+  egressQuotaBytes: 2147483648
+  tenantAccount: "acct-demo-1234"
+  lifecyclePolicy: "auto-release-on-ttl-expiry"
+  tags:
+    - team:platform
+    - project:ci-sandbox
+
+Operator responsibilities
+
+- Validate token with allocator-api before creating TF resources. If token invalid/expired, mark status=Rejected and emit event.
+- Create TF module with immutable name derived from token (so promotion is idempotent).
+- Annotate created TF resources with reservation-token and request_id for billing mapping.
+- Support a safe conversion path: when token is released, operator adds a grace window (default 5m) before triggering TF destroy.
+- Expose status fields: Ready, PendingValidation, Draining, Releasing, Errored.
+
+Terraform module conventions
+
+- Module must be deterministic and reference variables only (no local imperative discovery).
+- Resource names must include short token-hash to avoid collisions.
+- Example published module: redwood/modules/gpu-slice/aws.
+
+SLOs and thresholds (infra-level)
+
+- Warm pool fill fraction (warm_pool_fill_fraction): target >= 0.90 (90%) measured at 5m intervals. Alert on < 0.75 for 15m.
+- Reservation request success rate (redwood_gpu_reservation_success_ratio): target >= 99.5% over 1h window. Alert on < 98%.
+- Promotion-to-pinned latency: median < 60s, p95 < 180s. Alert if p95 > 300s for 3 consecutive checks.
+- Reclamation false-positive rate (reservations reclaimed but still active): target < 0.1% monthly.
+
+Metrics (prometheus names)
+
+- redwood_gpu_reservation_requests_total{result="granted|deferred|rejected"}
+- redwood_gpu_reservation_promotions_total{policy="auto|manual"}
+- redwood_gpu_reservation_ttl_seconds_summary
+- warm_pool_fill_fraction
+- redwood_tf_operator_reconcile_duration_seconds
+
+Monitoring and dashboards
+
+- Dashboard: "GPU Reservations - allocator" (panels: success ratio, qps by region, average ttl, pool fill).
+- Dashboard: "TF GPU Operator" (panels: reconcile latencies, error rate, pending validations).
+- Alerting: Pager duty integration for operator errors where > 5% of promotions fail in 10m.
+
+Rollout plan (safest progression)
+
+1) Canary allocator change: enable GRSP v1 for a single internal tenant namespace (ci-sandbox) for 48h.
+2) Instrument metrics & audit logging; validate idempotency by replaying historical request_ids.
+3) Deploy tf-gpu-operator v1 as canary in same namespace (annotation opt-in).
+4) Expand to 10% of tenants and run chaos test (simulate preemption & token expiry).
+5) Full rollout if no critical regressions for 7 days and metrics meet SLOs.
+
+Runbook: common failure modes and remediation
+
+- Symptom: Promotion stuck PendingValidation > 5m
+  Steps:
+  1) kubectl describe gpureservationslice demo-tenant-slice-001. Check status and events.
+  2) curl allocator API /v1/reservations/validate?token=<token> to see TTL and preempt_score.
+  3) If token expired, ask tenant to re-request or request a manual promotion with governance approval.
+  4) If allocator healthy but operator failing, restart operator pod and inspect reconcile logs: kubectl logs -l app=tf-gpu-operator.
+
+- Symptom: Warm pool fill drops below 60%
+  Steps:
+  1) Trigger on-call playbook for capacity runway (see /confluence/eng-infra/gpu-fleet-and-capacity/gpu-capacity-runway-and-auto-sinking-playbook).
+  2) Temporarily increase burstable preemption threshold or enable bursting to cloud-edge pools.
+  3) Notify FinOps if burst will incur >$5k/day incremental cost.
+
+- Symptom: TF resources orphaned after token release
+  Steps:
+  1) Verify audit-log for release event matching token.
+  2) Check operator status for grace-window. If grace window elapsed and TF destroy failed, run operator repair CLI: tf-gpu-operator repair --token <token>.
+  3) If failing, manually run terraform destroy with locking comments and escalate to infra-eng.
+
+Security and billing considerations
+
+- Tokens are bearer tokens scoped to account and should never be logged in plaintext to general purpose logs. Audit log redaction is enforced in the allocator pipeline.
+- Promotion to pinned reservation triggers billing ledger entry. The operator must annotate resources with billing tags: billing:reservation, reservation_id, tenant_account.
+- Long-term reservations require finance approval if commit_hours * gpu_count cost > $50k.
+
+Developer guidance and examples
+
+- CI jobs should prefer soft reservations with request_id set to CI_JOB_ID to enable safe retries.
+- Backoff strategy: on deferred responses, clients should implement jittered exponential backoff starting at 200ms, max 30s, and give up after 6 attempts (for interactive workloads).
+
+Troubleshooting checklist for operators
+
+- Ensure allocator API version matches operator config (GRSP_V1 vs GRSP_V2).
+- Confirm Terraform state backend credentials for the workspace the operator uses.
+- Check for drift: resource name collisions usually indicate operator double-apply; ensure reconcile idempotency keys are used.
+
+Open items and future work
+
+- Support cross-region token reservation with transparent egress balancing.
+- Formal rate-limiting policy per tenant and per-org to replace current global soft-limits.
+- Integration with cost-forecasting to auto-deprioritize promotions that would blow monthly budget.
+
+Ownership and contacts
+
+- Protocol owner: Maya Patel (infra-capacity).
+- TF operator owner: Connor Liu (infra-platform).
+- On-call rota: see team wiki infra/oncall. For emergencies, page #infra-pager (PD).
+
+References
+
+- allocator-api swagger: https://internal-api-docs.redwood/allocator
+- TF operator repo: git@github.com:redwood-inference/tf-gpu-operator.git
+- Audit log schema: /confluence/eng-infra/cloud-accounts-and-networking/gpu-egress-metering-and-tenant-cost-allocator-playbook
+
+Appendix: token lifecycle diagram (text)
+
+1. Request -> 2. Allocator grants token (soft) -> 3a. Use token and release before TTL OR -> 3b. Promote token -> operator validates -> operator creates TF resources -> token pinned -> billing entry created -> eventual release triggers TF destroy (with grace window).
+

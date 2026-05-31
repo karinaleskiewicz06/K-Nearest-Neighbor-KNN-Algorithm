@@ -1,0 +1,164 @@
+Operator decision lattice for prefix-cache failure and dashboard playbook
+
+Summary
+-------
+This document defines an operator-focused decision lattice and accompanying dashboard/playbook for diagnosing, mitigating, and preventing critical failures of the KV/prefix cache layer used by the runtime (internal service name: kv-prefix-cache). The lattice formalizes prioritized actions to preserve SLOs (p95 < 120ms, availability 99.95%) while minimizing cost and avoiding data-corrupting rollbacks.
+
+Scope
+-----
+- Components: kv-prefix-cache, runtime-router, request-batcher, model-variant-service, cache-reaper-job.
+- Primary symptoms covered: sudden prefix-cache eviction storms, rising cache-miss ratio, KV replication lag, and operator-driven mis-configuration that causes cascading tail latency.
+- Intended audience: platform operators, oncall engineers, runtime maintainers, and product SREs.
+
+Why a decision lattice?
+----------------------
+Traditional linear runbooks prescribe a single sequence of steps. For prefix-cache incidents, the operational choice depends on correlated signals (latency, eviction rate, tenant priority, capacity headroom). A decision lattice maps these signals to a partial order of safe actions so operators can pick the highest-priority intervention that matches real-time telemetry. The lattice encodes safety invariants (avoid data loss, prefer graceful degradation, maintain critical-tenant SLOs).
+
+Key signals and their thresholds (telemetry primitives)
+-----------------------------------------------------
+- prefix_cache_evictions_total (per-pool, 1m rate): GREEN < 10/m, YELLOW 10–200/m, RED > 200/m
+- prefix_cache_miss_ratio (5m): GREEN < 0.08, YELLOW 0.08–0.25, RED > 0.25
+- runtime_tail_p95_ms (global request path, 1m): GREEN < 120, YELLOW 120–300, RED > 300
+- tenant_token_cost_rate_delta (1h, top tenants): GREEN < +20% baseline, YELLOW +20–100%, RED > +100%
+- cache_reaper_backlog_count (queue length): GREEN < 500, YELLOW 500–5000, RED > 5000
+- kv_replication_lag_seconds: GREEN < 2s, YELLOW 2–30s, RED > 30s
+
+Decision lattice overview (high level)
+------------------------------------
+Nodes (action groups):
+A: Informational — add context to dashboards, annotate runbook.
+B: Non-disruptive mitigations — throttle low-priority tenants, enable short-lived local caching, increase batch window slightly.
+C: Capacity adjustments — spin temporary burst capacity, increase worker count in cache pool, increase memory headroom.
+D: Controlled degradation — apply tenant slicing, soft-eviction for background tenants, reduce max sequence length for non-critical requests.
+E: Failsafe swaps — swap to model-variant with lower KV usage, enable fallback read-through from regional caches.
+F: Emergency teardown — drain and restart cache pool nodes, manual KV repair (high risk).
+
+Partial order (examples): A < B < C < D < E < F (A is always safe; F is last resort). The lattice allows multiple branches in parallel: e.g., if tenant_cost_spike AND replication_lag is low, prefer B; if replication_lag high, avoid C until lag resolves.
+
+Playbook: step-by-step with decision points
+------------------------------------------
+1) Triage (0–5 minutes)
+   - Observe: open the prefix-cache incident dashboard (see Dashboard kit).
+   - Confirm scope: is the evictions/miss spike global or per-region/pool?
+   - Run quick checks: `kubectl -n runtime get pods -l app=kv-prefix-cache` and `curl -s http://ops-api/internal/kv/cache-stats?pool=all`
+   - If runtime_tail_p95_ms < 200ms and miss_ratio RED but evictions low: annotate and proceed to step 2.
+
+2) Information collection and annotation (5–10 minutes) [A]
+   - Post an incident channel message with a short summary and links to panels.
+   - Record top-5 affected tenants (by token_cost and error_rate).
+   - Capture a heap/profile snapshot if safe (non-blocking).
+
+3) Apply non-disruptive mitigations (10–25 minutes) [B]
+   - Soft-throttle background tenants: `opsctl tenant throttle --tag background --rate 0.5x` (targets 40% cost reduction for non-critical workloads).
+   - Increase local LRU window: `opsctl cache tune --pool default --lru-window 2m` (reduces immediate eviction churn).
+   - Enable request batching delay hint on router: set batch_delay_ms +10ms for best-effort requests.
+   - Observe metrics for 5–10 minutes. If tail latency improves and miss_ratio falls, transition to monitoring.
+
+4) Capacity adjustments (25–60 minutes) [C] — conditional
+   - Precondition: replication_lag_seconds <= 5s and cloud-burst headroom available.
+   - Action: spin temporary burst workers: `infractl instance-group scale --name kv-cache-burst --delta +6`.
+   - If using Dedicated pools, route lower-priority traffic to burst pool via runtime-router policy.
+   - Watch cache_reaper_backlog_count and eviction rate. If improvements, plan a measured scale plan (add permanent capacity or tune LRU thresholds).
+
+5) Controlled degradation (60–120 minutes) [D] — when C is not possible/sufficient
+   - Apply tenant slicing policy: move non-critical tenants to a soft-eviction class. 
+   - Enforce reduced max_seq_len for background tenants: update runtime config `max_seq_len.background = 512`.
+   - Re-run spot-checks against QPS-sensitive endpoints to ensure core customers maintained.
+
+6) Failsafe swaps and fallback (120–180 minutes) [E]
+   - Swap to model-variant that avoids heavy KV churn (example: variant-quantized-v2).
+   - Enable read-through from regional cache nodes: flip `runtime-router.fallback.read_through = true` for affected routes.
+   - Communicate with impacted partner teams about degraded feature flags.
+
+7) Emergency teardown (>=180 minutes) [F] — last resort
+   - If KV replication_lag_seconds > 120s OR cache node memory corruption suspected: schedule coordinated drain.
+   - Drain nodes via `kubectl cordon/drain`, bring up fresh nodes only after operator verification.
+   - If manual KV repair is required, follow the KV-repair playbook (link in Related Pages). This step requires approval from Platform Lead and DB owner.
+
+Dashboards and alerts (Dashboard kit)
+------------------------------------
+Required panels (minimal kit):
+- Prefix Cache Overview: eviction rate (per-pool), miss ratio (5m), memory utilization, active keys.
+- Tail Latency by route: p50/p95/p99 heatmap.
+- Tenant impact: top 10 tenants by error_rate and token_cost_delta.
+- Replication health: lag_seconds, commit_errors, replica_count.
+- Operator actions timeline: annotations stream (incidents, throttles, scale events).
+
+Suggested Grafana panel queries (Prometheus examples):
+- Eviction rate (1m): `increase(prefix_cache_evictions_total[1m]) / 60`
+- Miss ratio (5m): `sum(prefix_cache_misses_total[5m]) / sum(prefix_cache_requests_total[5m])`
+- p95 tail latency: `histogram_quantile(0.95, sum(rate(runtime_request_duration_seconds_bucket[1m])) by (le, route))`
+
+Alerting rules (recommended)
+- ONSET_ALERT: prefix_cache_evictions_total_rate > 200/m sustained for 3m -> severity: P2 -> runbook: this document (step 1–3)
+- DEGRADATION_ALERT: runtime_tail_p95_ms > 300ms for 2m -> severity: P1 -> require paging and immediate triage
+- REPLICATION_ALERT: kv_replication_lag_seconds > 30s for 1m -> severity: P0 -> immediate page to platform-db and platform-ops
+- COST_SURGE_ALERT: top-3 tenant_token_cost_rate_delta > 100% (1h) -> severity: P2 -> coordinate with customer-success before throttling
+
+Annotated operator checklist (for oncall)
+---------------------------------------
+- [ ] Open prefix-cache incident dashboard and read recent annotations.
+- [ ] Tag incident severity and add initial notes (owner, scope).
+- [ ] Run quick infra checks (pods, backlog queue lengths).
+- [ ] Apply B-group mitigations if safe; observe 10m.
+- [ ] If no improvement, verify preconditions and proceed to C (scale) or D (degrade) depending on replication health and business priorities.
+- [ ] If action E or F executed, notify platform leadership and customer success; prepare postmortem.
+
+Runbook safety rules and invariants
+----------------------------------
+- Never perform emergency teardown (F) during a global network partition unless approved by Platform Lead.
+- Always prefer throttling lower-priority tenants before restarting service pools.
+- For any restart/drain, annotate the dashboard with expected downward traffic impact and monitor 1–5 minute windows.
+
+Post-incident follow-up and roadmap actions
+-----------------------------------------
+- Immediate: capture incident timeline and annotate decision lattice branches chosen. Add the event to the operator training deck.
+- 1-week: run a replay in the staging degradation-lab to reproduce the scenario and validate automated mitigations.
+- 1-month (roadmap): evaluate permanents: increase cache memory headroom, introduce tenant-grade-aware eviction policies, implement auto-throttle runbooks that can be run by the controller (human-in-loop).
+
+Retrospective template (to file after incident)
+---------------------------------------------
+1) Executive summary (1 paragraph)
+2) Timeline of observable signals + operator actions (table)
+3) What went well / What did not
+4) Root cause hypothesis and confidence level
+5) Concrete next steps (owners + due dates)
+
+Appendix: example maintenance matrix (text table)
+------------------------------------------------
+| Action                             | Impact scope    | Risk   | Typical duration | Owner          | Approval needed? |
+|------------------------------------|-----------------|--------|------------------|----------------|------------------|
+| Soft-throttle background tenants   | background only | Low    | 5–10m            | platform-ops   | No               |
+| Spin burst workers                 | pool-level      | Med    | 10–30m           | infra-team     | Ops Lead         |
+| Apply tenant slicing               | tenant groups   | Med    | 10–30m           | runtime-team   | Product SRE      |
+| Drain cache node                   | pool node       | High   | 30–60m           | platform-ops   | Platform Lead    |
+\nAppendix: common commands and snippets
+--------------------------------------
+- Inspect pods: `kubectl -n runtime get pods -l app=kv-prefix-cache -o wide`
+- Get cache stats (example API): `curl -sS https://ops-api/internal/kv/cache-stats?pool=pool-1 | jq`
+- Throttle background tenants: `opsctl tenant throttle --selector tag=background --factor 0.5`
+- Scale burst instance group: `infractl instance-group scale --name kv-cache-burst --delta 6`
+
+Ownership and SLAs
+------------------
+- Primary owner: Runtime platform team (runtime-platform@redwood.com).
+- Secondary owner: Infra capacity team.
+- Oncall rotation: platform-ops oncall.
+- Target SLOs to protect during incidents: global p95 < 120ms, availability >= 99.95%.
+
+Related pages
+-------------
+- Emergency model swap and token surge mitigation (runbook)
+- Cache prefetch prioritization guide
+- KV repair playbook (sensitive)
+
+Document maintenance
+--------------------
+- This playbook should be reviewed quarterly and after any incident where step D or above is executed.
+- Add new alert thresholds as telemetry evolves and after each postmortem.
+
+Acknowledgements
+----------------
+Contributors: Ravi Kapoor (runtime), Tomoko Saito (platform-ops), Lena Ortiz (infra).
+
+End of document

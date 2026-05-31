@@ -1,0 +1,359 @@
+Runbook: Suggestions API Latency and 5xx Triage
+
+## Purpose
+This runbook covers triage and mitigation for elevated latency and/or 5xx error rate on the **Suggestions API** used by the Redwood Console “Optimization suggestions” beta.
+
+Primary goals:
+- Restore availability and latency SLOs quickly.
+- Prevent cross-tenant or broad Console impact (UI timeouts, repeated retries).
+- Preserve correctness guarantees (RBAC + org/project scoping) while degraded.
+
+Non-goals:
+- Deep root cause analysis (capture data for follow-up; open an incident or ticket as needed).
+
+---
+
+## Service / Endpoint Overview
+**User-facing surface:** Redwood Console → Optimize → Suggestions
+
+**Backend service:** `optimize-suggestions-service`
+
+**Primary endpoint (internal naming):**
+- `GET /optimize/suggestions` (list; paginated, sortable)
+- `GET /optimize/suggestions/{suggestion_id}` (details)
+
+**Common query parameters:**
+- `org_id`, `project_id`
+- `route_id` (optional filter)
+- `model` (optional filter)
+- `sort` (e.g., `estimated_savings_usd_day_desc`, `risk_asc`)
+- `page_size`, `page_token`
+
+**Critical dependencies:**
+- Suggestions DB (Postgres)
+- Cache layer (Redis) for hot list requests (if enabled)
+- RBAC/Authz service and policy store
+- Suggestions compute pipeline (produces precomputed estimates + `stale_as_of`)
+
+---
+
+## SLOs, Alerts, and What “Bad” Looks Like
+### SLO targets (beta)
+These are operational targets for the **API**, not the compute pipeline:
+- **Availability:** 99.9% (per 30d) for `GET /optimize/suggestions`
+- **Latency:** p95 < 350ms for list endpoint (typical page_size 25)
+- **Error rate:** 5xx < 0.2% (5-minute window)
+
+### Common alert triggers
+- `SuggestionsAPIHighP95Latency` (p95 > 500ms for 10m)
+- `SuggestionsAPI5xxRateHigh` (5xx > 1% for 5m)
+- `SuggestionsAPITimeouts` (upstream gateway timeouts elevated)
+- `SuggestionsDBPoolSaturation` (connection pool > 90% for 10m)
+
+### User symptoms
+- Console Suggestions page spinner/timeouts
+- Empty states that look like errors (e.g., “Couldn’t load suggestions”)
+- Rapid retries from Console amplifying load
+
+---
+
+## Where to Look First (Dashboards)
+1) **Grafana: Suggestions API Health (Overview)**
+- Panels: RPS, p50/p95 latency, 4xx/5xx, timeouts, payload size
+- Breakdowns: region, cluster, endpoint, status_code
+- Link (internal): `grafana://dashboards/suggestions-api-overview`
+
+2) **Grafana: Suggestions API – Dependency Drilldown**
+- DB query latency, DB connections, Redis ops/latency, authz latency
+- Link (internal): `grafana://dashboards/suggestions-api-deps`
+
+3) **Grafana: Suggestions Compute Lag**
+- Compute job success rate, last successful run, lag minutes, stale rows
+- Link (internal): `grafana://dashboards/suggestions-compute-lag`
+
+4) **Funnel dashboard (for blast radius / retries)**
+- Impressions → expand → error events
+- Link (internal): `grafana://dashboards/suggestions-beta-funnel`
+
+---
+
+## Fast Triage Checklist (10 minutes)
+### Step 0 — Confirm scope and severity
+- Is it **one region/cluster** or global?
+- Is it **list endpoint only** or also details?
+- Is the issue **latency**, **5xx**, or both?
+- Is there a correlated **deploy**, **config change**, or **feature flag ramp**?
+
+### Step 1 — Check recent changes
+- Deploys (last 2 hours): `optimize-suggestions-service`, authz service, DB migrations
+- Console rollout: Suggestions feature flag ramp, cohort expansion
+- Infra: DB failover, Redis maintenance, network incidents
+
+### Step 2 — Identify dominant failure mode
+Use dashboard splits by `status_code` and error class.
+- If **5xx spikes** with stable latency → likely exceptions, dependency outage, pool exhaustion
+- If **p95 latency climbs** with rising DB time → query regression or DB contention
+- If **gateway timeouts** dominate → threads blocked, deadlocks, slow queries, downstream timeouts
+
+### Step 3 — Capture evidence for follow-up
+- Snapshot graphs (latency, 5xx, DB latency, DB pool)
+- Top error messages (from logs)
+- A few example request IDs / trace IDs
+
+---
+
+## Logs, Traces, and Key Signals
+### Logs (Kibana/Loki)
+Filter by:
+- `service=optimize-suggestions-service`
+- `endpoint=/optimize/suggestions`
+- `status>=500`
+
+Look for:
+- DB errors: `too many connections`, `timeout`, `deadlock detected`
+- Authz errors: policy fetch timeouts
+- Serialization/payload errors: response too large
+- Pagination token parsing failures (can present as 5xx if unhandled)
+
+### Traces (Tempo/Honeycomb)
+Find slow traces and identify which span dominates:
+- `db.query` (slow SQL)
+- `authz.check` (RBAC latency)
+- `redis.get`/`redis.mget` (cache slowness)
+
+### Metrics (names may vary by cluster)
+- `http_server_request_duration_seconds{service="optimize-suggestions-service"}`
+- `http_server_requests_total{status_code=~"5.."}`
+- `db_pool_in_use{service="optimize-suggestions-service"}`
+- `db_query_duration_seconds{query_name=...}`
+- `authz_request_duration_seconds`
+- `redis_command_duration_seconds{command=...}`
+
+---
+
+## Common Causes and Mitigations
+### A) DB query regression / N+1 behavior
+**Signals**
+- p95 increases with DB time; CPU on DB rises; slow query log shows repeated similar queries.
+- Latency worsens with higher `page_size`.
+
+**Immediate mitigations**
+1) Reduce load:
+- Temporarily reduce Console page_size defaults (if configurable via server config).
+- Consider throttling list endpoint at the gateway for abusive orgs (avoid global throttles if possible).
+
+2) Enable/Increase caching for list responses (if safe for RBAC scoping):
+- Ensure cache key includes `org_id`, `project_id`, filters, and `sort`.
+- Keep TTL short (e.g., 60–120s) to avoid confusion and preserve “near-real-time” expectation.
+
+3) If a known regression is identified, roll back:
+- Roll back the last deploy to `optimize-suggestions-service`.
+- If caused by a query change, prefer rollback over hotfix unless rollback is blocked.
+
+**Follow-up**
+- Open ENG ticket and attach the slow query / trace evidence.
+- If this resembles the prior N+1 pattern, reference the query optimization work (e.g., “N+1 in suggestions query” fix).
+
+---
+
+### B) DB connection pool saturation
+**Signals**
+- Elevated 5xx with errors like `remaining connection slots are reserved`.
+- `db_pool_in_use` near max; queue wait time increases.
+
+**Immediate mitigations**
+1) Scale application pods (carefully):
+- Scaling pods can worsen DB saturation if pool sizes scale linearly.
+- If scaling, ensure max connections per pod is bounded.
+
+2) Reduce concurrent work:
+- Temporarily lower worker concurrency / thread pool if requests are blocking.
+
+3) Gate traffic:
+- Pause new beta org enables (feature flag) and/or reduce cohorts.
+
+4) Engage DB on-call if the DB itself is overloaded (high CPU/IO, long locks).
+
+**Escalation trigger**
+- Pool saturation sustained > 15m or repeated DB connection errors → page SRE + DB owner.
+
+---
+
+### C) Redis/cache degradation (if enabled)
+**Signals**
+- `redis_command_duration` increases; timeouts; cache miss rate spikes.
+- Latency increases but DB time may remain flat (if app blocks on cache timeouts).
+
+**Immediate mitigations**
+1) Fail open on cache:
+- Switch cache operations to non-blocking mode / shorter timeouts (config).
+- If Redis is causing tail latency, temporarily disable cache reads (keep writes off as well).
+
+2) Reduce cache key cardinality:
+- Ensure keys are not including high-cardinality fields unnecessarily.
+
+---
+
+### D) Authz/RBAC dependency latency
+**Signals**
+- Traces show `authz.check` dominating.
+- Increased 5xx due to authz timeouts or circuit breaker open.
+
+**Immediate mitigations**
+1) Confirm we are not making per-row authz checks.
+- List endpoint should authorize at org/project scope once, then filter results.
+
+2) Enable authz result caching (short TTL) if available.
+
+3) If authz is down: fail closed (no data) rather than serving suggestions without verification.
+- Prefer returning a 403/feature unavailable rather than leaking data.
+
+---
+
+### E) Suggestions compute lag / stale data confusion (not usually 5xx)
+Compute lag typically causes “stale_as_of” to be old or “insufficient telemetry” states, but can cause backend errors if invariants break.
+
+**Signals**
+- Compute lag dashboard shows last successful run too old.
+- Errors referencing missing aggregates or null estimate fields.
+
+**Immediate mitigations**
+1) Degrade to “stale but serveable”:
+- Continue serving last known suggestions with `stale_as_of` intact.
+- Do not recompute synchronously on read.
+
+2) Pause compute backfills if they overload the DB.
+- Prefer off-peak backfills.
+
+3) If compute job is failing repeatedly:
+- Page compute owner (Optimize pipeline) and consider disabling new suggestion generation while serving cached results.
+
+---
+
+## Safe Degradation Options (Preferred Order)
+Use these to reduce user impact while protecting safety and trust.
+
+1) **Serve cached / precomputed results with explicit staleness**
+- Keep `stale_as_of` visible to UI.
+
+2) **Return partial list with clear UI messaging**
+- Example: “Some filters are unavailable right now. Showing top suggestions only.”
+
+3) **Temporarily disable expensive fields** (only if the API contract allows)
+- Example: omit confidence bands or verbose explanations if they cause payload bloat.
+- Must maintain backward compatibility per API contract.
+
+4) **Feature flag off** for impacted cohort
+- If needed, disable Suggestions UI entry point for newly-enabled orgs first.
+
+5) **Hard disable endpoint** (last resort)
+- Return 503 with Retry-After and ensure Console handles gracefully.
+
+---
+
+## Step-by-Step: What to Do During an Active Alert
+### 1) Acknowledge and assess
+- Confirm alert is real (not a monitor glitch).
+- Identify affected clusters/regions.
+
+### 2) Stabilize
+- If 5xx > 5% or timeouts are high: reduce traffic first (pause cohort ramp, throttle abusive orgs).
+- If p95 is high with DB saturation: prioritize DB protection (reduce concurrency, consider rollback).
+
+### 3) Identify top contributor
+- Check traces for the slowest span type.
+- Check logs for top error signature.
+
+### 4) Apply the smallest reversible mitigation
+- Prefer config toggles and rollbacks over code changes during incident.
+
+### 5) Validate improvement
+- Watch latency p95 and 5xx over 10–15 minutes.
+- Confirm no new regression (e.g., 4xx spike from authz failures).
+
+### 6) Communicate
+- Update incident channel with:
+  - Current status, suspected cause
+  - Mitigation applied
+  - Next checkpoint time
+
+---
+
+## Rollback / Feature Flag Procedures
+### Backend deploy rollback
+- Use standard deploy tooling to roll back `optimize-suggestions-service` to last known good.
+- Confirm schema compatibility (no forward-only migrations).
+
+### Console feature flag gating
+- If Console traffic is the amplifier, disable Suggestions view for new cohorts first.
+- Keep internal dogfood enabled if it’s needed for debugging and is low volume.
+
+Audit expectations:
+- Record org IDs enabled/disabled and reason.
+- Ensure access changes are logged (especially if involving RBAC scopes).
+
+---
+
+## Escalation Paths
+Page in this order, based on evidence:
+
+1) **Eng Platform On-call (API owner)**
+- Primary responder for API errors, deployment, caches.
+
+2) **SRE On-call**
+- If multi-service incident, gateway timeouts, cluster instability, or broad customer impact.
+
+3) **DB On-call / Infra**
+- If DB saturation, lock contention, failover, or disk/IO pressure.
+
+4) **Telemetry/Compute owners**
+- If compute lag/failure is causing API exceptions or overload (backfills).
+
+When to declare an incident:
+- User-facing 5xx > 1% sustained > 10m for multiple orgs, OR
+- p95 > 2s sustained > 15m, OR
+- Any suspicion of cross-tenant data risk (immediate incident + security escalation).
+
+---
+
+## Post-Incident Follow-ups (Required)
+Within 24 hours of stabilization:
+- Create a ticket with:
+  - Start/end time, regions affected
+  - Primary metrics (p95, 5xx, timeouts)
+  - Root cause hypothesis and evidence (logs/traces/screenshots)
+  - Mitigation applied and any downsides
+  - Concrete prevention items (query fix, caching changes, monitor tuning)
+
+Within 5 business days (if severity warrants):
+- Write an incident review summary (or attach to ongoing reliability initiative).
+
+---
+
+## Appendix: Quick Commands
+### cURL sanity checks (internal)
+- List:
+  - `curl -H "Authorization: Bearer $TOKEN" "https://api.redwood.example/optimize/suggestions?org_id=...&project_id=...&page_size=25" -v`
+- Details:
+  - `curl -H "Authorization: Bearer $TOKEN" "https://api.redwood.example/optimize/suggestions/$SUGGESTION_ID" -v`
+
+What to verify:
+- Server timing, status code
+- Response size
+- Presence of `stale_as_of` and stable `suggestion_id`
+
+### kubectl (if applicable)
+- Pods:
+  - `kubectl -n optimize get pods -l app=optimize-suggestions-service`
+- Recent errors:
+  - `kubectl -n optimize logs deploy/optimize-suggestions-service --since=10m | grep -E "ERROR|panic|timeout"`
+
+---
+
+## Appendix: Known Edge Cases
+- Large orgs with many routes/models can produce heavy list queries if filtering is absent.
+- Certain sorts (e.g., sorting by computed savings fields) can be expensive if not indexed.
+- Page token parsing errors can cascade into 5xx if not handled defensively.
+- Retries from Console can amplify load; watch for sudden RPS step functions correlated with UI changes.
+
+If any of the above is suspected, prefer mitigation via throttling + rollback, then follow up with indexing/query fixes and contract-safe caching.

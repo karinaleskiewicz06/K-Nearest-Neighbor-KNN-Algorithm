@@ -1,0 +1,159 @@
+GPU CI test quarantine and resource fencing protocol
+
+Summary
+-------
+This document defines the automated and manual procedures for quarantining failing GPU-backed CI jobs and fencing the noisy or misbehaving GPU resources they consume. The goal is to keep the shared GPU fleet healthy, minimize developer disruption, and ensure CI throughput while preserving production SLAs. It covers detection rules, pipeline changes, IaC patterns, incident escalation, and postmortem requirements.
+
+Scope
+-----
+Applies to:
+- All GPU-backed CI runners (kubernetes pod runners and GKE node pools) used for: unit tests that exercise the serving runtime, integration/eval jobs, and small-scale model evaluation suites.
+- Self-serve ephemeral GPU environments (developer sandboxes) initiated via our ci-gpu-lease broker.
+
+Excludes:
+- Long-running training clusters and customer-dedicated pools (those have separate tenancy lifecycle).
+
+Owners and Contacts
+-------------------
+- Document owner: eng-infra CI/CD (owner_team: engineering).
+- Primary oncall escalation: infra-sre-oncall@redwood.com (pager duty: INFRA-SRE).
+- CI platform lead: Miguel Santos.
+- GPU fleet lead: Priya Kapoor.
+
+SLOs and thresholds
+-------------------
+We maintain the following high-level SLOs for CI services that touch GPU resources:
+- CI GPU job success rate (7-day window): >= 95%
+- Mean job startup latency (time from job queued -> pod running): <= 45s for warm pools, <= 180s for cold allocs
+- GPU node eviction events caused by CI jobs: <= 1 per 10,000 allocation-minutes
+
+Detection and alerting rules
+---------------------------
+1) CI job failure spike
+- Trigger when a job-type-specific failure rate exceeds 3x baseline over a 30m window and absolute failure rate > 10% for that job queue.
+- Alert: Alert name: ci.gpu.job_failure_spike
+
+2) Abnormal GPU metrics on node
+- Trigger when GPU memory utilization > 92% for > 10 minutes or GPU SM utilization is > 98% for > 5 minutes across a node with CI label.
+- Alert: infra.gpu.node_resource_pressure
+
+3) Pod-level OOM / driver crash frequency
+- Trigger when > 5 kernel/driver crashes or OOMKilled pods are observed on a single node within 15 minutes.
+- Alert: infra.gpu.driver_crash_burst
+
+4) CI-runner leak detection
+- Trigger when runner pods are not terminating and hold GPU allocation for > 90 minutes (for ephemeral tests).
+- Alert: ci.gpu.runner_leak
+
+Automated quarantine workflow (high level)
+-----------------------------------------
+When an alert fires, the following sequence runs automatically if the alert meets threshold criteria. Automation steps are implemented as a small Kubernetes operator (ci-gpu-guard) and a companion GitHub Actions workflow for pipelines.
+
+1) Classify the signal
+- ci-gpu-guard queries the CI metadata service (ci-metadata: /v1/jobs/{id}) to map failing jobs to pipeline, owner, and git commit.
+
+2) Create a quarantine allocation
+- The operator creates a namespace-scoped label: `gpu-quarantine=true` and spins up a temporary taint on the node(s) involved: `taint=ci/quarantine:NoSchedule` to prevent new CI jobs from landing.
+- A node annotation (quarantine_started_at) is added for auditing.
+
+3) Evict/Drain non-essential pods
+- Non-critical system pods are evicted (respecting PodDisruptionBudgets). Critical infra (prometheus, logging-agent) is preserved.
+
+4) Snapshot and isolate state
+- KV caches and temp mounts are snapshotted into the artifacts bucket (s3://redwood-ci-artifacts/quarantine/{node}/{timestamp}).
+
+5) Notify owners and cut a short-lived quarantine label on the pipeline run
+- A Slack incident message is posted to #infra-alerts and the pipeline owner with links to logs and the snapshot.
+
+6) Apply resource fencing and cgroup limits
+- The operator patches kubelet config for the node to impose conservative limits: GPU memory soft-limits and CPU throttles for CI pods in the affected namespace.
+
+Automatic remediation candidates (fast path)
+------------------------------------------
+The system will attempt the following fast-path remediations before manual review:
+- Restart the offending CI job(s) up to 2 times with reduced parallelism and smaller batch size env vars (CI_REDUCE_BATCH=true).
+- If GPU driver/kernel instability detected, attempt a privileged driver daemon restart with rolling driver reload script: `/opt/infra/bin/driver-reload --grace 30s`
+- If memory pressure is persistent, attempt to live-migrate ephemeral pods to warm-pool nodes with spare capacity (via node selector `gpu-pool=warm`).
+
+Manual quarantine runbook (when automation escalates)
+---------------------------------------------------
+Steps for the oncall/engineer to follow when the guard operator flags a node for manual review:  
+1) Confirm alerts and failure patterns. Query the following dashboards: `dashboards/ci/gpu-job-failures`, `dashboards/infra/gpu-node-health`, and `dashboards/ci/runtime-startup-latency`.
+2) Run `kubectl describe node <node>` and `kubectl get pods -o wide --field-selector spec.nodeName=<node>`.
+3) If driver crash history present, collect support bundle: `sudo /opt/infra/bin/collect-gpu-support --node <node> --out /tmp/support-$(date +%s).tgz` and upload to the quarantine artifact path.
+4) Decide: drain node vs. patch in place. If > 3 distinct pipelines affected or driver-level crashes -> drain.
+   - To drain: `kubectl drain <node> --ignore-daemonsets --delete-local-data --force` (documented exception: preserve logging-agent daemonset).
+5) Replace node via IaC (preferred) using `terraform apply -target=module.gpu_pool.aws_autoscaling_group.quarantine_replacement` to reprovision replacement nodes and retire the quarantined node.
+6) Post-event: create a Jira incident ticket with the `CI-QUAR` template and assign to pipeline owners and gpu-fleet lead.
+
+Resource fencing patterns (IaC & runtime)
+----------------------------------------
+We use a combination of Kubernetes taints/labels, cgroups (via kubelet and runtime), and cloud-level tagging to implement fencing. Key patterns: 
+- Terraform module: `modules/gpu-fencing` (exposes `quarantine_taint` and `fence_policy` inputs).
+- Node group variants: `warm-pool`, `cold-pool`, `quarantine-pool`.
+- ASG lifecycle hook to snapshot volumes before termination (hook name: `quarantine-snapshot-hook`).
+
+Example Terraform snippet (pseudo):
+
+module "gpu_fencing" {
+  source = "git::ssh://git@github.com/redwood/terraform-modules.git//modules/gpu-fencing"
+  fence_policy = "conservative"
+  quarantine_taint = "ci/quarantine:NoSchedule"
+}
+
+CI pipeline changes required
+---------------------------
+- Each GitHub Actions runner job that uses GPUs must:
+  1) Set metadata labels: `ci.labels = ["gpu","team:<team>","pipeline:<pipeline>"]`
+  2) Honor backoff env vars: `CI_REDUCE_BATCH`, `CI_MAX_RETRIES`
+  3) Upload runtime diagnostics on failure to s3 artifacts with structure `ci/{pipeline}/{run_id}/diagnostics/`
+
+- New shared workflow: `.github/workflows/gpu-quarantine-notify.yml` that listens to ci.gpu.* alerts and posts a Slack card with quick actions (restart job, open Jira, run diagnostic).
+
+Observability and dashboards
+---------------------------
+Minimum dashboards and views to include in any quarantine incident: 
+- Node detail: GPU memory/SM/mig counters, driver logs, pod list.
+- CI job timeline: queue->start->end with runtime metrics.
+- Quarantine audit: list of quarantined nodes in last 30 days with reason, owner, outcome.
+
+Alert severity mapping and SLAs
+-------------------------------
+- P0: infra.gpu.driver_crash_burst -> page infra-sre oncall immediately. Expected action: node quarantine within 15 minutes.
+- P1: ci.gpu.job_failure_spike -> notify pipeline owner and infra-sre; automated quarantine reviewed within 60 minutes.
+- P2: ci.gpu.runner_leak -> create ticket, auto-restart runners, remediation within 24 hours.
+
+Post-incident requirements
+-------------------------
+For every manual quarantine event the owner must produce:
+- A one-page incident summary in the incident-triage doc including root cause hypothesis, actions taken, and mitigations.
+- Telemetry artifacts: node snapshot path, job traces, and pulled driver support bundles.
+- A regression test in the CI non-prod sandbox that reproduces the failure class (if applicable).
+
+Practice & test plan
+--------------------
+- Quarterly chaos game day: run controlled driver crash simulation on 1% of warm-pool nodes to validate eviction and replacement flow.
+- Weekly burn-in: run the GPU-ci-smoke suite on a fresh warm-pool to detect startup regressions.
+
+Appendix - Quick commands and examples
+-------------------------------------
+- Force-annotate a node as quarantined (manual):
+  kubectl annotate node <node> quarantine_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" && kubectl taint nodes <node> ci/quarantine:NoSchedule=true:NoSchedule
+
+- Snapshot helper (driver bundle):
+  sudo /opt/infra/bin/collect-gpu-support --node <node> --out s3://redwood-ci-artifacts/quarantine/<node>/bundle.tgz
+
+- Reprovision via terraform: `terraform apply -target=module.gpu_pool.aws_autoscaling_group.quarantine_replacement`
+
+- Example alert query (Grafana/Prometheus):
+  sum(rate(ci_job_failures_total{job_type="gpu"}[5m])) by (pipeline) / sum(rate(ci_job_runs_total{job_type="gpu"}[5m])) by (pipeline) 
+
+Related pages and reading
+------------------------
+- See also: GPU warm-pool sizing guidelines (internal), gpu-node-image-rotation-and-cve-response-runbook.json, gpu-provisioning-immutable-state-and-disaster-recovery.json
+
+Revision history
+----------------
+- 2024-10-15: Draft created by Aisha Raman.
+- 2024-11-20: Added automated remediation steps and ci-gpu-guard operator design (review by Miguel S.).
+- 2025-02-18: Published after game-day validation and Terraform module `modules/gpu-fencing` checked into infra repo.

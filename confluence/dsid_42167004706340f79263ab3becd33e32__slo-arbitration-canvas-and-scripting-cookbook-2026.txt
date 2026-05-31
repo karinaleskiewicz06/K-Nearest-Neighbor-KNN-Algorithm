@@ -1,0 +1,165 @@
+SLO arbitration canvas and scripting cookbook
+
+Overview
+
+Purpose:
+This document defines the SLO arbitration canvas — a lightweight decision framework and accompanying operator scripting cookbook for platform operators to make deterministic choices when multiple SLOs conflict during capacity shortages, model cascades, or regional degradations. The goal is to make trade-offs repeatable, auditable, and automatable.
+
+Who should use this doc:
+- Platform operators running regional operator consoles
+- Oncall engineers executing mitigation steps during degradation
+- Platform product owners designing graceful degradation policies
+
+Background and motivation:
+Redwood's multi-tenant inference surface exposes numerous SLOs simultaneously (tail latency, p50 token latency for interactive customers, throughput for batch customers, token-cost SLOs for internal billing cadence, and quality regressions for model variants). Historically, operators relied on ad-hoc judgement when arbitrary combinations of alerts fired. That led to inconsistent customer impact and avoidable cost. The arbitration canvas reduces cognitive load by enumerating priority axes, safe fallbacks, and deterministic scriptable actions.
+
+Key definitions:
+- SLI: observable metric (e.g., delivery.latency_99, generate.tokens_per_second).
+- SLO: target over rolling window (e.g., delivery.latency_99 < 200ms over 1h).
+- Arbitration policy: ordered rules mapping SLO breach contexts -> action sets.
+- Action set: set of operator-invokable steps (scripts, API calls, manual checks).
+
+High-level arbitration flow (summary):
+1) Ingest signals: SLO breach alarms + contextual telemetry (tenant, model, region, queue depth).
+2) Classify scenario: use deterministic matcher to map to scenario type (Capacity Scarcity, Model Misbehaviour, Regional Network Degradation, Cost Spike).
+3) Evaluate policy matrix: apply prioritized rules to select a candidate action set.
+4) Recommend automation script(s) with safety gates.
+5) Execute with operator confirmation or fully-automated if pre-authorized.
+6) Observe and revert/rollforward per outcome.
+
+Arbitration canvas (decision matrix) — columns and example entries:
+
+Columns:
+- Scenario type
+- Primary SLO at risk
+- Secondary SLOs impacted
+- Tenant priority tier (free | standard | enterprise | internal-critical)
+- Suggested immediate action (lowest-latency mitigation)
+- Suggested conservative action (costly but protective)
+- Safety gates / prechecks
+- Escalation and audit steps
+
+Example rows (ASCII table):
+
+| Scenario | Primary SLO | Secondary SLOs | Tenant tier | Immediate action | Conservative action | Gates | Escalate to |
+|---|---|---:|---|---|---|---|---|
+| Regional GPU saturation | p99 latency (interactive) | tokens/sec, billing burn | enterprise, standard | Increase tenant slice weight by +10% via allocator API | Temporarily move lower-tier tenants to burstless pool and enable quantized variant for enterprise | Check local thermal/spot capacity; confirm no ongoing maintenance | Platform oncall -> Capacity lead |
+| Model KV-cache corruption | correctness/regression alerts | p50 latency | internal-critical, enterprise | Route affected requests to read-through cache fallback and enable model-variant v1.1 | Roll back to previous model version across region | Confirm KV checksum mismatch and replication lag < 60s | ML infra + Serving runtime team |
+| Token-cost sudden spike | per-tenant cost SLO | p99 latency | free, standard | Throttle per-session token max to 512 tokens and notify customer | Apply soft-quotas and dynamic batching to high-cost flows | Verify billing spike signal and correlating prompt patterns | Billing -> Customer Success |
+
+Arbitration policy language (example):
+We maintain a compact rule format that is deliberately scriptable and human readable. Rules are stored in the platform config store as newline-separated expressions: 
+
+RULE_ID: cap_saturation_2026
+MATCH: signal.tags contains "gpu-saturation" AND signal.p99_latency > 250ms
+PRIORITY: 10
+ACTIONS: [script://increase-slice-weight --tenant=${tenant} --delta=10, notify://ops-channel] 
+AUTOMATION: gated (requires operator ack)
+ESCALATE_TO: team:eng-platform, severity:high
+
+Operator scripting cookbook (safe, idempotent examples)
+Notes: all example scripts below assume the operator's cli (rwc) and the allocator rest API are available on the operator jump host and proxied to the control plane. Scripts must be idempotent and log to /var/log/platform-ops/actions.log.
+
+1) increase-slice-weight (bash wrapper)
+
+#!/bin/bash
+# increase-slice-weight --tenant <tenant> --delta <percent>
+set -euo pipefail
+tenant="$1"
+delta="$2"
+# idempotent: record last action in KV so repeated runs don't repeatedly increase
+LAST_KEY="ops:${tenant}:last-slice-inc"
+last=$(rwc kv get "$LAST_KEY" || echo "0")
+if [ "$last" = "$delta" ]; then
+  echo "already applied delta=$delta for $tenant"
+  exit 0
+fi
+rwc allocator adjust-slice --tenant "$tenant" --percent="$delta"
+rwc kv put "$LAST_KEY" "$delta"
+echo "slice weight increased for $tenant by $delta%" | tee -a /var/log/platform-ops/actions.log
+
+2) route-to-fallback-cache (python pseudo SDK)
+
+# idempotent: sets a per-tenant override route for 15m
+from redwood import controlplane
+def enable_fallback(tenant, duration_minutes=15):
+    key = f"override:{tenant}:fallback_active"
+    if controlplane.kv.get(key) == "true":
+        return
+    controlplane.routing.set_tenant_route(tenant, backend="fallback-kv-cache")
+    controlplane.kv.put(key, "true", ttl=duration_minutes*60)
+    controlplane.audit.log("operator", f"enabled fallback cache for {tenant}")
+
+Automated safety gates (checks to run before scripts)
+- capacity_check(): confirm effective free GPU capacity in region > 2 units OR queued eviction < 5%
+  PromQL: sum(gpu_free_units{region="$region"}) > 2
+- thermal_check(): ensure recent node temperature median < 85C
+  PromQL: histogram_quantile(0.5, node_gpu_temperature_celsius{node=~"node.*"}) < 85
+- model_checksum(): verify model shard checksums disagree with baseline
+  CLI: rwc model verify-checksum --model-id ${model} --since 60s
+
+Dashboard & alert appendix (concrete panels and example queries)
+- Panel: Arbitration Context View
+  - Queries:
+    - p99 latency by region and tenant: delivery_latency_seconds{quantile=\"0.99\"} by (region, tenant)
+    - tenant slice weight: allocator_slice_percentile{tenant=~".*"} by (tenant)
+  - Layout: top row: affected tenants, second row: active arbitration rule, third row: suggested script status
+
+- Alert: arbitration.rule_triggered (composite alert)
+  - Trigger when: delivery_latency_p99 > 250ms AND gpu_utilization > 85% for 3m
+  - Severity: P1 for enterprise tenants, P2 for standard, P3 for free-tier
+  - Runbook link: <this doc>
+
+- Example PromQL snippets:
+  - p99 latency: histogram_quantile(0.99, sum(rate(request_duration_seconds_bucket[1m])) by (le, region, tenant))
+  - gpu utilization: 100 - (avg by(node)(irate(node_gpu_idle_seconds_total[1m])) * 100)
+
+Execution patterns and playbook templates
+- Operator-in-the-loop (recommended default):
+  1) Alert fires and recommendation posted to ops channel by the arbitration bot.
+  2) Operator opens Arbitration Context View and reviews prechecks.
+  3) Operator clicks "Run increase-slice-weight" which invokes script with dry-run flag.
+  4) If dry-run looks safe, operator confirms to execute.
+  5) Automation records action and links to PR cadence if rollback needed.
+
+- Fully automated (only for pre-authorized rules):
+  - Conditions: low-blast-impact actions (thin-slice adjustments), rule priority >= 20, test window pass rate > 90% in staging playback.
+  - Audit: every automated execution posts a structured event to the audit index and notifies the SRE paging channel.
+
+Post-incident retrospective checklist (short):
+- Collect arbitration-trigger events: rule id, inputs, chosen actions, operator ack, and outcome metrics (p99 latency delta, tokens/sec, cost delta).
+- Run the replay in the synthetic lab for 3 historic windows.
+- Update policy parameters if action produced negative downstream effects (e.g., increased error rate or unfair tenant eviction).
+- Add a short blameless note to the ops retro board and assign follow-ups (owner, due date).
+
+Roadmap and next steps (product/automation):
+- Q2 2026: Add ML-assisted rule ranking to propose the minimum-impact action set from historical replays.
+- Q3 2026: Ship policy authoring UI in the Console (visual arbitration canvas + simulator).
+- Q4 2026: Integrate fine-grained tenant affinity signals (session intents) into matcher inputs.
+
+Operational ownership and contacts:
+- Primary owner: eng-platform (operator cadence)
+- Secondary: eng-serving-runtime (for runtime safeguards), eng-sre (for alert routing)
+- Escalation contact list: ops-pager@redwood.example.com, capacity-leads@redwood.example.com
+
+Appendices
+A. Minimal change template for adding a new arbitration rule:
+1) Create rule file in config repo: rules/<team>/my-rule.rule
+2) Add unit tests that simulate signal inputs and assert action selection.
+3) Submit PR with description and risk matrix.
+4) Schedule a 2h canary in staging with the arbitration-simulator.
+
+B. Example audit event schema (flat key/value examples):
+- timestamp: 2026-01-11T14:23:00Z
+- rule_id: cap_saturation_2026
+- inputs: delivery_latency_p99=310ms;gpu_util=87%
+- action: increase-slice-weight:tenant=acme-corp:delta=10
+- operator: asha.menon
+- outcome: p99_delta=-120ms;cost_change=+3.4%
+
+C. Quick references:
+- allocator API: https://internal-api.redwood.example.com/allocator/docs
+- automation CLI (rwc) help: rwc --help
+- arbitration config repo: git@internal:platform/arbitration-rules.git
+
+If you are an operator: bookmark this page and add it to your shift handoff packet. Maintain conservative defaults for automation until policy replays in the synthetic lab have proven safe for at least three independent runs.

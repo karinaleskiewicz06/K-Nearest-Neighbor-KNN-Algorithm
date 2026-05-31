@@ -1,0 +1,501 @@
+Optimization Config Service (OCS)
+
+## Overview
+Optimization Config Service (OCS) is the control-plane service responsible for **versioning, validating, and safely rolling out** optimization configuration changes across Redwood’s inference fleet.
+
+Optimization configs cover settings that affect runtime economics and performance, including:
+- **Batching** (heuristics, max batch tokens/size, queue timeouts)
+- **Caching** (prefix/KV cache enablement, cache sizing policies)
+- **Quantization profiles** (profile selection, compatibility constraints, quality gating)
+
+OCS implements:
+- Immutable **Optimization Config Version** objects with metadata and diffs
+- Safe apply workflows (validate → canary → promote)
+- One-click rollback (Console + API)
+- Audit logging and RBAC enforcement
+
+OCS supports **Hosted** and **Dedicated** fully managed via Redwood control plane, and provides the same versioning model for **Private** deployments (with operator-driven pin/rollback via helm/installer/terraform).
+
+---
+
+## Responsibilities
+OCS is the system of record for optimization config lifecycle.
+
+**In-scope responsibilities**
+1. Store immutable optimization config versions.
+2. Validate:
+   - Schema validation (shape/types)
+   - Semantic validation (safe ranges, compatibility rules, scoping constraints)
+3. Compute diffs between versions and generate risk annotations.
+4. Manage rollout jobs (canary %, staged progression, pause/resume).
+5. Evaluate rollout gating signals (SLO + quality where applicable) via gate hooks.
+6. Manage “active version pointers” by scope (tenant/model/region) with promotion/rollback semantics.
+7. Emit audit events for create/validate/apply/promote/rollback.
+
+**Out of scope**
+- Serving runtime implementation details (workers, cache invalidation, batching scheduler).
+- End-to-end metric computation (OCS consumes gate evaluations from the SLO/gate toolchain).
+- Fully automated rollback for all customers without human confirmation (early phases restricted).
+
+---
+
+## Service ownership and on-call
+- **Owner team:** Engineering – Platform Control Plane
+- **EM:** Ethan Park
+- **Primary engineers:** Benji Okafor, Michael Nguyen
+- **Policy/RBAC partner:** Jordan Lee
+- **SRE partners:** Sean Gallagher (lead), Aisha Bello
+
+**On-call**
+- Tier 1: Platform Control Plane on-call
+- Tier 2: SRE on-call (for DB/infra incidents, widespread rollout failures)
+- Tier 3: Serving Runtime on-call (if worker apply/rollback propagation is unhealthy)
+
+Slack channels (internal): #eng-platform, #eng-sre, #eng-runtime, #eng-security
+
+---
+
+## Architecture (high level)
+OCS is a stateless API service backed by PostgreSQL and an event stream used for runtime propagation and audit export.
+
+**Key components**
+- **OCS API** (this service)
+- **Postgres** (authoritative storage for versions, pointers, rollout jobs)
+- **Rollout Controller** (part of OCS; drives progressive apply and gate checks)
+- **Gate Evaluator integration** (SLO toolkit + perf-canary + eval harness)
+- **Event stream/Webhooks** (internal event bus for config lifecycle + external integrations)
+- **Runtime Config Fetch** (runtime workers poll/subscribe to fetch active versions per scope)
+
+**Data flow summary**
+1. Operator creates a new version (draft) → schema/semantic validation.
+2. Operator starts an apply job (e.g., canary 5%) → rollout controller updates desired pointers in stages.
+3. Runtime workers observe pointer changes → fetch version payload → apply idempotently.
+4. Gate checks run on metrics tagged with config_version + scope → controller promotes/pause/rollback.
+
+---
+
+## Storage model
+OCS stores immutable config versions and mutable “active pointers” per scope.
+
+### Core tables (conceptual)
+**optimization_config_versions**
+- version_id (ULID)
+- config_set_id (stable identifier for a logical config stream; e.g., “default”, “tenant:abc”) 
+- created_at, created_by
+- source (console | api | terraform | private-operator)
+- change_summary (human-readable)
+- config_payload (JSON)
+- schema_version (int)
+- validation_status (pending | passed | failed)
+- validation_errors (text)
+- parent_version_id (optional)
+- content_sha256 (dedupe + integrity)
+
+**optimization_config_pointers** (mutable)
+- scope_type (global | tenant | tenant_model | tenant_model_region)
+- scope_key (string encoding of scope)
+- active_version_id
+- updated_at, updated_by
+- update_reason (apply | promote | rollback | emergency)
+- rollout_job_id (optional)
+
+**optimization_rollout_jobs**
+- rollout_job_id
+- target_scope (encoded)
+- from_version_id, to_version_id
+- canary_strategy (percent | shard)
+- canary_percent (if percent-based)
+- status (queued | running | paused | succeeded | failed | rolled_back)
+- stage (precheck | canary | expanded | promote | rollback)
+- gate_policy_id
+- started_at, completed_at
+
+**optimization_audit_events_outbox**
+- outbox_id
+- event_name
+- event_payload
+- created_at
+- delivered_at (nullable)
+
+### Immutability guarantees
+- **Versions are immutable** after creation (config_payload, metadata, parent reference).
+- If a mistake is found, create a new version that supersedes the bad version; do not edit history.
+
+### Retention
+- Versions: retained for **at least 18 months** (subject to enterprise retention requirements).
+- Rollout jobs + gate results references: retained for **at least 12 months**.
+- Audit events: follow Security’s audit logging retention policy (see related page).
+
+---
+
+## Scoping model
+OCS supports hierarchical scoping; the runtime resolves the most specific applicable pointer.
+
+Resolution order (most specific wins):
+1. tenant_model_region
+2. tenant_model
+3. tenant
+4. global
+
+**Scope key encoding (examples)**
+- global: `global`
+- tenant: `tenant:tn_8f3b2`
+- tenant_model: `tenant:tn_8f3b2|model:rw-qwen2.5-72b`
+- tenant_model_region: `tenant:tn_8f3b2|model:rw-qwen2.5-72b|region:us-east-1`
+
+---
+
+## API surface
+OCS exposes internal and customer-facing APIs (Console and SDKs call the customer-facing endpoints).
+
+### Authentication and authorization
+- All endpoints require authn.
+- RBAC enforced via policy bundle:
+  - `optimization_config.read`
+  - `optimization_config.create`
+  - `optimization_config.validate`
+  - `optimization_config.apply`
+  - `optimization_config.promote`
+  - `optimization_config.rollback`
+
+**Important:** rollback is the most privileged action; production rollbacks require `optimization_config.rollback` and may require an approval workflow depending on tenant policy.
+
+### Idempotency
+- Mutation endpoints accept `Idempotency-Key` header.
+- If the same idempotency key is replayed with the same payload, OCS returns the prior result.
+
+### Endpoints (customer-facing)
+Base: `/v1/optimization-config`
+
+1) **Create version**
+- `POST /v1/optimization-config/versions`
+- Creates an immutable version in `validation_status=pending`.
+
+2) **Validate version**
+- `POST /v1/optimization-config/versions/{version_id}:validate`
+- Runs schema + semantic checks; returns actionable errors.
+
+3) **Get version**
+- `GET /v1/optimization-config/versions/{version_id}`
+
+4) **List versions**
+- `GET /v1/optimization-config/versions?scope=...&limit=...&cursor=...`
+
+5) **Diff versions**
+- `GET /v1/optimization-config/versions/{a}/diff/{b}`
+- Returns human-readable diff plus risk annotations (e.g., “batch_max_tokens increased 4x”).
+
+6) **Start rollout (safe apply)**
+- `POST /v1/optimization-config/rollouts`
+- Parameters include target scope, from_version, to_version, canary policy, and gate policy.
+
+7) **Get rollout status**
+- `GET /v1/optimization-config/rollouts/{rollout_job_id}`
+
+8) **Pause/resume rollout**
+- `POST /v1/optimization-config/rollouts/{rollout_job_id}:pause`
+- `POST /v1/optimization-config/rollouts/{rollout_job_id}:resume`
+
+9) **Rollback**
+- `POST /v1/optimization-config/scopes/{scope_key}:rollback`
+- Rolls back the active pointer to a specified prior version (or last known-good).
+
+10) **Get active version**
+- `GET /v1/optimization-config/scopes/{scope_key}`
+- Includes active_version_id and last change metadata.
+
+### Internal endpoints (control plane)
+- Worker-facing fetch endpoints may include additional debug headers/fields.
+- Webhook/event stream endpoints for internal integrations.
+
+---
+
+## Payload examples
+### Optimization config payload (example)
+(Stored as `config_payload`; the exact schema is versioned.)
+
+```json
+{
+  "schema_version": 3,
+  "batching": {
+    "enabled": true,
+    "max_batch_tokens": 8192,
+    "max_batch_size": 16,
+    "queue_timeout_ms": 8
+  },
+  "caching": {
+    "prefix_cache": {
+      "enabled": true,
+      "max_prefix_entries": 200000
+    },
+    "kv_cache": {
+      "enabled": true,
+      "spill_to_host": false
+    }
+  },
+  "quantization": {
+    "profile_id": "qp_int8_v5",
+    "requires_quality_gate": true
+  }
+}
+```
+
+### Create version request (example)
+```json
+{
+  "config_set_id": "global-default",
+  "parent_version_id": "01J4Z9K9S2C9Q2...",
+  "scope": "global",
+  "change_summary": "Enable prefix cache and tighten queue timeout",
+  "config_payload": {"...": "..."}
+}
+```
+
+### Rollback request (example)
+```json
+{
+  "target_version_id": "01J6D2...",
+  "reason": "p99 latency regression after canary expansion",
+  "confirm": {
+    "expected_current_version_id": "01J6F8...",
+    "blast_radius": "tenant_model_region",
+    "type_to_confirm": "ROLLBACK"
+  }
+}
+```
+
+Note: API examples show nested objects; this is fine for the *document body*. Storage schemas and audit events use structured JSON as well.
+
+---
+
+## Validation and semantic checks
+OCS validation is split into:
+
+1) **Schema checks**
+- JSON shape/types
+- required fields by schema_version
+- unknown field policy: reject by default (to avoid silent no-ops)
+
+2) **Semantic checks (examples)**
+- `batching.max_batch_size` must be within runtime bounds for the target model family.
+- `batching.queue_timeout_ms` must be within `[1, 50]` unless explicitly overridden by an allowlisted policy.
+- Cache settings must be compatible with region capacity class (e.g., certain cache sizes disabled on smaller Dedicated pools).
+- Quantization profiles must be compatible with target model architecture (e.g., attention/MLP packing constraints).
+
+Validation results are stored on the version record and included in audit logs.
+
+---
+
+## Rollout, promotion, and rollback semantics
+### Safe apply lifecycle
+A typical rollout:
+1. **Precheck**
+   - version validated
+   - scope resolved
+   - gate policy selected (defaults based on blast radius)
+2. **Canary stage**
+   - set pointer for a small percentage/shard
+   - monitor gates for N minutes
+3. **Expansion**
+   - increase coverage
+   - re-evaluate gates per stage
+4. **Promote**
+   - set pointer to full scope
+   - mark rollout succeeded
+
+OCS does not directly “push config” to workers; it updates pointers (desired state). Workers converge by polling/subscription.
+
+### Rollback
+Rollback updates the active pointer to a previous version.
+
+Rollback goals:
+- Fast mitigation path during incidents
+- Clear audit trail (who/why)
+- Deterministic end state for the scope
+
+Rollback behaviors:
+- **Idempotent**: repeating the same rollback request results in the same pointer state.
+- **Race-safe**: rollback has precedence over in-flight rollout stages for the same scope (see Concurrency below).
+- **Blast-radius aware**: UI/API requires explicit confirmation and shows impacted tenant/model/region.
+
+---
+
+## Consistency and concurrency guarantees
+OCS provides the following guarantees:
+
+### Consistency model
+- **Strong consistency for writes** within a region (Postgres primary).
+- **Read-your-writes** for the same caller token/session (best-effort; strict guarantee requires pinned primary reads).
+- Runtime convergence is **eventually consistent**: workers poll/subscribe and apply asynchronously.
+
+### Pointer update atomicity
+- Pointer updates for a given `scope_key` are atomic (single-row update).
+- Version objects are immutable; pointer references always point to a fully stored version.
+
+### Concurrency control
+OCS enforces an optimistic concurrency mechanism for scope pointer updates:
+- Rollout/rollback requests can include `expected_current_version_id`.
+- If the current pointer does not match, OCS returns `409 Conflict` with the current version and the last changer.
+
+### Rollout vs rollback precedence
+- If a rollback is initiated for a scope, OCS transitions any in-flight rollout job for that scope into `paused` and then `rolled_back` once rollback completes.
+- Rollout controller checks pointer state before each stage advancement; if pointer diverges, it halts.
+
+---
+
+## Failure modes and mitigations
+### 1) Partial propagation to runtime workers
+**Symptom:** some workers apply new version while others remain on old version.
+- Mitigation:
+  - Runtime applier is idempotent and periodically reconciles.
+  - OCS exposes propagation metrics (see Observability).
+  - Rollback updates pointer; workers converge back.
+
+### 2) Gate signal flakiness / false positives
+**Symptom:** rollout pauses despite no real regression.
+- Mitigation:
+  - Gate policies include minimum sample windows.
+  - Ability to pause/resume and add an operator note.
+  - For quantization, require both quality gate + SLO gate to fail before auto-pause (policy-dependent).
+
+### 3) Incorrect scoping (wrong region/tenant)
+**Symptom:** config applied beyond intended scope.
+- Mitigation:
+  - Console shows blast-radius summary and requires confirm.
+  - API requires explicit scope_key and validates caller has permission for that scope.
+  - Audit events include scope + request_id.
+
+### 4) Database unavailability
+**Symptom:** inability to create/apply/rollback.
+- Mitigation:
+  - Postgres HA with automated failover.
+  - Rollback runbook includes emergency procedure for pointer restoration after DB recovery.
+
+### 5) Outbox / audit export delay
+**Symptom:** enterprise customer reports missing rollback event in SIEM.
+- Mitigation:
+  - Outbox pattern with retries.
+  - Alert if outbox lag exceeds threshold.
+  - Manual re-drive tool for stuck events.
+
+### 6) Rollout controller stuck
+**Symptom:** rollout status remains running with no stage changes.
+- Mitigation:
+  - Controller heartbeats; job considered unhealthy after no progress.
+  - Operator can pause and re-drive.
+  - SRE alert on stalled jobs.
+
+---
+
+## SLOs and reliability targets (service-level)
+OCS SLOs (initial GA targets; see SRE reliability plan for details):
+
+- **Availability (API):** 99.9% monthly for read endpoints; 99.5% for mutation endpoints.
+- **Rollback initiation latency:** P95 < 2s for accepting rollback request and updating pointer (does not include worker convergence).
+- **Rollout controller correctness:** < 1% of rollouts require manual DB intervention.
+- **Audit event delivery lag:** P95 < 5 minutes to downstream audit export.
+
+Operational KPIs:
+- Change failure rate (rollouts leading to rollback)
+- MTTR for config-induced incidents
+- Rate of scope conflicts / 409s (signals process issues)
+
+---
+
+## Observability
+### Metrics
+OCS emits metrics tagged with:
+- tenant_id (where applicable)
+- model
+- region
+- scope_type
+- config_set_id
+- version_id
+- rollout_job_id
+
+Key metrics:
+- `ocs_http_requests_total{route,code}`
+- `ocs_request_latency_ms{route}`
+- `ocs_rollout_stage_duration_ms{stage}`
+- `ocs_rollout_gate_evaluations_total{result}`
+- `ocs_pointer_updates_total{reason}`
+- `ocs_outbox_lag_seconds`
+- `ocs_conflict_total{action}`
+
+### Logs
+- Structured logs with request_id, actor_id, scope_key, version_id.
+- Redaction rules apply to config_payload fields marked sensitive.
+
+### Dashboards
+- Rollout health dashboard (errors/latency/throughput/GPU util annotated with apply/rollback events).
+
+---
+
+## Security and compliance
+### RBAC
+- RBAC policy bundle enforces permissions by action and scope.
+- Console hides rollback actions when the user lacks `optimization_config.rollback`.
+
+### Audit logging
+OCS emits audit events for:
+- optimization_config.version_created
+- optimization_config.version_validated
+- optimization_config.rollout_started
+- optimization_config.rollout_paused
+- optimization_config.rollout_resumed
+- optimization_config.promoted
+- optimization_config.rollback_initiated
+- optimization_config.rollback_completed
+
+Audit event required fields (high level):
+- event_name, event_time
+- actor (user/service), actor_ip (if applicable)
+- tenant_id / scope_key
+- from_version_id / to_version_id
+- request_id, idempotency_key (if provided)
+- outcome (success/failure) and error details
+
+---
+
+## Operational notes
+### Backfills / migration
+Existing (pre-versioning) optimization configs are migrated by:
+- Creating an initial version per existing config payload.
+- Setting pointers to that initial version.
+- Marking the migration actor as `source=migration` with a standardized change_summary.
+
+### Rate limiting
+- Mutation endpoints are rate limited per tenant and per user to reduce accidental rapid changes.
+- Rollouts are limited concurrently per scope to prevent overlapping applies.
+
+---
+
+## Runbooks and escalation
+- Rollback procedure: see **Rollback Optimization Config** runbook.
+- If rollback API is unavailable during an incident:
+  1) Engage Platform on-call and SRE.
+  2) Confirm DB health.
+  3) Use the emergency pointer restore procedure (SRE-only) after approval.
+
+Escalation triggers:
+- Audit export lag > threshold for enterprise tenants
+- Multiple tenants reporting unexpected scope impact
+- Rollout controller stuck across multiple jobs
+
+---
+
+## Appendix: Gate policy defaults (summary)
+Defaults vary by blast radius:
+- tenant_model_region: canary 5% for 10 minutes; gates: 5xx rate, p95 latency
+- tenant_model: canary 2% for 15 minutes; gates: 5xx, p95 + p99 latency
+- tenant/global: canary 1% for 20 minutes; gates: 5xx, p95/p99, saturation signals; requires SRE acknowledgement
+
+Quantization changes:
+- Always require quality gate (eval harness) unless explicitly waived by an allowlisted internal policy.
+
+---
+
+## Changelog
+- 2026-02-10: Updated rollout/rollback semantics to reflect rollback precedence and conflict handling; clarified audit outbox lag SLO.
+- 2026-01-22: Added scoping resolution order and scope key encoding examples.
+- 2025-11-12: Initial published service doc.

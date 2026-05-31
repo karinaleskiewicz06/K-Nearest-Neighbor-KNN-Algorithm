@@ -1,0 +1,175 @@
+Predictive error-budget pulse and capacity hedging playbook
+
+Overview
+
+Purpose: This playbook documents the predictive error-budget pulse process and the automated/manual capacity hedging patterns Redwood SREs use to avoid SLO burn and graceful-degrade user impact. It combines short-term forecasting, signal thresholds, automated mitigations, and manual escalation steps.
+
+Audience: SREs, on-call engineers, platform owners, and incident commanders for inference services.
+
+Scope: Applies to multi-tenant model-serving routes exposed via Redwood API and Dedicated pools. Targets availability-style and latency P99/P95 SLOs. Not intended for billing or billing-only throttles.
+
+Owner and contacts
+
+- Playbook owner: SRE Capacity & Resilience (eng-sre)
+- Primary on-call: inference-sre rotation
+- Pager escalation: inference-team@redwood.ai, oncall-phone (see org directory)
+
+Signals and telemetry
+
+We rely on these core signals (priority order):
+
+1) Prometheus metrics (primary)
+- service_request_latency_p95, service_request_latency_p99
+- request_success_ratio_5m (successes/total)
+- token_consumption_rate (tokens/s per pool)
+- queued_requests and active_workers per pool
+
+2) Traces & sample logs
+- Trace spans over 5s for generation path
+- Error types: OOM, OOM-kv, model-cold-start, gpu-timeout
+
+3) Observability derived series (used by forecasting & alerts)
+- rolling_error_budget_burn_24h (calculated by SLO pipeline)
+- predicted_error_budget_burn_72h (model forecast)
+- capacity_headroom_ratio = (available_slots / target_slots)
+
+Forecasting model (short description)
+
+- Purpose: provide a 72-hour probabilistic forecast of error-budget burn and capacity headroom to inform preemptive actions.
+- Inputs: 1h/5m telemetry series (latency P99, QPS, tokens/s), scheduled deployments, known maintenance windows, recent model rollouts, anomaly flags, week-of-year, hour-of-day.
+- Model type: ensemble (exponential smoothing + gradient boosted tree for exogenous features). Forecast outputs: median and 90th percentile burn-rate and headroom.
+- Housekeeping: retrain weekly with latest 6 weeks of data, validate on holdout, alert on >15% model drift.
+
+Policy: thresholds and decision matrix
+
+Table: Decision thresholds (applies per service/route/pool)
+
+| Signal | Action trigger | Primary action | Escalation window | Notes |
+|---|---:|---|---:|---|
+| predicted_error_budget_burn_72h >= 80% (90p) | imminent risk of SLO violation | start automated hedging pipeline level-1 | 30m | confidence-weight with model output |
+| rolling_error_budget_burn_24h >= 50% | early caution | prepare mitigation snapshot, notify PM/owner | 2h | runbook ready |
+| capacity_headroom_ratio <= 0.15 | low headroom | throttling + scale-up attempt | 15m | prefer safe scale actions |
+| service_request_latency_p99 increase > 50% vs baseline | user-visible latency | degrade non-critical routes, enable lower-quality model variant | 10m | preserve core SLA routes |
+
+Automated hedging pipeline (levels)
+
+Design principles: automated actions must be reversible, safe-by-default, and logged/audited. Each level increases intervention scope. Automation runs in the control plane with circuit-breakers and manual approval gates for disruptive steps.
+
+Level 0 — Observation and notification
+- Trigger: rolling_error_budget_burn_24h >= 30% or small predicted bump.
+- Actions: create an incident ticket (internal), post to #sre-alerts with summary and forecast link, snapshot routing policies.
+
+Level 1 — Lightweight automated mitigations (non-disruptive)
+- Trigger: predicted_error_budget_burn_72h >= 50% (median) OR capacity_headroom_ratio <= 0.25.
+- Actions (automated):
+  - Enable request batching tweaks: increase max_batch_wait_ms by +20% (safe sample), enable prefix-KV cache for high-hit routes.
+  - Increase autoscale target for dedicated pools by +10% (if spare capacity in region).
+  - Temporarily prioritize high-value tokens (per-customer weights) if customer tier policy allows.
+- Observable endpoints: /ops/hedge/status and automated runbook log.
+
+Level 2 — Moderate automation with controlled degradation
+- Trigger: predicted_error_budget_burn_72h >= 80% (90p) OR capacity_headroom_ratio <= 0.10.
+- Actions:
+  - Swap non-critical routes to cheaper model variant (e.g., fp16 → int8 quantized) with grace period for soft rollbacks.
+  - Apply soft-rate-limits to background requests (retry-after headers).
+  - Activate cross-region routing fallback to alternate region pools (if latency acceptable).
+  - Notify product owners and SRE manager.
+
+Level 3 — Aggressive emergency actions
+- Trigger: rolling_error_budget_burn_24h >= 100% OR rapid latency spike causing user-impact.
+- Actions:
+  - Enforce strict per-tenant throttles for non-critical classes.
+  - Initiate emergency scale (spin up reserved burst nodes) using warm image; if unavailable, enable degraded-read-only features for admin tooling.
+  - Escalate to incident commander and exec on-call.
+
+Safety and rollback controls
+
+- Every automated change is: idempotent, tagged with correlation-id, and reversible via the control-plane undo API (opsctl hedge rollback <id>).
+- Automation is rate-limited (max 1 hedge action per 5 min per-service).
+- Post-action canary monitoring runs for 5 minutes verifying latency and error rate improvements; if worse, automation auto-rolls back.
+
+Manual runbook: step-by-step
+
+1) Confirm signals and validate forecast
+   - Query latest rolling_error_budget_burn_24h and predicted_error_budget_burn_72h in Grafana.
+   - Check recent deploys: kubectl get deployments --namespace=model-serving -l rollout=true --since=24h.
+
+2) If Level 1/2 triggers are met and automation has not started, run automated pipeline from opsctl:
+   - opsctl hedge start --service <service> --reason "predictive-pulse" --level 1
+   - Watch correlation-id logs: curl -s "https://ops-api/hedge/<id>/status" | jq .
+
+3) For Level 2 manual confirmations (model swaps, route changes):
+   - Prepare model-variant config: edit /configs/route-overrides/<route>.yaml and push to canary using gitops (PR + auto-merge allowed for emergency).
+   - Promote canary after 10 min of stability.
+
+4) For Level 3 emergency steps:
+   - Page the incident commander and request exec on-call.
+   - If cold-starts or OOMs are primary cause, remove offending rollout: kubectl rollout undo deployment/<name> --namespace=model-serving
+   - If capacity insufficient, trigger reserved-burst: opsctl capacity reserve --pool <pool> --nodes 4 --reason "emergency-hedge"
+
+Communication templates
+
+- Slack incident header (use #sre-alerts):
+  HEADING: [HEDGE] <service> predicted error budget burn >= <threshold> – automatic mitigation applied (level X)
+  BODY: Summary, actions taken, current telemetry links, expected next check-in in 15 minutes.
+
+- Customer-facing/Ticket note (for status page):
+  "We are mitigating increased delays for <service>. We have applied prioritization and are working to restore standard performance. No data loss expected. Status updates every 30 minutes."
+
+Operational tooling and queries (appendix)
+
+- Key Grafana dashboards: SRE > Predictive SLO Pulse, Service Headroom, Hedging Actions Audit.
+- Example Prometheus query (rolling 24h error budget burn):
+  sum_over_time((1 - request_success_ratio_5m)[24h:5m]) / count_over_time(requests_total[24h:5m]) * 100
+
+- Example BigQuery forecast job (pseudocode):
+  SELECT service, forecast_median, forecast_p90 FROM inference_forecasts WHERE run_ts = CURRENT_DATE() - 1
+
+- opsctl sequence examples:
+  - Start hedge: opsctl hedge start --service inference-api --level 1 --comment "auto-run"
+  - Rollback: opsctl hedge rollback --id <correlation-id>
+
+KPIs and post-action validation
+
+- Short-term KPIs (0–2h): reduce predicted 72h burn to <50% at 90p or restore headroom >20%
+- Medium-term KPIs (2–24h): rolling_error_budget_burn_24h decreases by >=30% vs peak
+- Validation steps: confirm P95/P99 improvement, confirm no increase in customer 5xx rate, verify canary and rollback logs.
+
+Incident review & continuous improvement
+
+- Every predictive pulse that results in a Level 2+ automated mitigation must have a post-action review within 3 business days. Review template:
+  - Timeline, root cause (infrastructure, model, traffic shift), forecast accuracy, automation decisions and whether rollback was needed, suggested config fixes, owner for follow-up.
+- Track what threshold values triggered actions and tune decision thresholds quarterly.
+
+Runbook exercises and validation
+
+- Quarterly simulations: run a synthetic forecast spike in staging that triggers Level 1 and 2 flows. Check that automation actions respect safety gates and that rollback flow works end-to-end.
+- Metrics to monitor during exercises: automation success rate, false positives (automation triggered incorrectly), time-to-stable-state.
+
+Appendix A — Configuration reference (examples)
+
+| Config key | Default | Allowed range | Description |
+|---|---:|---:|---|
+| hedge.max_automations_per_hour | 6 | 0-20 | throttle for hedge automation events |
+| hedge.scale_inc_pct | 10% | 0-50% | percent increase applied to autoscale targets |
+| hedge.batch_wait_ms_delta | 0 | -50% to +200% | delta applied to batching latency budget |
+
+Appendix B — Troubleshooting quick hits
+
+- If automation fails to scale up: check capacity provider logs (cloud-provider), verify quota. Command: cloudcli quotas describe --region <r>
+- If model-swap causes quality regressions: revert variant and create a prompt-set smoke test: evals run --suite quick-quality-check --service <service>
+
+Ownership and next steps
+
+- Maintainers: SRE Capacity & Resilience (primary), Runtime Team (secondary for model-variant ops).
+- Roadmap items: integrate short-term demand forecasting into routing controller (Q2 2026), add drift alerts to forecast pipeline, add customer-aware hedging policies.
+
+Change log
+
+- 2025-11-02 — v0.1 created (Aisha Patel)
+- 2026-02-14 — v0.2: added forecasting details, automated rollback semantics, updated thresholds (reviewers: Marco Ruiz, Emily Chen)
+
+Related pages
+
+- See also: /confluence/eng-sre/capacity-planning/predictive-slo-driven-capacity-playbook-2026
+- Telemetry standards: /confluence/eng-sre/operational-tooling/telemetry-cost-fidelity-slo-governance-2025

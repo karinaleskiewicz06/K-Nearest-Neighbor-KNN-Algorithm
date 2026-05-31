@@ -1,0 +1,132 @@
+Nightly State Validation and Consistency Operator Playbook
+
+Summary:
+This playbook describes the nightly validation and consistency checks that operators run against private (VPC/on-prem) deployments to detect state drift, KV cache divergence, model artifact mismatches, and configuration skew before they become customer-impacting. It contains automated job templates, run procedures, thresholds that trigger operator intervention or automated remediation, and the evidence collection format for audits.
+
+Purpose and scope:
+- Purpose: detect and repair cross-node and cross-tenant state inconsistencies and surface regressions early in a low-traffic window.
+- Scope: private deployments (VPC and on-prem), covering runtime state (KV caches, model versions, session metadata), control-plane config drift, telemetry ingestion parity, and artifact provenance checks. Not intended for application-level data reconciliation (customer storage).
+- Audience: field operators, SREs, runtime engineers, and support engineers responsible for tenant availability and KV integrity.
+
+Key definitions:
+- KV cache reconciliation: ensuring LLM KV caches are consistent with expected model checkpoints and that hot prefixes are available on serving nodes.
+- State snapshot: compact representation of runtime state per node/tenant (model_id, model_sha256, kv_checkpoint_id, active_stream_count, memory_usage_mb, last_sync_ts).
+- Drift: any divergence between expected and observed state fields that exceeds configured thresholds.
+
+Ownership and schedule:
+- Primary owner: Runtime Reliability (runtime-reliability@redwood.example.com)
+- Secondary: Private Deployments Field Ops
+- Nightly run window: 03:00–04:30 local cluster time (chosen low-traffic window).
+- Retention for evidence: 90 days for run artifacts; 365 days for security-sensitive evidence when confidentiality requires.
+
+Prerequisites and environment:
+- Operator must have access to the private control plane or operator bastion and the audit S3/GCS bucket.
+- Required CLI tools: rwinferctl v0.21+, kubectl 1.26+, jq, curl.
+- Secrets: readonly service account token with namespace-scoped read to runtime-state and telemetry namespaces, and write to evidence-bucket service principal.
+
+Nightly validation job overview (automated):
+1) Orchestrate per-cluster CronJob: run a lightweight validation container that:
+   - pulls model artifact manifest from artifact-store (signed manifests)
+   - queries per-node runtime endpoints for state snapshots
+   - computes checksums and summary metrics
+   - uploads evidence bundle to evidence bucket and emits metrics to obs pipeline
+2) If thresholds are exceeded, create an incident ticket and optionally trigger automated remediation for low-risk fixes (cache warm, restart a worker).
+3) Operators review high-severity findings, run reconciliation steps, and close incidents with evidence.
+
+Validation checklist (table):
+| Check | Target / Threshold | Detection method | Automated remediation |
+|-------|--------------------|------------------|----------------------|
+| Model artifact mismatch | model_sha256 != expected OR more than 1% of nodes with mismatch | compare manifest vs per-node model_sha256 | Pull missing artifact, verify signature, and hot-swap artifact; if >10% mismatch, pause traffic to canaries and escalate |
+| KV cache divergence (prefix misses) | >0.5% of requests see cold-prefixes for hot prefixes in last 24h | query runtime /internal/kv/summary | Trigger KV prefetch job for affected prefixes; restart worker if persistent |
+| Last sync latency | > 120s since last successful control-plane heartbeat | last_sync_ts vs now | Reconnect control-plane proxy; restart sync agent |
+| Active stream leakage | node has > 2x expected active_stream_count | runtime snapshot compare to baseline | Drain and restart node; trigger operator investigation |
+| Telemetry ingestion lag | > 5 minutes for critical telemetry stream | compare ingestion watermark in metrics | Restart ingest adapter; fallback to buffered transfer |
+| Configuration drift (feature flags) | any protected flag differs from intended template | compare config-template vs runtime flags | Apply config via configmanager and record diff |
+
+Nightly run procedure (operator-visible steps):
+1) Preflight (T-30m): confirm low traffic and no active maintenance windows: rwinferctl cluster status --brief
+2) Kick off job (T=0): review CronJob logs: kubectl -n infra logs cronjob/nightly-validation -f --since=30m
+3) Examine quick summary (auto-posted to #ops-nightly): the job posts a TL;DR containing node counts, checksum mismatches, and top 5 affected tenants.
+4) Triage: for each finding with severity CRITICAL or HIGH follow the triage decision tree (below).
+5) Remediate using automated recipes where safe; if manual, follow the operator recovery checklist and capture evidence.
+6) Close the loop: attach evidence and remediation notes to the incident ticket and add run artifacts to nightly index.
+
+Triage decision tree (summary):
+- If model artifact mismatches < 1% nodes AND the missing artifact is available in artifact-store -> auto-hot-swap and monitor for 30 minutes.
+- If mismatches between 1%–10% -> pause canary traffic, escalate to runtime-release, schedule controlled node restarts.
+- If >10% or mismatch involves signed-manifest failure -> declare P1, notify field-eng, and consider rollforward/rollback depending on root cause.
+
+Operator recovery checklist (for manual remediation):
+1) Isolate impacted nodes: cordon node(s) and route traffic away. kubectl cordon <node> && rwinferctl node drain <node> --grace=60s
+2) Capture live snapshot: rwinferctl node snapshot <node> --output=/tmp/evidence-<node>.json
+3) Attempt safe fix: (a) restart sync agent: kubectl -n runtime restart deploy/sync-agent || (b) trigger KV-prefetch job: kubectl -n infra apply -f jobs/kv-prefetch-<prefix>.yaml
+4) If safe fix fails and state is inconsistent, roll node back to previous runtime image: rwinferctl node rollback-image <node> --image=registry/redwood/runtime:<previous-tag>
+5) Validate: rerun the single-node validation script and confirm green.
+6) Reintroduce node: rwinferctl node uncordon <node>
+7) Capture remediation evidence and link to incident ticket.
+
+Rollback vs rollforward guidance:
+- Prefer rollforward when a fix can be applied to artifact-store or control-plane configuration and the fix is validated in canary.
+- Use rollback only when the regression is introduced by a malformed runtime artifact or signed-manifest corruption and customers are already impacted. Follow the general rollback SOP in upgrade-and-rollback and preserve all evidence for forensic review.
+
+Automated remediation recipes (examples):
+- KV prefetch (safe): a cluster-scoped job that targets specific tenant prefixes and populates local caches. Example command: kubectl -n infra run kv-prefetch --image=registry/redwood/tools:kv-warm --env="PREFIX=tenant-123/prefix-abc" --restart=OnFailure
+- Artifact hot-swap (safe when signature verifies): rwinferctl artifact apply --manifest s3://artifacts/2026/manifest-2026-06-08.json --scope tenant:global
+- Restart sync agent: kubectl -n runtime rollout restart deploy/sync-agent
+
+Sample CronJob manifest (lightweight validation):
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nightly-state-validation
+  namespace: infra
+spec:
+  schedule: "0 3 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: validation-runner
+          containers:
+          - name: validator
+            image: registry.redwood/tools:state-validator-0.10
+            args: ["--evidence-bucket", "s3://redwood-evidence/nightly"]
+          restartPolicy: OnFailure
+
+Metrics and SLOs to monitor:
+- nightly.validation.success_rate (goal 99.5%) measured per cluster per month
+- model.artifact.match_rate (goal >= 99.99% across nodes nightly)
+- kv.cache.hot_rate (goal >= 99.0% for top 1k prefixes)
+- telemetry.ingest_lag_p95 (goal < 2 minutes nightly)
+- alerting: any nightly check that drops below warning threshold (see table) should create a P0/P1 pageable if critical.
+
+Evidence format (required fields for audit):
+- run_id (ISO timestamp), cluster_id, node_list, check_summaries (list of lines), artifacts (signed-manifest.json), incident_ticket_id (if any), remediation_steps, operator_name, retention_ttl_days.
+Example: /tmp/evidence-2026-06-15-0300.zip contains: manifest.json, node-snapshots/*.json, validation.log, metrics-summary.json
+
+Post-incident reporting and follow-up:
+- If an operator performed a manual rollback or a P1 incident was opened, populate the incident template with timeline (T-0..T+), impact summary (tenants affected, request rate delta), root cause hypothesis, and corrective actions.
+- For all nightly findings with severity HIGH or CRITICAL, schedule a blameless 1-hour review within 72 hours and link to the evidence bundle.
+
+Safety notes and constraints:
+- Do not run full-state reconciliation during production business hours without prior approval from the cluster owner. Nightly validation is tuned to be read-only by default; remediation jobs must be explicitly allowed via the remediation flag in the CronJob.
+- Signed-manifest verification is mandatory for any artifact hot-swap. Reject unsigned manifests and escalate.
+
+Appendix: quick CLI snippets
+- Run single-node validation: rwinferctl validation run --node node-12 --output /tmp/node-12.json
+- Re-run nightly job on-demand: kubectl -n infra create job --from=cronjob/nightly-state-validation rerun-$(date +%s)
+- Extract top mismatches: jq -r '.nodes[] | select(.status=="mismatch") | [.node, .model_sha256, .expected_sha256] | @tsv' /tmp/validation-summary.json
+
+Related pages and templates:
+- See tenant-state-snapshot-coordination-and-operator-checklist for snapshot schema and sample snapshots.
+- See incremental-stateful-upgrade-strategy for coordination with controlled upgrades and rollback guidance.
+
+Revision history:
+- 2026-02-10: initial draft by Aisha Khan
+- 2026-03-18: added KV-prefetch automation and triage thresholds (reviewers Marco Rivera and Priya Desai)
+- 2026-06-15: updated SLOs and evidence retention guidance
+
+Contact and escalation:
+- Runtime Reliability oncall: #runtime-oncall (Slack)
+- Field Ops pager: pagerduty -> Private-Deploy Field Ops
+- Email: runtime-reliability@redwood.example.com

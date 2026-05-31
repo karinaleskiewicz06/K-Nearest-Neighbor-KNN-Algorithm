@@ -1,0 +1,160 @@
+transient-model-switch-oscillation-incident-and-mitigation-2026
+
+Summary:
+
+This document describes a recurrent production phenomenon we observed in Q4 2025–Q1 2026 that we have labeled 'Transient Model Switch Oscillation' (T-MSO). Symptoms include a rapid sequence of model routing changes for the same logical request stream, causing repeated KV-cache invalidations, throughput collapse, and elevated tail latency for 20–40s bursts. The behavior was visible across multiple tenants and both Hosted and Dedicated modes.
+
+Purpose and audience:
+
+- Audience: runtime engineers, oncall SREs, platform reliability, and product teams coordinating model rollout policies.
+- Purpose: document root cause analysis, reproduction steps, mitigation and long-term fixes, and monitoring/alerting recipes.
+
+Incident timeline and impact:
+
+1) First escalations: 2025-11-12 — intermittent customer reports of long tail latencies (95th–99.9th spike) during midday traffic.
+2) Pattern recognition: 2025-11–2026-01 — telemetry showed recurring multi-second oscillations coincident with model rollout events and autoscaling bursts.
+3) Root-cause CVE to product: production incidents impacted 3 high-throughput tenants (2 enterprise, 1 AI-startup).
+4) Severity: P2 on affected tenants; burst loss of throughput and 2x token-cost increase due to repeated re-warmups.
+
+Observed symptoms (signals):
+
+- Per-request traces show routing decisions flip between Model-A (quantized) and Model-A-v2 (float) multiple times during a single conversation session.
+- KV cache miss-rate spikes from baseline ~5% to ~70% for affected sessions.
+- Kernel scheduling shows alternating allocation of shard ownership across NUMA nodes leading to extra cross-node memcpy and dispatch delays.
+- Autoscaler logs show a short-lived scale-up then immediate scale-down (<45s) before traffic stabilizes.
+
+Root cause analysis (summary):
+
+Contributing factors (combined):
+
+1) Route-policy hysteresis gap: the routing policy that chooses model variants had insufficient hysteresis for transient capacity signals. It used a simple threshold on per-model GPU utilization and a last-eviction timestamp without multi-sample confirmation.
+2) Fast autoscale + conservative warmup policy: autoscaler reacted to short spikes by adding nodes; warmup and placement logic attempted to place the preferred model variant on newly provisioned nodes without synchronized cache warming.
+3) Fallback policy collision: the fallback mechanism to switch to a cheaper variant when capacity is constrained did not lock per-session routing decisions. Multiple concurrent components (router, fallback controller, and per-tenant policy agent) raced to reconcile the model id.
+4) Model-version affinity: model variants shared the same model family id but had incompatible KV cache representations (different quantization metadata), which forced cache invalidations when a session switched variants.
+
+Put together, a short traffic spike would trigger autoscale -> router attempted to move traffic to new nodes -> fallback policy evaluated capacity and flipped model variant -> per-session routing did not persist a decision -> router flipped variant again when observed latency on new nodes rose -> oscillation continued until traffic dropped or a manual kill-switch engaged.
+
+Reproduction steps (sanitized, deterministic):
+
+1) Environment: use a staging cluster with two-node initial pool (GPU A1, GPU A2) and the same autoscaler policy used in production (scale-step: +1, cool-down 30s).
+2) Models: upload Model-A (8-bit quantized) and Model-A-v2 (fp16) with distinct model_variant_ids and the same model_family tag. Ensure model_variant metadata has different cache_schema fields.
+3) Traffic generator: run sustained baseline QPS 120 with short spikes: every 90s inject 30s burst of 600 QPS.
+4) Observe: within 1–3 burst cycles, routing flips per-session multiple times, KV cache miss-rate spikes, and tail latency increases.
+
+Temporary mitigations (applied Nov 2025–Jan 2026):
+
+- Hysteresis increase: increased routing decision confirmation window from 3s to 45s (multisample policy). Deployed as a stop-gap to reduce flip frequency.
+- Per-session sticky routing: introduced sticky-routing flag for at-most-once routing decisions for session TTL = 120s to keep sessions bound to the same model_variant_id while warming caches.
+- Autoscaler hold: added a 60s 'placement-quarantine' after scale-up during which routing avoids moving sessions to newly provisioned nodes for that tenant.
+- Fallback locking: implemented an optimistic lock in fallback controller; fallback changes now require acquiring per-session key for the TTL duration.
+
+These mitigations reduced oscillation frequency by ~90% in canaries and restored tail latency to acceptable SLOs for affected tenants.
+
+Permanent fixes and design proposals (owner & timeline):
+
+1) Stronger routing contract (owner: runtime-routing team). Timeline: Q2 2026.
+- Implement a small state-machine per-session: {PreferredVariant, FallbackVariant, Transitioning} with explicit TTL, and expose it to router + fallback controller via a single authoritative store (Redis cluster/sharded snapshot).
+- Ensure routing decisions are idempotent and can be reconciled from traces.
+
+2) Cache schema compatibility registry (owner: model-onboarding). Timeline: Q2–Q3 2026.
+- During model onboarding, compute a compatibility signature for KV cache schema. Reject variant pairings that are incompatible unless a migration plan is provided.
+
+3) Autoscaler grace API (owner: eng-sre + autoscaler). Timeline: Q3 2026.
+- Autoscaler should expose placement state for new nodes and allow the routing layer to query 'ready_for_session_migration' boolean.
+- Add 'soft-add' option where capacity bookkeeping increases but routing waits until warmup script returns success.
+
+4) Observability: enhanced traces and derived metrics (owner: telemetry team). Timeline: Q2 2026.
+- New tracing span: routing.decision.{evaluate|commit} with tags model.family, model.variant, decision.ttl, decision.reason.
+- Telemetry to emit 'session_routing_flip' event with sample of request ids.
+
+Monitoring and alerting recipes (immediate and long-term):
+
+- Immediate alert (P95 spike correlated with session-flip rate):
+  Condition: p95_latency(service:inference) > 2x baseline AND rate(session_routing_flip) > 5/min for 5m.
+  Pager: oncall-runtime primary.
+
+- PromQL example (sample):
+  # session flip rate per tenant
+  sum(rate(session_routing_flip_total[1m])) by (tenant_id)
+
+- Grafana dashboard panels to add:
+  - per-tenant routing flip heatmap (time vs tenant)
+  - KV-cache miss-rate and miss-to-hit ratio overlayed with routing flips
+  - autoscaler events timeline aligned with routing.decision spans
+
+Operational runbook (short):
+
+1) When alerted, run quick triage (5m):
+  a) Query session_routing_flip_total for affected tenant.
+  b) Check autoscaler events: list recent scale-up/scale-down events.
+  c) Identify if fallback controller applied variant change events (via event log).
+2) Mitigate (10–20m):
+  a) If flip rate is high and autoscaler churn is observed, activate 'routing-hysteresis-override' for tenant to 120s via console.
+  b) If particular model variants are involved, mark the newer variant as 'do-not-route' until canary is analyzed.
+  c) If on Dedicated, coordinate with SRE to hold node termination/scale-down.
+3) Post-incident (24–72h):
+  a) Capture traces and attach to the incident with key spans highlighted.
+  b) Run the deterministic reproduction in staging and file a follow-up ticket to implement missing design fix.
+
+Ownership matrix (short):
+
+- Runtime-routing team: lead = Omar Lewis — authoritative for routing contract, sticky routing, and hysteresis tuning.
+- Model-onboarding: lead = Priya Natarajan — schema compatibility registry and model metadata.
+- Autoscaler: lead = Samir Patel — expose placement readiness API and scale behavior.
+- Telemetry: lead = Maya Chen — new tracing spans and metrics.
+- Oncall SRE: rotation owners — incident triage and manual mitigations.
+
+Backwards compatibility and customer communication:
+
+- We will send an incident summary to affected customers with an explanation of the cause and the applied mitigations. The summary will include recommended tenant-level options (enable routing session stickiness, request canary windows) and a support contact.
+- No data loss or model output correctness issues were observed; impact was limited to latency and cost.
+
+Appendices:
+
+A) Example routing-decision trace span (pseudo-JSON):
+
+routing.decision.evaluate {
+  trace_id: "abcd-1234",
+  tenant_id: "acct_9876",
+  session_id: "sess_42",
+  candidate_variants: ["A-q8", "A-fp16"],
+  chosen: "A-q8",
+  reason: "capacity_low",
+  timestamp: "2026-01-13T18:03:21Z"
+}
+
+routing.decision.commit {
+  trace_id: "abcd-1234",
+  model_variant: "A-q8",
+  commit_timestamp: "2026-01-13T18:03:21Z",
+  ttl_seconds: 120
+}
+
+B) Quick CLI snippets for oncall
+
+# Check flip rate for tenant acct_9876
+curl -s "https://telemetry.internal/api/metrics?query=sum(rate(session_routing_flip_total[1m])) by (tenant_id)" | jq '.data'
+
+# Temporarily force-sticky routing for a tenant (console API)
+curl -X POST -H 'Authorization: Bearer $ADMIN_TOKEN' -H 'Content-Type: application/json' \
+  https://console.internal/api/v1/tenants/acct_9876/routing-override \
+  -d '{"force_sticky": true, "ttl_seconds":120}'
+
+C) Short-term test checklist (for release engineering before Q2 deploy):
+
+- [ ] Add unit tests for per-session routing lock acquisition and expiry.
+- [ ] Integration test: inject autoscaler events and assert zero session_routing_flip for 2 consecutive burst cycles.
+- [ ] Backwards-compat test: verify model onboarding rejects incompatible cache_schema if model_family collision exists.
+
+Contacts:
+
+- Runtime-routing: omar.lewis@redwood.ai
+- Oncall SRE rotation: oncall-runtime@redwood.ai
+- Model-onboarding: priya.natarajan@redwood.ai
+
+Revision history:
+
+- 2026-02-18: Document created by Maya Chen (initial analysis and temporary mitigations summary).
+- 2026-03-01: Updated to include permanent fix roadmap and expanded runbook items (reviewed by Omar Lewis, Priya Natarajan).
+
+End of document.

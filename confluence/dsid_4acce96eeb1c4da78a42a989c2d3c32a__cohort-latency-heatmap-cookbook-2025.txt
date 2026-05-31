@@ -1,0 +1,157 @@
+Cohort Latency Heatmap Cookbook and Incident Playbook
+
+Overview
+
+This cookbook describes how we construct, maintain, and operate cohort-level latency heatmaps for the Redwood serving runtime. The document includes: rationale, data collection and aggregation guidance, a canonical generation pipeline, visualization and dashboard conventions, alerting thresholds, and an incident response playbook tied to heatmap signals.
+
+Audience
+
+- Runtime engineers
+- SREs responsible for inference SLOs
+- Performance and profiling teams
+
+Problem statement and motivation
+
+Tail and cohort-specific latency behavior frequently hide inside aggregate p99 metrics. A heatmap that slices latency by request cohort (e.g., model variant, sequence_length bucket, batch size, customer_tier) gives us a richer signal to:
+
+- Quickly identify emergent hotspots (e.g., a model variant regressions for long sequences)
+- Prioritize kernel rollouts and scheduling policy changes by impacted cohorts
+- Correlate kernel pressure, kv-cache hit-rate, and GPU occupancy with cohort-level latency shifts
+
+Scope and definitions
+
+- Cohort: a single dimension or combination of dimensions used to group requests. Canonical fields: model_name, model_variant, sequence_length_bucket, batch_size_bucket, customer_tier, route.
+- Heatmap cell: distribution summary for a (cohort, latency_bucket, time_bucket) tuple; we store p50/p95/p99 and count.
+- Time resolution: default 1m for operational dashboards, 5m for long-term retention.
+
+Prerequisites and telemetry sources
+
+- Traces: request-level spans emitted by runtime-dispatcher and kernel-orchestrator with tags for model_name, variant, seq_len, batch_size, route_id, customer_tier.
+- Metrics: Prometheus counters/gauges for kernel_queue_depth, kernel_active_count, gpu_occupancy_percent, kv_cache_hit_ratio, request_count_total by labels.
+- Logs: structured JSON request logs (request_id, cohort labels, elapsed_ms, status_code).
+- Storage: long-term heatmap aggregates live in the performance-timeseries cluster (Influx/Clickhouse) with 5m rollups.
+
+Canonical cohort bucketing scheme (recommended)
+
+| Field | Buckets | Rationale |
+|---|---:|---|
+| sequence_length_bucket | 1-32, 33-64, 65-128, 129-256, 257-512, 513+ | Kernel breakpoints and attention memory patterns occur at these ranges |
+| batch_size_bucket | 1, 2-4, 5-8, 9-16, 17+ | Shapes typical for interactive vs batch workloads |
+| customer_tier | free, standard, enterprise | Routing and capacity policy differences |
+| model_variant | base, q8_0, q4_0, distilled | Distillation/quantization affects kernel choice |
+
+Heatmap generation pipeline (end-to-end)
+
+1. Instrumentation: ensure every request writes a short request-level record to the request-log with the canonical labels. Use runtime tracing to populate model and kernel hints.
+2. Ingestion: pipeline-job (k8s job: heatmap-ingest) consumes request logs and spans; performs label normalization, applies bucketing rules, and emits per-minute aggregates: count, p50, p95, p99, sum.
+3. Storage: write per-minute aggregates into performance-timeseries cluster using keys: ts, model, variant, seq_bucket, batch_bucket, tier, route.
+4. Rollup: a scheduled job performs 5m/30m/1h rollups and computes historical baselines (7d median and 28d median) for each cohort.
+5. Visualization: Grafana dashboard 'Cohort Latency Heatmap (runtime)' renders a timeseries heatmap using p95 latency with cohort on Y axis, time on X axis.
+6. Alerting: apply anomaly detectors on per-cohort p95 and on the delta-from-baseline metric (see alert thresholds).
+
+Prometheus & Clickhouse queries (examples)
+
+- PromQL (short-term):
+  - p95 latency for a specific cohort (1m): histogram_quantile(0.95, sum(rate(request_latency_bucket{model_name="gpt-lite",sequence_length_bucket="65-128"}[1m])) by (le))
+- Clickhouse example (aggregation over logs):
+  - SELECT toStartOfInterval(timestamp, INTERVAL 1 minute) as t, sequence_length_bucket, quantileExact(0.95)(elapsed_ms) as p95, count() as n FROM request_logs WHERE model_name='gpt-lite' AND t >= now() - INTERVAL 1 DAY GROUP BY t, sequence_length_bucket ORDER BY t ASC
+
+Visualization conventions and dashboard layout
+
+- Single dashboard panel per tenant slice: aggregated (all tiers) + enterprise-only panel.
+- Heatmap colors: green (p95 < 200ms), amber (200–500ms), red (>500ms). Use a bivariate tooltip that shows p50/p95/p99 and request count.
+- Cohort ordering: stable sort by historical 7d median p95 descending so noisy cohorts float to the top.
+
+Alerting thresholds and incident signal rules
+
+- Severity P1 (Immediate)
+  - Rule: any cohort with p95 > 1s AND request_count >= 50 in 1m window OR delta-from-baseline > 250ms sustained for 3 consecutive 1m buckets.
+  - Pager duty: on-call runtime-sre 
+  - Runbook: follow "Heatmap-P1 runbook" below.
+
+- Severity P2 (Investigate)
+  - Rule: cohort p95 between 500–1000ms with request_count >= 20 in 5m window OR delta-from-baseline > 150ms.
+  - Slack notify: #runtime-observability
+
+- Noise suppression: ignore cohorts with request_count < 5 in 5m unless the customer_tier==enterprise.
+
+Heatmap-P1 runbook (play-by-play)
+
+1. Acknowledge the alert and open an incident channel in #runtime-incidents with alert details.
+2. Pull the heatmap panel and filter to the top-5 cohorts by request_count.
+
+Quick triage checklist (ordered):
+
+1. Is this localized to a single model_variant? If yes, check kernel rollout recent deployments: kernel-orchestrator release history and canary health.
+2. Are kernel_queue_depth or kernel_active_count elevated? Prometheus: rate(kernel_queue_length[1m]) and kernel_active_count. If yes, investigate admission controller and scheduling policy EQS.
+3. Check kv_cache_hit_ratio for the cohort. A sudden drop often explains long-tail runtime stall due to kv cache warmup.
+4. Confirm GPU throttling or thermal events (GPU driver logs + node-exporter gpu_temp, gpu_throttle_count). Thermal-induced slowdowns appear as gradual p95 increase with high GPU occupancy.
+5. Correlate with infra events: autoscaler activity, node restart, or AZ/region events.
+6. If customer_tier==enterprise and service SLA impacted, page CSM on-call.
+
+Mitigation strategies (fast):
+
+- Immediate fallback: route impacted cohort to a compatible, lower-fidelity model_variant via delta-routing when kernel pressure is observed. See "tiered-fallback-routing-and-eviction-architecture-2026" for config steps.
+- Temporary throttling: apply per-route concurrency cap for the cohort to reduce kernel queueing.
+- Cache prewarm: trigger async KV prefetch job for the model and sequence length range.
+- Evict/scale: if GPU occupancy is saturated and autoscaler has capacity, scale dedicated-pool by +20% and monitor.
+
+Post-incident follow-up (blameless)
+
+- Owner: the on-call who acknowledged the alert must file an incident summary within 48h. The summary must include: impacted cohorts, estimated customer impact, root cause hypothesis, mitigation applied, and recommended changes (patch/observability/runbook update).
+- Run an experiment: recreate cohort traffic in the synthetic workload builder and run the profiler-microbench for the implicated kernel path.
+- If root cause is a kernel regression, follow the kernel rollback procedure (see kernel-snapshot-observability-contract-2026).
+
+Operational hygiene and scheduled jobs
+
+- Weekly: validate bucket definitions and mapping rules; if model lineup changes add new variant mappings.
+- Daily: ingest job health check — ensure no >1% of logs are dropped for the last 24h.
+- Monthly: review dashboards and baselines; retire cohorts with <1000 requests/month.
+
+Troubleshooting annex (common patterns)
+
+- Pattern: sudden p95 bump for high sequence buckets only
+  - Likely causes: new kernel change that increases memory working set or introduces extra synchronization; KV cache effectiveness drops for long prefixes.
+  - Actions: capture a kernel flame trace, compare occupancy and workspace allocation between baseline and current, roll back kernel patch if confirmed.
+
+- Pattern: scattered red cells across many cohorts with high GPU occupancy
+  - Likely causes: noisy neighbor or autoscaler insufficient to absorb batch bursts.
+  - Actions: inspect scheduler admission logs, review batch-slicing policy, increase burst capacity for Dedicated pools.
+
+Ownership and contacts
+
+- Dashboard owner: runtime-observability team (runtime-observability@redwood.com)
+- On-call: runtime-sre rotation (see team roster)
+- Kernel escalation: kernel-maintainers@redwood.com
+
+Appendix A — sample heatmap color scheme (Grafana friendly)
+
+- Value mappings: 0-200 -> #2ECC71 (green); 200-500 -> #F1C40F (amber); 500-1000 -> #E67E22 (dark amber); >1000 -> #E74C3C (red).
+
+Appendix B — example heatmap-ingest job config (k8s snippet)
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: heatmap-ingest
+spec:
+  template:
+    spec:
+      containers:
+      - name: heatmap-ingest
+        image: gcr.io/redwood/heatmap-ingest:stable
+        args: ["--log-source=s3://ingest/request-logs/", "--out-db=clickhouse://perf-ts:9000/heatmaps", "--interval=1m"]
+      restartPolicy: OnFailure
+
+Appendix C — related dashboards and runbooks
+
+- Grafana dashboard: Cohort Latency Heatmap (runtime)
+- Related runbooks: runtime-deployment-circuit-breakers-and-sla-fallback-playbook-2026, quantization-rollout-safety-and-quality-gate-playbook-2026
+
+Change log
+
+- 2025-02-12: Initial draft and acceptance test harness described.
+- 2025-05-03: Added PromQL + Clickhouse examples and rollout mitigations.
+- 2026-01-18: Refined alert thresholds and added post-incident follow-up requirements.
+
+End of document.

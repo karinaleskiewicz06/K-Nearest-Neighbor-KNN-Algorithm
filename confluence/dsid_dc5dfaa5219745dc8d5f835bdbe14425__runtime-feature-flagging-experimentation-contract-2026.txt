@@ -1,0 +1,220 @@
+Runtime feature flagging and experimentation contract
+
+Overview
+--------
+This document defines the architecture and operational contract for feature flagging and experimentation that touches the serving runtime. It covers how runtime-visible flags are declared, negotiated with kernels, staged in production, instrumented for SLO-aware rollouts, and automatically (or manually) rolled back. It is intended for runtime engineers, release engineers, kernel maintainers, and SREs who operate inference fleets.
+
+Scope
+-----
+- Applies to any toggle that changes runtime execution behavior: kernel selection, batching policy, KV cache semantics, prefetch hints, quantization/fast-path heuristics, backpressure thresholds, admission controls, and routing fallbacks.
+- Excludes UI-only feature flags, SDK developer flags, or experiment flags that do not alter server-side execution.
+
+Goals
+-----
+1. Provide a single, auditable contract for staging and running runtime-facing feature flags.
+2. Ensure rollouts are SLO-aware with automated safety gates that prevent expensive regressions.
+3. Standardize telemetry and decision tracing so every flag decision can be reconstructed end-to-end.
+4. Reduce blast radius with progressive targeting (canary -> ramp -> percent -> full) and deterministic fallback strategies.
+
+Key definitions
+---------------
+- Flag: An identifier that toggles behavior in the runtime (e.g., runtime.kv_prefetch_v2).
+- Kernel capability: a runtime or accelerator property (e.g., async_prefetch, sharded_attention_v2) that a kernel exposes and can negotiate with the control plane.
+- Decision trace: structured metadata attached to each request that records the flag decisions and kernel choices used to serve the request.
+- Safety gate: a set of observable constraints (SLO/metric thresholds) that must hold before a flag can progress to the next stage.
+
+Contract: Flag lifecycle and metadata
+------------------------------------
+Every runtime flag must have the following canonical metadata (stored in the feature-store):
+- id: short dashed name, e.g., runtime.kv_prefetch_v2
+- owner: GitHub handle and team, e.g., @asha / runtime-kernels
+- description: one-sentence purpose and risk summary
+- scope: one of [kernel-level, node-level, tenant-level, route-level]
+- default: boolean (sane production default)
+- stages: ordered list: [canary, ramp, percent, full, deprecated]
+- canary_policy: YAML pointer to rollout policy (see examples)
+- telemetry_keys: list of required metrics and trace attributes (see Observability section)
+- precondition_checks: optional list of checks (e.g., min-gpu-firmware-version, kvcache-available)
+- rollback_policy: pointer to automated rollback rule set
+- audit_log_url: URL to changelog / PR for the flag
+
+Example metadata (YAML snippet for the feature-store):
+```
+id: runtime.kv_prefetch_v2
+owner: @asha (runtime-kernels)
+description: Enable asynchronous KV prefetching for seed-based warmup to reduce cold tail latency. Risk: may increase memory churn under high-concurrency workloads.
+scope: node-level
+default: false
+stages: [canary, ramp, percent, full]
+canary_policy: /flags/policies/canary-kv-prefetch-v2.yaml
+telemetry_keys: [p50, p95, p99, cpu_util, gpu_mem_used, kv_prefetch_hit_ratio]
+precondition_checks: [gpu_driver>=560.20, kvcache_enabled]
+rollback_policy: /flags/rollback/auto-sla-rollback.yaml
+audit_log_url: https://sc/reviews/12345
+```
+
+Runtime negotiation and kernel capability model
+----------------------------------------------
+1. Capability declaration: Each kernel binary declares a static capability vector at build time (JSON manifest attached to the runtime image). Capabilities are short tokens: async_prefetch, sharded_attn_v2, quant_fp8_fastpath.
+2. Dynamic negotiation: At node start, the control plane retrieves the capability vector and stores it with node metadata. Flags scoped to kernel-level are only eligible for nodes that advertise the required capability.
+3. Fallback compatibility matrix: For each flag, authors must provide a fallback kernel variant or a safe no-op. Control plane enforces that flag activation never routes traffic to an incompatible kernel.
+
+Example kernel manifest (single-line JSON for feature-store):
+{"kernel_version":"3.2.0","capabilities":["async_prefetch","sharded_attn_v2"]} 
+
+Canary and rollout policy (SLO-aware)
+-------------------------------------
+All rollout policies must include: target traffic fraction, duration, ramp step size, observation window, and safety gates. Safety gates are specified as PromQL-style constraints.
+
+Minimum canary policy (example):
+```
+name: kv-prefetch-v2-canary
+target_fraction: 0.01 # 1% of signed traffic
+duration: 2h
+steps:
+  - until: 30m
+    fraction: 0.01
+  - until: 1h
+    fraction: 0.05
+observation_window: 5m
+safety_gates:
+  - name: p99-latency-regression
+    query: rate(p99_latency_ms[5m]) > baseline_p99 * 1.15
+  - name: cpu-spike
+    query: avg(cpu_user_seconds_total[5m]) > baseline_cpu * 1.2
+```
+Progression rules: a step only advances when none of the safety gates have fired for two consecutive observation windows. If any gate fires, follow rollback policy.
+
+Telemetry and decision tracing requirements
+-----------------------------------------
+Every request served under a runtime flag must record the following trace attributes (as structured tags):
+- flag.id (string)
+- flag.stage (canary|ramp|percent|full)
+- kernel.id
+- kernel.capabilities (comma-separated token list)
+- decision.reason (e.g., 'canary-match','tenant-override','precondition-fail')
+- decision.timestamp (ISO8601)
+- fallback.used (true|false)
+
+Required aggregated metrics (per-flag and per-kernel) reported at 1m resolution:
+- request_count
+- successful_count
+- error_rate (5xx / total)
+- latency_p50_ms, latency_p95_ms, latency_p99_ms
+- cpu_util_percent
+- gpu_mem_bytes_used
+- kv_prefetch_hit_ratio (when applicable)
+- cost_per_1000_tokens (est.)
+
+Observability dashboards and baseline generation
+------------------------------------------------
+- Every flag must have a templated dashboard generated automatically (Flag Overview): timeline of rollout fraction, p50/p95/p99, error_rate, resource usage, and decision_trace sampling panel.
+- Baselines: rollouts must compare to a running baseline captured from the 72h window before the rollout. Baseline values are stored in the experiment index and used in safety gate expressions.
+- Example PromQL safety gate (p99 regression):
+  (avg_over_time(latency_p99_ms{flag=\"control\"}[72h]) * 1.15) < avg_over_time(latency_p99_ms{flag=\"candidate\"}[5m])
+
+Automated rollback and escalation
+--------------------------------
+Two rollback mechanisms are supported: automated rollback and manual rollback. Authors must declare which mechanism applies and provide the thresholds.
+
+Automated rollback rule template (example):
+- Trigger: any safety gate that is marked auto-rollback triggers immediate rollback.
+- Action: flag is set to previous stage (or disabled if canary) and affected traffic is re-routed to fallback kernel.
+- Notification: paging to on-call + slack #runtime-incidents + email to flag owner and reviewers.
+
+Manual rollback: Any engineer can manually revert via the feature-store UI or CLI; manual rollback must include reason and a summary to the audit log.
+
+Experimentation harness and synthetic traffic protocol
+-----------------------------------------------------
+We require a reproducible synthetic load generator for each flag to exercise worst-case shapes (short bursts, long-context, many small parallel requests). The harness must:
+- Support tenant-scoped replay with recording/replay of real traffic signatures (scrubbed for PII)
+- Provide pre-seeded KV cache patterns and long/short sequence distributions
+- Allow failure injection (GPU OOM, NVLink latency, kernel timeouts) to test fallback behavior
+
+Commands (example):
+- Start a canary run: `rx experiment start --flag runtime.kv_prefetch_v2 --policy kv-prefetch-v2-canary`
+- Attach synthetic traffic: `rx loadgen --profile long-context-burst --tenants 100 --qps 200`
+- Collect traces: `rx traces export --filter flag=runtime.kv_prefetch_v2 --since 60m`
+
+Kernel rollout considerations
+---------------------------
+- Kernel authors must include a compatibility shim that allows a node to accept both old and new kernels during a rolling upgrade.
+- Rolling kernel upgrades must be coordinated with flag rollouts: a flag that depends on a new kernel capability must not be advanced beyond canary until 80% of eligible nodes are on the target kernel.
+- If the target capability is optional (best-effort), flag authors must specify safe degradation path in the metadata.
+
+SLOs and alerting thresholds (suggested defaults)
+--------------------------------------------------
+These thresholds are minimums; product teams may tighten them for higher-risk flags. All alerts are aggregated by flag and by model/route.
+- Error rate increase: > 0.5 percentage point absolute increase over baseline (5m window)
+- p95 latency increase: > baseline_p95 * 1.20 (5m window)
+- p99 latency increase: > baseline_p99 * 1.10 (5m window)
+- CPU usage: sustained > baseline * 1.25 (10m)
+- GPU memory pressure: > 85% for any node (1m)
+- Cost per 1k tokens: > baseline * 1.3 (24h)
+
+Runbook: immediate steps when a safety gate fires
+------------------------------------------------
+1. Alert fires -> page on-call SRE and notify flag owner.
+2. On-call runs `rx flags status --id runtime.kv_prefetch_v2` to confirm active stage.
+3. If auto-rollback enabled, verify whether rollback already executed. If not, run `rx flags rollback --id runtime.kv_prefetch_v2 --reason \"auto_gate_fire_manual_confirm\"`.
+4. If manual rollback required, set flag to previous stage and re-route traffic.
+5. Collect artifacts: 1m-resolution metrics, 1000 sampled traces (decision traces), kernel logs from nodes in cohort, and synthetic harness logs.
+6. Postmortem: owner opens a short incident review within 48h, including root cause hypothesis and next steps.
+
+Ownership and approvals
+-----------------------
+- Flag owner (declared in metadata) is responsible for: precondition checks, telemetry coverage, and runbook artifacts.
+- Kernel owners must sign off on capability declarations and provide fallback readiness proof.
+- Release owner (release-engineering) must approve any global >10% traffic ramp.
+- Security review required for any flag that changes encryption, key usage, or telemetry collection.
+
+Implementation examples
+-----------------------
+Feature-store CLI example (create a flag):
+```
+rx flags create --id runtime.kv_prefetch_v2 \
+  --owner @asha --scope node-level --default false \
+  --telemetry p99,kv_prefetch_hit_ratio,cpu_util --precondition kvcache_enabled
+```
+
+Prometheus rule example (p99 regression gate):
+```
+alert: Flag_P99_Regression
+expr: (avg_over_time(latency_p99_ms{flag=\"candidate\"}[5m]) > avg_over_time(latency_p99_ms{flag=\"control\"}[72h]) * 1.15)
+for: 2m
+labels:
+  severity: page
+annotations:
+  summary: \"Candidate p99 exceeding baseline by >15%\"
+```
+
+Change log and auditability
+---------------------------
+- Every state transition (create, canary-start, ramp-step, rollback, disable) must be recorded in the audit log with: user, timestamp, previous_state, new_state, reason, and a link to the PR/change.
+- Audit retention: 3 years for production-facing flags.
+
+Security and privacy notes
+--------------------------
+- Decision traces must not contain PII. Fields that could contain user data must be hashed or replaced with stable pseudonyms.
+- Experiment replay must use scrubbed recordings: scrub policy stored at /policies/replay-scrub-policy.md
+
+Appendix: FAQ and common patterns
+----------------------------------
+Q: When should a flag be kernel-level vs node-level?
+A: Kernel-level flags are for behavior inside kernel code paths that are compiled-in; node-level for runtime orchestration or config toggles. If the change touches GPU kernel binary interfaces, use kernel-level.
+
+Q: Can we bypass the safety gates for urgent hotfixes?
+A: Only with a documented emergency exemption approved by Release Engineering + SRE. The exemption must be recorded and the flag reverted to standard flow within 24h.
+
+Contacts and references
+-----------------------
+- Runtime flag steward: @asha (Asha Patel) — runtime-kernels
+- On-call SRE rotation: https://oncall.redwood/services/runtime
+- Feature-store UI: https://flags.redwood/internal
+- Related docs: runtime-feature-lifecycle-and-sunset-playbook, runtime-upgrade-validation-and-canary-matrix
+
+Change history
+--------------
+- 2025-11-07: Initial draft created by Asha Patel.
+- 2026-01-20: Added automated rollback templates and synthetic harness commands.
+- 2026-02-14: Finalized telemetry attribute names and reviewer sign-offs.

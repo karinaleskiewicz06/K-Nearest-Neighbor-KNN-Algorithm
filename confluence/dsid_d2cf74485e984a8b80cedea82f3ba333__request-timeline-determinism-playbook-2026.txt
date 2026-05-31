@@ -1,0 +1,164 @@
+Request Timeline & Determinism Playbook
+
+Purpose
+
+This document defines a reproducible approach to mapping an end-to-end request timeline through the Redwood serving stack, explains sources of non-deterministic latency and behavior, and provides a playbook for profiling, benchmarking, and mitigating determinism regressions. The goal is to enable engineers and SREs to quickly triage and resolve incidents where identical request inputs do not produce stable latency envelopes or consistent processing paths.
+
+Scope
+
+- Applies to hosted, dedicated, and private deployments where the runtime codebase is shared.
+- Covers request ingress -> routing -> batching -> kernel dispatch -> KV cache -> model execution -> network egress.
+- Does NOT cover model stochasticity (sampling temperature/top_k) or application-level business logic differences.
+
+Background and motivation
+
+We observed a growing class of incidents where median latency is stable but per-request timelines diverge (e.g., 95th/99.9th spikes) without obvious capacity pressure. Root causes frequently involve timing interactions across kernel scheduling, KV cache warmup, and ephemeral network backpressure. Deterministic request timelines make capacity planning, autoscaling, and SLO enforcement reliable. This playbook codifies instrumentation and procedures to diagnose and reduce nondeterministic behavior.
+
+High-level dependency map
+
+Component | Responsibility | Owner | Key telemetry
+----------|----------------|-------|--------------
+API gateway | Authentication, rate limit, initial routing | api-gateway | api.gateway.request_duration_ms, api.gateway.route_decisions
+Router/Orchestrator | Policy-based routing (latency/cost/region) | routing | routing.request_dispatch_ms, routing.fallback_count
+Batcher | Windowing, priority mixing, slice formation | runtime-batcher | batch.size, batch.slice_latency_ms
+Scheduler / Kernel mapper | Kernel selection, GPU mapping, preemption tickets | kernel-scheduler | kernel.dispatch_latency_ms, kernel.preempt_events
+KV cache | Prefix/KV cache lookup, miss/warmup | kvcache | kv.hit_rate, kv.miss_latency_ms
+Model execution | Compilation & kernels, attention state | model-exec | model.step_latency_ms, model.kv_memory_pressure
+Network/Transport | Client socket, streaming backpressure | transport | transport.send_queue_ms, transport.socket_write_retries
+
+Determinism-sensitive subsystems and how they break determinism
+
+- Kernel scheduler: non-deterministic preemption ordering and fairness heuristics can reorder slices across tenants, causing high tail latency for otherwise identical requests.
+- Batching: dynamic slice formation (size-based timeouts + priority mixing) can cause similar requests to hit different batch boundaries.
+- KV cache: cold misses introduce variable latency; inconsistent shard-affinity (NUMA placement changes) amplifies variance.
+- GPU memory fragmentation: transient OOMs and page migration can introduce stalls not visible in average metrics.
+- Networking: TCP retransmits, streaming backpressure or socket write stalls cause long-tailed egress.
+
+SLOs and jitter budgets (recommended)
+
+- 50th latency SLO: median request end-to-end < 30ms (sample workload).
+- Tail latency SLO: 99.9th < 300ms for standard small response workloads; jitter budget for run-to-run variance (stability) is 10% at 99th.
+- Determinism alert: when the standard deviation of 99th percentile across 1-minute windows > 15% for 30 minutes.
+- Cache warmup budget: first 100 requests on a model variant should not exceed 5x median if traffic steady; >10x indicates warmup misrouting.
+
+Instrumentation and telemetry checklist (minimum)
+
+- Per-request tracing spans across: ingress -> route -> batch-window -> kernel-dispatch -> kv-lookup -> model-step -> egress. Use trace tags: request.id, model.version, kernel.variant, batch.id, tenant.id.
+- Metrics to emit per component: see dependency map above. Add cardinality-limited labels: model_family, seq_len_bucket, priority.
+- Span duration histogram (exponential buckets) for kernel.dispatch and model.step.
+- Emit an event when a request is preempted, including preempting_ticket_id and reason string.
+
+Example PromQL queries for quick triage
+
+- 99.9th end-to-end latency (1m):
+  histogram_quantile(0.999, sum(rate(api_gateway_request_duration_seconds_bucket[1m])) by (le))
+- Variance of 99th over past 30m (one-liner):
+  stddev_over_time(quantile_over_time(0.99, api_gateway_request_duration_seconds_bucket[30m])[30m:1m])
+- Preemption events rate:
+  sum(rate(kernel_preempt_events_total[5m])) by (node)
+
+Profiling playbook: reproduce, collect, analyze
+
+1) Reproduce with a deterministic harness
+   - Use the gated harness mode in the perf repo: set RNG seeds and use fixed workload trace. Example run:
+
+   ```bash
+   PERF_SEED=1234 ./perf/harness/run_workload.sh --trace samples/seq_32_fixed.json --parallel 8 --warmup 200
+   ```
+
+2) Record full trace with dependent spans (30s window around the offending request id). Use the runtime debug trace API:
+
+   ```bash
+   curl -X POST -H "Authorization: Bearer $TOKEN" \
+     https://internal-debug.redwood/api/v1/runtime/trace?request_id=<REQUEST_ID> \
+     -d '{"window_ms":30000, "include_kernel_samples": true}'
+   ```
+
+3) Collect kernel-level GPU samples (NVTX/CUPTI) from the node running the kernel mapping. Sample policy (recommended YAML):
+
+   sampling_policy:
+     profile_duration_ms: 30000
+     sample_rate_per_ms: 0.5
+     include_nvtx: true
+     include_cpu_stacks: true
+
+4) Correlate traces and GPU samples by timestamp and batch.id. Look for: long idle gaps between spans, unexpected preempt events, or repeated KV misses in the same request path.
+
+Benchmarking suite: adversarial recipes
+
+- Seeded homogeneous bursts: sequences of identical small requests with controlled inter-arrival jitter [0–10ms]. Measure batch boundary sensitivity.
+- Mixed-priority storms: interleave priority=high and priority=low with 80/20 ratio to exercise scheduler fairness.
+- KV churn profile: rotate prefix keys every N requests to force cache eviction and validate warmup budget.
+
+Example wrk-style scenario to create edge-case jitter (bash):
+
+   ```bash
+   # run for 10 minutes, spawn 64 connections, random sleep to mimic jitter
+   wrk -t8 -c64 -d600s --latency --script scripts/jitter.lua http://runtime-redwood/api/v1/generate
+   ```
+
+Runbook: triage steps for nondeterministic tail latency
+
+1) Gather a representative request id and time window. Ensure you have traces and request headers (model.version, seq_len, priority).
+2) Check routing decisions for that time: routing.fallback_count and route.dispatch_latency_ms. If >0 fallback, proceed to step 6 (fallbacks).
+3) Inspect batcher logs for batch.size and slice_latency_ms around the request. If request landed in different sized batches across runs, note weight of adaptive timeouts.
+4) Query kernel.preempt_events for the node and tenant. If preemption occurred, capture the preempting_ticket_id and escalate to kernel-scheduler owners.
+5) Check KV cache metrics for the model/version shard: kv.hit_rate and recent misses. If miss pattern aligns with spikes, run cache-warmup script and consider pinning shard affinity.
+6) Fallback and route-mismatch: if routing routed to a cheaper/remote variant, annotate the trace and consider rollout policy changes to prefer latency-stable variants during canaries.
+7) If GPU-level stalls suspected, request GPU profile (NVTX/CUPTI) and look for CUDA synchronization points or long memcpy operations.
+
+Quick remediation actions (temporary)
+
+- Enable deterministic-batching-mode for the model variant (forces fixed batch window and disables dynamic priority mixing) via runtime flags. Note: increases average latency for small workloads.
+- Pin request affinity to a node group to avoid NUMA rebalancing during incident.
+- Increase kernel preemption grace period to reduce preemption churn while investigating.
+
+Recent release notes (high-level)
+
+Release: determinism-mode v0.7 (Feb 2026)
+- New: deterministic-batching-mode flag (per-model). When enabled, the batcher uses fixed windows and sequence-aware packing.
+- New: kernel.dispatch_span_id included in traces for robust cross-correlation.
+- Fixed: race condition in preemption accounting that underreported preempt_events under high multiplexing.
+- Known limitation: deterministic-batching-mode may increase average latency for seq_len <= 16 workloads.
+
+Known issues and recommended mitigations
+
+- ISSUE-6721: Intermittent kernel.preempt_events surge on A100-80GB nodes after driver upgrade. Mitigation: pin driver to 525.60 or roll back kernel mapper policy to conservative_crediting. Owner: kernel-scheduler.
+- ISSUE-6842: KV shard skew after rolling upgrade leads to miss storms. Mitigation: run shard-rebalance with dry-run and then schedule gradual rebalance during low-traffic window. Owner: runtime-batcher/kv-team.
+- ISSUE-7015: Tracing gaps for high-throughput streaming clients. Mitigation: increase tracing sampling window and use combinatorial span deduplication. Owner: observability.
+
+Ownership and escalation
+
+- First responder: team oncall (eng-serving-runtime).
+- Kernel scheduling issues: kernel-scheduler team (pager: kernel-sched@sre).
+- KV cache and shard issues: runtime-batcher and kv-team.
+- Observability / tracing gaps: observability team.
+
+Appendix: handy CLI snippets and scripts
+
+- Fetch recent 5 preempt events with context (kubectl):
+
+  ```bash
+  kubectl logs -n runtime -l app=kernel-scheduler --tail=200 | rg "preempt" -n | tail -n 5
+  ```
+
+- Pin model variant to deterministic batching (admin CLI):
+
+  ```bash
+  redwood-admin model set-flag --model my-model:v2 --flag deterministic_batching=true
+  ```
+
+References
+
+- See kernel scheduler spec: ../kernel-and-scheduling/preemption-aware-batch-slicing-spec-2026.json
+- Profiling playbook: ../profiling-playbook/variance-driven-sampling-and-cost-correlation-playbook-2026.json
+
+Action items
+
+- [ ] Add a synthetic test to CI that runs seeded-burst scenario nightly and fails on >20% 99.9th variance. Owner: eng-serving-runtime perf.
+- [ ] Instrument preempting_ticket_id in rollout dashboards. Owner: observability.
+
+Document history
+
+- 2025-11-12: Created by Priya Nair
+- 2026-02-20: Added deterministic-batching-mode runbook steps and release notes

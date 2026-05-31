@@ -1,0 +1,198 @@
+Scheduler integration and end-to-end profiling playbook
+
+Overview
+
+This playbook documents an end-to-end procedure for integrating scheduler-level signals with kernel and runtime profiling to diagnose performance regressions, validate scheduler changes, and produce deterministic benchmarking artifacts. It covers required telemetry, experiment templates, step-by-step collection recipes, analysis heuristics, SLO checks, and incident/runbook guidance. The intended audience is runtime engineers, scheduler authors, SREs, and performance QA.
+
+Scope and goals
+
+- Scope: production and staging runtime clusters, kernel scheduler variants (e.g., preemptive handoff, admission-controller tweaks), and profiling pipelines that touch GPU/CPU kernel execution, KV cache behavior, and request multiplexing.
+- Goals:
+  - Provide a repeatable profiling and benchmarking workflow that links scheduler decisions -> kernel execution metrics -> end-to-end latency distribution.
+  - Define minimal telemetry contract and collection commands so experiments are comparable across hardware and model variants.
+  - Produce artifacts for regression triage (trace bundles, synthetic replay, and a short summary report).
+
+When to use this playbook
+
+1. After a scheduler change (policy or implementation) that touches admission, preemption, or batch slicing.
+2. When a P95/P99 latency regression is observed after release.
+3. Prior to a canary rollout of a scheduler or kernel change.
+4. During capacity planning or hardware-fit experiments.
+
+High-level architecture impact
+
+- Scheduler decisions should carry a deterministic context token (scheduler_decision_id) that is injected into request provenance and all downstream traces.
+- The decision token must propagate to kernel dispatch layers, runtime traces, and exporter annotations. This allows trace correlation across layers without manual mapping.
+- Telemetry producer components: request-gateway, admission-controller, kernel-dispatcher, kvcache-shard, and kernel-runner.
+
+Minimal telemetry contract (required fields)
+
+Each sampled trace must include the following fields (as tags/fields):
+- trace_id (string)
+- request_id (string)
+- scheduler_decision_id (string)
+- cohort (string) — e.g., canary|control|baseline|experiment
+- model_variant (string)
+- kernel_variant (string)
+- gpu_id / cpu_node (string)
+- seq_len (int)
+- token_count (int)
+- enqueue_time, dispatch_time, kernel_start_time, kernel_end_time, response_write_time (ISO timestamps)
+- batch_size (int)
+- admission_reason (string) — e.g., immediate, queued, preempted, hedged
+
+Suggested additional metrics (histograms / counters):
+- kernel_exec_ms (histogram) - kernel execution duration per request
+- enqueue_ms, queue_wait_ms (histogram)
+- kvcache_hit_rate (gauge) per tenant/cohort
+- kernel_retry_count (counter)
+- scheduler_action_counts{action} (counter)
+
+Collection and tooling prerequisites
+
+- Tracing: Jaeger-compatible traces with 100% decision token sampling for scheduled experiments.
+- Kernel traces: nsys (NVIDIA Nsight) or ROCm tracing for AMD, plus lightweight per-kernel timing exposed via runtime counters.
+- Profiler builds: builds instrumented for timeline annotations (build tag: prof/annotated-2026*).
+- Replay harness: request-surface-replayer v2.1 or later.
+- Central artifact store: s3://redwood-perf/artifacts/{experiment}/{date}/
+
+Standard experiment template (single file: experiment.yaml)
+
+Example experiment metadata (YAML):
+
+experiment_name: scheduler-hand-off-microburst-2026-02-01
+description: Measure tail-latency impact of preemptive handoff under microburst traffic for llama-13b-quant
+cohorts:
+  - control: scheduler:stable, kernel:baseline, cohort:control
+  - experiment: scheduler:preemptive-hand-off-v3, kernel:baseline, cohort:experiment
+traffic_profile: microburst-1s-on-9s-off
+model_variant: llama-13b-quant
+sequence_distribution: p(<=64)=0.7, p(65-256)=0.25, p(256+)=0.05
+collect_traces: true
+trace_sample_rate: 1.0
+artifact_bucket: s3://redwood-perf/artifacts/scheduler-hand-off-microburst-2026-02-01/
+
+Step-by-step collection recipe (canonical)
+
+1) Prepare baseline: pin control cohort to scheduler:stable and kernel:baseline. Verify canary isolation (no cross-cohort mixing).
+2) Start the replay harness against staging cluster with the defined traffic_profile. Use request-surface-replayer with injected request_id and scheduler_decision_id:
+
+# run from perf workstation
+request-surface-replayer --experiment experiment.yaml --outdir /tmp/exp-run --inject-decision-token
+
+3) Start system-level collectors (run on all nodes hosting kernel-runner processes):
+- Start nsys for GPU: sudo nsys profile -o /tmp/nsys-${NODE}.qdrep --sample=cpu,gpu --trace=nvtx --duration=600s --capture=all
+- Start cpu perf or eBPF sampler: sudo perf record -F 99 -a -g -o /tmp/perf-${NODE}.data sleep 600
+- Start lightweight runtime exporter: curl -X POST http://localhost:9001/debug/trace/start?out=/tmp/trace-${NODE}.ndjson
+
+4) Start distributed trace capture (Jaeger) with 100% sampling for the experiment cohort.
+5) Run the replay for configured duration (recommended 10–30 minutes for microburst experiments).
+6) After run completes, collect artifacts from nodes and upload to experiment artifact bucket following naming convention: {experiment}/{cohort}/{node}/{timestamp}/trace.qdrep, perf.data, runtime-trace.ndjson, jaeger-trace.json
+
+Analysis heuristics (quick triage)
+
+- Correlate scheduler_decision_id with kernel_exec_ms from kernel traces. Create a pivot table: scheduler_action -> median kernel_exec_ms, p95 kernel_exec_ms, mean queue_wait_ms.
+- Look for cohorts where kernel_start_time is significantly delayed relative to dispatch_time (>10 ms baseline depending on model shape).
+- If kernel_exec_ms variance grows with batch_size, inspect batch-slicing/handoff logs for cross-tenant batching.
+- If eBPF/perf shows system-level scheduling preemption spikes coincident with high p99, search for SIGSTOP/SIGCONT patterns or GPU watchdog resets.
+
+Automated checks and SLO gates
+
+Before a scheduler change is promoted to production, these automated checks must pass in staging: 
+- Regression-free on p50/p95/p99 for baseline workload within 5%/8%/12% respectively.
+- Kernel retry rate increase < 2% absolute.
+- kvcache_hit_rate delta < 1% (unless expected).
+- No increase in scheduler_action_counts{preempt} > 3x baseline without documented rationale.
+
+Alerting rules (sample)
+
+- alert: SchedulerTailLatencyRegression
+  expr: histogram_quantile(0.99, sum(rate(kernel_exec_ms_bucket[5m])) by (le, cohort)) > 1.12 * baseline_p99
+  for: 10m
+  labels: {severity: page}
+
+- alert: KernelRetrySpike
+  expr: increase(kernel_retry_count[5m]) > 100 && increase(kernel_retry_count[5m]) / increase(request_count[5m]) > 0.02
+  for: 5m
+  labels: {severity: ticket}
+
+Rollout checklist (pre-canary)
+
+- [ ] Experiment YAML committed to repo and pinned to artifact bucket.
+- [ ] Tracing + kernel trace infrastructure smoke-tested.
+- [ ] Baseline run completed and artifact snapshot stored.
+- [ ] Owners & oncall notified (Slack #serving-runtime with experiment tag).
+- [ ] Canary policy configured (5% of traffic for 30 minutes -> 25% for 1h -> 100% with rollback).
+- [ ] SLO gates configured in deployment pipeline.
+
+Runbook: triage flow for observed tail-latency regression
+
+1) Verify alert source and cohort. If cohort != canary and no rollout in progress, page oncall.
+2) Fetch experiment artifact bundle and open the summary report (artifact/{experiment}/summary.json). Key fields: delta_p99, median_queue_wait_ms, kernel_retry_rate.
+3) Cross-correlate scheduler_decision_id for top 10 slow traces and inspect kernel qdrep slices at those timestamps.
+4) Check node-level telemetry: GPU utilization, nvlink errors, dmesg, OOM/killer events, and GPU watchdog messages.
+5) If traces show kernel_start_time delayed but steady kernel_exec_ms, suspect admission latency or queueing; escalate to scheduler owner.
+6) If kernel_exec_ms inflated and kernels show >1.5x expected occupancy drift, open a kernel regression issue and attach qdrep.
+7) If system-level indicators show GPU thermal throttling, coordinate with SRE to move canary to alternate hardware.
+
+Known issues and mitigations (short catalog)
+
+- mis-attributed-decision-token: Some legacy gateway versions drop scheduler_decision_id when requests are proxied through legacy route. Mitigation: enforce gateway version >= 2025.11 and run injector sidecar for older routes.
+- perf-sampling-sparsity-on-high-throughput: perf recorder under-samples when node CPU is saturated; mitigation: reduce sampling frequency and increase test duration for stability.
+- nsys-file-size-bloat: long runs generate large qdrep files; mitigation: use time-windowed capture and aggregate smaller windows with qdrep-concat.
+
+Release notes (summary of recent changes relevant to this playbook)
+
+- 2026-01-10: scheduler:preemptive-hand-off-v3 landed. The new policy reduces starvation but introduced additional preempt events; this playbook includes a specific experiment template to quantify the latency impact under microbursts.
+- 2025-12-03: runtime:annotated-prof builds published; these include NVTX span annotations for scheduler_decision_id and batch lineage. Use these builds for kernel-level correlation.
+
+Ownership and escalation
+
+- Primary owners: Serving Runtime - Scheduling subteam (owner alias: runtime-scheduler@redwood.com).
+- SRE escalation: eng-sre-oncall@redwood.com.
+- Performance lab contact: perf-lab@redwood.com.
+
+Artifact naming and retention policy
+
+- Naming: {experiment}/{cohort}/{node}/{YYYYMMDD_HHMMSS}/{artifact}.{ext}
+- Retention: experiments used for production rollouts retained for 365 days. Debug/ephemeral experiments may be retained for 30 days. Critical regression runs (P99 delta > 10%) archived indefinitely.
+
+Appendix A — useful commands and snippets
+
+Collecting a short GPU slice with nsys:
+
+sudo nsys profile -o /tmp/qdrep --capture=nvtx,cuda,nvtx --sample=cpu,gpu --duration=60s --trace=nvtx --quiet
+
+Extracting timeline to JSON (local):
+
+nsys stats --report gputimeline --format json /tmp/qdrep.qdrep > /tmp/qdrep.timeline.json
+
+Quick pivot using jq and python (example):
+
+jq -c '.[] | select(.tags.scheduler_decision_id != null) | {trace_id: .trace_id, decision: .tags.scheduler_decision_id, kernel_ms: .metrics.kernel_exec_ms}' jaeger-trace.json | python -c 'import sys, json; data=[json.loads(l) for l in sys.stdin]; print(len(data))'
+
+Experiment result template (copy into artifact summary.json)
+
+- experiment: string
+- cohort: string
+- p50_control, p95_control, p99_control: ms
+- p50_experiment, p95_experiment, p99_experiment: ms
+- delta_p99_percent: float
+- kernel_retry_rate_control, kernel_retry_rate_experiment: float
+- notes: string (root cause hypothesis)
+
+Related documentation
+
+- Kernel scheduling handbook (internal): /confluence/eng-serving-runtime/kernel-and-scheduling/runtime-scheduler-decision-fabric-and-telemetry-playbook-2024
+- KV cache and session lifecycle: /confluence/eng-serving-runtime/runbooks/session-lifecycle-kvcache-consistency-guidelines-2024
+
+Feedback and continuous improvement
+
+- Add new experiment templates to this page and tag with the date.
+- After each canary, the owner must add a short summary to the experiment artifact and tag whether the SLO gate passed.
+
+Document history
+
+- 2025-11-12: initial draft (Asha Kapoor)
+- 2025-12-15: added known issues and retention policy (review by Daniel Park)
+- 2026-02-03: clarified telemetry contract and added rollout checklist (review by Marta Gutierrez)

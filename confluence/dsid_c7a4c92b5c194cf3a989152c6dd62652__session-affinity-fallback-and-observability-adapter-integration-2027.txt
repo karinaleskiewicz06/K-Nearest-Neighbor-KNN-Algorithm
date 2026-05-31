@@ -1,0 +1,165 @@
+Session affinity fallback and observability adapter integration
+
+Summary
+This guide describes the integration pattern and operational playbook for Session Affinity Fallback paired with the Observability Adapter. The goal is to maintain per-tenant session continuity (sticky routing + KV cache coherence) during model rollouts, capacity surges, and cross-environment (hosted -> dedicated -> private) handoffs while preserving telemetry fidelity for QBRs and incident investigations.
+
+Context and problem statement
+- Customers expect conversational continuity: the same persona, context, and KV cache should follow a tenant’s session even if the request is routed to a fallback or alternate deployment.
+- During capacity pressure, routing changes, or version rollouts, naive failover breaks KV caches and makes tracing and quality regression analysis difficult.
+- We provide an Observability Adapter that adds tenant-level metadata and reconciles distributed KV cache ownership during handoffs. This document explains the integration steps, config, and runbook for failure modes.
+
+When to use
+1) Enterprise tenants with strong SLAs for session continuity and traceable outputs.
+2) Migration windows between hosted and dedicated/private deployments.
+3) Canary or canary-surge auto-failovers where preserving context reduces user-facing quality regressions.
+
+Architecture overview (text diagram)
+- Client -> Ingress-proxy (sticky cookie / token) -> Routing-orchestrator -> [Primary pool: tenant-gateway -> model-pool, KV-store primary]
+                                                                                                                        -> [Fallback pool: tenant-proxy -> model-pool, KV-sync sidecar]
+- Observability Adapter (obs-adapter) is a sidecar in front of forwarders and emits tenant-scoped traces/metrics to the telemetry pipeline.
+- KV-sync replicates prefix caches (KV cache) with configurable staleness windows.
+
+Key components and responsibilities
+- ingress-proxy: issues session tokens, enforces affinity hints (cookie, JWT claim), and marks requests with affinity headers. Owner: ingress team.
+- routing-orchestrator: evaluates routing policy (latency vs cost vs tier) and decides fallback targets. Owner: routing team.
+- tenant-gateway: primary request path for tenant; keeps authoritative KV ownership. Owner: tenant-platform.
+- tenant-proxy + kv-sync sidecar: receives handoff requests; kv-sync attempts prefix/KV reconciliation with primary. Owner: private-deployments / dedicated ops.
+- obs-adapter: injects tenant_id, session_id, model_version, fallback_reason into spans/metrics and emits structured logs for the QBR pipeline. Owner: telemetry team.
+
+Prerequisites
+- Tenant has a session token flow (cookie or bearer token) and tenant_id is present in request.
+- KV sync endpoints enabled with TLS between primary and fallback pools.
+- Observability Adapter image version >= 2.3.0 deployed alongside ingress-proxy and tenant-proxy.
+- Routing-orchestrator supports fallback_reason codes and an affinity header (X-Redwood-Affinity).
+
+Configuration examples
+1) ingress-proxy affinity cookie (snippet):
+- cookie_name: rw_session
+- ttl: 3600 # seconds
+- secure: true
+- same_site: Lax
+
+2) routing-orchestrator policy (YAML):
+policy:
+  - name: preserve-affinity-on-surge
+    priority: 10
+    conditions:
+      - type: capacity-pressure
+        threshold: 0.85
+    actions:
+      - type: fallback
+        target_pool: fallback-pool-us-west
+        preserve_affinity: true
+        kv_reconciliation_window_sec: 30
+
+3) kv-sync sidecar config (JSON example):
+{
+  "mode": "incremental",
+  "max_prefix_bytes": 524288,
+  "staleness_ttl_sec": 60,
+  "consistency": "eventual",
+  "reconciliation_interval_sec": 15
+}
+
+4) obs-adapter injection config (snippet):
+- obs_adapter:
+    emit_span_tags: ["tenant_id","session_id","model_variant","fallback_reason"]
+    redact_fields: ["user_message.pii"]
+    sample_rate: 1.0
+
+Integration steps (high level)
+1) Deploy obs-adapter v2.3.0 to ingress-proxy and tenant-proxy pods. Verify sidecar readiness.
+2) Enable X-Redwood-Affinity header in ingress-proxy and set preserve_affinity: true in the routing-orchestrator policy used for the tenant.
+3) Configure kv-sync TLS trust between primary and fallback clusters. Exchange certs using the private-deployments onboarding script.
+4) Start a staged rollout: 10% traffic to fallback-pool with preserve_affinity and kv_reconciliation_window_sec=60.
+5) Validate session continuity using the QA checklist below and observe traces in the telemetry dashboard.
+
+QA and verification checklist
+- Create a multi-turn session (10 turns) and note session_id.
+- Force a controlled failover via routing-orchestrator API:
+  curl -X POST "https://orchestrator.internal/api/v1/fallback" -H "Authorization: Bearer $RW_ADMIN_TOKEN" -d '{"tenant_id":"acme-corp","target":"fallback-pool-us-west","force":true}'
+- Confirm the session_id is preserved in returned response headers (X-Session-Id).
+- Inspect obs-adapter spans in Grafana/Tempo: ensure span tags contain tenant_id/model_variant/fallback_reason.
+- Compare the produced response tokenization metadata for parity between primary and fallback (embedding dimensions, top-p, temperature).
+
+Monitoring, alerts, and SLOs
+- Telemetry emitted by obs-adapter: metric rw.session.handoff.count, rw.kv.reconciliation.success_rate, rw.handoff.latency_ms (p50/p95/p99).
+- Recommended alert thresholds (pager):
+  - rw.kv.reconciliation.success_rate < 95% for 5m -> page oncall (severity P1).
+  - rw.handoff.latency_ms.p95 > 400ms for 10m -> notify routing and tenant-platform (P2).
+  - rw.session.handoff.count spikes > 3x baseline per 5m -> alert capacity ops (P2).
+- SLO targets for enterprise tenants using affinity:
+  - Session continuity (session-id preserved across handoff): 99.9% monthly.
+  - KV reconciliation success rate: 99% monthly.
+  - Handoff latency p95: < 350ms.
+
+Failure modes and runbook (step-by-step)
+1) Symptom: KV_sync failing (error logs show TLS handshake failures) Runbook:
+  a) Check kv-sync sidecar logs on fallback node: kubectl -n tenant-proxy logs -l app=kv-sync
+  b) Validate TLS cert expiry: kubectl -n certs get secret tenant-kv-tls -o yaml | grep expiration
+  c) If cert expired, follow cert-rotation playbook: update secret with new cert and restart pods.
+  d) If network policy blocking, verify CNI rules and peering: run traceroute from fallback to primary on port 9200.
+
+2) Symptom: Session ID not preserved after failover Runbook:
+  a) Verify ingress-proxy is propagating X-Session-Id header.
+  b) Inspect routing-orchestrator logs for preserve_affinity evaluation.
+  c) If preserve_affinity=false, verify policy matches tenant label (policy may be scoped to enterprise-tier).
+  d) If header present but lost downstream, check tenant-proxy header whitelist. Add X-Session-Id to allowed list.
+
+3) Symptom: Observability spans missing tenant tags Runbook:
+  a) Confirm obs-adapter sidecar is running and healthy. kubectl -n ingress get pods -l app=obs-adapter
+  b) Check obs-adapter config: emit_span_tags includes tenant_id and session_id.
+  c) If sample_rate < 1.0, temporarily set to 1.0 for a diagnostics window.
+
+Rollout checklist and rollback plan
+- Rollout (canary):
+  1) Deploy obs-adapter to staging and run synthetic multi-turn sessions.
+  2) Enable preserve_affinity for 5% of traffic to fallback. Monitor kv_reconciliation.success_rate and rw.session.handoff.count for 30 minutes.
+  3) Increase to 25% if metrics stable.
+  4) After 2 hours at 25% and no P1s, expand to 100% for tenant.
+- Rollback:
+  - Immediate rollback: set routing-orchestrator policy to disable fallback (preserve_affinity=false) and redirect traffic to primary only.
+  - If KV divergence occurred, run kv-sync reconciliation job with mode=full-sync (may incur cost/time). Track reconciliation job via job id returned by API.
+
+Ownership and contacts
+- Oncall (first-line): Customer Success Oncall (cs-oncall@redwood.ai)
+- Escalation (P2+): Routing team (routing-eng@redwood.ai), Tenant Platform (tenant-platform@redwood.ai)
+- Telemetry debugging: telemetry-observability@redwood.ai
+
+Testing matrix for enterprise scenarios
+- Scenario A: small multi-turn chat with immediate failover -> expected: session preserved, p95 latency increase < 150ms
+- Scenario B: long context completion (2k tokens) with fallback -> expected: responses aligned but may have reduced caching efficiency; run embedding parity check post-handoff
+- Scenario C: cross-region handoff (us-east -> eu-west) -> expected: increased latency but KV-sync allowed with staleness_ttl_sec >= 120
+
+Operational notes and tips
+- Prefer incremental kv-sync for low-latency workloads; schedule full-sync during maintenance windows.
+- Use the obs-adapter structured logs to drive automated QBR sampling: tag sessions with product_feature and sample by tenant_impact_score.
+- For private deployments behind air-gapped networks, provide a signed cert bundle using the private-deployments onboarding tool: scripts/certs/generate-bundle.sh
+
+References and related pages
+- routing policy reference: /confluence/eng-platform/routing-policy-reference
+- kv-sync architecture: /confluence/eng-infra/gpu-fleet-and-capacity/kv-sync-architecture
+- obs-adapter telemetry schema: /confluence/eng-platform/dashboards-and-alerts/obs-adapter-schema
+
+Appendix: useful CLI snippets
+- Force canary fallback via orchestrator:
+  curl -X POST "https://orchestrator.internal/api/v1/fallback" -H "Authorization: Bearer $RW_ADMIN_TOKEN" -H "Content-Type: application/json" -d '{"tenant_id":"acme-corp","target":"fallback-pool-us-west","preserve_affinity":true}'
+
+- Inspect reconciliation job status:
+  curl -s "https://kv-sync.internal/api/v1/reconcile?job_id=JOB12345" -H "Authorization: Bearer $RW_ADMIN_TOKEN" | jq
+
+- Quick validation script (python):
+  python - <<'PY'
+  import requests
+  headers = {"Authorization":"Bearer $RW_ADMIN_TOKEN","Content-Type":"application/json"}
+  r = requests.post("https://api.redwood.ai/v1/chat", headers=headers, json={"tenant_id":"acme-corp","session_id":"test-123","input":"hello"})
+  print(r.headers.get('X-Session-Id'), r.json().get('response'))
+  PY
+
+Document lifecycle and maintenance
+- Owners must review this guide quarterly or after any obs-adapter, routing-orchestrator, or kv-sync release.
+- Major changes to preserve_affinity semantics require an update to enterprise SLOs and customer-facing documentation.
+
+Feedback and improvements
+- For integration gaps or missing telemetry fields, open an internal ticket in the #obs-adapter Slack channel and link the ticket to this page.
+- Suggested improvements: automatic prefix reconciliation metrics per-session, stronger guarantees for bounded staleness in dedicated-private handoffs.

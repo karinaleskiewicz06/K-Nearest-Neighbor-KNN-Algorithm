@@ -1,0 +1,275 @@
+Runbook: Control Plane Backup (Redwood Private Day-2 Ops)
+
+## Purpose
+This runbook describes how to take a consistent, supportable **control-plane backup** for **Redwood Private** deployments (VPC or on-prem), including pre-flight checks, optional quiesce/maintenance steps, snapshot creation, encryption, verification, and artifact storage.
+
+This runbook is intended to be repeatable by:
+- Customer platform operators (with Redwood guidance)
+- Redwood Solutions Engineering during onboarding / DR readiness
+- Redwood SRE/Private Deployments Engineering during staging drills
+
+## Scope
+### Included (control-plane)
+A successful control-plane backup MUST capture the state required to reconstruct the Redwood Private control plane and tenant configuration:
+- Control-plane configuration database ("Config DB") snapshot (schema + data)
+- Redwood control-plane configuration and routing policy state (as stored in Config DB)
+- Kubernetes release configuration needed for deterministic redeploy (Helm values + Redwood-managed manifests)
+- Backup metadata/manifest, integrity checksums, and encryption metadata
+
+### Explicitly not included
+- **Kubernetes etcd** cluster backups (cluster-level recovery is separate; see related infra runbook)
+- Data-plane caches and ephemeral runtime state (assumed stateless redeploy)
+- Raw secret material (e.g., secret values). Backups include **references/metadata** only; secrets must be rehydrated from the customer’s secret manager/KMS integration during restore.
+- Customer application data stored outside Redwood control plane (e.g., your product DBs)
+
+## Ownership and escalation
+- Runbook owner: **Sean Gallagher (SRE lead, runbooks/on-call)**
+- Control-plane implementation: **Ethan Park**
+- Security review and encryption requirements: **Marcus Lin / Hanae Suzuki**
+- Release/packaging (on-prem): **Connor O’Brien**
+
+If backup creation fails in a customer production environment:
+- Collect the command output + logs bundle (see “Collect support bundle” below)
+- Escalate via the normal Private support channel and include the backup manifest (if produced)
+
+## Preconditions and prerequisites
+### Access
+You need:
+- `kubectl` access with permissions to read namespaces and exec into the backup job/pod
+- Access to the backup storage backend (S3/GCS/NFS) with write and list permissions
+- If using KMS envelope encryption: permission to call the relevant key APIs (e.g., `kms:Encrypt`, `kms:Decrypt` on the configured key)
+
+### Recommended operational window
+- Prefer a maintenance window for production, especially for first-time runs.
+- Ensure no platform upgrade, migration, or cluster maintenance is in progress.
+
+### Inputs you must know
+- Cluster identifier (for naming/prefixing artifacts)
+- Deployment type: VPC or on-prem (air-gapped changes storage paths and verification steps)
+- Storage backend config (bucket/path, retention, credentials)
+- KMS key reference (ARN/URI) if using envelope encryption
+
+### Quick health checks (required)
+Run these before taking a backup:
+1) Confirm Kubernetes control-plane components are stable:
+   - `kubectl get nodes`
+   - `kubectl -n redwood-private get pods`
+   - `kubectl -n redwood-private get jobs,cronjobs`
+
+2) Confirm Redwood control-plane readiness (choose the option available in your environment):
+   - If the control-plane status endpoint is enabled: check “Backup status” / last successful run in the admin/status output.
+   - Otherwise: confirm key control-plane deployments are Ready and not crashlooping.
+
+3) Confirm storage backend reachability:
+   - For S3/GCS: perform a small write test (a temporary object under the backup prefix)
+   - For NFS: verify mount is present and writable
+
+4) Confirm time sync:
+   - Ensure cluster nodes have correct time (clock skew has caused signature and TLS validation failures in restore drills).
+
+## Backup consistency model (what “consistent” means)
+The goal is an application-consistent snapshot of the control-plane state.
+- The backup workflow enforces an ordering: capture deployment/release configuration, then capture the Config DB snapshot, then write a manifest that binds the backup together.
+- Optional quiesce places the control plane into a “maintenance” posture (reduced background reconciliation) to minimize write churn during the snapshot window.
+
+## Procedure
+### Step 0 — Decide backup mode
+Use one of the following patterns:
+- **Recommended (standard):** Run the installer CLI backup workflow (`backup create`) and let it generate manifest + encrypted artifact + checksums.
+- **Fallback (manual):** Only if the CLI is unavailable; requires more operator judgment and is harder to support.
+
+This runbook documents the recommended standard flow.
+
+### Step 1 — Pre-flight checklist (required)
+Record the following in your ops ticket/change record:
+- Date/time (UTC)
+- Cluster name/ID
+- Redwood Private version
+- Backup storage backend + location (bucket/path)
+- KMS key reference (if used)
+- Operator name
+
+Then run:
+1) Confirm no active migrations/rollouts:
+   - `kubectl -n redwood-private get deployments`
+   - Verify no rollout is mid-flight (pods constantly restarting, replicas flapping).
+
+2) Confirm backup tooling version is compatible with the deployment:
+   - `redwood-private-installer version`
+   - If you have a version/compatibility warning, stop and consult the compatibility/migrations guidance.
+
+3) Confirm you can authenticate to the backup destination:
+   - S3: validate credentials via a `ListBucket` and `PutObject` on the target prefix
+   - NFS: `touch` a file under the intended directory and remove it
+
+4) Confirm encryption settings:
+   - If KMS is configured, verify the key is reachable and enabled.
+   - If KMS is not available (on-prem/air-gapped), confirm local key material is present per your security policy and the environment is permitted to use it.
+
+### Step 2 — Optional: Quiesce control plane (recommended for production)
+Quiescing reduces write churn and improves determinism.
+
+2.1) Notify stakeholders
+- Announce start time, expected duration, and potential impact (e.g., brief delays in admin/config operations).
+
+2.2) Put the control plane into maintenance posture
+Choose the method supported in your deployment:
+- If your environment supports a maintenance toggle in the admin tooling, enable it.
+- Otherwise, pause non-critical reconciliation jobs that write to the Config DB (do not delete resources). Common examples:
+  - Temporarily suspend scheduled control-plane maintenance CronJobs
+  - Reduce background controller concurrency if your deployment exposes that knob
+
+2.3) Confirm quiesce took effect
+- Ensure no new control-plane write-heavy jobs are running.
+- Proceed even if minor churn exists; do not hold indefinitely.
+
+### Step 3 — Execute backup (standard CLI workflow)
+The installer CLI is the supported path.
+
+3.1) Set environment variables (example)
+Adjust values for your environment:
+- `export RW_PRIVATE_NAMESPACE=redwood-private`
+- `export RW_BACKUP_DEST=s3://redwood-private-backups-prod/control-plane/cluster-<cluster-id>/`
+- `export RW_KMS_KEY=<kms-key-arn-or-uri>`
+
+3.2) Run the backup
+Example command:
+- `redwood-private-installer backup create \
+    --namespace "$RW_PRIVATE_NAMESPACE" \
+    --destination "$RW_BACKUP_DEST" \
+    --encryption kms \
+    --kms-key "$RW_KMS_KEY" \
+    --include-helm-values \
+    --output-report backup-report.json`
+
+Notes:
+- For NFS destinations, use a filesystem path (e.g., `/var/lib/redwood/backups/control-plane/cluster-<cluster-id>/`).
+- For air-gapped installs, ensure the command is configured to avoid external calls; use only local destinations and locally available key providers.
+
+3.3) What the command produces
+A successful run writes a timestamped directory/prefix containing:
+- `manifest.json` (backup metadata, component inventory, encryption metadata)
+- `control-plane-state.tar.zst.enc` (encrypted archive)
+- `checksums.txt` (SHA-256 checksums)
+- `logs/` (backup job logs, if configured)
+
+### Step 4 — Verify backup integrity (required)
+Verification must occur immediately after creation.
+
+4.1) Verify checksums and decryptability
+Run one of the following verification actions:
+- Preferred (automated):
+  - `redwood-private-installer backup verify --destination "$RW_BACKUP_DEST" --latest`
+- If automated verify is unavailable, perform manual checks:
+  - Confirm `manifest.json` exists
+  - Confirm checksums file exists and matches artifact size expectations
+  - Perform a decrypt test to a temporary location (do not leave decrypted artifacts on shared disks)
+
+4.2) Confirm the manifest is complete
+Open `manifest.json` and confirm it includes (at minimum):
+- Backup format version
+- Backup timestamp (UTC)
+- Cluster identifier
+- Redwood Private version
+- Destination URI/path
+- Encryption mode and key reference (not secret key material)
+- Component list including Config DB snapshot and release configuration capture
+
+4.3) Record verification results
+- Store `backup-report.json` (or equivalent output) alongside your ops ticket.
+- Record artifact URI/path and the backup ID/timestamp.
+
+### Step 5 — Store artifacts and enforce retention (required)
+5.1) Ensure artifacts are in the correct location
+Recommended storage layout:
+- `control-plane/<cluster-id>/<YYYY>/<MM>/<DD>/<timestamp-utc>/...`
+
+5.2) Retention guidance
+- Default guidance (unless customer policy differs): 30 days retention for control-plane backups.
+- Ensure bucket lifecycle policy (or NFS cleanup job) is configured.
+- Confirm backups are immutable or protected against accidental deletion when possible (e.g., object lock / write-once policies, depending on environment).
+
+5.3) Access control
+- Ensure least-privilege access:
+  - Backup writer identity: write-only to the prefix, no read of other environments
+  - Restore identity (break-glass): read access (and decrypt permission) gated and audited
+
+### Step 6 — Unquiesce / return to normal operations
+If you performed quiesce:
+1) Re-enable suspended CronJobs / controllers.
+2) Disable maintenance posture.
+3) Confirm control-plane health:
+   - `kubectl -n redwood-private get pods`
+   - Verify normal reconciliation resumes and error rates remain stable.
+
+### Step 7 — Post-backup checklist (required)
+- [ ] Backup artifacts exist at the destination
+- [ ] `manifest.json` present and complete
+- [ ] Integrity verified (checksums + decrypt test or CLI verify)
+- [ ] Backup report stored with change record / ticket
+- [ ] Quiesce reverted (if used)
+- [ ] Any warnings reviewed and either resolved or tracked
+
+## Troubleshooting
+### Backup fails with permissions errors (S3/GCS/NFS)
+Symptoms:
+- AccessDenied, Forbidden, permission denied, or RBAC errors
+
+Actions:
+1) Confirm the backup identity has write permissions to the configured destination prefix.
+2) Confirm KMS permissions (if used): encrypt/decrypt allowed for the configured key.
+3) If running via a Kubernetes job/service account, confirm RBAC allows reading required resources.
+
+### Backup fails due to “missing CRDs” or API discovery errors
+Symptoms:
+- Errors enumerating Kubernetes resources, or references to CRDs not found
+
+Actions:
+1) Confirm the cluster has Redwood CRDs installed and at the correct version.
+2) Confirm the namespace is correct.
+3) If this is an on-prem restore/backup mismatch scenario, validate the installer and chart versions match the deployment.
+
+### Backup artifact created but verify fails
+Symptoms:
+- Checksum mismatch
+- Decrypt test fails
+
+Actions:
+1) Treat as a failed backup; do not rely on it for DR.
+2) Re-run backup after confirming:
+   - Storage backend consistency (avoid eventually-consistent or flaky NFS mounts)
+   - Sufficient disk space and stable network
+   - KMS reachable and not rate limited
+3) If repeated, collect a support bundle and escalate.
+
+### KMS unavailable
+If KMS is temporarily unavailable:
+- Do not silently fall back to unencrypted backups.
+- Either:
+  - Wait for KMS recovery, or
+  - Use the approved on-prem encryption provider only if permitted by the customer’s security posture.
+
+## Collect support bundle (when escalating)
+When opening an escalation, include:
+- Backup command used and full stdout/stderr
+- `manifest.json` (if produced)
+- `backup-report.json` (if generated)
+- Relevant pod/job logs:
+  - `kubectl -n redwood-private logs <backup-pod> --all-containers`
+- Destination details (bucket/path) and approximate artifact size
+
+## Security notes
+- Backups must be encrypted at rest. Use envelope encryption with customer-managed keys where applicable.
+- Do not store decrypted artifacts on shared or long-lived disks. If you must decrypt to verify, use a temporary location, restrict permissions, and securely delete afterwards.
+- Backups should not contain raw secret values. During restore, secrets are rehydrated from the configured secret manager/KMS integration.
+
+## Appendix: Example artifact layout
+Example S3 layout:
+- `s3://redwood-private-backups-prod/control-plane/cluster-7f3a/2025/03/01/20250301T021500Z/manifest.json`
+- `s3://redwood-private-backups-prod/control-plane/cluster-7f3a/2025/03/01/20250301T021500Z/control-plane-state.tar.zst.enc`
+- `s3://redwood-private-backups-prod/control-plane/cluster-7f3a/2025/03/01/20250301T021500Z/checksums.txt`
+- `s3://redwood-private-backups-prod/control-plane/cluster-7f3a/2025/03/01/20250301T021500Z/logs/backup.log`
+
+## Appendix: Operator expectations
+- Run a restore drill periodically in staging using the companion restore runbook.
+- If this is the first backup in a new environment, schedule a restore validation within 7 days to prove end-to-end recoverability.

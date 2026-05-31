@@ -1,0 +1,294 @@
+Experiment Quality Evals Integration (Route Experiments)
+
+## Overview
+This document defines how Redwood attaches quality evaluation (eval) signals to route-level experiment variants and surfaces them as first-class metrics in Console Rollouts.
+
+The goal is to make “quality” a measurable guardrail alongside latency, cost, and errors, without requiring customers to bring custom metrics in the initial release.
+
+This design covers:
+- How we generate and attribute eval score streams to {route, experiment_id, variant_id}.
+- Sampling and prompt-set execution strategy so variant comparisons are meaningful.
+- Score normalization so metrics are comparable across prompt sets and over time.
+- Quality regression guardrails (detection + alerting + optional auto-stop integration).
+
+## Goals
+1) Provide an attributed, near-real-time “quality score” time series for each experiment variant.
+2) Enable guardrails for quality regressions with clear defaults, and make them configurable per experiment.
+3) Keep operational overhead bounded (compute cost, metric cardinality, and on-call burden).
+4) Ensure auditability and reproducibility: prompt sets, scorer versions, and normalization method must be recorded.
+
+## Non-goals (GA)
+- A full statistical significance engine.
+- Customer-defined custom metric ingestion.
+- Cross-region population rebalancing beyond deterministic assignment.
+
+## Definitions
+- **Experiment variant**: A named routing target in a route experiment (e.g., “control”, “treatment-quantized”).
+- **Eval prompt set**: A curated set of prompts used for automated quality scoring (Redwood-managed for GA).
+- **Quality score stream**: A compact stream of scored eval results (scalar scores + metadata) that can be aggregated by variant.
+- **Normalization**: Converting raw scores into a comparable scale across prompt sets and scorer versions.
+
+## High-level architecture
+We support two complementary signal paths:
+
+A) Online “shadow eval” sampling (near-real-time)
+- Sample a small fraction of production requests per variant.
+- Execute a lightweight eval scorer on the sampled request/response.
+- Emit per-sample eval events with experiment attribution.
+- Aggregate into variant-level quality metrics.
+
+B) Offline prompt-set eval runs (batch / scheduled)
+- Run predefined prompt sets against each variant’s configured model/settings.
+- Score outputs using Redwood eval harness.
+- Emit a compact score stream attributed to the experiment + variant.
+- Aggregate to time-windowed quality metrics used by Console.
+
+We will ship GA with (B) as the primary supported signal, and (A) as an optional beta capability for select workloads where scoring is safe and low-latency.
+
+## Data contracts and attribution
+### Canonical dimensions
+All eval events emitted for experiment quality MUST include:
+- route_id (normalized template id; not raw URL path)
+- experiment_id
+- variant_id
+- model_id (resolved model version actually served)
+- region
+- eval_prompt_set_id
+- eval_run_id (unique id for a batch run)
+- eval_scorer_id + eval_scorer_version
+- started_at, completed_at
+
+Notes:
+- These match the attribution principles in ADR-048. Where cardinality risk exists, we keep route_id as a normalized route template identifier (e.g., route “chat.completions.v1”) rather than raw paths.
+- For safety, we do not attach customer-provided prompt text to telemetry by default; only hashed identifiers and aggregate metrics are stored unless the account opts in to “eval trace retention” (separate feature).
+
+### Event types
+We use two event types emitted to telemetry ingestion:
+1) eval.sample_scored (one row per scored prompt)
+2) eval.run_summary (one row per eval run, contains aggregates and metadata)
+
+We strongly prefer aggregating from eval.run_summary for Console dashboards to limit cost/cardinality.
+
+## Prompt-set execution design (offline path)
+### When prompt sets run
+For each active experiment:
+- On experiment start: run baseline prompt sets for all variants.
+- During the experiment: run on a schedule (default every 6 hours).
+- On variant config change (e.g., model version update): trigger a run for that variant.
+
+Default cadence is configurable per experiment, with bounds enforced by policy:
+- Minimum: every 2 hours
+- Maximum: every 24 hours
+
+### What prompt sets run
+Prompt sets are selected by route type and model family:
+- Chat routes: instruction-following, refusal safety, structured extraction, summarization.
+- Embedding routes: retrieval relevance probes (where applicable).
+- Rerank routes: ranking consistency probes.
+
+At GA we will support Redwood-managed prompt sets only, organized into “suites”. The suite is chosen automatically with an option to override:
+- suite: general-chat-v1
+- suite: extraction-json-v1
+- suite: summarization-v1
+
+### Minimum sample size
+Each eval run must meet minimum prompt coverage per variant for the run to be considered “valid”:
+- Default: 200 prompts per suite per variant
+- Hard floor: 50 prompts per suite per variant (below this, Console shows “insufficient data”)
+
+If the configured suite has fewer than 200 prompts, we execute the full suite and flag the run with run_quality=LOW_SAMPLE_SIZE.
+
+### Versioning and reproducibility
+Each eval.run_summary includes:
+- prompt_set_version
+- scorer_version
+- model_id (exact served model version)
+- runtime_profile (e.g., quantization profile id)
+
+Console must display these in the run details drawer for auditability.
+
+## Online sampling design (optional / beta)
+### Sampling objective
+Provide near-real-time signals for fast-moving rollouts (especially guardrails) without waiting for scheduled prompt-set runs.
+
+### Sampling strategy
+We apply deterministic sampling based on a stable key to avoid bias:
+- sampling_key = sha256(experiment_id + variant_id + sticky_key)
+- include sample when sampling_key modulo 10,000 < sampling_rate_basis_points
+
+Defaults:
+- sampling_rate_basis_points = 50 (0.5%)
+- per-account cap: 2,000 sampled requests per hour (to control cost)
+
+If sticky_key is missing, we DO NOT enable online sampling by default (to avoid skew and accidental PII use). The Console wizard should show a warning: “Online quality sampling requires a stable stickiness key.”
+
+### Scoring constraints
+Online scoring must be:
+- bounded latency (p99 < 50ms per scored sample at steady state) OR performed async out-of-band
+- non-blocking for user response (shadow evaluation)
+
+We will implement online scoring as asynchronous: enqueue a scoring job with the request/response payload reference, then score out-of-band.
+
+## Scoring and normalization
+### Raw score types
+We support three raw score types:
+- scalar_0_1: continuous score in [0, 1] (e.g., judge model rating)
+- pass_fail: boolean converted to {1, 0}
+- distance: numeric distance/loss where lower is better (must be converted)
+
+Each scorer declares:
+- score_direction: HIGHER_IS_BETTER or LOWER_IS_BETTER
+- score_range: [min, max] where applicable
+
+### Normalization method (GA)
+We normalize all scores to a comparable “quality_index” where higher is better.
+
+For each (prompt_set_id, scorer_id, scorer_version), we maintain baseline statistics computed from the control variant over a trailing window:
+- baseline_mean
+- baseline_stddev
+
+Normalization per sample:
+- If HIGHER_IS_BETTER: z = (raw - baseline_mean) / max(baseline_stddev, epsilon)
+- If LOWER_IS_BETTER: z = (baseline_mean - raw) / max(baseline_stddev, epsilon)
+
+Then we convert z-score into a bounded index:
+- quality_index = sigmoid(z) = 1 / (1 + exp(-z))
+
+Rationale:
+- z-score accounts for differing score distributions across prompt sets.
+- sigmoid bounds the metric into [0, 1] for easier UX and guardrail thresholding.
+
+Notes:
+- epsilon default: 1e-6.
+- If baseline_stddev is ~0 (degenerate), we fall back to absolute delta thresholds on raw scores and flag the metric as “low variance baseline”.
+
+### Aggregation
+For Console and guardrails we compute per-variant aggregates over a time window (default 2 hours):
+- quality_index_mean
+- quality_index_p10 / p50 / p90 (optional; behind a feature flag)
+- valid_run_count
+- prompt_count
+
+We also compute deltas vs control within the same window:
+- quality_delta = mean(treatment_quality_index) - mean(control_quality_index)
+
+## Guardrails: quality regression detection
+### Guardrail types
+We define two guardrail classes:
+
+1) Relative regression vs control (default)
+- Trigger when quality_delta < -T for W minutes
+
+2) Absolute floor (optional)
+- Trigger when treatment_quality_index_mean < F for W minutes
+
+### Default thresholds (recommended)
+These defaults were selected to be conservative and minimize false positives; they can be tightened by advanced users.
+
+Table: Defaults
+- Window (W): 120 minutes
+- Minimum prompts per variant in window: 200
+- Relative threshold (T): 0.03 (absolute drop in quality_index_mean)
+- Absolute floor (F): 0.55
+
+Interpretation:
+- A drop of 0.03 on the bounded [0,1] index corresponds roughly to a noticeable shift in normalized score distribution, but not minor noise.
+
+### Severity and actions
+Guardrails produce a severity state:
+- OK
+- WARN (threshold breached but low sample size, or baseline low-variance)
+- DEGRADED (threshold breached with sufficient sample size)
+
+Actions (GA promise):
+- Notifications (Console banner + webhook/email integration where configured)
+- Optional auto-stop integration is supported but must be explicitly enabled per account and has a global kill switch.
+
+Auto-stop policy (if enabled):
+- Trigger only on DEGRADED for 2 consecutive evaluation windows (e.g., 4 hours total)
+- If triggered: experiment transitions to STOPPING state; routing returns to pre-experiment policy
+- Always emit an audit event with reason “quality_regression_guardrail” and attach the computed metrics snapshot.
+
+## Console UX requirements (quality section)
+Console should:
+- Show “Quality” alongside latency/cost/errors for each variant.
+- Display:
+  - quality_index_mean over time
+  - delta vs control
+  - sample size (“prompts scored”) and data freshness
+  - active suite(s) and last eval run id
+- Provide a “Why is this red?” explanation that includes:
+  - threshold breached (T/F), window, sample size
+  - prompt set suite + scorer version
+  - link to run details
+
+When data is insufficient:
+- Show “Insufficient data” with the reason (e.g., “<200 prompts in last 2h” or “No valid eval runs yet”).
+
+## Data quality, failure modes, and mitigations
+### Known failure modes
+1) Missing experiment attribution (variant_id absent)
+- Impact: eval scores can’t be compared; deltas become misleading.
+- Mitigation: ingestion rejects or quarantines eval events missing {experiment_id, variant_id} for experiment-attached runs; dashboards show “attribution_drop_rate”.
+
+2) Skewed eval coverage across variants
+- Impact: biased comparisons.
+- Mitigation: enforce minimum prompts per variant per run; show run_quality and exclude low-quality runs from guardrails.
+
+3) Cardinality blow-ups
+- Impact: telemetry cost increases and dashboards slow.
+- Mitigation: prefer eval.run_summary aggregation; keep route_id normalized; limit dimension fan-out (no per-customer prompt ids in metrics).
+
+4) Scorer drift / version changes
+- Impact: apparent quality regression due to scorer change.
+- Mitigation: scorer_version is a required dimension; Console must annotate changes and avoid comparing across scorer versions for guardrail decisions.
+
+### Backfill policy
+If schema changes occur (e.g., adding a required dimension), we will backfill eval.run_summary aggregates only (not per-sample events) to limit cost. Backfill must preserve:
+- prompt_set_version
+- scorer_version
+- model_id
+
+## Security and privacy considerations
+- Production payloads are not stored in eval telemetry by default.
+- Any retention of prompt/response text requires explicit account-level opt-in and is governed by separate data handling policy.
+- Eval events are treated as internal operational telemetry; access in Console is gated by RBAC.
+
+## Implementation plan (phased)
+Phase 1 (Beta enablement)
+- Emit eval.run_summary with experiment attribution for offline prompt-set runs.
+- Build rollups by {route, experiment_id, variant_id, suite, scorer_version}.
+- Console displays quality metrics and “insufficient data” states.
+
+Phase 2 (Guardrails)
+- Implement quality guardrail evaluator using rollups.
+- Add alerting + audit events for guardrail breaches.
+- Integrate with experiment stop semantics (soft-stop default; optional hard-stop behind kill switch).
+
+Phase 3 (Optional online sampling)
+- Deterministic sampling gate + async scoring jobs.
+- Add join path between sampled requests and experiment attribution.
+- Tighten caps and add dashboards for sampling coverage.
+
+## Open questions
+1) Which suites are GA-default per route type, and who owns ongoing suite maintenance?
+2) What is the minimum acceptable latency/cost budget for optional online scoring in hosted deployments?
+3) Should we support “multiple controls” (e.g., control is a canary baseline) or enforce a single control variant per experiment?
+
+## Ownership
+- Applied ML / Evals: Jonas Weber (implementation), Dr. Maya Srinivasan (sponsor)
+- Telemetry: Logan Wright
+- Experiment routing/control plane: Jada Williams
+- SRE/Observability: Allison Grant
+
+## Appendix: Example guardrail configuration copy (Console)
+Quality guardrail (relative):
+- Evaluate every: 2h
+- Minimum prompts per variant: 200
+- Alert if treatment quality drops by more than: 0.03 vs control
+- Auto-stop experiment if breached for: 4h (two consecutive windows) [toggle]
+
+Quality guardrail (absolute):
+- Alert if treatment quality index mean falls below: 0.55
+
+(These values should be shown with tooltips explaining that the quality index is normalized per prompt suite and scorer version.)

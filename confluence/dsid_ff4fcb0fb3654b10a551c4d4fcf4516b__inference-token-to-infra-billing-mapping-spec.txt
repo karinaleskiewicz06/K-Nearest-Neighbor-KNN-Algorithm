@@ -1,0 +1,173 @@
+inference-token-to-infra-billing-mapping-spec
+
+Overview
+
+This document defines the canonical mapping from inference-level telemetry (tokens, model variant, request metadata) to infra cost buckets (GPU time, memory-backed KV cache, egress) and the recommended implementation patterns for recording, exporting, and reconciling those mappings in our billing/finops pipelines. The goal is to produce a repeatable, auditable join between request telemetry and infra cost so product teams can understand per-route unit economics for hosted and dedicated tenants.
+
+Goals and acceptance criteria
+
+- Provide a deterministic mapping that is: consistent (same request -> same buckets), explainable (clear formulae), and low-latency to compute (can be emitted by the serving runtime with <5ms overhead).
+- Reconcile per-day totals within 2% of infra cost reports for non-e2e sources (GPU hours, egress bytes).
+- Schema and export must be compatible with existing BigQuery cost tables and the FinOps reconciliation queries.
+
+Scope and assumptions
+
+- Applies to: hosted API, Redwood Dedicated, and Private (VPC) deployments where telemetry is forwarded to central observability.
+- Excludes: long-running training jobs and ad-hoc CI eval grids (those have different accounting flows).
+- Assumes serving runtime emits token counts and model flavor annotations in the request-span and a best-effort GPU time probe per-request.
+
+Key concepts and definitions
+
+- nominal_token: token count reported by the tokenizer used to charge customers.
+- token_phase: category for the token (prompt | completion | system).
+- model_variant: semantic identifier: model_family@quantization:example raven-70b.q4f16.
+- execution_time_ms: wall-clock GPU execution time measured per-request (micro-batched attribution discussed below).
+- kv_cache_delta_bytes: bytes read/written from shared KV cache during the request lifecycle.
+- egress_bytes: total body bytes sent to the caller.
+- tenant_credit_tag: tenant identifier passed by frontdoor to route and bill the request.
+
+Telemetry schema (canonical export)
+
+We expect the serving runtime and proxy to emit the following JSON event per completed request to the telemetry pipeline (flattened for BigQuery export). The service-side exporter must populate NULL for fields it cannot measure and send a best-effort envelope.
+
+Example exported row (pseudo-JSON):
+
+{
+  "request_id": "req_1234abcd",
+  "timestamp": "2026-01-18T12:05:34.123Z",
+  "tenant_id": "acct_987",
+  "route": "/v1/chat/completions",
+  "model_variant": "raven-70b.q4f16",
+  "nominal_token_prompt": "24",
+  "nominal_token_completion": "128",
+  "token_phase_breakdown": "prompt:24,completion:128",
+  "execution_time_ms": "34.2",
+  "kv_cache_delta_bytes": "8192",
+  "egress_bytes": "2048",
+  "region": "us-west1",
+  "routing_policy": "standard"
+}
+
+Mapping rules: formulae and heuristics
+
+1) Token-based GPU allocation
+- Base GPU time allocation = execution_time_ms (measured) when available. For micro-batched requests where the runtime reports per-batch execution_time_ms only, divide batch_time by batch_size and attribute to each request equally.
+- If execution_time_ms is missing, fallback to a model_variant median per-token coefficient:
+  gpu_ms_estimate = median_ms_per_token[model_variant] * (nominal_token_prompt + nominal_token_completion)
+- Maintain a model_variant median table updated daily from production telemetry (see "Daily aggregation job" below).
+
+2) KV cache cost attribution
+- If kv_cache_delta_bytes > 0, attribute cost proportional to bytes touched. For shared caches spanning tenants, use a time-weighted lru-share factor sampled from cache-maintenance telemetry per-window.
+- For private tenant caches (Dedicated/Private), attribute 100% to tenant_id.
+
+3) Egress cost
+- Use raw egress_bytes multiplied by regional per-GB network rate (from pricing catalog). For multipart/compressed responses, use wire bytes.
+
+4) Shared infra remainders (overhead, orchestration, control-plane)
+- Apply a daily fixed overhead per-tenant derived from reserved capacity or account tier (see FinOps mappings). This is a separate ledger entry and should not be mixed into per-request unit economics.
+
+Implementation details
+
+- Export location: BigQuery table: infra_telemetry.inference_requests_v1 with the canonical schema matching the example fields. Use stream insert from telemetry pipeline.
+- Complementary cost sources: BigQuery tables infra_billing.gpu_usage_v1, infra_billing.egress_rates_v1, infra_billing.kv_costs_v1.
+- Join keys: request_id for direct attribution; when missing, join on tenant_id + date + approximate_time_window (5s bucket) using heuristics.
+
+Daily aggregation job (scheduler: Cloud Composer / Airflow):
+
+1. Ingest previous-day infra_telemetry.inference_requests_v1 partition.
+2. Compute model_variant median_ms_per_token table:
+   - Query: SUM(execution_time_ms)/SUM(total_tokens) grouped by model_variant, filter execution_time_ms present.
+3. Patch null execution_time_ms rows with estimates using median table.
+4. Produce per-tenant-per-route cost by joining with gpu_usage_v1 and egress_rates.
+5. Emit reconciliation reports and alerts if per-tenant total deviates >2% from infra_billing totals.
+
+SQL snippet (BigQuery)
+
+-- compute median ms per token per model
+WITH token_stats AS (
+  SELECT
+    model_variant,
+    SUM(CAST(execution_time_ms AS FLOAT64)) AS total_ms,
+    SUM(CAST(nominal_token_prompt AS INT64) + CAST(nominal_token_completion AS INT64)) AS total_tokens
+  FROM `infra_telemetry.inference_requests_v1`
+  WHERE DATE(timestamp) = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+    AND execution_time_ms IS NOT NULL
+  GROUP BY model_variant
+)
+SELECT model_variant, total_ms/NULLIF(total_tokens,0) AS ms_per_token FROM token_stats;
+
+Reconciliation and alerting
+
+- Thresholds:
+  - daily_reconciliation_tolerance: 2% (default)
+  - missing_telemetry_rate_warn: 1% of requests per-tenant per-day
+  - high_estimation_ratio_alert: when >20% of tenant's cost is from estimated execution_time_ms
+- Alerting flows: PagerDuty for infra-owner-oncall and Slack #finops-billing for summaries.
+
+Runtime and exporter requirements
+
+- Serving runtime must attach request_id and tenant_id to every completed span.
+- Exporter must send the canonical row within 30s of request completion; allow batching with stream inserts.
+- Request telemetry must include model_variant and token breakdowns; tokenizer versions must be included when available (tokenizer: v2.1).
+
+Terraform / IaC considerations
+
+- BigQuery dataset infra_telemetry must be created under the monitoring GCP project. Use module: modules/bigquery/dataset with access grant to telemetry_writer service account.
+- Example terraform resource snippet (HCL string):
+
+resource "google_bigquery_table" "inference_requests_v1" {
+  dataset_id = var.dataset_id
+  table_id   = "inference_requests_v1"
+  schema     = file("schemas/inference_requests_v1.json")
+  time_partitioning { type = "DAY" }
+}
+
+- Add IAM binding: telemetry-writer-sa -> roles/bigquery.dataEditor on infra_telemetry dataset.
+
+Testing and validation playbook
+
+1) Unit tests: exporter library should include deterministic serialization tests and a sanitizer that enforces schema and non-negative numeric fields.
+2) Integration test: deploy a canary traffic generator that emits synthetic requests with known token counts and a deterministic execution_time_ms probe. Validate the end-to-end join and reconciliation numbers for the canary tenant.
+3) Chaos test: simulate dropped execution_time_ms telemetry at 5%–30% to validate median fallback behavior and alerting.
+
+Rollout plan
+
+1. Implement telemetry exporter in serving runtime (canary binary) and add feature-flagged stream insert to BigQuery.
+2. Run for a weekend for non-critical tenants (canary tenant set). Verify reconciliation.
+3. Gradually ramp to 25% of traffic, then 100% after two successful 24-hour reconciliations within threshold.
+4. Disable estimates-only fallback for tenants with dedicated capacity; require measured execution_time_ms in those environments.
+
+Operational ownership and contacts
+
+- Owners: infrastructure-telemetry (primary), infra-finops (secondary).
+- Oncall: infrastructure SRE rotations (page: /confluence/eng-infra/eng-sre/oncall-rotations).
+- Escalation: contact Maya Thompson (infra-telemetry lead) then Diego Alvarez (FinOps).
+
+Appendix: sample reconciliation query and dashboard panels
+
+- Dashboard panels to build: per-tenant day-by-day cost stack (GPU | KV | egress), estimation ratio, missing telemetry rate, per-model ms_per_token trend.
+
+Sample reconciliation join (BigQuery, simplified):
+
+SELECT t.tenant_id,
+  SUM(IFNULL(t.gpu_cost,0)+IFNULL(t.kv_cost,0)+IFNULL(t.egress_cost,0)) AS inferred_cost,
+  b.actual_invoice_cost
+FROM `infra_telemetry.inference_requests_v1` t
+LEFT JOIN `infra_billing.daily_invoice_v1` b
+  ON t.tenant_id = b.tenant_id AND DATE(t.timestamp) = b.date
+WHERE DATE(t.timestamp) = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+GROUP BY t.tenant_id, b.actual_invoice_cost;
+
+Contact and change log
+
+- Created by: Jordan Patel (2025-08-12)
+- 2025-09-02: Added kv_cache attribution heuristic (Maya Thompson)
+- 2026-01-18: Added median fallback SQL and rollout plan (Diego Alvarez)
+
+Related artifacts
+
+- schemas/inference_requests_v1.json (BigQuery schema spec)
+- terraform/modules/bigquery/dataset/README.md (module usage)
+- infra-telemetry-exporter repo (link internal)
+
+If you are implementing this spec, start by cloning infra-telemetry-exporter and running the integration canary described under "Testing and validation playbook".

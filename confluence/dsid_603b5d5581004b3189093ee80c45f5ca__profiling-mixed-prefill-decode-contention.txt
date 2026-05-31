@@ -1,0 +1,363 @@
+Profiling mixed prefill/decode contention (mixed-workload tail latency)
+
+## Purpose
+This playbook documents how to reproduce and diagnose **mixed prefill/decode contention** that produces **user-visible p95 tail latency** regressions under mixed prompt-length distributions (e.g., short chat prompts interleaved with long-context prompts).
+
+In steady-state homogeneous traffic, continuous batching tends to be stable. Under mixed workloads, we commonly see:
+- **Head-of-line blocking**: long-prefill requests dominate GPU time and batch selection.
+- **Scheduler instability**: rapid shifts between “prefill-heavy” and “decode-heavy” work.
+- **Kernel selection thrash**: frequent switching of attention kernels/profiles as sequence lengths vary.
+- **KV cache pressure**: eviction/compaction spikes that amplify decode latency.
+
+This doc is written to be usable by Serving Runtime + Kernel teams and as a reference during canary triage.
+
+---
+
+## When to use this playbook
+Use this playbook when you observe one or more of the following in Hosted or Dedicated pools:
+- TTFT (time-to-first-token) p95 increases primarily during spikes of long-context traffic.
+- Decode token latency looks fine in isolation, but p95 end-to-end increases due to queueing and/or prefill blocking.
+- Per-GPU throughput remains similar, but p95 and p99 drift upward under mixed mixes.
+- Increased variance in per-iteration batch composition and/or sequence-length distribution.
+
+Not a good fit if the issue is clearly:
+- Network or upstream API latency.
+- Model-level regressions unrelated to serving (e.g., prompt changes, tool calling loops).
+- GPU health / ECC / throttling incidents.
+
+---
+
+## Definitions (quick)
+- **Prefill**: processing the prompt/context to initialize KV cache.
+- **Decode**: iterative next-token generation using KV cache.
+- **Mixed-workload contention**: prefill workload stealing scheduling budget from decode (or vice versa), creating tail amplification.
+- **Kernel thrash**: repeated switching between kernels/profiles (often due to sequence-length variability) that reduces effective GPU utilization.
+
+---
+
+## Prerequisites and access
+**Environments**
+- Prefer a controlled staging pool or perf canary environment first.
+- If profiling prod canary, coordinate with SRE (see “Operational safety”).
+
+**Tools**
+- Grafana dashboards for runtime + scheduler class metrics.
+- Tracing (Tempo) and logs (Loki) access.
+- Nsight Systems (nsys) and optionally Nsight Compute (ncu).
+- Triton debug/autotune controls (if relevant for the deployed build).
+
+**Build / flags**
+- Runtime build with NVTX ranges enabled (recommended): `RUNTIME_NVTX=1` (or the equivalent runtime config toggle for the current release).
+- Scheduler class metrics enabled (required for mixed-workload work): see metric names below.
+
+---
+
+## Operational safety (don’t skip in shared pools)
+Profiling can be disruptive.
+- Prefer capturing **short windows** (10–60s) during a stable reproduction.
+- Do not run `ncu` in production pools unless explicitly approved; it can serialize kernels and distort latency.
+- If you must profile on a shared canary GPU:
+  1) Announce in `#eng-runtime` and `#eng-sre`.
+  2) Ensure the canary guardrails are active (rollback triggers and p95/p99 thresholds).
+  3) Use a single GPU or an isolated worker when possible.
+
+---
+
+## Step 1: Reproduce the issue reliably
+### A. Synthetic mixed workload (recommended starting point)
+Use benchmark-lab mixed scenarios (e.g., 80/20 short/long, 50/50, long-spike). Ensure the long prompts are long enough to create meaningful prefill cost (not just slightly longer chat prompts).
+
+Reproduction checklist:
+- Fix model version + runtime version.
+- Fix GPU SKU and driver.
+- Fix max batch / continuous batching settings.
+- Fix request concurrency (start low; increase until p95 degradation begins).
+
+What “good reproduction” looks like:
+- p95 TTFT increases with long-traffic fraction.
+- Queue time or scheduler wait time is a dominant contributor.
+- Prefill duration p95 increases disproportionately (often due to batching side effects).
+
+### B. Trace replay (closest to production)
+Use anonymized production trace distributions and replay with the same short/long prompt-length mix.
+
+Notes:
+- Ensure the replay includes the same **arrival process** (bursty vs Poisson matters).
+- Verify the prefill/decode ratio resembles production by comparing:
+  - `prefill_latency_ms` distribution
+  - average decode length and per-token decode latency
+
+---
+
+## Step 2: Confirm the signature in metrics before GPU profiling
+Start with metrics; avoid Nsight until you know what you’re looking for.
+
+### Key metrics to inspect (runtime + scheduler)
+**Scheduler / queueing (per class if enabled)**
+- `scheduler_queue_depth{class="short|long"}`
+- `scheduler_time_in_queue_ms_bucket{class=...}` (focus p95)
+- `scheduler_dispatch_share{class=...}` (how much GPU time/iterations each class gets)
+- `scheduler_starvation_counter_total{class="long"}`
+- `scheduler_aging_applied_total{class=...}`
+
+**Prefill / decode breakdown**
+- `prefill_latency_ms_bucket` (p50/p95)
+- `decode_iteration_ms_bucket` (p50/p95)
+- `ttft_ms_bucket` (TTFT p95 is typically the user-visible pain)
+- `e2e_request_latency_ms_bucket`
+
+**Batch composition and token budgeting**
+- `batch_tokens_total{phase="prefill|decode"}`
+- `batch_size{phase=...}`
+- `scheduler_token_budget_overrun_total{class=...}`
+
+**KV cache pressure**
+- `kv_cache_hit_ratio` (trend matters more than absolute)
+- `kv_cache_evictions_total`
+- `kv_cache_compactions_total`
+- `kv_cache_bytes_in_use`
+
+**Kernel selection stability (if exposed by build)**
+- `kernel_select_changes_total{op="attention_prefill|attention_decode"}`
+- `kernel_profile_selected{op=..., profile=...}` (watch for oscillation)
+
+### What to look for (common signatures)
+1) **Head-of-line blocking**
+- Long queue depth spikes coincide with rising short TTFT p95.
+- Prefill latency p95 increases and consumes iteration budget.
+
+2) **Decode starvation**
+- Decode iteration p95 increases even when per-token compute is stable.
+- Queue time dominates but GPU utilization stays high (GPU is busy, just on the “wrong” work).
+
+3) **KV cache eviction spikes**
+- Evictions/compactions spike during long-context bursts.
+- Decode iteration latency increases shortly after eviction spikes.
+
+4) **Kernel thrash**
+- Kernel selection changes increase; latency variance increases.
+- Effective throughput drops despite similar nominal GPU utilization.
+
+If metrics do not show queueing / prefill dominance / cache pressure, do not proceed to GPU profiling yet; the bottleneck may be elsewhere (networking, upstream throttling, tokenization, etc.).
+
+---
+
+## Step 3: Capture traces (runtime + GPU)
+### A. Runtime tracing (cheap, always do this first)
+Recommended trace spans:
+- `request.enqueue -> scheduler.classify -> prefill.start -> prefill.end -> decode.first_iteration -> first_token -> request.complete`
+
+Minimum set of spans/attributes to verify are present:
+- request_id, model, pool, region
+- prompt_tokens, max_output_tokens
+- class=short/long (if enabled)
+- queue_time_ms
+- prefill_time_ms
+- decode_time_ms
+- tokens_generated
+
+If the trace shows large `queue_time_ms`, focus on scheduler policy and queue composition first.
+
+### B. Nsight Systems (nsys) for timeline correlation
+Use Nsight Systems to correlate:
+- CPU scheduling and enqueue/dequeue behavior
+- GPU kernel launches and gaps
+- NVTX ranges for prefill vs decode
+
+**Capture guidelines**
+- Keep captures short: 10–30 seconds usually sufficient.
+- Capture under stable load (after warmup; not during ramp).
+- Prefer a dedicated worker.
+
+**Suggested nsys command (example)**
+- `nsys profile --trace=cuda,nvtx,osrt --sample=none --cpuctxsw=true --duration=20 --output=/tmp/mixed_contention_$(date +%s) --force-overwrite=true <run_command>`
+
+NVTX naming conventions (what we expect to see):
+- `rrt/prefill` ranges
+- `rrt/decode` ranges
+- `rrt/scheduler/dispatch` ranges
+
+If NVTX ranges are missing, re-run with the correct runtime config (e.g., `RUNTIME_NVTX=1`) and confirm the build includes NVTX instrumentation.
+
+### C. Nsight Compute (ncu) for kernel-level diagnosis (use sparingly)
+Use `ncu` when you have strong evidence of kernel inefficiency or selection instability.
+
+Recommended approach:
+- Target a **single kernel** (attention prefill or decode) using regex filters.
+- Capture a minimal set of metrics: occupancy, memory throughput, warp stall reasons.
+
+Do not run `ncu` in production canary pools without explicit sign-off.
+
+---
+
+## Step 4: Interpret GPU timelines for mixed prefill/decode contention
+### What “healthy” looks like
+- Prefill bursts are present but bounded.
+- Decode iterations are regular with limited jitter.
+- Minimal gaps between kernel launches.
+- Batch composition does not oscillate dramatically iteration-to-iteration.
+
+### Red flags
+1) **Prefill runs dominate long continuous windows**
+- Timeline shows long unbroken sequences of prefill kernels.
+- Short requests’ TTFT increases due to waiting behind long-prefill work.
+
+2) **Kernel launch gaps / synchronization stalls**
+- Gaps appear when switching between prefill and decode phases.
+- Often coincides with memory pressure, cache management, or host-side batching logic.
+
+3) **Kernel profile oscillation (thrash)**
+- Attention kernel variants switch frequently.
+- Increased CPU overhead for kernel selection/autotune or code paths that depend on shape buckets.
+
+4) **Memory bandwidth saturation during cache events**
+- Spikes in memory throughput correlate with KV cache compaction/eviction.
+- Decode iterations immediately after eviction show higher latency.
+
+---
+
+## Triton + kernel selection debugging tips (when kernel thrash is suspected)
+### Common causes
+- Sequence lengths cross internal “bucket boundaries” frequently (short/long mixed in same batch).
+- Autotuner evaluates multiple configs due to varied shapes.
+- Runtime alternates between different attention implementations based on (seq_len, batch_size, head_dim, dtype, quant profile).
+
+### What to enable (non-prod first)
+If using Triton-based kernels or autotuned paths in your build:
+- Enable autotune logging for a single run window.
+- Pin or limit configurations if the build supports it.
+
+Useful environment variables (names vary by release; treat as examples):
+- `TRITON_PRINT_AUTOTUNING=1`
+- `TRITON_CACHE_DIR=/tmp/triton_cache`
+- `CUDA_MODULE_LOADING=LAZY` (to reduce module load stalls, depending on deployment)
+
+What to look for:
+- Repeated autotune entries for similar shapes.
+- Frequent cache misses in the Triton cache directory (indicating cache eviction or non-reuse).
+- Shape drift causing many unique compiled variants.
+
+Mitigation patterns (to validate during experiments):
+- Increase shape bucketing stability (larger buckets, fewer boundaries).
+- Avoid mixing extreme seq lengths in a single batch when it forces worst-case kernel choice.
+- Pin kernel profiles per SKU/model where supported.
+
+---
+
+## KV cache eviction/compaction debugging (cache pressure spikes)
+### Symptoms
+- `kv_cache_evictions_total` spikes during long-context bursts.
+- `kv_cache_hit_ratio` drops and does not recover quickly.
+- Decode iteration latency becomes noisy (high variance) after evictions.
+
+### What to check
+- Is the cache sized appropriately for the concurrency and max context length?
+- Are long-context requests dominating concurrency in a way the pool wasn’t sized for?
+- Is cache compaction running too frequently (small free segments, fragmentation)?
+
+### Practical diagnostics
+- Correlate eviction spikes with request mix changes and batch size changes.
+- Confirm whether cache events align with prefill-heavy windows.
+- Check if a new scheduling policy increased the number of “active sequences” in-flight and raised cache residency requirements.
+
+---
+
+## Common failure modes and how to confirm them
+### 1) Kernel thrash due to sequence-length variability
+**Confirm**
+- Kernel selection changes increase (`kernel_select_changes_total`)
+- Nsight timeline shows frequent switching between attention kernel variants
+- Increased host overhead or gaps at transitions
+
+**Next steps**
+- Stabilize shape buckets; reduce boundary crossings
+- Consider separate batching lanes for extreme long contexts
+- Validate kernel profile pinning on the target SKU
+
+### 2) Cache eviction spikes amplifying decode latency
+**Confirm**
+- `kv_cache_evictions_total` and/or `kv_cache_compactions_total` spikes
+- Decode iteration p95 increases after eviction spikes
+
+**Next steps**
+- Reduce active sequences or cap long-context concurrency
+- Re-check cache sizing assumptions and fragmentation behavior
+- Validate whether scheduler changes increased cache churn
+
+### 3) Host-of-line blocking from long-prefill dominating dispatch
+**Confirm**
+- Long prefill windows coincide with rising short TTFT p95
+- Time-in-queue for short requests increases without a corresponding drop in GPU utilization
+
+**Next steps**
+- Test short/long class-based scheduling (two-queue) and token budgets
+- Ensure aging/starvation prevention doesn’t swing too far (watch long starvation counters)
+
+### 4) Instrumentation artifacts (profiling changes the workload)
+**Confirm**
+- Behavior only appears when Nsight is attached
+- Latency shifts significantly with profiler on/off
+
+**Next steps**
+- Shorten capture; reduce trace categories
+- Prefer nsys over ncu; avoid excessive logging
+
+---
+
+## Triage checklist (copy/paste into incident threads)
+1) Workload: mix ratio, arrival pattern, concurrency, prompt token distribution, output token distribution.
+2) Versions: runtime, model, driver, CUDA, SKU.
+3) Metrics screenshots/links:
+   - TTFT p95, e2e p95
+   - prefill_latency p95, decode_iteration p95
+   - scheduler_queue_depth + scheduler_time_in_queue (per class)
+   - kv_cache_* (evictions/compactions/hit ratio)
+   - kernel_select_changes_total (if available)
+4) Trace sample: 5–10 representative requests showing queue/prefill/decode breakdown.
+5) Nsight Systems: 10–20s capture with NVTX prefill/decode ranges.
+6) Hypothesis: (HOL blocking | kernel thrash | cache pressure | other)
+7) Proposed mitigation test: which knob, expected effect, rollback plan.
+
+---
+
+## Escalation and ownership
+- If metrics point to **scheduler policy / queueing**: escalate to Serving Runtime Scheduling (Lena Fischer / Marcus Reed).
+- If metrics + Nsight point to **kernel instability or attention kernel inefficiency**: escalate to Kernel team (Hiro Tanaka / Yuki Sato).
+- If there is **prod canary impact** or guardrail/SLO questions: escalate to SRE sponsor (Sean Gallagher) and on-call.
+
+---
+
+## Appendix: Suggested configuration knobs to experiment with (controlled environments)
+Note: knob names vary by release and deployment mode; confirm against the current runtime config schema.
+
+Scheduler knobs (mixed-workload prototype builds):
+- `scheduler.classification.enabled` (bool)
+- `scheduler.classification.short_threshold_prompt_tokens` (int)
+- `scheduler.dispatch.two_queue.enabled` (bool)
+- `scheduler.dispatch.short_share_target` (float)
+- `scheduler.dispatch.aging_ms` (int)
+- `scheduler.dispatch.max_skew` (float)
+- `scheduler.token_budget.per_iteration.short` (int)
+- `scheduler.token_budget.per_iteration.long` (int)
+
+Batching knobs:
+- `batching.max_batch_size`
+- `batching.max_prefill_tokens`
+- `batching.max_decode_tokens_per_iter`
+
+KV cache knobs:
+- `kv_cache.max_bytes`
+- `kv_cache.compaction.enabled`
+- `kv_cache.compaction.target_fragmentation`
+
+Kernel selection knobs (if supported):
+- `kernels.attention.profile_pin` (by SKU/model)
+- `kernels.attention.autotune.enabled` (bool)
+
+---
+
+## Appendix: Notes on avoiding false conclusions
+- Always compare against a **single baseline** with identical load generator settings.
+- Separate “prefill got slower” from “prefill waited longer” (compute vs queue time).
+- Don’t rely on average GPU utilization alone. Mixed contention often keeps GPUs busy while users experience worse tail latency.
+- Ensure you’re not mixing unrelated changes (scheduler + kernel + cache sizing) in a single experiment; change one variable at a time during diagnosis.

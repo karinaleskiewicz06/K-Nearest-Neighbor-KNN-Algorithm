@@ -1,0 +1,177 @@
+GPU Aging Node Retirement and Data-plane Transition
+
+Overview
+
+This document describes the recommended process for safely retiring aging GPU nodes from Redwood's inference fleet and transitioning the data-plane (runtime instances, cached KV-state, and prefetched model weights) to healthy replacement nodes or warm pools. The goal is to reduce unexpected evictions and performance regressions caused by hardware degradation while keeping customer-facing SLOs intact and minimizing billing perturbations.
+
+Audience
+
+- GPU Fleet engineers
+- SREs oncall for inference-production
+- Terraform/IaC owners for GPU node modules
+- CI/CD engineers responsible for provisioning and image promotion
+
+Goals and non-goals
+
+Goals:
+- Provide a safe, instrumented, and reversible retirement workflow for aged nodes.
+- Migrate runtime state (KV caches, warm session seeds) without request-level errors or confusing metrics spikes.
+- Ensure Terraform and CI/CD changes are low-risk and auditable.
+
+Non-goals:
+- Hardware decommissioning logistics (physical rack removal) — handled by Facilities.
+- Long-term capacity forecasting (see gpu-demand-forecasting doc).
+
+When to retire a node (decision criteria)
+
+Use the following signals (any single one can trigger a retirement candidate)
+
+1) Hardware telemetry thresholds (30-day rolling window):
+   - GPU ECC corrected error rate > 0.5% of ops AND rising for 3 consecutive days.
+   - Memory temperature excursions > 95th percentile for node type more than 4 times in 7 days.
+2) Host-level instability: repeated kernel oops or driver restarts (>= 3 in 24h).
+3) Performance regressions: P50 token latency drift > 20% compared with fleet baseline for same runtime flavor, sustained 6 hours, and correlated to node.
+4) Age policy: node age > 36 months AND one supporting telemetry threshold above.
+
+Tagging a node as retirement-candidate
+
+Owners (SRE or GPU-fleet engineer) should annotate the instance in the fleet catalog with label: retirement-candidate:<YYYY-MM-DD> and include brief rationale. Use the fleet CLI to annotate: 
+
+# mark candidate
+redwood-fleet annotate --node $NODE_ID --label "retirement-candidate:2025-10-03" --note "ECC spikes and P50 drift"
+
+Preflight checks (automated)
+
+Before beginning migration, run the preflight validation pipeline (ci/gpu-retire/preflight) which executes:
+- Capacity headroom verification for the affected placement shard (must be >= 10% spare capacity).
+- Image compatibility matrix check against deployment runtime flavors.
+- KV-cache checkpoint viability check (see KV cache checkpoint section).
+- IaC drift detection for associated node group.
+
+If any check fails, the runbook should abort and create an incident ticket with the preflight logs attached.
+
+Migration plan (high-level)
+
+1) Quarantine: mark node as no-new-allocations but continue serving existing sessions until warm handoff finishes.
+2) Allocate target replacement nodes (either new nodes from warm-pool or existing healthy nodes in same shard).
+3) Stream and reconstruct KV cache to targets, using checkpoint+delta where possible.
+4) Shift traffic gradually via routing policy (10% -> 25% -> 50% -> 100%), observing latency, error-rate and cache-miss curves.
+5) Final drain and deallocate node; trigger IaC change to remove node from managed group.
+
+Detailed steps and commands
+
+1) Quarantine the node
+- API: PATCH /fleet/nodes/$NODE_ID { "no_new_allocations": true, "retire_review": "in_progress" }
+- Confirm running sessions count and average token-per-second for remaining sessions. If > 200 concurrent tokens/s for that node type, wait until below threshold or increase headroom by spinning warm nodes.
+
+2) Provision replacement nodes
+- Trigger the IaC module to create N replacement nodes (N = max(active_sessions_estimate / avg_sessions_per_node, 1) + buffer). Example Terraform plan invocation: 
+
+cd infra/modules/gpu-node-group && terraform apply -var 'node_count=3' -auto-approve
+
+- Use the image tag promotion policy: image tags must be promoted from canary to stable via CI pipeline (ci/images/promote) before attaching nodes to inference-serving ASG.
+
+3) KV cache checkpoint and seed
+- If model supports checkpointing, create a consistent snapshot: 
+
+redwood-runtime kv-checkpoint create --node $NODE_ID --models "gptx-16b,gptx-7b" --out s3://retire-checkpoints/$NODE_ID/checkpoint-$(date +%s).tar.gz
+
+- Transfer checkpoint to target nodes and apply with delta-merge: 
+redwood-runtime kv-checkpoint apply --source s3://... --target-group $NEW_GROUP --concurrency 8
+
+4) Traffic shift policy
+- Use the routing controller to apply weights: 
+  - 10% to target for 10 minutes, monitor p50/p95 and errors.
+  - increase to 25% for 15 minutes if metrics stable.
+  - 50% for 20 minutes then monitor.
+  - 100% final cutover then begin drain.
+
+Monitoring and acceptance criteria
+
+Primary signals (must be within thresholds during each step):
+- p50 latency change <= +10% compared to baseline for same flavor
+- p95 latency change <= +20%
+- Error-rate increase <= 0.2 percentage points (absolute)
+- Cache-miss rate on new nodes declines steadily toward fleet average within 30 minutes
+
+If any primary signal breaches, pause the shift and either: roll back routing weights to previous stable split, or add more warm nodes and reattempt.
+
+Terraform and IaC adjustments
+
+- Node removal must be followed by a managed Terraform change. Do not manually delete instances outside the IaC flow unless in an emergency and after a documented blameless postmortem.
+- The recommended pattern: mark instance for retirement in the API, perform migration, then run terraform with the exact instance list variable so state removes the instance cleanly: 
+
+terraform apply -var 'nodes_to_remove=["instance-123","instance-456"]'
+
+- Update module version (if required) in infra/modules/gpu-node-group/versions.tf and follow the module promotion pipeline.
+
+CI/CD pipeline changes
+
+Small infrastructure changes (image promotions, module version increments) must go through the existing gated pipelines:
+- ci/images/promote: ensures runtime image builds pass canary e2e and security scans.
+- ci/iac/validate: runs terraform plan, sentinel policies, and a dry-run destroy check for node removals.
+
+Add a lightweight smoke test job to the gpu-retire workflow that validates that the newly created nodes successfully join the routing ring and report healthy KV cache apply metrics.
+
+Runbook: emergency rollback
+
+If at any point the cutover breaches acceptance thresholds and cannot be stabilized within 30 minutes with standard mitigations, execute rollback: 
+1) Set routing weights back to the last-known-good configuration.
+2) If nodes removed via IaC, run terraform apply to re-add instances using recorded instance IDs and attach to ASG.
+3) Open incident and assign SRE lead. Record timeline in incident timeline.
+
+Post-retirement tasks
+
+- Mark instance state as decommissioned in the fleet catalog and append the retirement rationale and artifacts (preflight logs, checkpoint URIs).
+- Trigger billing reconciliation job to reassign credits and update cost center tagging.
+- Schedule hardware disposal if applicable (Facilities ticket).
+
+Ownership and escalation
+
+- Primary owner: GPU Fleet team (contact: #gpu-fleet on Slack).
+- Secondary owner: Eng-SRE.
+- On-call escalation: if the retirement causes SLO degradation, page the oncall SRE and the GPU-fleet lead.
+
+Metric dashboard and alerts
+
+Create or use the existing dashboard template: GPU Node Retirement Overview. Required panels:
+- Node health time-series (ECC, temperature, restarts)
+- Traffic split and routing weight transitions
+- Latency P50/P95 by flavor with overlayed baseline
+- KV cache checkpoint apply throughput and errors
+
+Retention of artifacts
+
+- Preflight logs: retain for 90 days.
+- KV checkpoints: retain 14 days by default, 90 days for enterprise/regulated customers (see retention policy).
+
+Appendix: sample checklists (for runbook execution)
+
+Preflight checklist:
+1) Confirm node marked retirement-candidate and annotated
+2) Run preflight pipeline and attach logs
+3) Confirm headroom >= 10%
+4) Approve retirement in ticketing system
+
+Cutover checklist:
+1) Quarantine node and provision targets
+2) Apply KV checkpoint and validate seed
+3) Shift 10/25/50/100% per policy and monitor
+4) Drain and observe for 30 minutes post-100%
+5) Run terraform apply to remove instance from IaC state
+
+Notes and caveats
+
+- For heterogeneous pools (mixed GPU generations), ensure the replacement node matches the runtime flavor or that a compatible fallback model variant exists.
+- For regulatory customers pinned to Private deployments, coordinate with the Private deployment lead and follow the additional private-deploy retirement checklist.
+
+Contact and feedback
+
+For questions or updates to this playbook, contact Aisha Patel (aisha.patel@redwood.com) or open a PR against infra runbooks in the eng-infra repo.
+
+Change log
+
+- 2024-01-15: Draft created by Aisha Patel.
+- 2024-06-02: Added KV checkpointing section (review by María López).
+- 2025-03-11: Incorporated Terraform plan guardrails and CI pipeline gating.
+- 2025-10-03: Published with expanded rollback runbook and retention rules (reviewers: Ethan Chen, Ravi Menon).

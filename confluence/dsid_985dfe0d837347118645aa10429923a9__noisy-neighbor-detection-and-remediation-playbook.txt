@@ -1,0 +1,177 @@
+Noisy Neighbor Detection and Remediation Playbook for GPU Pools
+
+Overview
+
+This playbook describes detection, alerting, automated mitigation, and manual remediation for noisy-neighbor incidents affecting GPU pools. Noisy neighbors are tenant jobs or system components that consume disproportionate GPU, host CPU, memory, or PCIe bandwidth and degrade latency or throughput for colocated inference/eviction-sensitive workloads. The playbook is intended for oncall SREs, infra engineers, and platform owners.
+
+Scope
+
+- Applies to all tenant and internal GPU pools managed by Redwood Inference (hosted and dedicated pools).
+- Covers GPU-side resources (SM/compute), host-side constraints (CPU, memory, PCIe), and scheduler-induced contention (cgroups, container runtime).
+- Excludes planned capacity changes and expected eval-batch jobs that are pre-scheduled and accounted for in billing buckets.
+
+Goals / SLOs
+
+- Detect high-impact noisy neighbor events within 60s of onset.
+- Automatically reduce severe interference within 90s for bursty tenants (automated throttling or eviction).
+- Provide a clear manual triage path with root-cause identification within 30 minutes.
+
+Signals and Detection
+
+Primary signals (ranked):
+
+1. Token-latency tail spike (p95/p99) on inference routes routed to a pool.
+2. GPU SM utilization sustained > 90% while request queue grows.
+3. Host CPU steal / iowait > 30% for > 30s while GPU activity is high.
+4. PCIe TX/RX bandwidth saturation or elevated memory-copy latency.
+5. Elevated GPU PCIe replay/uncore error counters.
+6. Runtime scheduling metrics: long KV-cache miss rate, kernel scheduling latency.
+
+Recommended metric queries (Prometheus/Thanos):
+
+- p99 token generation latency by pool:
+  sum(rate(redwood_inference_token_latency_seconds_bucket{le="+Inf",pool=~"$pool"}[1m])) by (le)
+  (Use histogram_quantile(0.99, ... ) in dashboards)
+
+- Sustained SM utilization:
+  avg_over_time(nvidia_smi_gpu_utilization_percent{device=~"$gpus"}[2m]) > 90
+
+- Host CPU iowait spike:
+  avg(node_cpu_seconds_total{mode="iowait"}[1m]) by (instance) * 100 > 30
+
+- PCIe TX bandwidth high:
+  max_over_time(nvidia_pcie_tx_bytes_total[1m]) by (device) > 0.9 * pci_max_bandwidth_bytes
+
+Alerting and Thresholds
+
+Create the following alert groups with runbook links to this doc: 
+
+- noisy-neighbor.high-latency (severity P1)
+  - Trigger: p99 token latency > X ms above baseline for 2 consecutive 1m windows or token backlog growth > 50 requests in queue.
+  - Pager: oncall-sre
+
+- noisy-neighbor.gpu-saturated (severity P2)
+  - Trigger: avg GPU util > 92% for 3m AND node_cpu_iowait > 25%
+  - Pager: infra-gpu
+
+- noisy-neighbor.pcie-congestion (severity P2)
+  - Trigger: PCIe bandwidth > 85% for 2m or error counters increment
+  - Pager: infra-net
+
+Automated Mitigations (fast path)
+
+Where possible prefer automated, reversible actions that preserve safety and observability: 
+
+1. Prefix throttling: if the route is tail-latency-sensitive, automatically throttle non-critical background routes for 60s. (Config: route-level weight reduction in routing-policy service).
+2. Tenant soft-eviction: move lower-priority jobs to warm pool or signal the tenant's job agent to pause. Requires tenant lease metadata.
+3. Cgroups/CGPU limits: lower CPU shares for containers associated with the offending process profile via the node agent. Revert after 2m if signals normalize.
+4. PCIe backpressure diversion: for multi-GPU hosts, shift new KV-cache warmups to other hosts using the placement balancer.
+5. Canary rollback: when noisy neighbor follows a recent rollout, immediately unpin to previous runtime image or kernel via K8s node labels and drain policy.
+
+Automated mitigation must be gated by an ownership check and safe-guard feature flag. All automated actions must emit an event to the incident-log stream with a remediation_id and revert window.
+
+Manual Triage and Remediation Steps (ordered)
+
+1. Confirm alert context:
+   - Check alerts in PagerDuty (or OpsGenie) and open the linked Grafana dashboard.
+   - Note affected pool, node list, tenant IDs, and recent deployment events.
+
+2. Correlate metrics:
+   - Run PromQL queries for p95/p99 latency, GPU_util, node_cpu_iowait, and nvidia_pcie_errors across implicated hosts.
+
+3. Identify suspect processes:
+   - On affected node: ssh to node (bastion use required).
+   - Launch: sudo runc top / docker top <container> or use nvidia-smi dmon to map processes to GPU indexes.
+   - Check container labels: redwood.tenant_id, redwood.job_type, image tag.
+
+4. Short-term manual mitigation (if automated mitigations didn't run):
+   - throttle route: PATCH /api/v1/routing/pools/$pool/weights set reduced_weight (CLI: redwoodctl routing set-weight --pool $pool --weight 0.4)
+   - soft-evict job: redwoodctl jobs pause --tenant $tenant --job $job_id --reason "noisy-neighbor mitigation"
+   - node cgroup adjustment (last resort): sudo echo 512 > /sys/fs/cgroup/cpu/<slice>/cpu.shares (follow cgroup rollback steps)
+
+5. If host-level resource contention persists: drain node with graceful eviction timeout 120s to avoid losing long-lived KV caches: kubectl drain <node> --ignore-daemonsets --delete-local-data --grace-period=120
+
+6. Post-mitigation validation:
+   - Verify p99 latency returned to baseline within target window and GPU utilization dropped to expected operating range.
+   - Record remediation_id and actions taken in the incident log.
+
+Root-cause identification checklist
+
+- Was there a recent job rollout or canary that aligns with the start time? (CI/CD run id in related events)
+- Was the tenant running unbounded micro-batching or large eval jobs that bypassed cost protection?
+- Was a node misconfigured (driver mismatch, wrong kernel, missing cgroups limits)?
+- Was there cross-tenant disk/egress congestion (models downloading, checkpoint restore)?
+- Did autoscaler mis-predict warm pool needs and create multiple heavy warmup jobs on same node?
+
+Preventive Infrastructure Patterns (IaC and CI/CD)
+
+1. Enforce per-tenant resource profiles in Terraform module for GPU pools (example snippet):
+
+  module "gpu_pool" {
+    source = "git::ssh://git@internal/repo.git//modules/gpu_pool"
+    pool_name = "inference-standard"
+    tenant_profiles = {
+      default = { cpu_shares = 1024, gpu_fraction_limit = 0.6, max_batch_size = 128 }
+    }
+  }
+
+2. CI gating: add noisy-neighbor integration test to the build pipeline that spins a small synthetic contending job and validates p99 tail. Failing tests block kernel/runtime image promotion.
+
+3. Preflight IaC checks: iac-lint should flag pools without tenant_profile or with gpu_fraction_limit=1.0 for shared pools.
+
+4. Placement policy: prefer heterogeneous placement across physical PCIe domains; create placement topology hints in TF to avoid colocating heavy warmup traffic.
+
+Observability and Dashboards
+
+- Provide a dedicated noisy-neighbor panel per pool that shows token latency distribution, GPU util, node CPU iowait, PCIe bytes, and kernel scheduling latency.
+- Add timeline annotations for automated mitigations and manual actions (remediation_id).
+
+Playbook for Post-Incident Review
+
+1. Create incident ticket and attach graphs, remediation actions, and timeline.
+2. Collect host-level traces (nsys / perf) for affected pods within 24h and store in centralized archive with incident_id.
+3. Determine corrective action: terraform module change, scheduler tuning, or tenant contract enforcement.
+
+Ownership and Escalation
+
+- First responder: oncall-sre (primary).
+- Secondary: infra-gpu team for remediation requiring driver/kernel changes.
+- Tertiary: infra-net for PCIe or node-level bus issues; platform-team for routing weight policy changes.
+
+Escalation matrix: escalate to Engineering manager after 90 minutes of sustained customer impact. If an SLA breach is suspected, notify Customer Success.
+
+Testing and Runbook Drills
+
+- Quarterly chaos exercises: run a controlled noisy-neighbor campaign on a sandbox cluster. Validate automated mitigations and end-to-end playbook steps.
+- Add synthetic noisy neighbor jobs to the nightly CI-eval sandbox and assert routing policy and throttle behavior.
+
+Common FAQs
+
+Q: Is eviction permanent for the tenant?
+A: No. We use soft-evictions and rate-limited throttles. Permanent actions require review and approval by infra leads.
+
+Q: Can warm pools be isolated to avoid noisy neighbors?
+A: Warm pools are size-limited and can be configured per-tenant in the TF module. Full isolation increases cost; use on a per-customer basis.
+
+Appendix: Useful Commands and Queries
+
+- redwoodctl routing set-weight --pool $pool --weight 0.4 --reason "noisy-neighbor"
+- redwoodctl jobs pause --tenant $tenant --job $job_id --reason "diagnostic pause"
+- PromQL p99 latency example: histogram_quantile(0.99, sum(rate(redwood_inference_token_latency_seconds_bucket{pool="$pool"}[1m])) by (le))
+- Find processes on GPU: sudo nvidia-smi pmon -c 1 or sudo nvidia-smi dmon -s u
+- Capture perf sample: sudo perf record -a -g -o /tmp/incident-$incident_id.perf && sudo perf script > /tmp/incident-$incident_id.perf.script
+
+Change Log
+
+- 2025-02-14: Created initial playbook (Aisha Raman).
+- 2025-05-09: Added automated mitigation gating and remediation_id requirements (Jonas Patel).
+- 2025-09-30: Expanded PromQL examples and added CI gating guidance (Marta DeLeon).
+
+Related pages and references
+
+- See placement and topology guidance in the iam/gpu-topology docs and the gpu-allocator safety checklist.
+- For routing policy API reference, see docs: sources/confluence/eng-developer-experience/api-examples/routing-policy-api.json
+
+Contact
+
+For questions or to propose changes to this playbook, open a PR in the infra-runbooks repo or ping #infra-gpu on Slack.

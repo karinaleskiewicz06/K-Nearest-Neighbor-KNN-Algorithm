@@ -1,0 +1,176 @@
+Degradation Probing and Load‑Shed Orchestration Manual
+
+Overview
+========
+This document describes the design, operational contracts, and runbook for Redwood's runtime-level degradation probing and load‑shed orchestration subsystem (the Shedder + Probe Controller). It explains how the system detects overload or fidelity regressions, safely degrades throughput/quality, probes for capacity recovery, and executes fallbacks to preserve customer‑facing SLOs. Intended audience: SREs, runtime engineers, oncall responders, and anyone running canary/rollout experiments against the serving runtime.
+
+Scope and goals
+----------------
+- Scope: host runtime components that make admission and fidelity decisions (shedder, probe controller, router policies, kernel scheduler hooks). Includes metrics, alerting, config knobs, and incident procedures. Does NOT cover dedicated customer‑side capacity contracts or API client behavior.
+- Goals:
+  - Keep p99 tail latency below configured SLOs during partial failure modes.
+  - Minimize error amplification from naive hard‑shutdowns.
+  - Provide deterministic probing detection windows (so automated rollbacks/canaries behave reliably).
+  - Offer clear observability signals for triage and postmortem.
+
+Ownership
+---------
+- Primary owner: eng-serving-runtime (runtime-sre squad)
+- Secondary owners: eng-platform (routing), eng-infra (autoscaler)
+- Pager: runtime-sre oncall
+
+Key terminology
+---------------
+- Shedder: admission component that rejects or defers incoming requests based on runtime signals and configured policies.
+- Probe: a controlled low‑volume request used to test component health/fidelity during or after a degraded state.
+- Degradation window: period during which the runtime accepts reduced throughput or fidelity (e.g., lower token budget, quantized model variant) to remain within resource bounds.
+- Fidelity fallback: deliberate swap to a cheaper/compact model variant to preserve latency at the expense of some output quality.
+
+High‑level architecture (text diagram)
+-------------------------------------
+Ingress -> Per‑route Router -> Admission Layer (Shedder) -> Scheduler/Kernels -> Execution
+                              ^                                      |
+                              |                                      v
+                        Probe Controller <--- Health Aggregator <-- Kernel Telemetry
+
+Design principles
+-----------------
+1. Graceful and measurable degradation: prefer smooth fidelity reductions (batch size limits, prefix caching, model variant swap) over abrupt connection resets.
+2. Explorable recovery: when shedding, emit probes at controlled cadence to test recovery; probes must be tagged and isolated for observability.
+3. Multi‑signal decisions: admission uses a weighted decision of kernel latency, GPU queue length, KV cache miss ratio, and model‑swap health. No single metric triggers an irreversible fallback.
+4. Safety first: all automated fallback actions are rate‑limited and subject to automatic rollback if probe failure rate exceeds threshold.
+
+Runtime components and contracts
+--------------------------------
+- Shedder (runtime component):
+  - Inputs: per‑GPU queue depth, p99 kernel latency (1s window), slot exhaustion events, memory pressure flag.
+  - Outputs: admit / queue / reject decisions + shed_reason tag.
+  - Contract: decision latency <= 2ms; decisions annotated with trace_id and shed_reason.
+
+- Probe Controller:
+  - Inputs: health signals from telemetry, manual override from console, experiment flags.
+  - Behavior: when degradation begins, schedule periodic probes (default cadence 1 probe/10s per cohort) that exercise the full model path including KV cache warmups.
+  - Contract: probes must not exceed 0.5% of normal traffic and must be isolated from user billing metrics.
+
+- Fidelity Orchestrator (model variant switcher):
+  - Inputs: probe success ratio, runtime pressure score.
+  - Outputs: model variant assignment per route/session.
+  - Contract: variant switch must be atomic at the session token boundary and revertible within 30s when probes pass recovery thresholds.
+
+Observability contract (metrics and logs)
+-----------------------------------------
+The following metrics must be emitted for every runtime shard and aggregated per cluster. Use these exact metric names for alerts and dashboards.
+
+Metrics table (CSV style)
+metric_name,description,unit,cardinality
+runtime.shedder.admit_rate,Requests admitted after admission logic,req/s,route+shard
+runtime.shedder.reject_rate,Requests rejected due to shedding,req/s,route+shard
+runtime.shedder.queue_depth,Admission queue length,requests,shard
+runtime.kernel.p99_latency,Kernel p99 latency over 1s window,ms,shard
+runtime.kernel.queue_wait,Time spent waiting for kernel slot,ms,shard
+runtime.kvcache.miss_ratio,KV cache miss ratio,percent,route
+runtime.probe.success_ratio,Fraction of probes that returned expected status,percent,cohort
+runtime.fidelity.variant,Active model variant id,string,route+session
+
+Alerting thresholds (recommended)
+- Sev 1: runtime.kernel.p99_latency > 1200ms for > 2m AND runtime.shedder.reject_rate > 0.1req/s aggregated across cluster.
+- Sev 2: runtime.probe.success_ratio < 80% over a 5m window.
+- Sev 3: runtime.kvcache.miss_ratio > 30% for a route over 10m.
+
+Runbook: detection -> containment -> probe -> recovery (step‑by‑step)
+-------------------------------------------------------------------
+1) Detection:
+   - Pager triggers on Sev 1 alert. Open incident channel and claim.
+   - Confirm p99 latency, drop rate, and any kernel OOM/slot errors in the trace stream.
+2) Containment:
+   - If admit decisions are saturating kernels, temporarily raise shedder aggressiveness to target 20% reject until further analysis. Command:
+     - rctl shedder set --route <route> --aggressiveness 0.2 --reason "temporary‑containment"
+   - Document the change in the incident timeline and tag affected customers in the console.
+3) Probe:
+   - Initiate manual probe run to validate execution path:
+     - curl -H "X-Redwood-Probe: true" -X POST https://runtime-probe.local/healthcheck --data '{"route":"<route>","model":"<variant>"}'
+   - Inspect runtime.probe.success_ratio and kernel traces for failed probes.
+4) Recovery:
+   - If probe success_ratio >= 95% for 2 consecutive 1m windows: gradually rollback shedder aggressiveness by 10% every 30s.
+   - If probe failure persists, trigger model variant swap to a lower‑cost variant (see fidelity table below) with a canary cohort (1% traffic) for 5m before wide rollout.
+
+CLI and diagnostic commands
+---------------------------
+- List shedding state per route: rctl shedder list --output table\- Set aggressiveness (0.0–1.0): rctl shedder set --route <route> --aggressiveness 0.3\- Trigger a manual probe: rctl probe run --route <route> --variant <variant> --count 10\- Dump last 5 kernel traces for a shard: rctl trace tail --shard <id> --limit 5\- Temporarily pin model variant: rctl model pin --route <route> --variant <id> --ttl 10m
+
+Sample PromQL alerts
+--------------------
+- High p99 latency with shedding:
+  sum by(cluster) (rate(runtime.kernel.p99_latency_sum[1m])) / sum by(cluster) (rate(runtime.kernel.p99_latency_count[1m])) > 1200
+- Probe failure rate:
+  1 - (sum(runtime.probe.success_ratio) by(cohort) / count(runtime.probe.success_ratio) by(cohort)) > 0.2
+
+Configuration knobs and recommended defaults (table)
+---------------------------------------------------
+knob,default,description
+shedder.window_size,1000ms,Time window for smoothing decision signals
+shedder.min_admit_rate,10req/s,Minimum guaranteed admission per route (soft)
+shedder.max_probe_fraction,0.005,Max fraction of traffic that can be probes
+probe.cadence,10s,Minimum interval between probes for same cohort
+variant.canary_fraction,0.01,Fraction of traffic used to canary a variant swap
+fallback.max_duration,15m,Maximum continuous duration for an automatic fallback before human review
+
+Safety & rollout constraints
+---------------------------
+- Any automated model variant swap must pass the probe gate for the canary cohort for at least three consecutive probe windows.
+- Fallbacks that persist longer than fallback.max_duration must open a ticket in the runtime backlog and notify the release owner.
+- All shedder aggressiveness changes performed by automation are rate limited to 10% change per minute to avoid oscillation.
+
+Testing and validation matrix
+----------------------------
+- Unit tests: shedder decision logic and probe tagging (CI enforced).
+- Integration tests: synthetic load profiles that simulate cache coldstart, kernel saturation, and degraded interconnect (run by perf CI nightly).
+- Chaos tests: injected kernel hang and NVLink degradation scenarios with controlled shedding to validate graceful degradation behavior (game day quarterly).
+
+Known limitations and tradeoffs
+------------------------------
+- Probes are small by design and can pass even when larger normal traffic fails due to queue ordering differences; use probe traces as one signal among many.
+- Model variant swaps reduce latency but may cause downstream semantic regressions; every variant includes a quality delta estimate that must be considered for enterprise customers.
+- The shedder cannot (currently) account for cross‑shard KV cache warming heuristics perfectly; this can lead to transient higher miss_ratio after recovery.
+
+Post‑incident checklist
+----------------------
+- Export probe traces and kernel traces for the incident window.
+- Compute probe success_ratio and compare to probe baseline.
+- If fallback triggered, run fidelity regression suite for affected prompt sets.
+- File a follow‑up action in the runtime backlog with owner and target date.
+
+Appendix A: Example YAML policy fragment
+---------------------------------------
+# admission policy for high throughput text-generation route
+admission_policy:
+  route: "/v1/generate"
+  shedder:
+    aggressiveness: 0.15
+    window_size_ms: 1000
+    min_admit_rate: 10
+  probe:
+    cadence_s: 10
+    max_fraction: 0.005
+  fidelity_fallback:
+    canary_fraction: 0.01
+    variants:["gptx-8b-q4","gptx-8b-q2a"]
+
+Appendix B: Quick reference for oncall responders
+--------------------------------------------------
+- First 5 minutes: confirm alerts, set temporary containment to 20% reject if kernels saturated.
+- 5–20 minutes: run manual probes and escalate to runtime-sre if probe fail rate > 20%.
+- >20 minutes: if automated rollback does not stabilize, trigger manual canary variant swap and route pin.
+
+Document history and changes
+--------------------------
+- 2026-02-10: created (Priya Nandakumar)
+- 2026-04-18: tightened probe cadence and added canary constraints (reviewers: Ethan Park)
+- 2026-09-15: updated alert thresholds and added PromQL examples (reviewers: Marcus Li, Sofia Alvarez)
+
+Related docs and links
+----------------------
+- Runtime decision graph: /confluence/eng-serving-runtime/runtime-architecture/runtime-decision-graph-and-observed-behaviour-catalog-2026
+- Backpressure playbook: /confluence/eng-serving-runtime/kernel-and-scheduling/sla-aware-admission-controller-and-backpressure-playbook-2027
+- Kernel telemetry contract: /confluence/eng-serving-runtime/team-wiki/kernel-telemetry-annotation-guidelines-2025
+

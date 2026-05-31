@@ -1,0 +1,153 @@
+Mixed-priority cgroup and soft-quota playbook for multi-tenant inference
+
+Summary
+
+This playbook defines a pragmatic, deployable policy and reference implementation pattern for enforcing mixed-priority resource controls on Redwood inference nodes. It combines OS-level cgroups, a soft-quota crediting algorithm, and scheduler-level hints to guarantee tenant fairness for bursty traffic while protecting latency-sensitive SLAs. The goal is predictable SLOs with controlled cost and graceful degradation under contention.
+
+Scope
+
+- Applies to dedicated GPU hosts and shared GPU slice deployments used for multi-tenant inference.
+- Covers CPU, GPU memory residency, NVLink and PCIe bandwidth gating, and host-level network egress shaping where supported.
+- Does NOT replace cloud provider-side hard quotas or hypervisor limits; this is an infra-layer policy implemented inside Redwood-managed nodes.
+
+Definitions and terminology
+
+- Soft-quota: a rate-style allocation enforced by token/credit accounting rather than hard kernel-level denial. Gives tenants temporary burst capacity until credits are exhausted.
+- Cgroup profile: named resource envelope mapped to a tenant route or model variant (e.g., low-priority-batch, standard-realtime, realtime-guaranteed).
+- Preemptible slot: runtime slot eligible for preemption when higher-priority work arrives. Clients may receive a retryable 429 with retry-after hints.
+- Credit refill window: interval on which soft-quota credit balances are replenished.
+
+Principles
+
+1) Prioritize latency SLOs for realtime-guaranteed tenants; starvation-avoidance for all others.
+2) Make policies observable and auditable: every decision must emit events and metrics.
+3) Prefer non-destructive throttling before eviction.
+4) Provide transparent billing signals: exhausted credits should generate usage traces and billing-affecting tags.
+
+Service model and mapping
+
+- Map inbound request classes to cgroup profiles at the edge ingress (edge-proxy or inference gateway) based on API token, route, or customer contract.
+- Example profile names: realtime-guaranteed, standard, burstable, spot-preemptible.
+
+Resource profile table (reference)
+
+Profile | GPU share | CPU share | Burst credits per minute | Preemptible
+---|---:|---:|---:|---:
+realtime-guaranteed | 60% | 4 CPUs | 0 | false
+standard | 25% | 2 CPUs | 100 credits | true
+burstable | 10% | 1 CPU | 1000 credits | true
+spot-preemptible | 5% | 0.5 CPU | 5000 credits | true
+
+Operational invariants
+
+- P95 latency for realtime-guaranteed must remain under 80 ms for 2kB prompt workloads under nominal load.
+- P99 latency degradation must be limited to 3x baseline under accepted degraded mode.
+- No tenant should consume >2x its configured long-term average without exhausting burst credits.
+
+Soft-quota algorithm (summary)
+
+1) Each profile has a token bucket: capacity (burst cap) and rate (sustained).
+2) Requests consume tokens proportional to an estimate of per-request GPU time (token_cost = base_cost + size_factor).
+3) When tokens are available, allow request and deduct tokens. When depleted, attempt polite throttling: apply queueing/backoff first (retry-after 150–500 ms depending on queue depth), then reject with 429 when queue > max_queue_len.
+4) Credits are replenished on a 1s tick with leaky-bucket refill semantics; windows can be tuned per workload.
+
+Cgroup & kernel-level controls (implementation notes)
+
+- Use systemd.slice + unified cgroup v2 where available. For GPU residency/visibility we use Nvidia MIG or runtime-controlled CUDA_VISIBLE_DEVICES mapping. For non-MIG GPUs, rely on process-level CUDA_VISIBLE_DEVICES combined with per-process niceness and CPU bandwidth controls.
+- Example cgroup layout (text description): root/rdw/guaranteed.slice, root/rdw/standard.slice, root/rdw/burstable.slice, root/rdw/spot.slice.
+- CPU bandwidth values set with systemd CPUQuota= and MemoryMax= where applicable.
+
+Example cgroup profile YAML (to be consumed by node agent)
+
+profile_name: standard
+labels: ["multi-tenant", "standard"]
+cpu_quota_percent: "25%"
+gpu_share_percent: "25%"
+burst_capacity_tokens: "1000"
+refill_rate_tokens_per_s: "16"
+
+(node-agent will translate to systemd + token-bucket state on startup)
+
+Preemption and eviction policy
+
+- Soft preemption: first step is to stop accepting new requests for preemptible profiles and burn down queues. Provide clients with a Retry-After header. Emit PreemptionWarning event to tracing.
+- Hard eviction: only when soft preemption fails for longer than 30s AND SLOs for realtime-guaranteed are violated by >10% over a rolling 1m window. Evicted sessions are checkpointed if runtime supports incremental KV-cache persistence; otherwise return structured error with model-invocation-id for audit.
+
+Telemetry and SLI set (required metrics to emit)
+
+- profile.request_rate (per-profile, r/s)
+- profile.token_balance (gauge)
+- profile.rejects_429 (counter)
+- node.gpu_utilization (gauge)
+- node.preemption_events (counter with reason label)
+- request.latency_p50/p95/p99 (per-profile)
+
+Alerting thresholds (recommended)
+
+- SLO breach alert: realtime-guaranteed.p99 > 120 ms for 2 consecutive 1m windows -> page SRE oncall.
+- Exhaustion alert: profile.token_balance < 1% of capacity for 5m -> create sustained-throttling ticket.
+- Preemption storm: node.preemption_events > 10 in 1m -> create incident and auto-scale farm capacity.
+
+Testing and validation
+
+- Synthetic load: use the perf-harness tool with a mixed-profile manifest. Example CLI:
+  rdw-perf start --manifest tests/manifests/mixed-bursty-50-30-20.yaml --duration 10m --trace=on
+- Chaos test: inject CPU throttling (stress-ng) and GPU memory pressure (cuda-memtest) during a 30m soak; verify token balances and preemption events are emitted and SLOs respected.
+- Contract tests: run end-to-end convergence tests in staging where billing tags, traces, and token accounting are validated.
+
+Rollout plan (canary -> gradual -> global)
+
+1) Implement node-agent feature flag behind runtime.flag.soft_quota_v2. Deploy to 2 canary nodes in staging.
+2) Run mixed synthetic load for 24h and validate metrics/alerts.
+3) Canary in production: enable on 5 nodes serving non-critical tenants for 48h with increased sampling.
+4) Gradual rollout: 10% -> 30% -> 60% -> 100% of nodes, with 6h observation between steps.
+4a) If preemption storm or SLO regressions are observed, auto-rollback to previous flag state.
+
+Operational runbook (summary)
+
+- Detect: Alert for realtime-guaranteed.p99 and node.preemption_events.
+- Mitigate: Increase node pool capacity (scale up dedicated nodes) or temporarily reduce burst refill rates via platform API: POST /admin/quota/adjust {"profile":"burstable","refill_rate":4}.
+- Recover: If hard eviction triggered, restart affected runtime with persisted KV-cache, and run postmortem with request ids (attach trace ids to incident).
+
+Ownership and change control
+
+- Primary owner: infra-scheduling@redwood.com (team: eng-infra).
+- Secondary owner: serving-runtime@redwood.com for runtime integration.
+- Any config changes to default profiles must go through CHANGE-FEATURE ticket and be approved by owners; large profile changes require a 1-week staged rollout and telemetry gating.
+
+Security and privacy considerations
+
+- Token accounting and audit logs must not include PII. Traces related to billing or chargebacks should be stored in restricted retention with RBAC.
+- Ensure GPU-side libraries are up-to-date to avoid kernel CVEs that could allow cross-tenant leakage.
+
+Appendix: Example node-agent CLI and YAML patch
+
+# Apply a new profile
+rdw-agent apply-profile --file profiles/burstable.yaml
+
+# Query balances
+rdw-agent profile-status --profile burstable --format json
+
+YAML (profiles/burstable.yaml)
+profile_name: burstable
+cpu_quota_percent: "10%"
+gpu_share_percent: "10%"
+burst_capacity_tokens: 5000
+refill_rate_tokens_per_s: 80
+queue_max_len: 64
+preemptible: true
+
+Related docs and references
+
+- See GPU fleet soft-quota eviction policy (eng-infra) for cross-reference.
+- See ADR: adaptive-priority-fairness for bursting for background rationale.
+
+Change log
+
+- 2025-10-12: Draft created by Maya Chen.
+- 2025-11-03: Added refill tuning guidance after staging tests.
+- 2026-03-01: Published after canary verification and reviewer sign-off.
+
+Contact
+
+For questions or rollout coordination, contact infra-scheduling@redwood.com or open a ticket in #infra-scheduling on Slack. 

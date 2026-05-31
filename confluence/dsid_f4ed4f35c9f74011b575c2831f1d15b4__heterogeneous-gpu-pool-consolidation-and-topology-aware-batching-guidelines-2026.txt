@@ -1,0 +1,136 @@
+Heterogeneous GPU Pool Consolidation and Topology-aware Batching Guidelines (2026)
+
+Summary:
+This document defines operational guidelines for consolidating heterogeneous GPU pools and applying topology-aware request batching in Redwood's serving runtime. It captures objectives, safe rollout steps, benchmarks to validate cost/latency trade-offs, kernel-selection constraints, telemetry queries, and troubleshooting guidance.
+
+Context and Motivation:
+- We operate multiple GPU types (A100 80GB, A100 40GB, H100 80GB, and 4/8-bit quantized T4/NVNeon instances in partner clouds). Running separate pools for every SKU is wasteful for mid- and tail workloads; consolidation improves utilization and reduces unit cost.
+- However, naive consolidation increases tail latency due to differing kernel characteristics, memory layouts, and NUMA/topology effects. Topology-aware batching and kernel routing preserve SLOs while realizing consolidation benefits.
+
+Goals and Non-goals:
+- Goals:
+  - Reduce average GPU utilization variance across fleets by 10–25% for mixed model workloads.
+  - Achieve >=15% nominal token cost reduction for multi-tenant serving clusters without regressing p50/p95 latency SLOs.
+  - Provide a safe rollout path that can be reverted in 15 minutes of an automated policy.
+- Non-goals:
+  - This is not a complete replacement for dedicated pools for high-security or extremely low-latency tenants.
+  - Not intended to optimize offline training workloads.
+
+Assumptions and Preconditions:
+- Runtime must support kernel variants per device family and a per-request device affinity label.
+- KV cache sharding must be accessible to batch router to prevent cross-shard hotkeys in a single micro-batch.
+- Observability must provide per-model, per-device-type token-level latency and kernel selection traces for the last 72 hours.
+
+Key Concepts (short):
+- Device bucket: group of GPUs with compatible kernels / memory footprint (e.g., A100-80 / A100-40 are separate buckets).
+- Topology tag: node-level metadata (NUMA groups, PCIe switch domains) supplied at node registration.
+- Topology-aware micro-batcher: runtime component that forms micro-batches considering both sequence-length distribution and device topology to avoid cross-switch memory transfers.
+
+Policy Matrix (when to consolidate):
+| Tenant class | Recommended pool | Consolidation allowed? | Fallback policy | Notes |
+|---|---:|---:|---|---|
+| Free / Trial | Consolidated heterogeneous pool (best-effort) | Yes | Auto-fallback to hosted small CPU-backed instances on overload | Accept higher variability |
+| Mid-market | Consolidated w/ topology awareness | Yes (soft) | Canary to tenant-dedicated on SLA breach | Monitor p95 closely |
+| Enterprise (SLA) | Dedicated GPU pool or pinned device family | No | N/A | Requires contractual sign-off |
+
+Application-level Kernel Constraints:
+- When serving autoregressive models with long KV caches (>128k tokens), prefer device buckets that support large contiguous memory kernel paths (A100-80, H100).
+- For quantized 4-bit variants with fused kernels, avoid mixing with non-fused kernel devices in the same micro-batch.
+- If a request's model variant requires FP16 kernels, do not route to devices flagged as quant-optimized-only.
+
+Benchmarking and Validation Checklist (before rollout):
+1) Microbenchmarks
+   - Generate synthetic request traces using the production sequence-length histogram (use workload >= 24 hrs).
+   - Run 3 full-pass simulations over mixed-device pools and collect p50/p90/p99 token latency and kernel-selection distribution.
+   - Tools: ./benchmark/simulate_pool.sh --trace=prod_hist.json --devices=A10080,A10040,H100 --runs=3
+2) End-to-end canary
+   - Route 5% of traffic for non-SLA tenants for 48 hours.
+   - Monitor: p50/p95 increase, error rate, kernel-variant churn metric.
+3) Cost analysis
+   - Compare token cost normalized per-device and extrapolate monthly savings; ensure no >5% p95 regression.
+
+Suggested Experiment Metrics (tracked as dashboards):
+- kernel.selection.rate: count by device_bucket, kernel_variant
+- request.latency.token_p95_by_device: histogram per device family
+- batching.deadline-missed: micro-batches that exceeded latency target due to waiting for topology alignment
+- kv.cache.hit_ratio_by_pool: ensure cache effectiveness unchanged
+
+Topology-aware Batching Rules (implementation constraints):
+- Prefer intra-switch micro-batches: assemble requests whose assigned devices share a switch or PCIe root complex.
+- Batch co-location window: 2ms default; if insufficient co-located requests form a fallback batch limited to size N_fallback (configurable, default 4).
+- Batch size guidance: prioritize latency SLOs — for p95-sensitive models, cap micro-batch at 8 tokens/requests; for throughput-first jobs, allow up to 32 where kernels are linear-scaling.
+
+Runtime Configuration Snippets (examples):
+- device-buckets.yaml (excerpt):
+  - name: a100-80
+    families: ["A100-80GB"]
+    supported_kernels: ["matmul-fused-v2","kv-sharded-contig"]
+    preferred_topology_tags: ["pci-socket-0","numa-0"]
+  - name: h100-80
+    families: ["H100-80GB"]
+    supported_kernels: ["matmul-fused-h100","kv-sharded-contig"]
+
+- batcher-config.json (excerpt):
+  { "co_location_window_ms": "2", "max_microbatch_size": "16", "fallback_batch_size": "4" }
+
+Rollout Procedure (step-by-step):
+1) Preparation (T-72h): signal to infra and run a dry-run of simulations; collect baseline dashboards.
+2) Canary (T-48h): enable topology-aware batching for 5% trial tenants and route synthetic traffic that mimics heavy tail sequences.
+3) Observe (T-24–48h): verify kernel.selection.rate stabilizes and p95 delta < 5%. If not, revert.
+4) Incremental ramp (T+72h): ramp to 25% then 50% over several days with automated health gates.
+5) Full roll (T+7d): consolidate pools for eligible tenants and deprovision redundant dedicated nodes.
+6) Post-roll review (T+14d): cost savings report, incident log, and lessons learned.
+
+Automated Health Gates (examples):
+- Abort if request.latency.token_p95_by_device increases >7% for 1h.
+- Abort if batching.deadline-missed rate > 0.5% for 30m.
+- Auto-fallback: if kernel.selection.churn > 3 variants per minute for a device node, reroute the node to dedicated small-pool mode.
+
+Observability Playbook (alerts and dashboards):
+- Dashboard: "Consolidation Health" showing per-device p50/p95/p99, kernel selection heatmap, kv cache hit ratio, microbatch sizes.
+- Alerting rules:
+  - P95 regression: trigger paging to eng-serving-runtime on >7% sustained p95 regression for 15 minutes.
+  - Kernel-fallback storms: low-severity Slack alert to #runtime-kernels when churn triggered.
+
+Troubleshooting (common failure modes):
+- Symptom: sudden p95 increase after consolidation
+  - Check: kernel.selection.rate for new device variants; if many requests falling back to slower kernels, mark node for probe and reduce co_location_window_ms to 1ms.
+  - Action: temporarily move affected tenant to prior pool via routing-policy and drain node for device-level profiling.
+- Symptom: high batching.deadline-missed on a subset of racks
+  - Check: node topology tag registration mismatch (PCIe root reported mismatches). Reconcile tags via: ./infra/topology-sync --node <id> --resync
+  - Action: Restart micro-batcher on affected agents to flush pending co-location buffers.
+
+Operational Runbook Commands (examples):
+- Simulate production trace: ./benchmark/simulate_pool.sh --trace=prod_hist.json --devices=A10080,H100 --runs=5
+- Reconfigure batcher on fleet: ./infra/ctl batcher update --config batcher-config.json --selector "pool=consolidated-1"
+- Force fallback for node: ./infra/ctl node set-mode --node <node-id> --mode dedicated
+
+Ownership and Contacts:
+- Primary owner: eng-serving-runtime / Priya Nair (runtime performance)
+- Secondary owners: Kernel team - Ethan Morales; GPU infra - Ling Zhao
+
+Compatibility and Future Work:
+- Planned: integrate kernel-selection ML policy that predicts fastest kernel variant per-request (Q3 2026).
+- Research note: explore per-tenant dynamic quantization routing to allow mixed micro-batches while preserving fused-kernel requirements.
+
+Appendix A — Example telemetry queries:
+- p95 by device (PromQL):
+  histogram_quantile(0.95, sum(rate(request_latency_seconds_bucket[5m])) by (le, device_family))
+- kernel selection proportion (Influx/SQL-like):
+  SELECT device_family, kernel_variant, count(*) FROM kernel_events WHERE time > now() - 1h GROUP BY device_family, kernel_variant
+
+Appendix B — Safety checklist before decommissioning dedicated nodes:
+1) Validate no tenant has explicit affinity labels to decommissioned device families.
+2) Confirm kv.cache.empty_rate < 1% on impacted pools.
+3) Ensure rollback script tested: ./infra/ctl pool restore --snapshot <timestamp>
+
+Document Change Log:
+- 2024-11-12: Initial draft (Priya Nair).
+- 2025-06-01: Added automated health gates and telemetry examples (Ethan Morales review).
+- 2026-02-15: Updated per-device batch size guidance after H100 rollout (Ling Zhao review).
+
+Related reading:
+- Priority-driven kernel scheduler spec (kernel-and-scheduling).
+- NUMA-aware shard placement and eviction playbook (runbooks).
+
+End of document.

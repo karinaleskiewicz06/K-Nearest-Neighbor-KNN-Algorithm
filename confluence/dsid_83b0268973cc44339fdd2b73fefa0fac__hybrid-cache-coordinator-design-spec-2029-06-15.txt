@@ -1,0 +1,190 @@
+Hybrid Cache Coordinator — Design Spec & Rollout Plan
+
+Overview
+=======
+
+This design spec describes the Hybrid Cache Coordinator (HCC), a cross-service component that unifies prefix/KV caching across hosted, dedicated, and private deployments. HCC's objective is to improve tail latency and per-token cost by coordinating cache placement, eviction, and prefilling policies across the serving runtime and the orchestration layer. This document includes goals, non-goals, architecture, config surface, rollout plan, SLO impact analysis, test plan, and ownership.
+
+Why HCC now
+------------
+- Increasing model sequence lengths and multi-turn chat workloads have amplified KV-cache miss amplification across concurrent replicas.
+- Existing per-node caches lead to duplicate state and higher memory pressure in dedicated pools.
+- Workloads exhibit skew (hot prompts, heavy tenants) where coordinated caching yields material cost and latency improvements.
+
+Goals
+-----
+1. Reduce median and 95th percentile token latency for chat workloads by coordinating cache warmup and eviction across replicas.
+2. Reduce aggregate memory footprint for KV prefixes across a dedicated pool by >= 20% for skewed workloads.
+3. Expose a small operator and API surface to allow per-tenant and per-route cache policy overrides.
+4. Be deployable in-hosted, dedicated, and Private (VPC) modes with identical control-plane APIs; implementation details can vary by deployment mode.
+
+Non-goals
+---------
+- Not a global state store for arbitrary application state. HCC will only manage inference-related cache metadata and prefetch assets (prefixes, quantized KV blobs).
+- Not intended to replace LRU per-node caches entirely on first rollout; we will phase in coordination gradually.
+
+High-level architecture
+-----------------------
+1. Control plane service (HCC-controller): maintains cache policy, global prefix popularity map, and prefill schedules. Runs in the Redwood control plane for hosted; for Private deployments it runs as an optional customer-managed control-plane service (process-mode).
+2. Local agent (hcc-agent): lightweight per-node daemon that implements local eviction actions, receives prefill tasks, and reports telemetry. Runs colocated with serving runtime.
+3. Prefill store: object store (S3/GCS/MinIO) or shared filesystem used to stage precomputed KV blobs (quantized). Not required for basic coordination but recommended for large-scale warmups.
+4. Runtime integration: RPCs between hcc-agent and serving runtime to apply KV blobs to in-memory/kernelsafe stores and to adjust batch scheduling priorities.
+
+Sequence diagram (text)
+-----------------------
+1. Runtime observes repeated prefixes for route R. 
+2. Runtime reports aggregated prefix fingerprints to hcc-agent.
+3. hcc-agent forwards compacted events to HCC-controller (batched).
+4. Controller updates popularity map and, if threshold crossed, schedules prefill task to agent(s).
+5. Agent prefetches prefabs from prefill store or requests runtime to generate.
+6. Prefilled KV is pinned with TTL on nodes chosen by the coordinator.
+7. Controller monitors hit-rate; evicts or reassigns when popularity decays.
+
+Control API (summary)
+--------------------
+- GET /v1/policies
+- POST /v1/policies {route: string, tenant_id: string, policy: {pin_ttl_s: int, replication: int, priority: enum}}
+- POST /v1/prefill-requests {route, tenant, fingerprint, target_nodes: [id], source: auto|manual}
+- GET /v1/metrics/{route}
+
+Configuration matrix (recommended defaults)
+-----------------------------------------
+| Parameter | Default (hosted) | Notes |
+|-----------|------------------|-------|
+| sampling_window_s | 60 | Aggregation window for prefix counts |
+| popularity_threshold | 150 | Count of occurrences in window to consider prefill |
+| default_replication | 2 | Number of nodes to pin prefills for redundancy |
+| pin_ttl_s | 900 | Time to keep a prefetched prefix before eligible for eviction |
+| max_prefill_bytes_per_node | 40MB | Soft limit to prevent memory starvation |
+| prefer_same-pool | true | Prefetch nodes co-located with request-serving pipelines |
+
+(Represented above as a preformatted table in Confluence UI.)
+
+Eviction and safety policies
+---------------------------
+- Eviction priority: 1) expired TTL 2) lowest access recency across pool 3) explicit controller-triggered reassign.
+- Safety: Agents will not evict pinned prefixes below a minimum_reserved_bytes (default 8MB) without controller approval.
+- Backpressure: If node memory becomes constrained, agent signals overload and controller reduces replication targets and deprioritizes low-priority prefills.
+
+Compatibility and fallback behavior
+----------------------------------
+- If HCC-controller is unreachable, agents continue local policies (existing LRU) and mark coordination degraded.
+- For Private deployments without a central prefill store, agents may coordinate via direct peer-to-peer transfers initiated by controller instructions.
+
+SLO and metric impact analysis
+-----------------------------
+Primary metrics (to emit):
+- prefix_hit_rate (per-route, per-tenant)
+- prefill_success_rate
+- average_prefill_latency_ms
+- memory_reserved_bytes
+- eviction_count
+- coordination_health: enum {ok,degraded,offline}
+
+SLO targets (proposal):
+- prefix_hit_rate: baseline +10% improvement within 30d for top-20 routes after rollout.
+- coordination_health: >= 99.5% ok for hosted clusters.
+
+Telemetry schema (example)
+------------------------
+- timestamp: ISO8601
+- node_id: string
+- route: string
+- fingerprint: string
+- access_count: int
+- last_access_ms: int
+- action: enum {reported,prefill,evict,fail}
+
+Security and tenant isolation
+-----------------------------
+- All control-plane RPCs are authenticated using mTLS and token-based ACLs.
+- Prefilled artifacts stored in prefill store must be encrypted at rest using customer-managed KMS for Private deployments that request it.
+- Access control: policies allow scoping by tenant_id and route; controller will enforce authorization on manual prefill and policy updates.
+
+Operational runbook (summary)
+----------------------------
+1. Detect coordination degraded: alert if coordination_health != ok for > 5 minutes.
+2. Quick remediation: restart local hcc-agent. If persisted, failover controller to standby.
+3. Emergency mitigation: set default_replication=1 and increase popularity_threshold by 2x to reduce prefill churn.
+4. Post-incident: collect agent and controller traces (/var/log/hcc/*) and increase sampling to capture misses for 24h.
+
+Rollout plan (phased)
+---------------------
+Phase 0 — Canary (2% of hosted traffic; 1 dedicated pool)
+- Deploy hcc-controller canary and hcc-agent to a small pool.
+- Run in passive reporting mode (no prefill actions) for 7 days.
+- Validate metrics plumbing and telemetry.
+
+Phase 1 — Coordinated prefill (10% traffic)
+- Enable auto-prefill for low-risk routes (non-sensitive, synthetic test prompts).
+- Limit default_replication=1 and max_prefill_bytes_per_node=8MB.
+- Run for 14 days; compare prefix_hit_rate and tail latency.
+
+Phase 2 — Pool-wide rollouts (50% traffic)
+- Increase replication to default 2, expand route coverage to top 50 routes.
+- Enable memory-based backpressure.
+
+Phase 3 — Global rollout
+- Full rollout across hosted pools, optional opt-in for Dedicated customers, and private packaging for Private deployments.
+
+Migration steps for Dedicated customers
+--------------------------------------
+1. Preflight: run the hcc-scan tool to estimate expected prefill storage and memory overhead.
+2. Agree on replication and pin_ttl defaults with customer.
+3. Schedule maintenance window for initial rollout (prefer low-traffic hours).
+4. Start in passive mode; after 7 days enable low-risk prefill.
+
+Testing and validation plan
+--------------------------
+- Unit tests for controller decision logic (popularity thresholding, reassignment).
+- Integration tests: simulate skewed prefix traffic and verify replication, eviction behavior, and failover.
+- Load tests: measure memory footprint reduction and tail latency under synthetic chat workloads.
+- Upgrade tests: agent upgrade must be rollbackable without losing pinned KV blobs.
+
+Metrics dashboard and alerts (recommended)
+----------------------------------------
+- HCC Overview: coordination_health, total_prefills, prefill_success_rate, prefix_hit_rate (global).
+- Node panel: per-node memory_reserved_bytes, eviction_count, local_hit_rate.
+- Alerts: coordination_health != ok (P1), prefill_success_rate < 90% for 10m (P2), memory_reserved_bytes > 90% of node capacity (P1).
+
+Backward compatibility and versioning
+-----------------------------------
+- HCC API will use semantic versioning: v1 for initial release. Agents will support negotiation of controller API version during bootstrap.
+- Controller will accept both v1 and v1beta clients with clear deprecation timelines (>=3 months notice).
+
+Open implementation decisions (to be resolved in follow-up design doc)
+------------------------------------------------------------------
+- Global vs per-pool popularity accounting: sketch above biases toward pool-local popularity for performance; final decision requires cost analysis.
+- Prefill artifact format and compression: need to choose a canonical blob format (protobuf vs flatbuffers) that balances deserialization latency and storage size.
+
+Owners and contacts
+-------------------
+- Design owner: Maya Chen (eng-serving-runtime)
+- Implementation lead: Luis Ortega (runtime-kernel)
+- Product sponsor: Priya Narayan (product)
+- SRE contact: Noah Kim (eng-sre)
+
+Appendices
+---------
+A. Example prefill request (JSON)
+{
+  "route": "chat.default",
+  "tenant_id": "acct_123",
+  "fingerprint": "fp:abcd1234",
+  "target_nodes": ["node-12", "node-15"],
+  "source": "auto"
+}
+
+B. Expected rollout checklist
+1. Merge controller and agent feature flags behind `hcc_enabled` remote feature flag.
+2. Complete telemetry contract and dashboard templates.
+3. Run 2-week canary and collect SLA delta report.
+4. Prepare customer-facing docs and Private deployment packaging.
+
+C. Related reading
+- KV cache management (runtime-wiki)
+- Serving batching and prefix handling design doc
+
+Notes
+-----
+This spec is intended to be an implementable blueprint for the next 6–9 months. Detailed implementation PRDs (storage format, RPC schemas, and PB formats) will be published as follow-ups and linked from the related_pages list.

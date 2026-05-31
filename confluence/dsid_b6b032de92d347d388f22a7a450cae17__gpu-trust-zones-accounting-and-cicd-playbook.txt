@@ -1,0 +1,213 @@
+GPU Trust Zones — Accounting, Terraform Modules, CI/CD, and Runbook
+
+Summary
+
+This playbook defines "GPU Trust Zones": an account- and network-segmentation pattern used by the infra team to provision, bill, and operate GPU capacity across Redwood Inference cloud accounts and on-prem pockets. The document covers the Terraform modules we use, CI/CD practices for GPU node images and nodepool changes, the capacity accounting model, and an operational runbook for common incidents (preemption, noisy-neighbor, autoscaler thrash).
+
+Intended audience
+
+- Infra engineers who provision GPU pools
+- SREs on GPU oncall
+- Platform engineers building autoscale and rollout tooling
+- Finance/ProdOps for capacity planning and chargeback
+
+Scope
+
+- Applies to: hosted GPU capacity in AWS (primary), GCP (secondary), and supported on-prem racks managed by the private-deploy team.
+- Not covered: model training workloads (handled by data-science infra), GPU experiments for bench/benchmarks (see eng-serving-runtime/benchmarking-and-perf-suite).
+
+Goals and constraints
+
+- Clear ownership per trust zone (owner_team + oncall) and billing tag parity across clouds.
+- Terraform-first provisioning; no manual long-lived changes in console.
+- CI/CD pipelines produce immutable GPU node images with reproducible drivers and CUDA stacks.
+- Safety SLOs: 99.95% node-pool availability for Dedicated zones; 99.9% for burst/best-effort zones.
+
+Definitions
+
+- Trust Zone: a cloud account or account-folder + VPC + nodepool set with unified billing tags and ACLs.
+- Nodepool: a set of instances with same SKU (e.g., g5.2xlarge / a2-highgpu-1g), taints/labels, and lifecycle policy.
+- Accounting Unit: the reporting granularity: zone/day/instance-type.
+
+Owners
+
+- Primary owner: infra/gpu-capacity (rotation: infra-oncall)
+- Billing owner: finance-cloud-ops
+- Security reviewer: security-infra
+- CI/CD owner: infra-ci
+
+High-level architecture
+
+- Each Trust Zone is created from the terraform module: redwood/gpu-trust-zone (registry/internal repo: infra-iac/gpu-trust-zone).
+- The module provisions:
+  - Cloud account (or subproject folder) bindings and required roles
+  - VPC, subnets, routing, NAT and egress rules according to network standards
+  - IAM roles, KMS key binding for nodepool bootstrap secrets
+  - Nodepool autoscaler config and managed instance group / node template
+  - Cloud billing tags and labels enforced by policy
+
+Terraform modules and repo layout
+
+- infra-iac/gpu-trust-zone (canonical module):
+  - inputs: zone_name, billing_tag, sku_buckets (list), max_nodes, min_nodes, preferred_zones
+  - outputs: nodepool_ids, iam_role_arn, subnet_ids, autoscaler_policy_id
+  - example usage snippet:
+
+    module "gpu_zone_prod" {
+      source       = "git::ssh://git.internal/redwood/infra-iac.git//modules/gpu-trust-zone"
+      zone_name    = "prod-gpu-a"
+      billing_tag  = "team:ml-platform"
+      sku_buckets  = ["a100:32gb", "g5:16gb"]
+      min_nodes    = 4
+      max_nodes    = 64
+    }
+
+- infra-iac/gpu-node-bootstrap (helper module): handles node image bootstrapping, driver install, and NVMe ephemeral mount.
+- infra-iac/account-binding (cross-account IAM and organization policies): ensures billing tag enforcement and private CA trust.
+
+Module lifecycle
+
+- Module changes must follow the module lifecycle guidelines: feature branch -> module regression tests -> module e2e in a staging trust zone -> canary apply in a non-prod trust zone -> prod apply.
+- Module changes that touch IAM or KMS require security sign-off and a 48-hour emergency rollback window in the change ticket.
+
+CI/CD pipeline
+
+- Repositories:
+  - infra-iac (Terraform modules)
+  - infra-images/gpu-node (Packer + Docker build scripts)
+  - infra-cd (pipeline definitions: GitHub Actions / CloudBuild / CodeBuild)
+
+- GPU node image pipeline (high level):
+  1. PR to infra-images/gpu-node triggers tests: unit (packer lint), hash pin check, driver smoke in ephemeral GCP project
+  2. Build immutable image (Packer) producing artifact: redwood-gpu-node-YYYYMMDD-HASH (GCP image / AMI)
+  3. Register image in image-catalog service (artifact store) and sign manifest
+  4. Create release tag and emit image metadata into infra-cd for downstream Terraform use
+
+- Terraform pipeline for trust zone changes:
+  1. PR to infra-iac triggers static checks (tflint, checkov), plan, and a plan comment with diff
+  2. Approvers required: owner_team and one security reviewer for sensitive changes
+  3. Merge triggers a staged apply: apply-staging -> smoke-tests against staging trust zone -> scheduled canary apply for prod (time-window)
+  4. Post-apply validation job validates node counts, labeling, and autoscaler behavior
+
+Image immutability and driver policy
+
+- Driver versions are pinned in infra-images and recorded in the image manifest. We only rotate drivers via a staged rollout.
+- Emergency driver patch path: image-build -> canary nodegroup rollout -> rollback within 30 minutes if GPU error rate > 2%.
+
+Capacity accounting and cost model
+
+- Accounting granularity: daily per-trust-zone per-instance-type. Reports generated by the billing-aggregator service (internal) and exported to BigQuery/Redshift.
+- Tags required for accounting:
+  - billing:team
+  - billing:project
+  - billing:workload_type (production | staging | burst)
+  - owner:email
+
+- Cost allocation rules:
+  - Dedicated zones: 100% chargeback to owning team
+  - Shared/burst zones: pro-rated by CPU/GPU-hours with a premium multiplier for burst usage (x1.25) to discourage unbounded burst
+
+- Example cost table (reference):
+  | instance_type | baseline_hourly | effective_hourly (with overhead) | billing_bucket |
+  | a100-80gb     | $8.40           | $9.05                           | dedicated-prod |
+  | g5-16gb       | $2.10           | $2.26                           | burst          |
+
+Operational runbook
+
+Incidents covered: node preemption, autoscaler thrash, network egress failures, NVMe corruption, noisy neighbor.
+
+1) Node preemption detected (spot/preemptible interruption)
+  - Trigger: alert GPU_PREEMPTION_RATE > 0.8% over 5m OR node termination events spiking
+  - Initial steps:
+    1. Oncall acknowledges and tags incident with trust-zone: <zone>
+    2. Check autoscaler logs and look for scaling activity: kubectl -n infra logs deploy/autoscaler --since=10m
+    3. If preemption rate is localized to a SKU or AZ, update autoscaler weight to avoid that SKU: infra-cd runbook patch -> increase preference for on-demand SKU pool
+  - Mitigation:
+    - For production-critical pools, temporarily increase min_nodes of on-demand pool by 10% using terraform variable override via runbook pipeline
+    - If preemption is cloud-wide, open ticket with cloud-support and follow provider escalation matrix
+  - Postmortem: capture preemption events, cost delta, and whether workload experienced failures
+
+2) Autoscaler thrash (oscillating scale up/down)
+  - Trigger: scaling events > 6 in 1 hour for same nodepool
+  - Steps:
+    1. Pause autoscaler: terraform set autoscaler.cooldown = 600s (via infra-cd safe patch)
+    2. Inspect workload queue/backlog metrics and per-node utilization
+    3. If safe, increase target utilization threshold by 10% to reduce oscillation
+    4. Re-enable after stabilization and monitor for 2 hours
+
+3) Noisy neighbor (GPU processes monopolizing single node)
+  - Detection: node-level GPU_utilization > 95% while pod_count < expected or sudden increase in eviction events
+  - Action:
+    1. Identify offending pod/container via cuda-smi + nodefs metrics
+    2. If tenant-owned, contact owner: owner:email tag
+    3. If infra-managed (system job), cordon and drain node and reprovision
+
+Runbook commands and quick references
+
+- Terraform plan: cd infra-iac && make terraform-plan ZONE=prod-gpu-a
+- Force apply (only with approver): infra-cd apply --zone prod-gpu-a --run-as infra-oncall
+- Build node image: cd infra-images/gpu-node && make build PACKER_VAR_image_tag=canary
+- Validate node health: curl -s http://node-metrics.internal/zone/prod-gpu-a/health | jq '.'
+
+Rollout checklist (pre-apply)
+
+- [ ] PR passes tflint/checkov and at least one infra owner approves
+- [ ] Billing tags added and validated by tag-linter
+- [ ] Image manifest exists and signature verified
+- [ ] Scheduled maintenance window for canary apply (UTC+2 for EU zones)
+- [ ] Security review complete if IAM/KMS changes
+- [ ] Backout plan documented with terraform state snapshots
+
+Post-apply validation (automated)
+
+- Nodepool count matches plan within 2
+- Labels and taints present on all new nodes
+- Autoscaler observed desired behavior under synthetic load (load-generator job)
+- Billing tag appears in cost-export within 24 hours
+
+Monitoring and Alerts (key thresholds)
+
+- Nodepool availability SLO: 99.95% (alert at 99.9%)
+- GPU error rate: alert if > 1% per hour
+- Preemption rate: alert if > 0.5% per 5m for production pools
+- Autoscaler churn: alert if > 6 scale cycles per hour
+- Billing anomaly: alert finance if daily cost delta > 20% vs rolling 7-day
+
+Documentation and knowledge sharing
+
+- Module README templates must include: inputs, outputs, example usage, upgrade notes, rollback procedure.
+- Keep a calendar of scheduled canaries and module upgrades in infra-team calendar: infra-team/schedule
+- Weekly postmortems for GPU oncall incidents are published to eng-infra/incident-review
+
+Appendix A — Quick Terraform variable reference
+
+- zone_name: string (e.g., prod-gpu-a)
+- billing_tag: string (team:ml-platform)
+- sku_buckets: list(string) (preferred SKUs)
+- min_nodes, max_nodes: int
+- autoscaler.cooldown: seconds
+
+Appendix B — Troubleshooting snippets
+
+- Check node allocation by SKU (aws): aws ec2 describe-instances --filters "Name=tag:nodepool,Values=prod-gpu-a" --query 'Reservations[*].Instances[*].[InstanceType,State.Name,Tags]'
+- GCP image import status: gcloud compute images describe redwood-gpu-node-YYYYMMDD-HASH --project=images-redwood
+- Fleet-level metric query (example BigQuery): SELECT zone, instance_type, SUM(gpu_hours) FROM `billing.dataset.gpu_usage` WHERE date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY) AND CURRENT_DATE() GROUP BY zone, instance_type
+
+Related pages and references
+
+- infra-iac: internal module registry and lifecycle docs
+- infra-images/gpu-node: image build and driver pinning
+- eng-infra/cloud-accounts-and-networking/cross-account-gpu-vpc-modules-and-network-runbook
+- eng-infra/gpu-fleet-and-capacity/gpu-fleet-scaling-metrics-and-oncall-runbook
+
+Contact and escalation
+
+- Primary oncall: infra-oncall@redwood.example.com
+- Escalation: infra-lead@redwood.example.com -> lori@redwood.example.com (pager)
+- Finance queries: cloud-billing@redwood.example.com
+
+Change history
+
+- 2024-11-15: Initial draft by Aisha Patel
+- 2025-06-30: Added CI/CD image signing and registry details (reviewed by Lena Ortiz)
+- 2026-02-05: Revised SLOs and added autoscaler cooldown guidance

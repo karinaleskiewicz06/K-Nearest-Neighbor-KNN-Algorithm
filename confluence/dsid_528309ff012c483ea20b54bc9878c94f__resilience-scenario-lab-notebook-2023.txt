@@ -1,0 +1,150 @@
+Resilience Scenario Lab Notebook
+
+Overview
+
+This lab notebook captures a set of reproducible resilience experiments for the Redwood serving runtime. It is intended to standardize how we exercise fallback, graceful degradation, kernel scheduling perturbations, and observability plumbing in a controlled environment so that results are comparable across releases and hardware types. The notebook cross-references profiling playbooks and benchmarking suites and provides explicit run instructions, telemetry targets, and postmortem templates.
+
+Goals
+- Establish a repeatable experiment matrix to validate runtime behavior across failure domains.
+- Produce telemetry-based acceptance criteria for degradation modes (latency SLOs, degradation SLOs, error budgets).
+- Provide runbook actions and mitigation patterns for observed failure classes.
+- Capture kernel-scheduler-specific knobs and their observable side effects.
+
+Audience
+- Runtime engineers running kernel scheduler experiments.
+- SREs validating release gates for degradation behavior.
+- Benchmarking and profiling teams creating long-running simulations.
+
+Experiment matrix (high level)
+| Scenario ID | Fault injected | Target surface | Primary metric | Secondary metrics | Expected outcome |
+|-------------|----------------|----------------|----------------|-------------------|------------------|
+| R-01 | KV cache miss storm (eviction) | KV cache subsystem | p50/p95 tail latency | per-token cost, kernel occupancy | graceful warmup, bounded p95 increase < 2x |
+| R-02 | Kernel slow-path insertion | kernel execution pipeline | kernel execution time (ms) | global request queuing, GPU utilization | detect and isolate slow kernel to degraded slot |
+| R-03 | Network partition to region | smart routing / fallback | request success rate | failover latency, extra cost | automated region fallback within configured policy |
+| R-04 | Mixed-tenant noise (burst) | scheduler admission controller | SLA-preserving fraction | token throughput, eviction rate | admission controller sheds best-effort traffic, preserves priority SLOs |
+
+Prerequisites and lab topology
+- Kubernetes cluster with node pools representing heterogeneous accelerators (A100, H100).
+- Canary model bundle named `gpt-lite-canary:v3` pinned for test.
+- Runtime image with experimental scheduler flags built: `redwood/runtime:test-experiments-2023-11`
+- Access to the synthetic workload generator (`/opt/bench/synth-load`) and the profiling collector (`/opt/bench/trace-collector`).
+- Telemetry stack: Prometheus remote write to test TSDB, Jaeger for traces, Loki for logs.
+
+Environment variables and config snippets
+- Example scheduler config (yaml):
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scheduler-experiment-config
+data:
+  admission_policy: |
+    priority_classes:
+      - name: interactive
+        weight: 100
+      - name: background
+        weight: 10
+    kernel_hints_enabled: true
+    max_cohort_size: 64
+
+- CLI to deploy synthetic traffic: 
+/sbin/benchctl --target http://runtime-canary.test --concurrency 120 --qps 400 --profile mixed_length_corpus.json --ramp 60s
+
+Injection recipes (step-by-step)
+1) KV cache eviction storm (R-01)
+   1. Start baseline capture (prometheus job: `baseline-run`, 5m).
+   2. Launch synth workload at 60% p95 load for 3 minutes.
+   3. Force eviction: `kubectl exec -it kvcache-controller -- ./evict --rate 5000 --duration 120`
+   4. Observe warmup trajectory in `runtime.kvcache.hits` and `runtime.kvcache.evictions`.
+   5. If p95 latency > 2x baseline for > 10m, record as failure and follow mitigation playbook.
+
+2) Kernel slow-path perturbation (R-02)
+   1. Enable fault injection in kernel plugin: set `KERNEL_FAULT_INJECTION=enabled` on canary pods.
+   2. Apply an experimental kernel that introduces a 15–50ms tail in attention compaction: `kubectl set env deployment/runtime-canary KERNEL_VARIANT=slowpath-test`
+   3. Run the microbenchmark harness: `/opt/bench/kernel-bench --model gpt-lite --seq 1024 --iters 1000`
+   4. Collect traces and annotate slow kernel spans with `kernel.name` tag.
+
+3) Admission controller overload (R-04)
+   1. Configure admission thresholds: `max_slot=512`, `background_share=0.08`.
+   2. Create a background blast: `benchctl --tenants background --concurrency 800 --qps 1200 --duration 600` while keeping interactive load steady.
+   3. Verify that `scheduler.admitted_by_priority` shows interactive preserved > 95%.
+
+Telemetry signals and dashboards
+- Primary signals (Prometheus metrics):
+  - `runtime.request.latency_seconds{quantile}` (p50/p95/p99)
+  - `kernel.exec_time_ms` (histogram)
+  - `runtime.kvcache.hits` and `runtime.kvcache.evictions`
+  - `scheduler.admitted_requests_total{priority}`
+  - `gpu.utilization_percent` and `gpu.memory.allocated_bytes`
+- Traces: span annotations for `kernel.exec`, `kvcache.lookup`, `request-routing`.
+- Log patterns to watch for (Loki):
+  - \"kernel-slow-path\" entries with stack context
+  - \"eviction-threshold-crossed\" events
+
+Acceptance criteria (per scenario)
+- R-01: After cache-storm ends, p95 should return to baseline within 5x median warmup time and not exceed 2x baseline for more than 10 minutes.
+- R-02: Slow kernel must be isolated to experimental cohort; global p95 must not exceed SLA target (200ms) for interactive tier.
+- R-04: Priority-preservation target >= 95% for interactive requests; background throttled to maintain SLO.
+
+Profiling playbook excerpt (when experiment diverges)
+1. Snapshot kernel-level histograms (use `kernel-bench --dump-histogram`).
+2. Correlate kernel spans with GPU metrics over the same timestamp window.
+3. Increase tracing sampling to 100% for suspect cohort for 10 minutes and collect full spans.
+4. Run a controlled microbenchmark that isolates sequence length and batch size to reduce confounders.
+5. Annotate the experiment run with `experiment_id` and add to the experiment registry.
+
+Runbook actions (triage ladder)
+1. Detect: Alert fires for p95 > SLO for two consecutive 1m windows.
+2. Contain: Flip `admission.shed_noninteractive=true` and reduce `max_cohort_size` by 50%.
+3. Isolate: Move suspect kernel variant to a canary node pool with `kernel_taint=experimental`.
+4. Recover: Roll back the kernel image or increase the admission reserve for interactive priority.
+5. Remediate: Create a ticket and schedule a root-cause profiling run with relevant owners.
+
+Known issues catalog (excerpt)
+- Issue K-117: Intermittent NVLink degradation causes higher than expected kernel exec variance. Workaround: enable `nvlink-probe` and auto-evacuate pods with > 2% packet-loss. Status: monitoring.
+- Issue R-204: Admission controller miscalculates slot cost when session KV prefetch is enabled. Workaround: disable prefetch for background classes. Status: mitigated in 2024-01 patch.
+
+Release gating checklist (for runtime release candidate)
+- Run R-01 through R-04 matrix against target release image on both A100 and H100 node pools.
+- All acceptance criteria met for interactive priority on both hardware types.
+- No new entries in known issues catalog with severity P0/P1.
+- Profiling artifacts (trace and kernel histograms) uploaded to experiment registry and linked from release notes.
+
+Postmortem template (use for any failed run)
+1. Summary: one-sentence description of what failed.
+2. Timeline: ordered list of events with timestamps.
+3. Impact: customers/tenants affected, SLO burn observed.
+4. Root cause hypothesis and evidence.
+5. Actions taken: contain/isolate/recover.
+6. Long-term fixes and owners.
+7. Regression test to prevent future recurrence.
+
+Ownership and contacts
+- Experiment owner: Asha Patel (runtime reliability).
+- SRE liaison: Michael Chen.
+- Kernel scheduling SME: Olivia Ruiz.
+
+Appendix A — Example synthetic workload (json)
+{
+  \"name\": \"mixed_length_corpus\",
+  \"shapes\": [
+    {\"seq\": 64, \"weight\": 0.6},
+    {\"seq\": 512, \"weight\": 0.25},
+    {\"seq\": 1024, \"weight\": 0.15}
+  ],
+  \"behavior\": \"bursty\"
+}
+
+Appendix B — Common troubleshooting commands
+- Stream request traces for a given request id: `kubectl logs runtime-canary --follow | jq -r \'select(.request_id==\"<id>\")\'`
+- Dump kernel histograms: `kubectl exec -it kernel-agent -- /opt/bin/kernel-stats --dump`
+- Force scheduler admission snapshot: `curl -X POST http://scheduler.test/admin/snapshot`
+
+Notes and next steps
+- Add R-05 (region failover under partial DNS outage) to next quarter's matrix with a focus on client retry behavior.
+- Formalize exact graph panels and dashboard ids referenced here and add them to the shared dashboard library.
+- Convert the lab harness into an automated CI job that runs on each candidate release image.
+
+Document history
+- 2023-11-07: Created by Asha Patel.
+- 2024-02-15: Expanded acceptance criteria and added R-04 admission controller scenario.

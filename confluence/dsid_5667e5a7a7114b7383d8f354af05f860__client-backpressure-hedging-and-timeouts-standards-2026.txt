@@ -1,0 +1,187 @@
+Client Backpressure, Hedging, and Timeout Standards
+
+Summary
+
+This document defines Redwood's cross-cutting standards for client-side backpressure, request hedging (duplicate/backup requests), timeouts, and related retry/circuit-breaker behaviour. The goal is to ensure predictable latency, protect model-serving capacity, avoid cascading failures across services, and provide consistent telemetry for SLOs and incident response. These standards apply to: Redwood public-facing APIs, internal microservices, Redwood Dedicated control planes, and any Private deployment agent code maintained by Redwood.
+
+Motivation and scope
+
+Observed issues (motivation):
+- Spikes in upstream latency causing large retry storms and cascading capacity exhaustion.
+- Client libraries with inconsistent default timeouts/hedging leading to unpredictable tail latency.
+- Lack of uniform metrics makes it hard to distinguish client-side timeouts from server-side throttling in alerts.
+
+Scope (applies to):
+- All HTTP/gRPC clients in Redwood-managed services and official SDKs.
+- Edge proxies and API gateways (as the first line of defense).
+- Model-serving request paths where per-token latency can amplify resource impact.
+
+Definitions
+
+- Backpressure: Mechanisms by which a client (or proxy) limits the rate at which it sends requests to a downstream service.
+- Hedging (backup requests): Sending a duplicate request to an alternate replica/region after a short delay to reduce tail latency.
+- Timeout: Maximum wall-clock time a caller waits for a response before giving up.
+- Retry: Resending a request after a failure; distinct from hedging because retry is triggered after failure, hedging proactively sends duplicates.
+- Circuit breaker: State machine that stops attempts to a target when error rates/timeouts exceed thresholds.
+
+Standards (overview)
+
+1) Default timeout and deadline policy
+- Public SDKs and internal clients MUST set a default per-request deadline for user-facing generation endpoints: 15 seconds for short completions (<=512 tokens), 45 seconds for long completions (>512 tokens). These defaults can be overridden by developer intent via explicit call parameters.
+- Internal control/management plane APIs (e.g., model upload, rollout control) MAY use longer defaults (120s) but should document the reason.
+
+Rationale: Model generation has high variance; explicit defaults prevent indefinite waits and make downstream capacity planning tractable.
+
+2) Hedging policy (when to use backup requests)
+- Hedging SHOULD only be enabled in high-SLA, read-heavy, stateless query paths where duplicate execution is cheap (e.g., embedding, retrieval, short-chat queries).
+- Hedging SHALL NOT be enabled for any state-changing endpoints (e.g., billing operations, provisioning, annotation ingestion) unless idempotency guarantees and duplicate-suppression are implemented.
+- Hedge delay default: 50th percentile p50_latency * 0.6, bounded to [25ms, 200ms]. Example: if p50=200ms, hedge delay=120ms.
+- Max outstanding hedged duplicates per client: 1 (i.e., one backup request only).
+
+3) Retry policy (after explicit failure)
+- Favor exponential backoff with jitter. Default retry window: up to 3 attempts (initial + 2 retries). Backoff base: 100ms, multiplier: 2x, max backoff: 1.6s. Add randomized jitter of +/-20%.
+- Retries are only allowed for idempotent or safe-to-retry endpoints (GET/embeddings status checks). For non-idempotent endpoints, return the original error to caller and surface guidance.
+
+4) Circuit breakers and failure-domain mapping
+- Each downstream dependency MUST have a circuit-breaker configuration in the client wrapper with the following default thresholds:
+  - Rolling window: 60s
+  - Request volume threshold: 50
+  - Error ratio trip threshold: 25%
+  - Reset timeout (half-open check): 30s
+- Circuit breakers must be tagged with service and failure-domain (region, availability-zone, model-variant) for observability.
+
+5) Backpressure signals and client-side queuing
+- Clients MUST expose an admission control limit (max_in_flight) to avoid unbounded request spikes. Defaults: 200 concurrent short requests per client process; 50 concurrent long-generation requests per client process.
+- When admission limit is reached, clients MUST return 429 to local callers with Retry-After header, rather than queuing indefinitely. Internal SDKs should provide a configurable in-process queue with a bounded TTL (default 2s) that returns 429 if full.
+
+6) API contract and headers
+- To aid observability and coordinated throttling, clients MUST propagate these headers on every request:
+  - X-Request-Deadline: absolute RFC3339 timestamp of deadline
+  - X-Client-Max-In-Flight: configured max_in_flight value
+  - X-Hedge-Attempt: 0/1 (0 for primary, 1 for hedged replica)
+  - X-Caller-Id: internal caller/team id
+- Servers SHOULD honor X-Request-Deadline for graceful cancellation and should return X-Observed-Processing-Time in the response for debugging.
+
+Telemetry and SLO integration
+
+Metrics (per client and per upstream target):
+- client.requests_total{outcome=success|timeout|error|hedged_success} (counter)
+- client.latency_ms{quantile} (histogram/summary)
+- client.in_flight (gauge)
+- client.hedge_attempts_total (counter)
+- client.retry_attempts_total (counter)
+- client.circuit_open{target} (gauge boolean)
+
+Standard alerting thresholds (examples):
+- P95 latency increase > 2x baseline for 10m -> P1 alert to owning service.
+- Circuit breaker opens for more than 3 consecutive reset windows -> P1.
+- Ratio of hedged_success / success > 0.2 sustained for 30m -> investigate upstream tail latency.
+
+Tracing and logs
+
+- Every request SHOULD include a trace span with tags: service.target, model.variant, hedge=0/1, request.deadline. Hedged requests must share a parent trace id with the primary and set the attribute hedged=true for the backup attempt.
+- Logs should record per-request decision points: admission drop, hedge launched, retry attempted, circuit breaker state change. Include request id and caller id.
+
+Configuration examples
+
+Example client YAML configuration (recommended defaults):
+
+---
+client:
+  max_in_flight:
+    short: 200
+    long: 50
+  timeouts:
+    short_default_ms: 15000
+    long_default_ms: 45000
+  hedging:
+    enabled: true
+    enabled_for: ["embedding", "query"]
+    max_duplicates: 1
+    hedge_delay_strategy: "p50*0.6"
+  retries:
+    max_attempts: 3
+    base_backoff_ms: 100
+    multiplier: 2
+    max_backoff_ms: 1600
+  circuit_breaker:
+    window_s: 60
+    volume_threshold: 50
+    error_ratio: 0.25
+    reset_s: 30
+---
+
+SDK usage example (pseudo-code):
+
+// JavaScript pseudo-code using Redwood SDK
+const resp = await redwood.client.generate({
+  model: 'openlm/c30-xxl',
+  prompt: 'Summarize quarterly revenue',
+  timeoutMs: 20000, // overrides default for this call
+  hedging: { enabled: true }
+});
+
+Edge / API gateway rules
+
+- API gateways (Envoy/Traefik) MUST enforce a hard request timeout no greater than the client's deadline + 1s to avoid proxy-induced indefinite waits.
+- Gateways SHOULD emit a standardized client timeout response body with fields: request_id, original_deadline, observed_processing_time_ms, and recommended_retry_after_seconds.
+
+Testing and rollout guidelines
+
+1) Unit and integration tests
+- Client libraries MUST include unit tests that validate header propagation, deadline cancellation, and hedging metrics.
+- Integration test harnesses should include a fault-injection mode (inject artificial 95th-percentile latency at upstream) and validate: hedging launches, duplicate suppression for stateful endpoints, and circuit-breaker behavior.
+
+2) Canary rollout checklist for enabling hedging in a service
+- Start with hedging disabled.
+- Canary 1: 1% traffic, observability only (do not hedge; emit metric as if hedging occurred). Duration: 24 hours.
+- Canary 2: 5% traffic, hedging enabled against cold standby replica; run 48 hours. Monitor hedged_success ratio, error rates, and downstream CPU/GPU utilization.
+- Canary 3: 25% traffic, full observability and throttling. Duration: 72 hours. If hedged_success>0.2 or downstream utilization increases >15% without latency improvement, rollback.
+
+Operational playbook (runbook excerpt)
+
+When alerts indicate client-side pressure or hedging spikes:
+1) Identify top clients by client.caller_id and top targets by service.target.
+2) Check admission drops (client.in_flight at limit). If admission triggered: scale clients horizontally OR adjust max_in_flight short-term with caution.
+3) If hedged_success ratio is high and circuits are opening upstream, reduce hedging traffic by toggling hedging.enabled_for to a smaller subset.
+4) If circuit-breakers remain open after multiple reset windows, escalate to owning service and consider temporary capacity boost for critical model variants.
+
+Ownership and exceptions
+
+- Owning teams: client-side library owners (SDK team) are primary for defaults. Each service owns its local configuration and must declare deviations in service README.
+- Exceptions: Any deviation from defaults (timeouts, hedge enabled for non-stateless endpoints) requires an ADR filed in architecture-and-standards/decision-records and approval from the Observability and Serving Runtime owners. Submit exceptions via PR to this directory with the same metadata envelope.
+
+Security and privacy considerations
+
+- Hedging duplicates must not leak ephemeral credentials or secrets to additional targets. All credentials must be fetched from safe stores per request, and hedged requests must use the same credential context as the primary.
+
+Decision log (summary of why this policy exists)
+
+- 2025-09: Postmortem for incident INF-2025-09 identified retries and missing client deadlines as primary contributors to cascading GPU exhaustion.
+- 2025-10: Experimentation showed hedging reduces P99 by up to 30% in queries but increases total token compute by 8% when broadly enabled. Therefore hedging is limited to stateless read paths and bounded duplicates.
+
+Appendix: Quick reference table
+
+| Area | Default | Notes |
+|---|---:|---|
+| Short request timeout | 15s | <=512 tokens, SDK default |
+| Long request timeout | 45s | >512 tokens |
+| Hedge delay | p50*0.6 (min 25ms, max 200ms) | 1 backup max |
+| Max in-flight short | 200 | per client process |
+| Circuit breaker window | 60s | volume threshold 50, error ratio 25% |
+
+Related reading
+
+- RFC: Hedging and backup requests in high-scale RPC systems (internal link)
+- Load-shedding and graceful degradation patterns (internal playbook)
+- Observability SLI catalog (for metric names and dashboards)
+
+Contact and ownership
+
+For questions or to propose changes: contact Maya Patel (owner) or the SDK team slack channel (#sdk-developers).
+
+Revision history
+
+- 2025-11-12: Created by Maya Patel (initial draft).
+- 2025-12-08: Updated hedging bounds after experiments (reviewers: Ethan Zhao).
+- 2026-02-18: Clarified header contract and added API gateway guidance (reviewers: Rashmi Verma, Luis Ortega).

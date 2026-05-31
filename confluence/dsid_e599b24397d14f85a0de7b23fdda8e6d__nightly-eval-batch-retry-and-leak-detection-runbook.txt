@@ -1,0 +1,159 @@
+Nightly Eval Batch Retry and Leak Detection Runbook
+
+Overview
+
+Purpose:
+This runbook describes detection, automated mitigation, and manual triage steps for nightly evaluation batches that run on ephemeral GPU pools. It covers transient failure retries, throttling/backs-off, memory and kernel-level leak detection, CI/CD deployment patterns for safe rollouts, and post-incident actions. Intended audience: oncall SRE, infra engineers supporting eval workloads, and CI/CD owners.
+
+Scope:
+- Nightly eval jobs (scheduled via GitHub Actions / Scheduler) that run models on the eval cluster
+- Ephemeral GPU pools provisioned by the eval CI pipeline
+- Supporting services: model-store, artifact-registry, metrics (Prometheus), logging (ELK/Datadog), cluster controller (Kubernetes), and Terraform modules for pool provisioning
+
+Key SLAs/Targets
+- Job completion SLO: 95% of nightly jobs complete within 2 hours (for standard test sets)
+- Alerting threshold: >10% job failure rate across the nightly window or >30m sustained GPU memory pressure above 85% on any node
+- Escalation trigger: repeated job failures for 3 consecutive nights or any detected resident process leak that fails auto-heal
+
+Quick links
+- CI pipeline: repo: infra/eval-ci (GitHub)
+- Terraform module: sources/infra/modules/ephemeral-gpu-pool
+- PagerDuty: #infra-eval (service id: PD-ENG-EVAL)
+- Dashboards: Grafana > Evaluations / Nightly Batch Overview
+
+Preconditions and ownership
+- Owner (primary): infra/sre (oncall rotation)
+- Owner (secondary): eng-serving-runtime (eval pipeline author)
+- Assumed IAM roles: oncall role + terraform-deployer for reprovision steps
+- Required access: kubectl to eval namespace, cloud console (GCP/AWS) with read/write to compute & IAM, access to artifact storage
+
+Automated defenses (what runs automatically)
+1) Orchestrator retry policy (configured in pipeline):
+   - Per-job: 2 automatic retries for transient errors (network, container OOM) with exponential backoff (1m, 5m).
+   - Global: if >25% of concurrent jobs hit transient errors, gate further launches and notify oncall.
+2) Node eviction & reprovision:
+   - Nodes flagged for kernel OOMs or sustained GPU ECC errors are cordoned and drained automatically by node-manager with a reprovision ticket.
+3) Memory leak auto-heal:
+   - Lightweight leak detector runs as a sidecar on long-running eval tasks. If resident GPU memory continues to increase for 30m and process count stays steady, the detector signals the controller to restart the pod once.
+4) Cost throttle:
+   - Daily GPU spend cap for eval namespace enforced by quota-manager (soft limit at 80% + notifications, hard stop at 100%).
+
+Detection: Alerts and signals to watch
+- Prometheus metrics to track (examples):
+  - gpu_mem_total, gpu_mem_used, gpu_utilization_percent
+  - kube_pod_container_status_restarts_total (look for steady increase)
+  - node_kernel_oom_count
+  - eval_job_duration_seconds_bucket
+- Important logs:
+  - pod logs (kubectl logs -n eval <pod>)
+  - node dmesg and /var/log/messages for GPU driver errors
+  - controller manager logs when pods are evicted/unscheduled
+
+Alert playbook (ordered)
+1) PagerDuty trigger: nightly-job-failure-rate-high or gpu-memory-pressure-high
+2) Oncall run initial checks (see "Initial triage")
+3) If auto-heal succeeds: close PD with runbook note and monitor for 6h
+4) If failures persist or leak suspected: escalate to infra/sre senior and create postmortem ticket (link to template)
+
+Initial triage (first 10 minutes)
+1) Identify failing job IDs:
+   - GitHub Actions: check workflow run summary for failing job names
+   - Internal scheduler UI: list of job IDs and owners
+2) Check cluster health (use eval namespace):
+   - kubectl get nodes -o wide | grep eval
+   - kubectl top nodes | sort -k3 -n (watch GPU memory/use)
+3) Inspect an affected pod:
+   - kubectl describe pod <pod> -n eval
+   - kubectl logs <pod> -c main -n eval --since=30m
+   - kubectl logs <pod> -c leak-sidecar -n eval --since=30m
+4) Check node-level diagnostics if multiple pods on same node fail: 
+   - ssh to node (or use cloud console) and run: dmesg | tail -n 200; nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv -l 1
+   - journalctl -u kubelet -n 200
+5) Verify controller behavior: has kube-scheduler or custom node-manager cordoned/drained the node? kubectl get pods -o wide -n kube-system | grep node-manager
+
+Containment steps (if immediate action required)
+- If single pod shows leak behavior: restart the pod with annotation to skip immediate retry: kubectl annotate pod <pod> meta/restart-skip=true -n eval && kubectl delete pod <pod> -n eval
+- If node-level driver failure: cordon the node and reprovision: kubectl cordon <node>; kubectl drain <node> --ignore-daemonsets --delete-local-data; open repro ticket and trigger node-manager reprovision
+- If quota/cost limit reached: pause new nightly pipeline runs by toggling the pipeline flag (infra/eval-ci > Settings > Disable nightly) and escalate to cost owners
+
+Mitigation and safe rollback (10–60 minutes)
+1) Disable new runs: toggle nightly flag to prevent additional job starts.
+2) Scale down parallelism: reduce parallel shards from N to max(4, floor(N/2)) via the pipeline matrix override.
+3) Switch to smaller model artifact (fallback): update pipeline to point to the fallback model-version tag (documented in model-store) and re-run a single job to validate.
+4) If a Terraform-level quota or VPC misconfiguration caused the issue, run the terraform plan/apply from infra/terraform/playbooks/eval-pool-fixes with the oncall deployer role. Follow the Terraform deploy checklist below.
+
+Terraform deploy checklist (when modifying pools or nodes)
+1) Ensure you have the terraform-deployer role and run: terraform init
+2) terraform plan -var-file=secrets.tfvars -out=tfplan
+3) Share tfplan with peer reviewer and obtain approval in PR
+4) terraform apply tfplan && verify node replacement in cluster
+5) Post-deploy: run the smoke test job (infra/eval-ci > workflows > smoke) and validate metrics for 15 minutes
+
+CI/CD safe deployment pattern (recommended)
+- Use canary runs: deploy changes to the eval pipeline to 5% of nightly shards, observe two cycles, then increase to 25% before full rollout.
+- Keep a fallback artifact tag for every change (e.g., artifact: repo:eval-artifacts@vX-fallback).
+- Pipeline example snippet (sample matrix override):
+  jobs:
+    eval-run:
+      strategy:
+        matrix:
+          shard: [0..N-1]
+      steps:
+        - name: run-eval
+          uses: ./actions/run-eval
+          with:
+            model-tag: ${{ env.MODEL_TAG }}
+            retry-count: 2
+
+Leak diagnosis (deeper analysis)
+- When auto-heal restarts fail or restarts are repeated: capture a full memory profile with nvidia-persistenced and nsight/system profiler on the node (requires scheduled maintenance window).
+- Collect heap and device memory snapshots from the process using our internal profiler endpoint: curl http://localhost:9000/debug/memstate
+- Track the object growth over successive snapshots to identify survivor objects and connections to Tensor/CUDA handles
+
+Forensics artifact list (what to collect before instance termination)
+- kubectl get pod -o yaml (save manifest)
+- kubectl logs (all containers) for last 1h
+- node dmesg and nvidia-smi output
+- perf/top output from process if possible
+- profiler snapshots and model artifact version
+
+Recovery and follow-up (post-incident)
+1) If root cause identified and fix applied: create a release with changelog and link to job results
+2) If leak is in model code: assign to model-owner with a remediation deadline (default: 3 business days for high-severity regressions)
+3) If infra bug: schedule a retrospective and include action items in the weekly infra retro
+4) Update the nightly-eval test-suite with a targeted test that reproduces the leak if possible
+
+Alert and dashboard tuning suggestions
+- Add an alert rule: eval_pod_gpu_memory_growth_rate > 0.05 over 30m for pods with runtime > 20m
+- Dashboard panels: per-node GPU memory heatmap, per-job restart rate (24h), daily cost by shard
+
+Postmortem template pointers
+- Use template: /confluence/eng-infra/runbooks/postmortem-template-eval
+- Required fields for this class: impact window, number of affected jobs, cost impact estimate, root cause, RCA timeline, action items with owners and deadlines
+
+Runbook maintenance
+- Owner updates: this runbook must be reviewed quarterly by infra/sre and updated when
+  - eviction policies change
+  - pipeline retry policies change
+  - new ephemeral pool IaC modules are released
+- Changelog: maintain a short changelog section at the bottom of the document when edits are made
+
+Appendix: Common commands and snippets
+- List failing jobs (GitHub CLI): gh run list --workflow=nightly-eval --status=failed
+- Tail pod logs: kubectl logs -n eval -f <pod> -c main
+- Node GPU live metrics: nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv -l 5
+- Restart pod and avoid immediate retry: kubectl annotate pod <pod> meta/restart-skip=true -n eval && kubectl delete pod <pod> -n eval
+
+Appendix: Threshold table
+- Table (CSV style):
+  metric,warning_threshold,severe_threshold,action
+  gpu_mem_used_percent,70,90,Warn then investigate / possible cordon
+  gpu_utilization_percent,90,98,Investigate hot loop or kernel issue
+  pod_restart_rate_per_hour,2,10,Escalate and capture profile
+  nightly_job_failure_rate_percent,10,25,Throttle nightly runs and page oncall
+
+Changelog:
+- 2024-07-10: Initial draft (Marcos Alvarez)
+- 2024-09-12: Added auto-heal sidecar logic and Terraform checklist (Aisha Patel)
+- 2025-01-15: Tightened SLOs, added cost throttle step, updated CLI snippets (Liam Chen)
+

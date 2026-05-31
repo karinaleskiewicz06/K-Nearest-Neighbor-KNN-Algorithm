@@ -1,0 +1,116 @@
+Delta routing and cost-partitioning architecture for request dispatch
+
+Summary:
+
+This document describes the Delta Routing and Cost-Partitioning Architecture: a cross-cutting design that unifies request dispatch, cost attribution, and kernel scheduling signals across hosted, dedicated and private deployments. Delta Routing is intended to reduce tenant-visible latency spikes during heterogeneous workload mixes while enabling precise per-route/per-model cost partitioning for billing and autoscaling decisions.
+
+Goals and non-goals:
+
+- Goals:
+  - Provide a deterministic dispatch policy that balances latency SLOs, per-token cost targets, and GPU kernel efficiency for mixed workloads.
+  - Enable cost-partitioning signals that feed the billing pipeline and autoscaler without adding >1% p99 latency overhead.
+  - Allow graceful degradation: automated fallback to cheaper model variants or cached responses when kernel pressure threatens SLOs.
+- Non-goals:
+  - Replace local kernel mappers; Delta Routing complements kernel selection but does not reimplement device-level scheduling.
+  - Solve cold-start model loading for on-prem packages (handled by deployment bootstrap docs).
+
+High-level architecture overview:
+
+1) Ingress and classification:
+  - Incoming request enters the API gateway and is annotated with: model_id, route_id, client_tier, requested_max_tokens, streaming_flag, and idempotency_key when provided.
+  - The classifier computes a compact workload fingerprint (sequence_length_percentile, prompt_entropy_estimate, streaming_hint) used to consult local routing caches.
+
+2) Delta Router (service):
+  - Stateless microservice running in every region/edge that decides: target-serving-pool, kernel-compatibility-tag, and cost-partition-token.
+  - Inputs: runtime telemetry (kernel queue lengths, p50/p95/p99 at pool), model variants matrix (latency/cost profiles), tenant policy (latency SLO, cost cap, allowed fallbacks).
+  - Outputs: dispatch_decision = {pool, kernel_tag, priority_bucket, partition_token, fallback_reason (optional)}.
+
+3) Cost Partitioning and Attribution:
+  - Cost partition token is a short opaque ID that flows with the request through serving runtime and is appended to usage events.
+  - The runtime multiplies per-token resource units by a kernel-efficiency factor (table below) before attributing to partition_token.
+  - Partition tokens are rotated per-hour and resolved offline to human-readable cost centers to avoid per-request metadata explosion.
+
+4) Kernel scheduling signal propagation:
+  - Delta Router writes (lightweight) scheduling hints to a shared ring buffer consumed by the kernel mapper on the GPU host. Hints include priority_bucket and expected_sequence_quantiles.
+  - Kernel mapper uses hints to pick kernel implementations and adjust slice sizes; it remains authoritative for final mapping.
+
+Policy heuristics and decision rules:
+
+- Priority buckets: real-time (p99 target <= 75 ms), interactive (p99 <= 250 ms), batchable (p99 <= 2s).
+- Cost-aware routing rule: if projected cost per 1k tokens > tenant_cost_cap and a compatible quantized variant exists with <= 8% relative quality delta, prefer fallback.
+- Kernel pressure fallback: if GPU kernel queue growth rate > 30% and average kernel latency > baseline*1.5, mark pool as degraded and trigger cross-pool redistribution.
+
+Kernel-efficiency factor table (example):
+
+- fp16-optimized-kernel: 1.0
+- int8-q4-kernel: 0.62
+- grouped-attention-shard-kernel: 0.85
+- causal-seq-opt-kernel: 0.94
+
+These factors are tuned from benchmarking runs and updated monthly. The runtime multiplies raw token counts by the selected factor to produce \"resource units\" for billing.
+
+Telemetry and observability requirements:
+
+- Delta Router emits the following metrics per route and per-pool:
+  - router.dispatches_total (labels: route_id, pool_id, decision)
+  - router.fallbacks_total (labels: fallback_reason, route_id)
+  - router.latency_ms_bucketed (p50/p95/p99)
+  - router.estimated_resource_units (sum)
+- Traces must include the partition_token and a wire-level tracepoint at: ingress -> delta-router -> pool-proxy -> kernel-entry.
+- Critical logs: any decision that chooses fallback must log tenant_id, route_id, quality_delta_estimate, and reason.
+
+Profiling playbook / sampling strategy (short form):
+
+- When deploying a new routing heuristic or updated efficiency factors, enable a 5% sample of production traffic routed to A (control) and B (candidate) for 48 hours.
+- Collect kernel-level spans for sampled requests with the tag sample.delta-routing=true. Store full spans for up to 7 days; aggregated metrics for 90 days.
+- Use the local profiling CLI to extract representative traces from a given pool:
+
+  # profile sampler for pool-3 between timestamps
+  rwt profile --pool pool-3 --from 2026-02-10T12:00Z --to 2026-02-10T14:00Z --tag sample.delta-routing=true --output traces.ndjson
+
+Benchmarking guidance (workload design):
+
+- Synthesize three canonical mixes for validation:
+  - Mix A (interactive-heavy): 70% short chat (<=64 tokens), 20% medium (64–256), 10% long (>256).
+  - Mix B (embedding-and-batch): 50% embedding requests, 30% text generation (batchable), 20% reranking requests.
+  - Mix C (burst-churn): repeated high-concurrency hotspots with 1s bursts every 30s to emulate PLG spikes.
+- Metrics to record per-run: p50/p95/p99 generation latency, kernel_throughput_tokens_per_sec, gpu_utilization_by_kernel, resource_units_consumed, cold-cache_miss_rate.
+- For comparative experiments, keep deploy delta isolated: run A/B for 2M tokens or 24 hours whichever is earlier.
+
+Runbook: pool-degradation and emergency fallback (operator steps):
+
+1) Detection:
+  - Pager triggers when router.fallbacks_total for a pool > 5/min for 10 min OR p99 latency for real-time bucket exceeds SLO by >25% for 5 min.
+2) Quick Triage (5 min):
+  - Check router.dispatches_total to confirm increased dispatches to fallback variants.
+  - Query kernel mapper metrics: kernel_queue_length, avg_kernel_latency, memory_pressure.
+3) Immediate mitigations (10 min):
+  - If kernel queue growth rate > 40%: toggle pool read-only to new requests and redirect traffic to warm standby pool. Command: rwt pool set-accepting --pool pool-x --accepting false
+  - If memory pressure detected (swap or OOM events): scale down concurrency slots on the pool and enable aggressive KV-cache eviction: rwt pool tune --pool pool-x --concurrency 0.5 --kvcache-eviction aggressive
+4) Recovery actions (30–120 min):
+  - Rolling restart of GPU hosts with drain policy: follow SIGTERM drain (see sigterm-connection-drain-and-graceful-shutdown-playbook).
+  - Recompute kernel-efficiency factors if a new kernel release was deployed in the previous 72 hours.
+5) Postmortem and action items:
+  - Create incident with tags: delta-routing, pool-id, fallback. Attach sampled traces and resource-unit time series.
+  - Run a benchmark job that replays the incident workload under controlled conditions and propose changes to fallback thresholds.
+
+Interplay with release process and rollout notes:
+
+- When releasing updates that affect the router decision logic or efficiency factors, attach the following to the release: 1) a benchmark report comparing resource_units for Mix A/B/C; 2) a toggled rollout plan with 5% -> 25% -> 50% -> 100% gates and automatic rollback on p99 increase >10%; 3) updated profiling sampler config.
+
+Known caveats and edge cases:
+
+- Cross-pool affinity churn: if a model has heavy KV-cache affinity to GPU-host A and Delta Router moves a chunk of concurrent sessions to pool B, cold misses will spike. Mitigation: affinity-aware cost of migration is included in projected cost model; prefer delayed migration for long-lived sessions.
+- Partition token resolution delay: offline resolution of partition tokens can lag up to 2 hours in heavy billing windows; ensure customer-facing billing UI displays a preliminary estimate with note about reconciliation.
+- Quality cliffs on low-bit quantization: automatic fallback uses a conservative 8% quality delta threshold; for sensitive routes (payment, legal) the policy must be set to disallow quantized fallbacks.
+
+Open design questions (for future work):
+
+- Dynamic partition token aggregation windows: can we reduce billing churn by grouping partitions across short-tenure tenants?
+- ML-guided decisioning: evaluate whether a learned policy yields materially better resource vs. latency tradeoffs than heuristic routing. Planned experiment Q2 2026.
+
+Appendix: example dataflow (text diagram)
+
+Ingress -> classifier -> Delta Router -> pool proxy -> kernel mapper -> GPU kernels
+  |                                      ^
+  +-- trace: partition_token -------------+

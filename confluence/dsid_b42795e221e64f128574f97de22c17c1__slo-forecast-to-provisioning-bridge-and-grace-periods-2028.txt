@@ -1,0 +1,143 @@
+SLO Forecast-to-Provisioning Bridge and Grace Periods
+
+Summary:
+
+This runbook describes the Forecast-to-Provisioning Bridge: an automated and human-reviewed pipeline that combines short-term SLO forecasts and error-budget signals to drive capacity provisioning and automatic grace-period decisions for inference workloads (hosted API + Dedicated pools). The goal is to avoid reactive over-provisioning while preserving SLOs (latency and availability) and minimizing cost.
+
+Scope:
+- Applies to services that route production inference traffic: inference-gateway, batch-aggregator, kv-cache-proxy, and per-customer model pools managed by the Dedicated controller.
+- Covers forecast horizon up to 72 hours and immediate 0-2 hour lead-time adjustments.
+- Does NOT replace long-term capacity procurement (monthly/annual committed pools).
+
+Background and motivation:
+Historically, we either relied on static rules (overprovision) or simple autoscalers reacting to current CPU/GPU utilization. As observed in incidents INC-2026-114 and INC-2027-009, this reactive approach led to late scaling and SLO breaches during sudden model-tenant spikes. The Forecast Bridge leverages short-term demand forecasts, token-level telemetry, and error-budget burn rates to create a controlled, auditable path from forecast to provisioning.
+
+Goals and success criteria:
+- Maintain P95 latency SLO for inference-gateway at <= 220ms (global) 99% of the time for tier-1 customers.
+- Keep sustained error-budget burn-rate actions predictable and within runbook thresholds: automated mitigation for burn-rate > 3x sustained over 30m.
+- Reduce emergency capacity top-ups by 40% compared to H1 2027 baseline.
+- Reduce average peak overprovisioning by 15% via forecast-informed provisioning.
+
+Key concepts and signals:
+- forecast_window_hours: default 72h; primary forecast uses 1h and 6h aggregation buckets.
+- demand_q95_forecast: predicted 95th percentile QPS/tokens for each tenant/service for horizon buckets.
+- provisioning_headroom_ratio: default 1.15 (15% headroom over predicted 95th).
+- provisioning_lead_time: configured per pool class (see table).
+- error_budget_burn_rate: 1x means burn consistent with SLO; >1 means faster burn.
+
+Provisioning lead time by pool class (table):
+| pool_class        | target_resource | typical_lead_time |
+|-------------------|-----------------|-------------------|
+| gpu-dedicated-rt  | p4d / a100      | 60m (can be 30-120m based on region) |
+| gpu-burst-preempt | t4 / cheaper    | 10m |
+| cpu-embedding     | cpu 32v         | 5m |
+
+Inputs to the bridge:
+1) Telemetry: slo_latency_p95, slo_error_rate, token_throughput_per_min, capacity_allocated_gpus, autoscale_events_count.
+2) Forecasts: model-level demand forecasts (1h/6h/24h buckets) from the Forecasting Service (forecasting-service.redwood.internal).
+3) Policy: per-tenant SLO tier and cost caps from TenantCatalog.
+4) Error budget status: current burn rate and remaining budget window from SLO Controller.
+
+Outputs and actions:
+- Provisioning proposals: a list of resource deltas (pool, #gpus, priority) written to Provisioning Queue (provision-queue.redwood.internal).
+- Grace period assignments: short-term SLO relaxation windows (see Grace Policy) applied to specific low-tier tenants during emergency capacity exhaustion.
+- Manual review tickets when automated confidence < 0.75.
+
+Decision algorithm (high level):
+1) Aggregate forecast for each pool over the configured forecast_window_hours.
+2) Compute demand_q95_forecast for next 1h and 6h buckets.
+3) For each pool, if (demand_q95_forecast * provisioning_headroom_ratio) > current_allocated_capacity * safe_utilization_threshold then trigger provisioning proposal.
+   - safe_utilization_threshold: default 0.85 for latency-sensitive pools, 0.65 for background/embedding pools.
+4) Short-circuit: If error_budget_burn_rate > 3.0 AND slo_error_rate > SLO_THRESHOLD for tier-1 customers, elevate to emergency path (notify oncall, mark proposals high-priority).
+5) Confidence gating: the Forecasting Service returns confidence [0.0-1.0]. If confidence < 0.75, proposals are sent to the "forecast-review" human queue before commit.
+
+Grace period policy (concrete):
+- Purpose: limit customer-visible SLO violations by temporarily applying controlled relaxation to non-critical tenants while preserving tier-1 SLOs.
+- Rules:
+  - Tier mapping: tier-1 (platinum) = no automated grace. Tier-2 (gold) = allowed up to 10% latency SLO relaxation for at most 20 minutes once per 24h. Tier-3 (standard) = allowed up to 25% latency SLO relaxation or partial deprioritization for 60 minutes.
+  - Guardrails: No grace assignment if overall cluster utilization > 98% or if any legal/compliance-labeled tenant is involved.
+  - Revocation: If error_budget_burn_rate falls below 1.2 for 30m, revoke grace and re-evaluate provisioning proposals.
+
+Runbook: Automated provisioning + human review flow (step-by-step):
+1) Forecasting Service posts proposal to provision-queue with metadata: pool, delta_gpus, forecast_bucket, confidence, proposed_by=forecast-bridge.
+2) Provisioning Controller evaluates policy: cost cap check, region availability, spot-preference.
+3) If pass and confidence >= 0.9 -> auto-commit and scale with idempotent commit-id.
+4) If 0.75 <= confidence < 0.9 -> open human review ticket in PagerDuty (PD service: SRE Forecast Review). Include proposal and last 3 telemetry windows.
+5) If confidence < 0.75 OR policy flags -> create ticket and pause auto-commit. SRE oncall triages within 20 min.
+6) On commit, Provisioning Controller records commit in capacity-audit.log and triggers post-scale verification.
+7) Post-scale verification: verify slo_latency_p95, token_throughput and queue latency within 2m and 30m windows. If metrics do not improve as expected, auto-rollback commit-id and escalate.
+
+Rollback criteria and procedure:
+- Immediate rollback if post-scale verification shows no >10% improvement in queue latency after 30m OR if error_budget_burn_rate increased after scaling (indicates load shapers).
+- Rollback CLI (example):
+# roll back a commit
+provisionctl rollback --commit-id=commit-20280109-0032 --reason="post-scale-no-improvement"
+
+Human escalation and notification matrix:
+- Auto-review required: PD schedule SRE Forecast Review (primary oncall: eng-sre). Notify product-owner and account-ops for affected tenants.
+- Emergency path: PD high-severity pager to SRE Lead, Product Incident Manager, and the customer Success lead for tier-1 impacted customers.
+
+Testing and validation:
+- Synthetic canaries: run forecasting-service against synthetic spikes (x2/x5) in the staging cluster. Verify that provisioning proposals match expected deltas within ±1 GPU for p4-sized pools.
+- Chaos tests: simulate cloud quota restriction to validate that grace-policy and eviction paths keep tier-1 SLOs intact.
+- Nightly regression job: forecast-bridge-integration-tests in CI validates end-to-end flow in a sandbox.
+
+Telemetry, dashboards and alerts (table):
+| Name                    | Query / Metric name                 | Alert threshold | Owner |
+|-------------------------|-------------------------------------|-----------------|-------|
+| Forecast Bridge Health  | forecast_bridge.process_latency_ms  | > 2000ms        | eng-sre |
+| Provisioning Queue Lag  | provision_queue.depth               | > 5 proposals   | eng-sre |
+| Headroom Breach         | provisionable_headroom_pct          | < 10%           | eng-sre |
+| Post-scale failure rate | capacity_commit.post_scale_failure_rate | > 2%        | eng-sre |
+
+Operational tooling integration and CLI snippets:
+- Submit a manual provisioning override:
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  https://provisioning-api.redwood.internal/v1/overrides \
+  -d '{"pool":"gpu-dedicated-rt","delta_gpus":8,"reason":"manual-prep-for-marketing-spike"}'
+
+- Example autoscale policy (YAML) to be placed in /etc/provisioning/policies/tenants/tenant-42.yaml:
+autoscale_policy:
+  min_gpus: 2
+  max_gpus: 64
+  safe_utilization_threshold: 0.85
+  provisioning_headroom_ratio: 1.15
+  forecast_confidence_allow_auto: 0.9
+
+Incident review tie-in and postmortem expectations:
+- Any incident where the Forecast Bridge contributed to a delayed or incorrect capacity decision must create an Incident Review with sections: timeline, forecast and telemetry snapshots, model input versions, policy decisions, and human actions.
+- Required artefacts: forecast inputs (last 6 windows), provision-queue snapshot, commit-id, capacity-audit.log entries, and corresponding traces from the Provisioning Controller.
+
+KPIs to track the runbook's effectiveness:
+- emergency_capacity_topups_per_quarter (target < 6)
+- average_peak_overprovision_pct (target down 15% vs baseline)
+- % of proposals auto-committed (target 70% with confidence >= 0.9)
+- mean_time_to_provision_commit (target < 25m for auto commits)
+
+Roles and ownership:
+- Forecast Bridge owner: eng-sre (primary) – Asha Patel (author).
+- Provisioning Controller owner: eng-platform – Diego Ramos.
+- Oncall escalation: eng-sre PagerDuty rota.
+- Product stakeholder: Model Serving PM – Linnea Andersson.
+
+Appendix: Example JSON proposal (provision-queue item)
+{
+  "proposal_id": "proposal-20280109-9901",
+  "pool": "gpu-dedicated-rt",
+  "delta_gpus": "+8",
+  "forecast_bucket": "2028-01-10T12:00Z/1h",
+  "confidence": "0.92",
+  "proposed_by": "forecast-bridge"
+}
+
+Related pages and references:
+- forecasting-service README: forecasting-service.redwood.internal/README
+- Capacity reservation playbook: /confluence/eng-sre/capacity-planning/service-onboarding-runway-and-slo-admission-playbook-2026
+- SLO ownership guide: /confluence/eng-sre/slo-and-error-budgets/slo-oncall-escalation-and-capacity-triggers-2026
+
+Change log:
+- 2027-11-15: Draft created by Asha Patel.
+- 2027-12-07: Added grace period tiers and confidence gating (reviewer input).
+- 2028-01-10: Published after staged rollout and simulation validation.
+
+Contact: eng-sre@redwood.internal for questions or to request policy exceptions.

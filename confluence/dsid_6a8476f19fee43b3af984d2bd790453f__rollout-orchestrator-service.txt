@@ -1,0 +1,420 @@
+Rollout Orchestrator Service (Hosted Canary Rollouts)
+
+## Overview
+The **Rollout Orchestrator** is the control-plane service responsible for the lifecycle of **Hosted canary rollouts** (percentage-based traffic splitting on Hosted routes). It owns the rollout state machine, validates progression against policy guardrails, persists rollout state, and emits events used by:
+
+- **Smart Routing / Data Plane** to enforce the current traffic split and cohort assignment
+- **Console backend** to drive the UI workflow (wizard, timeline, approvals)
+- **Telemetry/SRE** to evaluate stop conditions and trigger auto-pause/rollback
+- **Security/audit** to generate auditable change history of rollout actions
+
+The orchestrator is designed to be deterministic, auditable, and resilient to partial failures (e.g., transient metric fetch failures, region propagation delays).
+
+### Primary responsibilities
+- Create and persist rollout objects (route + baseline + canary + schedule + guardrails)
+- Enforce the rollout state machine and allowed transitions
+- Validate and apply step changes (manual or scheduled)
+- Gate actions based on policy evaluation (RBAC, max step size, min soak time, approval gates)
+- Apply/rollback rollout configuration in the routing config store (source of truth for data plane)
+- Emit lifecycle events to audit log + rollout activity timeline
+- Integrate with stop-condition evaluation (auto-pause / auto-rollback)
+
+### Non-responsibilities
+- Performing traffic splitting itself (data plane enforces)
+- Computing cohort assignment (see ADR; data plane uses deterministic hash)
+- Owning long-term metrics storage (telemetry pipeline owns)
+- Performing quality evaluations as a hard gate (optional inputs are stored but not automatically enforced for GA)
+
+---
+
+## Service identity
+- **Service name:** rollout-orchestrator
+- **Tier:** Control Plane (multi-tenant)
+- **Runtime:** Kubernetes (prod cluster: controlplane-prod)
+- **Primary datastore:** Postgres (rollout_orchestrator_db)
+- **Config propagation:** Writes to Routing Config Store (RCS)
+- **Event bus:** Kafka (topic: `rollout.events.v1`)
+
+### Ownership
+- **Product owner:** Marissa Cole (Console & rollouts)
+- **Engineering owner:** Ethan Park (Platform Control Plane)
+- **Service DRI:** Jada Williams
+- **On-call:** Platform Control Plane rotation (secondary: Smart Routing)
+
+---
+
+## High-level architecture & data flow
+1) Console wizard calls Console Backend.
+2) Console Backend calls **rollout-orchestrator** to create/validate rollout plans and to execute actions.
+3) Orchestrator performs policy checks (via policy engine) and persists state.
+4) Orchestrator writes the current rollout config snapshot to **RCS** (routing config store).
+5) Smart Routing/Data Plane reads RCS and enforces deterministic cohorting and split.
+6) Telemetry tags requests with `rollout_id` and `cohort` and aggregates baseline vs canary metrics.
+7) Stop-condition evaluator triggers orchestrator actions when thresholds breach.
+8) Orchestrator emits **audit events** and **rollout activity timeline** events.
+
+### Integration points
+- **Policy engine** (guardrails + RBAC): deny reasons returned to Console for UI display
+- **Routing config store (RCS)**: atomic publish of split state; includes revisioning
+- **Telemetry stop-condition evaluator**: calls orchestrator “auto action” endpoint; orchestrator records actor as `system`
+- **Audit logging pipeline**: emitted on all mutating actions
+
+---
+
+## API (public-to-internal)
+All endpoints are internal; customers interact via Console/Hosted API surfaces.
+
+- **Base path:** `/v1/rollouts`
+- **AuthN/AuthZ:** service-to-service auth + tenant scoping; user identity is passed through as an actor envelope for audit.
+- **Idempotency:** supported on all mutating endpoints via `Idempotency-Key` header.
+
+### Actor envelope (required on mutating calls)
+- `actor_type`: `user` | `service` | `system`
+- `actor_id`: user UUID or service principal
+- `actor_email`: (optional) displayed in customer timeline for user actions
+- `request_source`: `console` | `api` | `stop_condition` | `admin`
+
+### Core endpoints
+**Create rollout**
+- `POST /v1/rollouts`
+- Creates rollout in `DRAFT` state.
+- Validates route/model compatibility (baseline and canary variants) and validates initial schedule.
+
+**Preview/validate plan (no persistence)**
+- `POST /v1/rollouts/preview`
+- Returns derived step plan, warnings, and policy constraints (e.g., “max step size is 10% for this tenant”).
+
+**Get rollout**
+- `GET /v1/rollouts/{rollout_id}`
+
+**List rollouts**
+- `GET /v1/rollouts?route_id=...&status=...&limit=...`
+
+**Start rollout**
+- `POST /v1/rollouts/{rollout_id}:start`
+- Transitions `DRAFT` -> `RUNNING`.
+- Publishes initial step (typically 1% or configured first step) to RCS.
+
+**Advance to next step**
+- `POST /v1/rollouts/{rollout_id}:advance`
+- Moves to the next scheduled percentage.
+- Enforces min soak time and max step size.
+
+**Set canary percentage (explicit)**
+- `POST /v1/rollouts/{rollout_id}:setPercent`
+- Used by Console for manual step adjustments.
+- Enforces max step size and approval gates.
+
+**Pause rollout**
+- `POST /v1/rollouts/{rollout_id}:pause`
+- Transitions to `PAUSED` without changing the currently published split (unless explicitly configured to “pause at current split”).
+
+**Resume rollout**
+- `POST /v1/rollouts/{rollout_id}:resume`
+- Transitions `PAUSED` -> `RUNNING`.
+
+**Request approval / Approve step**
+- `POST /v1/rollouts/{rollout_id}:requestApproval`
+- `POST /v1/rollouts/{rollout_id}:approve`
+- Approval is enforced by policy for certain actions (e.g., moving above 25% or jumping more than 10%).
+
+**Rollback rollout**
+- `POST /v1/rollouts/{rollout_id}:rollback`
+- Publishes 0% canary / 100% baseline in RCS and transitions to `ROLLED_BACK`.
+
+**Complete rollout**
+- `POST /v1/rollouts/{rollout_id}:complete`
+- Publishes 100% canary and transitions to `COMPLETED`.
+
+**Auto action (stop conditions)**
+- `POST /v1/rollouts/{rollout_id}:autoAction`
+- Called by stop-condition evaluator with evidence payload (metric name, threshold, window, observed values).
+- Action may be `PAUSE` or `ROLLBACK` depending on tenant policy + stop-condition configuration.
+
+### Common response behaviors
+- All responses include `rollout_revision` (monotonic integer) and `rcs_revision` (routing config store revision when applicable).
+- Mutating endpoints return the updated rollout object and the latest activity event.
+
+---
+
+## State machine
+### States
+- `DRAFT`: created, not affecting traffic
+- `RUNNING`: actively progressing, split published in RCS
+- `PAUSED`: progression stopped (split remains as last published unless overridden)
+- `AWAITING_APPROVAL`: a requested step change is pending approval
+- `COMPLETED`: 100% canary; rollout finished successfully
+- `ROLLED_BACK`: canary set to 0%; rollout ended
+- `CANCELED`: draft or paused rollout removed without publishing further changes
+- `ERROR`: terminal-ish state when orchestrator cannot safely reconcile published config with stored state (requires operator intervention)
+
+### Allowed transitions (summary)
+- `DRAFT` -> `RUNNING` (start)
+- `RUNNING` -> `PAUSED` (pause)
+- `PAUSED` -> `RUNNING` (resume)
+- `RUNNING`/`PAUSED` -> `AWAITING_APPROVAL` (requestApproval for a step change)
+- `AWAITING_APPROVAL` -> `RUNNING` (approve and apply)
+- `RUNNING`/`PAUSED`/`AWAITING_APPROVAL` -> `ROLLED_BACK` (rollback)
+- `RUNNING` -> `COMPLETED` (complete)
+- `DRAFT` -> `CANCELED` (cancel)
+- any -> `ERROR` (only on reconciliation failure; see Failure Modes)
+
+### Step progression semantics
+- A rollout has an ordered list of steps with:
+  - `canary_percent` (0–100)
+  - `min_soak_seconds`
+  - optional `requires_approval`
+- Progression can be **manual** (Console action) or **scheduled** (orchestrator job runner evaluates due steps).
+- For GA, step scheduling is “best effort”; if the scheduler is delayed, the next step will not apply early.
+
+---
+
+## Persistence model
+### Storage goals
+- Maintain an auditable history of actions (who/what/when)
+- Support idempotent and replayable updates
+- Be able to reconcile orchestrator state against published routing config
+
+### Tables (conceptual)
+**`rollouts`**
+- `rollout_id` (UUID)
+- `tenant_id`
+- `route_id`
+- `baseline_target` (model version/config reference)
+- `canary_target` (model version/config reference)
+- `state`
+- `current_percent`
+- `rollout_revision` (int)
+- `rcs_revision` (string/int)
+- `created_by`, `created_at`
+- `updated_at`
+
+**`rollout_steps`**
+- `rollout_id`
+- `step_index`
+- `canary_percent`
+- `min_soak_seconds`
+- `requires_approval`
+- `status` (PENDING/APPLIED/SKIPPED)
+- `applied_at`
+
+**`rollout_activity_events`** (customer-visible timeline)
+- `event_id`
+- `rollout_id`
+- `event_type` (CREATED/STARTED/STEP_APPLIED/PAUSED/APPROVAL_REQUESTED/APPROVED/ROLLED_BACK/COMPLETED/AUTO_ACTION_TRIGGERED)
+- `actor_type`, `actor_display`
+- `summary`
+- `diff` (stored as text; redacted/sanitized)
+- `created_at`
+
+**`rollout_idempotency_keys`**
+- `tenant_id`
+- `idempotency_key`
+- `request_hash`
+- `response_blob`
+- `expires_at`
+
+### Consistency model
+- Orchestrator is the source of truth for rollout state.
+- RCS is the source of truth for routing enforcement but must be reconcilable back to orchestrator.
+- Each publish to RCS includes:
+  - `rollout_id`
+  - `rollout_revision`
+  - `effective_percent`
+  - `baseline_target_ref` / `canary_target_ref`
+
+On read, Console shows orchestrator state; if a mismatch is detected with RCS (rare), orchestrator marks `ERROR` and surfaces an operator-facing message.
+
+---
+
+## Publishing to the Routing Config Store (RCS)
+### What is published
+A per-route config document (owned by Platform Control Plane) that includes:
+- Active rollout metadata (rollout_id, revision)
+- Effective split percentage
+- Baseline and canary target references
+- Cohort assignment parameters (hash key inputs; see ADR)
+- Region behavior rules (e.g., “percent applies per-region with consistent cohorting”)
+
+### Atomicity and ordering
+- Orchestrator publishes using compare-and-swap semantics on `rcs_revision` to avoid lost updates.
+- If CAS fails, orchestrator re-reads RCS, re-runs policy checks if needed, and retries publish.
+
+### Reconciliation
+A periodic reconciler checks:
+- Is there an active rollout in orchestrator?
+- Does RCS reflect the same `rollout_id` and latest `rollout_revision`?
+
+If not, orchestrator emits an internal alert and may transition the rollout to `ERROR` depending on severity.
+
+---
+
+## Policy evaluation
+Orchestrator does not embed tenant-specific rules. All guardrails are evaluated via the policy engine.
+
+### Evaluated actions
+- Create rollout
+- Start rollout
+- Set percent / advance step
+- Request approval / approve
+- Pause/resume
+- Rollback/complete
+
+### Typical guardrails (GA)
+- **Max step size:** e.g., cannot increase canary by >10% per action
+- **Min soak time:** e.g., must wait 15 minutes between step increases
+- **Approval gates:** e.g., requires approval to exceed 25% or to complete to 100%
+- **Auto action permissions:** system actor may only pause/rollback if stop conditions are configured and enabled
+
+### Failure behavior
+- Policy engine deny returns:
+  - `deny_code` (machine)
+  - `message` (UI-safe)
+  - `details` (debug; not shown to end users)
+
+Orchestrator persists denied attempts as internal events only (not customer-visible) unless the action was user-initiated in Console, in which case it records an activity event: “Action blocked by policy: <message>”.
+
+---
+
+## Eventing and audit
+### Kafka events (internal)
+Topic: `rollout.events.v1`
+
+Emitted on every successful state transition and on every successful publish to RCS.
+
+Common fields:
+- `event_id`, `event_type`, `occurred_at`
+- `tenant_id`, `rollout_id`, `route_id`
+- `rollout_revision`, `state`, `current_percent`
+- `actor_type`, `actor_id`, `request_source`
+- `rcs_revision` (if publish occurred)
+
+Consumers:
+- Telemetry enrichment (optional)
+- Internal ops dashboards
+- Console timeline backfill (in case of transient DB write failures)
+
+### Audit logging
+All mutating actions generate audit events consistent with the Security spec (see related page). Orchestrator is responsible for:
+- Capturing the user/service actor identity
+- Emitting a redacted diff of fields changed (no prompts, no customer payload content)
+- Including tenant + route scoping
+
+Audit event types (minimum):
+- `rollout.create`
+- `rollout.start`
+- `rollout.step_change`
+- `rollout.pause`
+- `rollout.resume`
+- `rollout.approval_requested`
+- `rollout.approve`
+- `rollout.rollback`
+- `rollout.complete`
+- `rollout.auto_action`
+
+---
+
+## Stop conditions (auto-pause / auto-rollback)
+Stop conditions are configured per rollout (within policy bounds) and evaluated by the telemetry stop-condition evaluator.
+
+### Signals (GA defaults)
+- 5xx error rate increase (canary vs baseline)
+- timeout rate increase
+- p95 latency regression
+
+The evaluator calls `:autoAction` with evidence:
+- metric name + window
+- baseline value(s)
+- canary value(s)
+- computed regression
+- recommended action
+
+Orchestrator rules:
+- `autoAction` is always executed as `actor_type=system`.
+- If the rollout is already `PAUSED` or `ROLLED_BACK`, the call is a no-op (idempotent) and recorded as “ignored” internally.
+- If metrics are missing/insufficient, evaluator should not call; if it does, orchestrator returns `400` with `INSUFFICIENT_EVIDENCE`.
+
+---
+
+## Failure modes & mitigations
+### 1) RCS publish succeeds but DB update fails
+**Symptom:** data plane is on a newer split than orchestrator state.
+
+**Mitigation:** publish is followed by DB commit; if DB commit fails after publish, reconciler detects mismatch and attempts to repair (write-forward) using the latest known `rollout_revision` from RCS.
+
+### 2) DB update succeeds but RCS publish fails
+**Symptom:** orchestrator thinks step applied; data plane not updated.
+
+**Mitigation:** orchestrator only transitions the step to APPLIED after publish acknowledgement. If publish fails, rollout remains in previous percent; activity event records an error and suggests retry.
+
+### 3) Policy engine timeout
+**Symptom:** action cannot be validated.
+
+**Mitigation:** orchestrator fails closed (deny) with retryable error. No state change. Activity event for user-initiated actions: “Could not validate policy; try again.”
+
+### 4) Metric evaluation timeout (stop conditions)
+**Symptom:** rollout progression stalls due to missing stop-condition result.
+
+**Mitigation:** progression does not block on metrics; stop conditions are best-effort. For scheduled steps, orchestrator applies step if min soak time is satisfied; evaluator may still pause/rollback after the fact. (See SRE guidance for tuning.)
+
+### 5) Split mismatch observed in a region
+**Symptom:** metrics show percent deviating from configured percent.
+
+**Common causes:** config propagation lag, region-specific capacity fallback behavior.
+
+**Mitigation:** data plane exposes debug headers/logs for cohort assignment; on-call uses runbook “rollout stuck or bad split”. Orchestrator can force a re-publish to RCS (operator-only endpoint).
+
+### 6) Rollout stuck in AWAITING_APPROVAL
+**Symptom:** approvals not applied.
+
+**Mitigation:** orchestrator records the pending action payload and expiry. If expired, it auto-cancels the pending approval request and returns rollout to `PAUSED` (configurable; default is `PAUSED`).
+
+### 7) Orchestrator restart during action
+**Symptom:** duplicate requests from Console.
+
+**Mitigation:** idempotency keys prevent duplicate state transitions; all mutations are done with transactional checks on `rollout_revision`.
+
+---
+
+## Operational guidance
+### SLOs (service-level)
+- **Availability:** 99.9% for API endpoints (control plane)
+- **Publish latency to RCS:** p95 < 2s from action acceptance to RCS acknowledgement (excludes propagation to all regions)
+
+### Key dashboards
+- Action rate and error rate by endpoint
+- RCS publish failures (rate + by cause)
+- Reconciliation mismatch count
+- Rollouts in ERROR state (should be ~0)
+
+### Alerts (recommended)
+- Elevated 5xx on orchestrator endpoints
+- Sustained RCS publish failure rate
+- Reconciler detects mismatches for >5 minutes
+- Rollout ERROR state created
+
+### Feature flags / kill switch
+Hosted canary rollouts are gated per tenant. Kill switch behavior:
+- If disabled mid-rollout, orchestrator blocks further actions but does not automatically rollback. SRE may decide rollback based on incident severity.
+
+---
+
+## Security and data handling
+- No customer prompts or completions are stored.
+- Activity events and audit diffs are redacted to configuration-level changes only.
+- Actor identity and role are stored for auditability.
+- All queries are tenant-scoped; route_id must belong to tenant_id.
+
+---
+
+## Appendix
+### Example activity timeline entries
+- “Marissa Cole started rollout (1% canary) on route `support-agent-prod`.”
+- “System auto-paused rollout due to p95 latency regression (canary +180ms vs baseline over 10m).”
+- “Jordan Lee approved step change to 25% canary.”
+
+### Operator-only endpoints (restricted)
+- `POST /v1/rollouts/{rollout_id}:forceRepublish` (re-publish last known state to RCS)
+- `POST /v1/rollouts/{rollout_id}:markError` (last-resort; emits internal alert)
+
+Use operator endpoints only during incidents and document the reason in the incident channel + ticket.

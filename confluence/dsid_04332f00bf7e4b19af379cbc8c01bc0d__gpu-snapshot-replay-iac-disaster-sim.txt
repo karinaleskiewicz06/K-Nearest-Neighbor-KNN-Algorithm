@@ -1,0 +1,166 @@
+gpu-snapshot-replay-iac-disaster-sim
+
+Overview
+========
+This document describes the GPU Snapshot & Replay IaC pattern and an automated disaster-simulation runbook used by the infra team to validate capacity recovery, tenant networking, and state reconstruction after partial fleet loss. It is intended for SREs, infra engineers, and platform owners running periodic chaos drills and pre-release capacity migrations.
+
+Goals
+-----
+- Provide a repeatable IaC-driven way to capture GPU pool state and replay it into a test environment.
+- Validate allocation, KV cache reconstruction, and egress/networking policies under degraded conditions.
+- Verify recovery SLAs and alerting behavior before changes are promoted to production.
+
+Scope and assumptions
+---------------------
+- Applies to shared GPU pools and dedicated tenant pools managed via Terraform modules in the gpu-iac repo.
+- Assumes ability to create ephemeral test accounts/tenants and isolated VPCs in the same region.
+- Not intended for hardware-level failures (power/board failures) — those are handled by HW ops.
+
+High-level architecture (text diagram)
+-------------------------------------
+1) Production GPU pool -> snapshot exporter -> S3/GCS prefix (encrypted)
+2) IaC pipeline pulls snapshot -> creates ephemeral test VPCs, GPU instances, and routing; mounts KV cache store and replay server
+3) Load generator replays traffic traces against ephemeral pool while monitoring SLOs and alerts
+
+Key metrics and SLOs validated by the simulation
+-----------------------------------------------
+- Allocation success rate: target >= 99.5% for reserved+burst requests
+- Median cold-start (model load) lat: <= 1200 ms for 8k context models
+- KV cache warmup 90th pct recovery time: <= 5 minutes from start of replay
+- Egress policy enforcement: 100% of test flows must pass through egress-proxy (no direct internet)
+- Alerting correctness: PagerDuty routing exercised for two simulated error classes
+
+Owners and contacts
+-------------------
+- Primary owner: infra-gpu (team Slack: #infra-gpu)
+- Playbook steward: Aisha Patel (aisha@redwood.ai)
+- Secondary: Ethan Coleman, SRE on-call rotation
+
+Terraform IaC pattern
+---------------------
+This pattern uses three modules: snapshot-exporter, gpu-test-harness, and network-fabric-ephemeral. The modules expose versioned inputs so tests are reproducible. Example invocation (shortened):
+
+```hcl
+module "snapshot_exporter" {
+  source = "git::ssh://git@github.com/redwood/gpu-iac.git//modules/snapshot-exporter"
+  bucket = "redwood-gpu-snapshots"
+  prefix = "sim-2025-02-10/"
+  encryption_key = "projects/redwood/locations/global/keyRings/gpu/cryptoKeys/snapshot"
+}
+
+module "test_fabric" {
+  source = "git::ssh://git@github.com/redwood/gpu-iac.git//modules/network-fabric-ephemeral"
+  region = "us-west1"
+  tenant_label = "sim-replay-2025-02-10"
+  egress_proxy = true
+}
+
+module "gpu_pool_replay" {
+  source = "git::ssh://git@github.com/redwood/gpu-iac.git//modules/gpu-replay"
+  snapshot_prefix = module.snapshot_exporter.latest_prefix
+  instance_type = "nvidia-a100-40gb"
+  desired_replay_ratio = 0.5
+}
+```
+
+Snapshot export details
+-----------------------
+- Snapshot includes: instance topology, tenant allocations, model artifacts manifest, KV-cache checkpoints (not raw keys), and routing maps.
+- Snapshot retention: 30 days in encrypted object store; lifecycle rule moves to cold storage after 7 days.
+- Export frequency recommended: daily for prod-critical pools; weekly for non-production.
+
+Disaster-simulation runbook (step-by-step)
+------------------------------------------
+Pre-checks (run 24–72 hours prior)
+1. Confirm run window with on-call SRE, security, and platform leads.
+2. Ensure billing/project limits are available in target account.
+3. Notify Product Security if any customer-identifying traces will be used (anonymize where needed).
+4. Create a simulation ticket and attach this doc.
+
+Execution (on the day)
+1. Trigger snapshot export: terraform apply module.snapshot_exporter. Verify checksum in object store.
+2. Create ephemeral infrastructure: terraform apply -var replay=true module.test_fabric module.gpu_pool_replay
+3. Validate network isolation: run network smoke test: 
+   - curl -sS --interface <test-vpc-ip> https://egress-proxy.internal/status | jq .ok
+   - Ensure no direct 0.0.0.0/0 egress routes from GPU subnets
+4. Start replay harness at 25% of production QPS for 5 minutes: ./replay-run --snapshot <prefix> --scale 0.25 --duration 300
+5. Monitor SLOs and logs for 15–30 minutes. Escalate if allocation success rate < 98%.
+6. Ramp to target replay_ratio (example: 50–75%) for full validation window (30–60 minutes).
+7. Simulate degraded conditions in phases (allowed in controlled manner):
+   a. Phase A — 10% node drain (simulate preemption) via cloud API.
+   b. Phase B — network egress failure: block egress to backend datastore and validate fallback policies.
+   c. Phase C — model artifact mismatch: update manifest to a slightly incompatible variant to verify rollback paths.
+8. Run verification suite (see checks below).
+9. Terminate harness and tear down ephemeral infra: terraform destroy -auto-approve
+10. Collect logs, alerts, and snapshots; upload to simulation artifact bucket.
+
+Automated verification checks (commands)
+--------------------------------------
+- Allocation success: 
+  prometheus query: 
+  sum(rate(gpu_allocation_attempts_total{env="sim"}[1m])) by (result)
+  Expect > 99.5% with result="success"
+
+- KV cache warmup: 
+  prometheus query: histogram_quantile(0.9, sum(rate(kv_cache_reconstruction_seconds_bucket{env="sim"}[5m])) by (le))
+  Expect <= 300s (5 minutes)
+
+- Egress enforcement: run a short curl test from a replay instance: 
+  curl -sS http://169.254.169.254/latest/meta-data/iam | jq .  # should be blocked
+
+- Alert verification: ensure PD escalations triggered for injected "allocation_failure" and suppressed for transient cache misses.
+
+Observability and dashboards
+---------------------------
+- Dashboard: infra/gpu/sim-replay-overview — key panels: allocation-rate, model-load-latency, kv-warmup-time, egress-route-health, PD-alerts-fired.
+- Log grouping: use label sim_run_id and tenant=sim-* for filtering.
+- Traces: sample 100 warmup requests and 200 live requests; verify spans for model.load, runtime.allocate, cache.replay.
+
+Failure modes and rollbacks
+--------------------------
+- If allocation success < 95% during ramp to 50%: abort test, scale down harness, and mark as failed. Immediate remediation: revert any IaC changes, destroy ephemeral infra, re-run snapshot health checks.
+- If egress proxy fails to enforce routes: roll back network-fabric-ephemeral to previous version and run network smoke tests.
+- If persistent PD noise is observed: disable simulated PD rules and follow incident review flow.
+
+Post-run report and artifacts
+-----------------------------
+Create a Simulation Report with the following items attached:
+- replay-metrics.json (prometheus exports)
+- terraform-plan + terraform-state at time of run
+- alerting dump and PD incidents
+- short runbook retrospective (what failed, mitigation, follow-ups)
+
+Checklist for promoting fixes to prod
+-----------------------------------
+1. Fix reproduced locally and in sim; patch Terraform modules and add unit tests.
+2. Run two successful simulations separated by at least 48 hours.
+3. Create RFC/PR with annotated terraform plan and risk assessment.
+4. Schedule controlled canary (10% of burst capacity) before full rollout.
+
+FAQ and tips
+------------
+Q: Can we use real customer data in snapshots?
+A: No. Snapshots must be sanitized and customer identifiers removed. Use synthetic tenancy data whenever possible.
+
+Q: How often should we run full simulations?
+A: Quarterly for critical pools; monthly for medium-risk pools after major infra changes.
+
+Appendix: quick commands
+------------------------
+- Export latest snapshot (CLI): aws s3 cp s3://redwood-gpu-snapshots/latest sim-prefix/ --recursive
+- Start replay harness: ./replay-run --snapshot s3://redwood-gpu-snapshots/sim-2025-02-10 --scale 0.5 --duration 3600 --tag sim_run_id=2025-02-10
+- Destroy infra: terraform destroy -target=module.gpu_pool_replay -auto-approve
+
+Revision history
+----------------
+- 2024-05-12: Initial draft by Aisha Patel
+- 2024-11-03: Added automated verification queries and egress checks (review: Ethan Coleman)
+- 2025-02-10: Hardened rollback criteria and added retention/lifecycle rules (review: Ravi Singh)
+
+Related reading
+---------------
+- gpu-fleet-capacity-slo-policy (internal page)
+- network-fabric-ephemeral module README
+- incident-response-security/runbook for PD escalation mapping
+
+End of document

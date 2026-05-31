@@ -1,0 +1,158 @@
+Accelerator chaos and profiling playbook
+
+Overview
+
+Purpose:
+This playbook describes a controlled experiment and incident-response process for exercising and profiling heterogeneous accelerator configurations (mixed GPU types, CPU-only fallbacks, and experimental NPU/TPU-like devices) in Redwood's serving runtime. The goal is to surface scheduling, kernel-selection, KV cache, and memory-pressure behaviors that do not appear under homogeneous, baseline load, and to capture high-fidelity telemetry for triage and optimization.
+
+Scope:
+- Applies to internal test and canary clusters only, never to production customer-facing instances unless explicitly scheduled and approved.
+- Targets mixed-accelerator nodes, runtime scheduler, kernel mapper, and KV cache layers.
+- Includes both active chaos (throttling, device evictions) and passive profiling (high-sample tracing, microbenchmarks).
+
+Owner and contact:
+- Primary owner: eng-serving-runtime (runtime quality team)
+- On-call contact for experiments: @miguel-torres (pager)
+- Slack channel: #runtime-qa-experiments
+
+Timebox and safety:
+- All chaos windows must be scheduled in the team calendar and registered with SRE 72 hours before start.
+- Max experiment duration per cluster: 2 hours.
+- Abort condition: any production SLO deviation >2% in linked staging-prod shadow traffic metrics or alerting on GPU driver/host watchdog (see Abort conditions section).
+
+Pre-run checklist (must be completed before any active injection):
+1) Approvals: experiment approved by eng-serving-runtime lead and SRE duty engineer. Approvals recorded on the experiment ticket.
+2) Snapshot configs: capture current scheduler profiles, kernel-mapper table, and deployment manifests. Commands: 
+   - git rev-parse HEAD (runtime-config repo)
+   - kubectl get configmap runtime-scheduler -n runtime -o yaml > runtime-scheduler.snapshot.yaml
+3) Canary targets: select a dedicated canary pool labeled runtime-chaos=true with no customer traffic.
+4) Backups: ensure model KV cache checkpoints and stateful store snapshots have been saved.
+5) Alert hooks: add temporary dashboards and high-priority alerts (see Telemetry & dashboards).
+6) Rollback plan: documented step-by-step (see Rollback section).
+
+Experiment types and procedures:
+The playbook defines three canonical scenarios. Each scenario includes the purpose, exact commands, expected observability signals, and failure modes to watch for. Always run in sequence: Profiling -> Degraded scheduling -> Forced eviction.
+
+A) High-sample profiling (no chaos)
+Purpose: collect high-fidelity traces and kernel timings under controlled synthetic load.
+Steps:
+1. Deploy the profiling harness on canary pool: `kubectl apply -f profiles/harness-canary.yaml`
+2. Start load generator with shape file: `./perfgen --shape mixed-latency-burst.json --qps 150`
+3. Enable tracing at 1000Hz sampling for 5 minutes: set runtime flag `telemetry.sampler_rate=1000` via ConfigMap patch.
+4. Capture GPU kernel traces and nvprof logs (or nsys):
+   - `nsys profile --output=trace-canary --sample=cpu,cupti --duration=300s --target PID`
+5. Collect KV cache hit/miss histogram and sequence length distribution from internal endpoints: `curl http://runtime-metrics/kvcache?range=5m`
+Expected signals:
+- Kernel latency heatmap should show stable distribution; abnormal long tails indicate kernel contention or inefficient kernel selection.
+- KV cache cold-start rates after model reloads should be < 0.5% for steady-state load.
+
+B) Degraded scheduling (soft chaos)
+Purpose: validate scheduler priority inversion handling and kernel credit accounting when a subset of devices are throttled.
+Steps:
+1. Limit GPU SM frequency on 30% of nodes using device driver throttling (requires driver-level privileges). Example command (NVIDIA):
+   - `sudo nvidia-smi -i 0 -pl 120`  # reduce power limit to 120W on device index 0
+2. Introduce a slow background job pinned to those GPUs (long-running attention microkernel). Use `kubectl run` with nodeSelector runtime-chaos-slow=true.
+3. Monitor queue length, kernel credits, and request latencies.
+Expected signals:
+- Scheduler should demote low-priority jobs and preserve SLO for high-priority tiers.
+- Kernel credit reserves should decrease gracefully without causing node-wide starvation.
+Failure modes:
+- Priority inversion observed as sustained latency increase > 20% for high tiers.
+- Kernel queue growth that triggers preemption thrashing.
+
+C) Forced eviction (hard chaos)
+Purpose: verify graceful fallback, model variant switching, and session KV cache reconciliation when GPUs are evicted or removed unexpectedly.
+Safety note: this is the riskiest scenario; keep duration < 10 minutes per node, and have rollback plan ready.
+Steps:
+1. Coordinate with SRE to cordon nodes and then trigger device offline event (simulate with `kubectl drain --ignore-daemonsets --delete-local-data`).
+2. On the runtime control plane, reduce available slot counts to simulate sudden capacity loss: patch autoscaler minReplicas down by 40% for test pool.
+3. Observe the tiered fallback: do requests automatically route to CPU-only or smaller quantized variants? Check model_variant_switch metric.
+4. Validate KV cache consistency: confirm that new sessions warm KV caches appropriately and that previous sessions are either migrated or invalidated according to policy.
+Expected signals:
+- 95th percentile tail latency for critical routes should degrade no more than 2x for the duration, and error rate < 1%.
+- Model switch events should be recorded with reason=eviction and an associated decision trace id.
+
+Telemetry & dashboards (quick setup)
+Create temporary dashboards tagged `chaos-run-<ticket-id>` with the following panels:
+- Per-route p50/p95/p99 latencies (segmented by priority)
+- Kernel latency heatmap (kernel-name x device-type)
+- Kernel credit utilization by node
+- KV cache hit ratio and per-model warmup curve
+- Device driver errors and watchdog resets
+- Scheduler decision traces: counts of preemptions, demotions, and fallback decisions
+
+Alerts to enable for experiment window:
+- latency.p95.critical_route > baseline * 1.5 for > 1m -> paging
+- kernel.queue_length > 500 on any node for > 2m -> ops-crit
+- device.watchdog.reset > 0 -> paging
+
+Observability snippets (examples)
+- Kernel-level metric query (promql): `histogram_quantile(0.95, sum(rate(kernel_latency_seconds_bucket[1m])) by (le, kernel, device_type))`
+- KV cache warmup: `increase(kv_cache_warmups_total[10m]) / increase(kv_cache_requests_total[10m])`
+
+Data retention and artifact collection
+- Traces and nsight captures must be uploaded to S3 prefix: s3://redwood-telemetry/experiments/<ticket-id>/traces/
+- Prometheus: take a snapshot using `tsdbctl snapshot` and link in the experiment ticket.
+- Runtime logs: `kubectl logs -l app=runtime -n runtime --since=30m > runtime.<ticket-id>.log`
+
+Analysis checklist (post-run)
+1. Confirm that raw artifacts exist in S3 and are readable.
+2. Run automated correlation job: `python tools/chaos_correlation.py --ticket <id> --out report.html` which links kernel tails to scheduler events.
+3. Annotate release notes or kernel hints if a material regression is discovered.
+4. If mitigation or code changes are required, create an ADR or tactical patch and specify rollout strategy (canary -> progressive -> global).
+
+Rollback and remediation steps
+- Immediate rollback: revert autoscaler/minReplica patch, uncordon nodes (`kubectl uncordon <node>`), and restore driver power/ frequencies.
+- KV cache reconciliation: run `kubectl exec -it runtime-admin -- /opt/runtime/tools/kvcache-reconcile --model <id>` if mismatches are detected.
+- If preemption thrash observed: temporarily increase kernel-credit-per-slot for affected pool via configmap and re-evaluate.
+
+Abort conditions (must abort and remediate immediately):
+- Any customer-facing cluster shows p99 latency > 2x baseline for > 2 minutes.
+- Persistent driver or host-level watchdog resets on >3 nodes.
+- Error rate for critical routes > 2% and trending upwards.
+
+Postmortem and artifact requirements
+- Within 24 hours: publish an experiment write-up with summary, artifacts links, hypothesis vs outcome, and recommended actions. Use template: Experiment write-up - <ticket-id>.
+- Within 72 hours: if the experiment revealed a regression, propose a mitigation PR with test plan and include benchmark numbers pre/post.
+
+Kernel and scheduler knobs to inspect (quick reference)
+- scheduler.priority_decay_seconds: default 30
+- kernel.credit_per_slot: default 1000
+- kernel.max_concurrent_kernels_per_device: default 32
+- telemetry.sampler_rate: production default 10, test default 1000
+- kvcache.max_entries_per_model: default 512k
+(Note: change via runtime-config repo and apply as a canary)
+
+Run-specific config examples (YAML snippet)
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: runtime-experiment-config
+  namespace: runtime
+data:
+  telemetry.sampler_rate: "1000"
+  scheduler.priority_decay_seconds: "10"
+  kernel.credit_per_slot: "1500"
+```
+
+Known limitations and caveats
+- Driver-level throttling is vendor-specific; behavior differs dramatically across GPU families. Documented differences must be updated after each major driver release.
+- NPUs/TPUs in lab mode may not expose full tracing; fallback to request-level tracing for those devices.
+- Some kernel contention modes are only reproducible with sequence-length distributions that match production—use real request traces where possible.
+
+Related pages and artifacts
+- Link to runtime telemetry data model (internal): /confluence/eng-serving-runtime/team-wiki/runtime-observability-data-model-and-tracebook-2026
+- Link to kernel mapper design: /confluence/eng-serving-runtime/kernel-and-scheduling/adaptive-kernel-mapper-and-scaling-playbook-2026
+- Template: Experiment write-up template (internal ticket doc)
+
+Appendix: quick CLI commands reference
+- Start perfgen: `./perfgen --shape mixed-latency-burst.json --qps 150 --auth-token $TOKEN`
+- Capture nsys: `nsys profile -o /tmp/trace -t cuda,osrt --duration 300 --sample=cpu,cupti --pid $PID`
+- Snapshot config: `kubectl get configmap runtime-scheduler -n runtime -o yaml > runtime-scheduler.snapshot.yaml`
+- Upload artifact to S3: `aws s3 cp /tmp/trace.qdrep s3://redwood-telemetry/experiments/<ticket-id>/traces/`
+
+Revision history:
+- 2025-11-12: Created by Aditi Rao (initial draft).
+- 2026-01-20: Added forced-eviction scenario and telemetry queries (reviewer: Miguel Torres).
+- 2026-03-01: Finalized abort conditions and added runbook CLI snippets (reviewers: Lena Zhang, Owen Patel).

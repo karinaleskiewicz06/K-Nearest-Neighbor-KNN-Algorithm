@@ -1,0 +1,157 @@
+GPU canary burst backstop and CI safety harness
+
+Summary:
+This document defines the design, IaC integration, and operational runbook for the 'GPU Canary Burst Backstop' — a CI/CD safety harness that automatically exercises limited burst capacity during GPU image and kernel rollouts and provides automated backstop actions (throttle, rollback, and postmortem hooks) when defined safety gates fail. The goal is to let build/infra teams validate real allocation and egress behaviour without exposing production SLAs to undue risk.
+
+Motivation:
+- Recent rollouts of mixed-precision kernels and new driver bundles caused transient tenant preemptions and elevated egress traffic.
+- We need a reproducible CI-driven mechanism that:
+  - Exercises warm-pool and burst paths during canaries.
+  - Runs lightweight traffic simulations to detect allocation regressions.
+  - Enforces Terraform plan-level policy and CI gates before promotion.
+
+Scope and audience:
+- Audience: GPU platform engineers, CI/CD owners, oncall SRE.
+- Scope: Host (managed) and Dedicated fleet rollouts that touch node images, runtime kernels, or instance-level network egress rules. Does NOT cover on-prem air-gapped Private bundles (these use the airgap promotion checklist).
+
+Definitions:
+- Canary lane: a controlled canary topology consisting of 1–3 tenant shadow workloads routed to a dedicated warm-pool slice.
+- Burst backstop: automated steps executed when canary telemetry crosses thresholds (throttle, scale-down, abort, rollback).
+- Safety gate: metric-based condition in CI that must pass for rollout to continue.
+
+Safety goals and SLOs for canary lane:
+- Warm-pool allocation success >= 99.0% within 60s for canary requests.
+- No more than 5% increase in 95th p99 tokenization/latency CPU (canary workload baseline).
+- Egress spike delta <= +20% compared to baseline for the same synthetic workload.
+- Canary incident must auto-abort rollback within 10 minutes of safety gate breach.
+
+High level design:
+1) CI job composition (example names):
+   - ci/gpu-image/build -> publishes signed image tag to registry.
+   - ci/gpu-image/canary-deploy -> triggers canary deployment to warm-pool slice and runs simulator.
+   - ci/gpu-image/validate -> checks metric gates and Terraform plan policy.
+   - ci/gpu-image/promote -> promotes Terraform variables and triggers global rollout.
+
+2) Canary topology and networking:
+   - Dedicated warm-pool slice with min_size=2, max_size=6 GPUs (pool type: canary).
+   - VPC egress path uses egress-shard 'canary' and an egress-proxy to limit blast radius.
+   - Canary IAM role limited with tenant-stub credentials to avoid customer data access.
+
+3) IaC / Terraform integration:
+   - Terraform modules must expose a 'canary' bool and 'canary_pool_id' output.
+   - Pre-merge: policy check via tflint/OPA policy that blocks plan when canary_pool_id is absent and rollout touches image_version or kernel_tag.
+   - Promotion: promotion pipeline updates module var canary=false -> triggers full rollout.
+
+4) Simulation and synthetic traffic:
+   - Use the 'burst-smoke' harness (repo: infra/burst-sim) to generate 5–50 short LLM requests with realistic token distribution and KV-cache patterns.
+   - The harness runs 3 iterations (low, medium, high concurrency) with 30s warmup and captures allocation, preemption, and egress metrics.
+
+Safety gates (checked by ci/gpu-image/validate):
+- Allocation success rate >= 99.0% within 60s.
+- p95 latency change <= +15% from baseline.
+- Egress spike delta <= +20% from baseline.
+- No worker OOMs or kernel crashes logged.
+- No preempt_count increase > 2 per node.
+
+Metric sources and alert hooks:
+- Metrics used: warm_pool_allocation_success, gpu_preempt_count, tenant_kv_cache_misses, inference_p95_latency, egress_bytes_per_min.
+- Validation job writes a JSON verdict to S3 (path: s3://redwood-ci-canary-verdicts/<build_id>.json) consumed by promo controller.
+
+Automated backstop actions (ordered):
+1) Soft throttle: ci/controller sets canary_pool.max_size = current and scales min_size down to 1 to reduce new allocations.
+2) Abort traffic: route engine flips canary routing to traffic-sink (no customer impact).
+3) Rollback image: pipeline triggers image revert using previous signed image tag and redeploys to canary pool.
+4) Create incident: automatic PagerDuty incident with pre-populated playbook and timeline snapshoter.
+
+Runbook: Canary abort and rollback (oncall steps)
+1) PagerDuty alerted with tag 'gpu-canary-failure'.
+2) Oncall verifies verdict JSON in S3 and checks grafana dashboard 'Canary / ci/gpu-image/<build_id>'.
+3) If verdict says 'abort', confirm that controller executed Soft throttle. If not, run: infractl canary throttle --pool <id> --min 1 --reason "CI gate breach".
+4) If rollback not executed, run: infractl image rollback --pool <id> --to-tag <previous-tag> and observe pod restarts.
+5) Validate post-rollback metrics for 15 minutes; if instability persists escalate to platform-eng escalation channel.
+6) Capture logs: kernel crash logs, dmesg snapshots, and egress proxy logs; attach to incident.
+
+Post-deploy verification checklist (ci/gpu-image/validate runbook):
+- CI verdict present and marked PASS.
+- grafana: allocation success and p95 within threshold for three consecutive 5-min windows.
+- No node-level kernel oops in last 30 minutes.
+- Egress proxy throttle events absent.
+
+Terraform / OPA policy snippets (example):
+- OPA rule (pseudo):
+  package redwood.iac
+  deny[msg] {
+    input.change.type == "module"
+    input.change.module == "gpu_pool"
+    not input.change.variables.canary_pool_id
+    msg = "gpu pool changes require an explicit canary_pool_id variable for safe promotion"
+  }
+
+Example GitHub Actions job (trimmed):
+  name: Canary deploy and validate
+  on: [workflow_dispatch]
+  jobs:
+    canary-deploy:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v4
+        - name: terraform init & plan
+          run: |
+            terraform init -backend-config=...
+            terraform workspace select canary || terraform workspace new canary
+            terraform apply -var='image_tag=${{ github.sha }}' -auto-approve
+        - name: kick simulator
+          run: infra/burst-sim/run --pool ${POOL_ID} --profile medium --out verdict.json
+        - name: upload verdict
+          uses: actions/upload-artifact@v4
+          with:
+            name: verdict-${{ github.sha }}
+            path: verdict.json
+
+Operational ownership and SLAs:
+- Owner: GPU Platform (oncall rotation) — primary contact: @gpu-platform-oncall.
+- CI job owners: ci-team (ci-owner@redwood.ai).
+- Expected MTTD for canary failures: 5 minutes (automated detection).
+- Expected MTTR for automated rollback: 10–30 minutes depending on image size and pool churn.
+
+Testing and dry-run guidance:
+- The harness can run in 'dry-run' mode that produces a verdict without mutating pool sizes (useful for PR validation).
+- Nightly canary rehearsals run in sandbox accounts and publish a weekly summary to #gpu-canary-feedback.
+
+Metrics to collect for continuous improvement:
+- False positive rate (CI gates that caused rollback but no production impact).
+- Time-to-rollback and time-to-stable.
+- Number of canary verifications per month and pass rate.
+
+Appendix A: Quick commands
+- Check verdict: aws s3 cp s3://redwood-ci-canary-verdicts/<build_id>.json -
+- Force rollback (manual): infractl image rollback --pool <id> --to-tag <previous-tag> --reason "manual reversion"
+- Canary throttle: infractl pool update --id <id> --min-size 1 --max-size <current>
+
+Appendix B: Troubleshooting matrix (summary)
+| Symptom | Likely cause | Immediate action | Owner |
+|---------|--------------|------------------|-------|
+| High preempt_count during canary | driver/kernel regression | Soft throttle, capture dmesg, rollback | oncall |
+| Egress spike > +20% | regression in client batching logic or proxy misroute | Abort traffic to sink, throttle egress proxy rules | networking |
+| Allocation failures | wrong instance profile or IAM | Verify canary role has compute:AttachPermissions, revert terraform change | infra-iac |
+
+Contact and escalation:
+- Primary escalation: @gpu-platform-oncall (Slack)
+- Secondary: infra-sre-escalation@redwood.ai
+- For security-sensitive issues (e.g., unexpected data access), open a security-incident and notify security@redwood.ai.
+
+Change history:
+- 2024-09-20: Initial draft by Maya Chen.
+- 2024-11-15: Added OPA policy and soft-throttle step (reviewers: Diego Alvarez).
+- 2025-02-05: Formalized SLAs and added CI job templates; published.
+
+Related resources:
+- infra/burst-sim repo (internal link)
+- grafana/dashboard/canary-deployments
+- runbooks/preflight-gpu-deployment-validation-and-rollback-playbook
+
+Notes and open action items:
+- Add an integration test that runs the same harness against a heterogenous slow-node pool (action: Priya Nair, target Q2 2025).
+- Evaluate if egress delta thresholds should be scoped per-region (action: networking team).
+
+This playbook is intentionally conservative: prefer abort and rollback over continuing a rollout when the canary reveals resource or kernel regressions.

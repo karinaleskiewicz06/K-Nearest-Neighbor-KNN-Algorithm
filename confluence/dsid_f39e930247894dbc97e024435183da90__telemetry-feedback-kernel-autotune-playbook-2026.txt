@@ -1,0 +1,143 @@
+Telemetry-feedback kernel autotune playbook
+
+Summary
+---
+This playbook describes a telemetry-driven feedback loop used to automatically tune kernel selection and scheduling knobs in the serving runtime. It is intended for on-call engineers, runtime owners, and SREs who operate model-serving fleets. Unlike manual kernel tuning runbooks, this document specifies the signals, control loop design, safety gates, rollout and rollback procedures, and observability required to safely operate automated kernel autotuning in production.
+
+Motivation
+---
+- Kernel characteristics and the optimal scheduling strategy can vary by model, sequence-length distribution, and traffic mix.
+- Manual tuning is slow to react to changes (new models, workload shifts, infra upgrades).
+- A closed-loop approach reduces human burden and improves unit-cost while preserving latency SLOs.
+
+Scope and assumptions
+---
+- Applies to the inference serving runtime kernel-selection and minor scheduling parameters (batch-slice-size, prefetch-window, kernel-variant). Not in scope: major topology changes, shard rebalancing, or changes to global admission control.
+- Requires the telemetry pipeline to deliver per-kernel latency histograms, occupancy, failed-dispatch counts, and end-to-end request traces with kernel attribution.
+- Assumes we have an experiment framework for safe canary rollouts and immediate control-plane overrides.
+
+Signals and telemetry (required)
+---
+1) Per-kernel latency histograms (P50/P90/P99) with labels: model_id, variant, sequence_len_bucket, gpu_type
+2) Kernel occupancy (concurrent warps/threads) and utilization percentiles by GPU ID
+3) Dispatch failures and fallback counts (native->fallback) per minute
+4) E2E tail latency (request-level) with kernel attribution and route_id
+5) Cost proxies: tokens_per_sec and GPU-time-per-token estimates
+6) Sampled traces with kernel execution timeline (min 1 in 10k requests)
+
+Design: control loop overview
+---
+- Control frequency: 10-minute decision windows (configurable).
+- Candidate actions: switch kernel variant (e.g., aten->fused-attn), adjust batch-slice-size (-1/+1), +/- prefetch-window (ms), enable/disable quantized path.
+- Optimization objective: minimize cost_per_token subject to SLO constraints (P99 latency < route-SLO AND error-rate < 0.1%).
+- Policy engine evaluates candidates using a shadow-evaluation technique described below.
+
+Shadow evaluation procedure
+---
+1) For each candidate action, generate a shadow configuration that runs in parallel on a small subset (default 2%) of requests for 10 minutes. Shadow runs must be CPU/GPU-isolated where possible to avoid perturbing production.
+2) Collect the same telemetry for shadow runs. Compute deltas for P90 and P99 latency, error-rate, and estimated unit-cost.
+3) Only consider promotion if:
+   - latency delta at P99 <= +3% relative to baseline OR absolute P99 still under route-SLO, AND
+   - error-rate delta <= +0.05pp, AND
+   - estimated cost_per_token improves by >= 4% (configurable), AND
+   - no regression signals flagged by quality monitors (see Guardrails).
+4) When multiple candidates pass, rank by cost improvement / latency impact and select the top-ranked one for a staged rollout.
+
+Staged rollout plan
+---
+- Stage 0: telemetry-only shadow (2%) — minimum 10 minutes.
+- Stage 1: internal canary (10% of internal traffic) — 30 minutes.
+- Stage 2: progressive ramp (25% -> 50% -> 100%) over a configurable window (default 3 hours).
+- At each step, enforce automated checks (see Acceptance checks); if any check fails, abort and rollback immediately.
+
+Acceptance checks (automated)
+---
+- P99 absolute must remain < route.SLO (hard gate).
+- Relative P99 increase must be <= 7% at canary stage; <= 5% at progressive stage.
+- Dispatch failure increase <= 0.1pp.
+- Customer-impacting errors (500-level) must not increase above baseline + 0.02pp.
+- Unit-cost improvement must be observed at the canary window for promotion to wider rollout.
+
+Guardrails and safety mechanisms
+---
+- Kill-switch: Operators can flip a global flag to disable autotune; control plane respects immediate override.
+- Emergency rollback: If any safety check trip is detected by the monitoring alert (SRE-alert), an automated rollback job reverses kernel selection within 60s.
+- Rate-limited actions: no more than 3 kernel promotions per model per 24 hours.
+- Staleness detection: if telemetry lag > 60s, suspend the control loop.
+
+Operational runbook: step-by-step
+---
+1) If telemetry indicates a candidate passed shadow evaluation, the policy engine will post a pending action to /runtime/autotune/pending with details.
+2) On-call receives an automated notification with diffs and the top-3 metrics to inspect.
+3) Verify sampled traces for the canary population (use tracing panel: dashboard -> trace-sample -> filter model_id). Confirm no unexpected kernel fallbacks.
+4) Approve or reject the stage-1 rollout via the autotune UI or `rtictl autotune approve <action-id>`; approval triggers the canary stage.
+5) Monitor acceptance checks; if all pass, the system will continue ramping. If any check fails, the system will automatically rollback and create an incident ticket with correlated traces.
+6) Post-deployment: run the performance-regression-huntbook checklist (link in Related pages).
+
+Example CLI snippets
+---
+- Start a manual shadow run for diagnostics:
+  rtictl profile shadow --model my-model-v3 --kernel fused-attn --sample-rate 0.02 --duration 10m
+
+- List pending autotune actions:
+  rtictl autotune list --state pending
+
+- Approve an action (can be done from UI):
+  rtictl autotune approve 5c2a8b9f
+
+Configuration example (YAML)
+---
+autotune:
+  decision_window: 10m
+  shadow_fraction: 0.02
+  cost_improvement_threshold_pct: 4
+  max_promotions_per_day_per_model: 3
+  rollback_on_telemetry_lag_seconds: 60
+
+Metrics and dashboards to inspect
+---
+- Kernel latency heatmap (by model_id and sequence_len_bucket)
+- Promotion pipeline dashboard: pending -> canary -> ramp -> success/fail counts
+- Shadow delta table: candidate -> delta_P90 -> delta_P99 -> delta_cost
+- Rollback events timeline (sensitive to operator action)
+
+Alerting and SLOs
+---
+- SLOs consulted: route-SLO P99 (varies by product route), global error-rate target 0.1%
+- Alerts fired when: automated rollback occurs, P99 increases > 10% absolute, dispatch failure spike > 0.2pp in 1m
+
+Troubleshooting checklist (common failure modes)
+---
+- Symptom: P99 regressions after promotion
+  - Inspect shadow delta metrics and sampled traces.
+  - Check for sequence-length skew between shadow and production.
+  - If regression confined to one GPU-type, restrict kernel variant by gpu_type label.
+- Symptom: increased fallback counts
+  - Verify kernel binary compatibility and model build flags.
+  - Check for memory pressure or OOMs on canary nodes.
+- Symptom: no cost improvement observed
+  - Confirm cost estimator inputs (tokens/sec telemetry) and sample size.
+  - Consider longer shadow windows or larger shadow fraction.
+
+Ownership, release notes and roadmap items
+---
+- Primary owner: runtime-kernel-team (oncall alias: runtime-kernel@redwood.internal).
+- Next roadmap items: integrate model-quality signals into autotune, add RL-based policy exploration, extend autotune to multi-tenant admission knobs.
+- Ship notes: this playbook formalizes the telemetry-feedback pipeline for kernel autotune and documents the automated rollback behavior introduced in runtime release 2.14.0.
+
+Appendix: short glossary and safe values
+---
+- kernel variant: a compiled execution path for attention/feed-forward operators (e.g., fused-attn-v2, aten-attn).
+- prefetch-window: time in ms used to warm KV cache ahead of request.
+- safe promotion thresholds: default cost_improvement_threshold_pct=4, p99_relative_threshold_promote=3%
+
+Related pages
+---
+- Continuous runtime profiling strategy (link in Related pages)
+- Performance regression huntbook
+- Kernel build and compatibility matrix
+
+Change log
+---
+- 2026-01-18: initial published draft by Maya Chen.
+- 2026-02-12: clarified shadow fraction defaults and tightened rollback window.

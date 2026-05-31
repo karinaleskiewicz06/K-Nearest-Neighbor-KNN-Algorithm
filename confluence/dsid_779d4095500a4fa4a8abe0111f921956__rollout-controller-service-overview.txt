@@ -1,0 +1,305 @@
+Rollout Controller Service Overview
+
+## Overview
+The **Rollout Controller** (service name: `rollout-controller`, internal shorthand: **RC**) is Redwood’s control-plane service responsible for orchestrating **staged model deployments** and **traffic-shift rollouts** (canary + A/B) for inference routes across Hosted, Dedicated, and Private environments.
+
+RC owns the rollout **state machine**, applies **policy guardrails**, coordinates with execution systems to change routing/weights, and records an **audit trail** for every step and automated action (pause/rollback/suppress).
+
+This page is the operational/service reference for engineers and SREs: responsibilities, dependencies, failure modes, and on-call ownership.
+
+---
+
+## Responsibilities (what RC does)
+### 1) Rollout orchestration
+RC manages rollout plans for a scoped target:
+- **Scope:** `service/route`, `model_version`, `region`, `customer_tier` (and optionally `customer_id` for allowlisted enterprise rollouts)
+- **Rollout types:**
+  - **Canary:** shift traffic from baseline → candidate in defined steps (e.g., 1% → 5% → 25% → 50% → 100%)
+  - **A/B:** maintain a long-lived split for evaluation, with the ability to revert quickly
+  - **Staged deploy:** coordinate “deploy candidate everywhere” + “shift traffic later” patterns
+
+Key state machine transitions:
+- `CREATED` → `VALIDATING` → `RUNNING(step=N)` → `PAUSED` → `COMPLETED`
+- Failure/mitigation paths: `RUNNING` → `AUTO_PAUSED` | `AUTO_ROLLED_BACK` | `FAILED`
+
+### 2) Policy enforcement + safe bounds
+RC evaluates and enforces rollout policies via the Policy Engine:
+- Step sizes, max shift rate, and step duration minimums
+- Auto-mitigation policies (pause/rollback) on SLO breach
+- Suppression windows and admin override requirements
+- Safe-bounds validation to prevent oscillation and dangerous configs
+
+### 3) Auto-mitigation based on SLO monitoring (SLO breach → pause/rollback)
+When enabled for a rollout, RC periodically evaluates **rollout-scoped SLO monitors** (p95/p99 latency, error rate, selected saturation signals) and can:
+- **AUTO_PAUSE**: stop progression at the current step
+- **AUTO_ROLLBACK**: revert traffic split back to last-known-good baseline
+- **SUPPRESS**: do nothing due to explicit suppression / incident / missing data rules
+
+Breach evaluation strategy is documented in **ADR-0127** (burn-rate windows, minimum sample gating, debounce/holdoff).
+
+### 4) Auditability + event emission
+RC writes an append-only audit trail for:
+- Step transitions, approvals, and manual actions
+- Auto actions (pause/rollback), including SLO evidence references
+- Suppression/override events with justifications
+
+Audit schema requirements are documented in **ADR-0128**.
+
+### 5) API surface for Console + automation
+RC is called by:
+- Redwood Console (UI + Console backend)
+- Internal CLI tools for platform/release engineers
+
+RC provides:
+- Create rollout, fetch rollout status, list rollouts by route/model
+- Start/pause/resume/cancel rollout
+- Admin-only endpoints for suppression/override (RBAC enforced upstream)
+
+---
+
+## Non-goals (what RC does not do)
+- It is **not** the metrics source of truth (RC reads from telemetry/monitor systems).
+- It does **not** run LLM inference or manage GPU scheduling.
+- It does **not** (initially) perform multi-region failover orchestration beyond rollback/pause.
+- It does **not** run quality-evals as a rollback signal (separate system; may be integrated later as an additional signal).
+
+---
+
+## Architecture (high level)
+### Request + control flow
+1) Console/CLI creates a rollout and specifies scope (route/model/region/tier).
+2) RC fetches policy defaults/overrides from the Policy Engine.
+3) RC validates config, then begins executing steps.
+4) For each step:
+   - RC requests traffic weight changes through the Routing/Traffic Manager.
+   - RC emits state transition + audit events.
+   - RC evaluates SLO monitors and decides whether to proceed, pause, or rollback.
+
+### Data + event flow (text diagram)
+**Console / API Clients**
+  → (REST/gRPC) **Console Backend**
+  → (gRPC) **Rollout Controller (RC)**
+      → **Policy Engine / Config Service** (read rollout policy + validate)
+      → **Traffic Manager** (apply routing/weights)
+      → **Telemetry + Event Stream** (emit audit + metrics)
+      → **SLO Monitor Provider** (query burn-rate + sample sizes + staleness)
+
+---
+
+## Key dependencies
+### Policy Engine / Config Service
+Used for:
+- Resolving effective policy: service defaults + tier defaults + rollout overrides
+- Validating configs against safe bounds (e.g., min step duration, max rollback frequency)
+- Versioning policies (policy version recorded into audit events)
+
+Operational expectations:
+- RC should degrade gracefully if policy reads fail during evaluation (see failure modes).
+
+### Telemetry / Metrics Platform
+RC emits:
+- Metrics for rollout state and decision outcomes (see Observability section)
+- Structured audit events to the event stream
+
+RC reads:
+- None directly from time series DB in the critical path; it queries the monitor provider abstraction for SLO status.
+
+### SLO Monitor Provider (via `slo-toolkit` adapter)
+Used for auto-mitigation:
+- Query rollout-scoped SLOs (latency/error/saturation) with burn-rate windows
+- Retrieve minimum sample counts, timestamps, and staleness indicators
+
+Monitor requirements:
+- Must support labels for `route`, `model_version`, `region`, `customer_tier`
+- Must return “no data” and “stale” signals distinctly from “healthy”
+
+### Traffic Manager / Routing Plane
+Executes:
+- Weight changes for canary/A-B
+- Safe step-down strategy on rollback (rate-limited shifts, idempotent updates)
+
+RC relies on Traffic Manager to implement:
+- Idempotency keys
+- Conflict detection (e.g., another controller instance/actor attempting changes)
+
+---
+
+## Data stores / persistence
+RC persists:
+- Rollout objects (definition + scope + current state)
+- Step history and execution markers
+- Audit log references (or writes directly to Audit/Event Stream depending on environment)
+
+Data retention (current standard):
+- Rollout state/history: 90 days online, archive after
+- Audit events: per ADR-0128 (default 400 days unless customer contract requires longer)
+
+---
+
+## Failure modes and expected behavior
+### 1) Monitor missing / stale / lagging data
+Symptoms:
+- Monitor provider returns `MISSING` or `STALE` or insufficient samples
+
+Expected behavior:
+- Do **not** rollback purely on missing data.
+- Follow policy:
+  - `missing_data_action = PAUSE` (common for higher tiers) OR `missing_data_action = SUPPRESS` (common for low-risk internal rollouts)
+- Emit decision outcome with `reason=monitor_missing|monitor_stale|min_samples_not_met`.
+
+Notes:
+- Staleness thresholds and sample gates are configured in policy; see ADR-0127.
+
+### 2) Telemetry partial outage
+Symptoms:
+- Audit event stream delayed/errored
+- Metrics ingestion errors
+
+Expected behavior:
+- Rollout step execution must remain correct.
+- RC continues state transitions but:
+  - Buffers/retries audit emission (bounded)
+  - Records an internal “audit_emit_failed” marker and raises an alert if sustained
+
+### 3) Policy Engine unavailable
+Symptoms:
+- Cannot fetch policy (timeouts/errors)
+
+Expected behavior:
+- RC uses cached last-known-good policy for the service + tier if available (bounded TTL).
+- If no valid cached policy exists:
+  - New rollouts: fail validation (`VALIDATING` → `FAILED`) with actionable error
+  - In-progress rollouts: **PAUSE** rather than proceed blindly
+
+### 4) Traffic Manager apply failure / partial execution
+Symptoms:
+- Traffic weight update rejected or times out
+
+Expected behavior:
+- RC retries with idempotency.
+- If still failing, RC transitions to `PAUSED` (or `FAILED` if configured) and emits an alert.
+- RC must never assume a weight change succeeded without confirmation.
+
+### 5) Oscillation / flapping (false positives)
+Symptoms:
+- Rapid sequence of breach/healthy causing repeated pauses/rollbacks
+
+Mitigations:
+- Debounce/holdoff and dual-window burn-rate evaluation (fast + slow window)
+- Minimum sample size requirement
+- Guardrails: max auto-actions per rollout per hour; cool-down after rollback
+
+See ADR-0127 for chosen evaluation approach.
+
+### 6) Concurrent actors / double execution
+Symptoms:
+- Two controllers attempt to progress same rollout (leader election bug, retries)
+
+Expected behavior:
+- RC enforces per-rollout locking and idempotent step transitions.
+- If conflict detected: one actor wins; the other should no-op and log.
+
+---
+
+## Observability
+### Golden signals
+- **Latency:** time to execute a rollout step transition; time-to-mitigation on breach
+- **Errors:** failed step executions, policy resolution errors, monitor query errors
+- **Saturation:** queue depth/worker utilization for controller task processing
+- **Correctness:** unexpected state transitions, repeated step executions
+
+### Standard metrics (high level)
+Metrics are named/labelled per:
+- Confluence: Observability Standards → “Rollouts SLO Metrics Naming and Labeling”
+
+RC emits at minimum:
+- `rollout_controller_rollout_state{state,route,region,customer_tier}` (gauge)
+- `rollout_controller_step_transition_total{outcome,reason}` (counter)
+- `rollout_slo_evaluation_total{signal,window,outcome,reason}` (counter)
+- `rollout_auto_action_total{action,reason,suppressed}` (counter)
+- `rollout_monitor_query_errors_total{provider,reason}` (counter)
+
+Cardinality guidance:
+- Avoid raw `customer_id` in metrics (use audit events for per-customer details).
+- Prefer `rollout_id` only in audit logs/events, not metrics.
+
+### Dashboards and alerts
+Dashboards (Grafana) should include:
+- Auto action timeline (pause/rollback/suppress)
+- Monitor health coverage and staleness rates
+- Controller error budget burn: step failures, monitor query failures
+
+Alerts (routing guidance):
+- Page Platform Oncall if:
+  - sustained controller execution failures OR
+  - rollback executor failing to apply reversions
+- Notify (non-paging) if:
+  - monitor missing/stale spikes OR
+  - suppression events exceed baseline
+
+---
+
+## Security, compliance, and privacy
+- Audit events may include: rollout scope (route/model/region/tier), policy version, monitor IDs, and references to metric snapshots.
+- Do **not** store request payloads, prompts, or customer data in RC logs.
+- Any admin override/suppression requires:
+  - authenticated admin identity
+  - justification string
+  - recorded audit event (per ADR-0128)
+
+---
+
+## Ownership, on-call, and escalation
+### Team ownership
+- Primary owner: **Eng Platform / Control Plane**
+- Service architect: **Jada Williams**
+- Control plane integration: **Ethan Park**
+- Policy/config implementation: **Benji Okafor**, **Jordan Lee**
+- Console surfaces (API/UI): **Chloe Martin**, **Felix Schneider**
+- SLO semantics/on-call readiness: **Sean Gallagher**, **Rafael Mendes**
+
+### On-call
+- On-call rotation: **Platform Oncall (eng-platform)**
+- Secondary escalation: **SRE Oncall (eng-sre)** for SLO-monitoring/alerting issues
+- Tertiary escalation: **Traffic/Routing Oncall** if Traffic Manager is failing to apply weights
+
+### Runbooks
+- Primary runbook: “Auto-rollback on SLO breach” (triage, suppression, restart rollout)
+- Incident playbook: “Rollout incident playbook: auto mitigation”
+
+---
+
+## Operational guidelines
+### Before enabling auto-mitigation for a service/route
+Service owners must confirm:
+1) Required monitors exist and are labeled correctly for rollout scope.
+2) Dashboard links are present and accessible to on-call.
+3) Policy templates are selected with safe defaults for the tier.
+4) A rollback target (last-known-good) is defined and reachable.
+
+### During a rollout
+- Prefer small initial canary steps for new model versions.
+- Treat `AUTO_PAUSED` as a “stop and investigate” state; do not immediately resume without understanding the signal.
+
+### After an auto-rollback
+- Confirm the baseline is stable and traffic is fully reverted.
+- Review audit event details (monitor status, burn-rate windows, sample counts).
+- If rollback was false-positive, apply a documented suppression with justification and file a follow-up to adjust monitors/policy.
+
+---
+
+## Change management
+- RC changes are released behind feature flags:
+  - `rc.slo_auto_mitigation.enabled` (global)
+  - `rc.slo_auto_mitigation.tier_gates` (per tier)
+  - `rc.slo_auto_mitigation.actions` (pause vs rollback)
+- Staged enablement: dev → staging → internal prod route → wider prod (per release plan).
+
+---
+
+## Open questions / upcoming work
+- Expand saturation signals eligibility (GPU queue depth, router overload) with clear semantics.
+- Integrate quality-evals as an additional rollback signal (separate initiative).
+- Improve backpressure handling during large concurrent rollouts (scheduler fairness).
+
+For roadmap context, see the Reliability Initiative page for 2026-H1 auto-rollback.

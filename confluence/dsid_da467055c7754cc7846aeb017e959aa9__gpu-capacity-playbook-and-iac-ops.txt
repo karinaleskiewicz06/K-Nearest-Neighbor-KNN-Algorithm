@@ -1,0 +1,142 @@
+GPU Capacity Playbook and IaC Operational Patterns
+
+Summary
+This playbook describes how Redwood manages GPU fleet capacity end-to-end and how Terraform/IaC modules are used to make scaling predictable, auditable, and testable. It covers capacity triggers, cloud account and VPC patterns, IaC module examples, CI/CD build & deploy guidance for infra changes, and operational runbook steps for capacity incidents.
+
+Goals
+- Maintain >=99.9% availability for serving pools under committed throughput windows.
+- Keep median p99 latency impact from capacity events to <2x nominal for rolling fallbacks.
+- Prevent unplanned GPU provisioning failures and reduce mean time to recovery (MTTR) for capacity incidents to <30 minutes.
+
+Scope
+Applies to: Dedicated and Private GPU pools, autoscaling policies, Terraform modules that manage fleet instances, GKE/GCE/EC2/VMware provisioning pipelines, cloud accounts and cross-account network attachments. Does not replace customer onboarding docs for Dedicated contract sizing.
+
+Ownership and contacts
+- Primary owner: Infra - GPU Fleet (team alias: infra-gpu@redwood.internal)
+- Secondary owner: Eng-SRE (team alias: eng-sre@redwood.internal)
+- Pager: oncall-infra-gpu (page policy: weekdays 09:00–17:00 local; 24/7 for Prod SLO breaches)
+
+Key definitions
+- Pool: logical group of GPU instances behind a serving cluster (e.g., pool-realtime-a100-40g).
+- Committed capacity: reserved instances tied to customer Dedicated contracts.
+- Burst capacity: ephemeral instances used to absorb short peaks.
+- Safety headroom: free capacity buffer target (default 15% across serving pools).
+
+Capacity targets and SLOs
+- Safety headroom: 15% (configurable per-pool)
+- Scale-up alert threshold: queue depth >75% of usable capacity for >3 minutes
+- Scale-down cooldown: no scale-down unless utilization <40% for 10 minutes
+- Provision failure SLO: 98% of new instances provision within 8 minutes
+
+Alerting matrix (examples)
+- Alert: pool_queue_sustained_high (severity: P1) — triggers when queue depth >= 75% for 3+ minutes. Action: attempt autoscale, if fail run incident playbook.
+- Alert: provisioning_fail_rate_high (severity: P2) — >5% failed launches in 5m. Action: notify infra-gpu, open ticket.
+
+Cloud account and networking patterns
+- Separate cloud accounts/projects by environment: prod, staging, infra-management.
+- Use shared VPCs for Dedicated/private deployments with explicit subnet allocations per region and per-pool. Subnet CIDR planning table: 
+
+| Environment | Region | Subnet CIDR | Purpose |
+|-------------|--------|-------------|---------|
+| prod        | us-west1 | 10.20.0.0/16 | GPU serving pods (pool A) |
+| prod        | us-east1 | 10.21.0.0/16 | GPU serving pods (pool B) |
+| infra       | global  | 10.30.0.0/20 | Management & build agents |
+
+- VPC peerings/VPNs: peer prod VPCs to customer VPCs only via audited attachments; use service accounts with least privilege for cross-account networking operations.
+- Tags and labels: every GPU instance must include labels: env, pool, owner, commit_id. Terraform module enforces this as a policy.
+
+IaC module patterns (Terraform examples)
+- High-level module decomposition:
+  1) cloud-networking - shared VPC, subnet allocations, firewall, route tables
+  2) gpu-pool - instance template, instance group / node pool, autoscaler policy, node metadata and taints
+  3) k8s-shims - GKE/AKS/EKS node pool attachments, kubelet config, GPU drivers bootstrap
+  4) iam-roles - service accounts, instance profiles, KMS bindings
+
+Example usage: gpu-pool module (HCL snippet)
+```hcl
+module "gpu_pool_realtime_a100" {
+  source = "git::ssh://git@repo.redwood.internal/infra/modules//gpu-pool.git?ref=v1.7.3"
+  env = "prod"
+  region = "us-west1"
+  pool_name = "realtime-a100-40g"
+  instance_type = "nvidia-a100-40g"
+  target_utilization_pct = 65
+  safety_headroom_pct = 15
+  min_size = 4
+  max_size = 200
+  labels = { owner = "infra-gpu", commit_id = var.commit_id }
+}
+```
+Operational constraints encoded in module: instance boot scripts install drivers via cached packages, attach block volumes for KV cache, and register node with tagging for autoscaler. Modules include acceptance tests run in CI (see CI/CD section).
+
+CI/CD and build for infra changes
+- Pipeline flow for Terraform changes (high level):
+  1) Developer opens PR against infra repo.
+  2) CI runs fmt, validate, static checks (tfsec), and module acceptance tests in sandbox (emulated using cheap spot GPUs or mocked API).
+  3) If tests pass, plan is posted to PR. Approvers (infra-gpu + eng-sre) review.
+  4) On merge to main, automated apply runs in infra-management account using an ephemeral service account with limited scope and runbook-guard rails.
+- CI jobs to include:
+  - terraform fmt + validate
+  - tfsec and checkov (policy as code)
+  - plan with PR comment, store plan artifact in artifacts bucket
+  - acceptance tests: small-scale apply to a staging pool, smoke test with a perf harness (tokenized load generator)
+  - canary apply for prod: apply to staging-prod subnet pair, wait 15 minutes, smoke test, then full apply.
+
+Testing & staging patterns
+- Always test instance boot scripts and GPU driver upgrades on a dedicated staging pool (named staging-gpu-driver-upgrade) that mirrors prod instance types and network config.
+- Use isolated accounts for destructive tests (e.g., node-image rebuilds) and ensure these accounts are subject to stricter approvals.
+
+Runbook: capacity-degeneration (P1)
+1) Detect: Alert "pool_queue_sustained_high" triggers.
+2) Triage: Oncall checks dashboards: pool utilization, queue depth, recent scaling events, provisioning_fail_rate.
+3) Immediate mitigation (first 10 minutes):
+   a) Attempt scale-up via terraform trigger: 
+      - CLI: terraform workspace select prod && terraform apply -target=module.gpu_pool_realtime_a100 -var='desired_capacity=${current+expected}' 
+   b) If autoscaler failing, fallback to routing policy: shift new requests to secondary pool or cheaper downstream fallback model (console route override).
+4) If scale-up fails due to provisioning failures:
+   a) Inspect cloud provider console for quota errors or instance types unavailable.
+   b) If quota: request quota increase via cloud support and open temporary burst policy to use alternate instance family (e.g., a40->a100 or p4->a100) with immediate CDC approval.
+5) Recovery verification: confirm queue depth back below 50% and no errors for 15 minutes.
+6) Post-incident actions: create incident ticket, capture timeline, root cause, and remediation in postmortem template.
+
+Runbook: provisioning-failure (P2)
+1) Detect: Alert "provisioning_fail_rate_high" fires.
+2) Triage: Determine error class (quota, network attach, image pull, metadata failure).
+3) Quick fixes:
+   - Quota: temporary shift to alternate region with lower utilization, apply terraform with region override.
+   - Image pull: revert to cached driver bundle via instance metadata flag.
+   - Network: re-run cloud init and examine route tables; ifmanaged firewall blocked, add exception rule.
+4) Long term: add acceptance test that reproduces the failure path and add regression guard to CI.
+
+Change approval and audit controls
+- All prod terraform applies require at least two approvers: one infra-gpu owner and one eng-sre.
+- Module releases (semver) are signed and changelogs published to internal artifact registry.
+- Every apply logs: operator, plan artifact id, git commit, and terraform state diff summary to the infra-audit log (retention 1yr).
+
+Driver & image upgrade policy
+- Upgrade cadence: drivers and node images are upgraded on a quarterly cadence for stable release branches; emergency patches can be applied earlier.
+- Upgrade workflow: stage -> canary (5% capacity) -> 20% -> 50% -> full, with automated rollback if p99 latency degrades >30% during a window.
+
+Operational playbooks for common tasks
+- Scale-by-terraform (approved): use terraform var overrides and module targets as documented in the module README.
+- Emergency manual scale: CLI quickscale script (internal): /ops/bin/gpu_quickscale --pool realtime-a100 --delta +20 --reason "incident". This script is logged and gated by MFA.
+- Rebuild node image: jira ticket with owner and scheduled window; use staging pool to validate image and then rollout with node drain and rolling replacement.
+
+Audit & compliance notes
+- Access to presence-changing operations (apply, quickscale, canary toggle) is audited via IAM roles and recorded in Cloud Audit Logs + internal infra-audit.
+- For Dedicated customer deployments with separate VPCs, ensure that audit logs are forwarded to customer-allowed destinations only per contract.
+
+Appendix: Troubleshooting quick reference
+- High queue + failed scale: check quota -> check spot reclaim rates -> check cloud provider instance market status.
+- Slow provisioning (>8m): examine instance boot logs (serial console), and check health of image registry and metadata server.
+- Autoscaler flapping: increase cooldown and set max surge to 1.
+
+References and links
+- Module repo: git@repo.redwood.internal:infra/modules/gpu-pool.git
+- CI job definitions: /concourse/pipelines/infra-gpu.yml
+- Incident template: /confluence/eng-sre/postmortem-template
+
+Change history
+- 2024-10-02: Created by Evelyn Chen
+- 2025-02-12: Added runbooks for provisioning-failure and updated CI/CD acceptance test guidance (Ravi Nair)
+

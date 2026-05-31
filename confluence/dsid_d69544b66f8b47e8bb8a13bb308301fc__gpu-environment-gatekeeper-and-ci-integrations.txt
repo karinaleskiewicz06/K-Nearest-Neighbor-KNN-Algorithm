@@ -1,0 +1,182 @@
+GPU Environment Gatekeeper and CI Integrations
+
+Overview
+
+This document defines the GPU Environment Gatekeeper pattern and how Terraform/IaC modules integrate with our CI pipelines to provide safe, auditable, and automated GPU environment provisioning. Target audience: infra engineers, platform, SREs, and anyone touching GPU IaC or CI for inference clusters.
+
+Why this exists
+
+- GPU capacity and network egress are high cost and high-impact resources. Misprovisioned environments cause billing surprises, noisy-neighbor incidents, or security exposure.
+- We need deterministic, reviewable changes that enforce guardrails (quota ceilings, egress fencing, tenant isolation) before a change is allowed to run at scale.
+
+Goals
+
+1. Prevent destructive or overly permissive GPU environment changes from landing without explicit approval.
+2. Encode environment constraints as gatekeeper policies (OPA/Gatekeeper) enforced both locally and in CI.
+3. Integrate Terraform modules with CI steps that run static checks, plan-diffs, policy-evaluation, and canary promotions.
+4. Provide clear runbooks for deployment, rollback, and incident triage.
+
+Scope
+
+- Applies to all GPU IaC modules under the terraform/accelerators namespace.
+- Includes cross-account VPC modules that attach to GPU pools, egress NAT/Gateway components, and IAM/ServiceAccount bindings used by GPUs.
+- Does NOT instruct on ephemeral developer sandboxes (those are handled by the dev-sandbox repo).
+
+High-level architecture
+
+1) Author changes in feature branch that updates terraform modules or variables.
+2) CI pipeline executes: lint -> unit terraform validation -> terraform plan -> policy-eval (Gatekeeper/OPA) -> plan approvals.
+3) If policy-eval passes and approvals are present, plan moves to canary/prod promotion pipelines.
+4) Post-deploy hooks validate topology via telemetry (VPC flow logs, endpoint health, egress metrics).
+
+Diagram (textual)
+
+- Developer -> Git (feature branch) -> CI Runner (buildkite) -> Terraform Plan/Apply stages -> Gatekeeper / OPA checks -> Canary -> Promoted to prod clusters -> Observability (Datadog + internal exporters).
+
+Terraform modules: layout and expectations
+
+- Module naming: accelerator-<purpose>-<region> (example: accelerator-inference-us-east1).
+- Each module must expose the following variables and outputs (snippet):
+
+Variables expected (reference):
+- name (string) 
+- gpu_pool_size (number) 
+- instance_profile (string)
+- egress_mode (string) // one of [fenced, nat-gateway, private-api-only]
+- tenant_tag (string)
+- cost_center (string)
+
+Outputs expected:
+- vpc_id
+- subnet_ids
+- gpu_pool_id
+- iam_role_arn
+
+Module-level invariant checks (requirements):
+1) gpu_pool_size cannot exceed account_quota_limit - safety_buffer. Must be validated in a pre-apply hook.
+2) egress_mode default must be "fenced" for tenant-owned pools unless explicit security review tag present.
+3) All modules must tag resources with cost_center and tenant_tag for billing and RBAC.
+
+Gatekeeper / OPA policies (examples)
+
+We run identical policy sets in two places: a CI-side OPA evaluation (rego) and cluster-level Gatekeeper admission for on-cluster resources. Below is an illustrative policy snippet.
+
+# Rego snippet (policy: disallow-large-gpu-pool)
+package infra.gatekeeper
+
+violation[{
+  "msg": msg,
+  "details": {"requested": requested, "limit": limit}
+}] {
+  requested := input.plan.requested_gpu_count
+  limit := input.account_limits.max_gpu_per_tenant
+  requested > limit
+  msg := sprintf("requested GPU count (%v) exceeds tenant limit (%v)",[requested, limit])
+}
+
+Policy evaluation is executed as: opa eval --input plan.json --data policies/ -f pretty 'data.infra.gatekeeper.violation'
+
+CI/CD pipeline: recommended stages (Buildkite example)
+
+1) lint-iac
+- run: tflint, tfsec, checkov
+- fail fast on high-severity issues
+
+2) terraform-validate
+- run: terraform init -backend=false && terraform validate
+
+3) terraform-plan
+- run plan with approved variable set for target environment
+- output plan.json for policy evaluation and artifact storage
+
+4) policy-eval
+- opa/rego or gatekeeper-constraints run against plan.json
+- reject on any violations
+
+5) cost-estimate
+- run our cost-estimator tool to annotate plans with expected monthly GPU cost delta
+- annotate PR with cost delta and billing owner
+
+6) human-approval / security-approval
+- auto-approve for small delta changes (<= 3 GPUs and < $200/mo), otherwise require 2 approvers
+
+7) apply-canary
+- apply to canary account/region with reduced capacity and short TTL tag (apply and schedule destroy if not promoted)
+
+8) promote-to-prod
+- if canary health checks pass within 12 hours, promote apply in production account(s)
+
+CI snippets (terraform plan -> policy eval)
+
+- terraform plan -out=tfplan.binary -var-file=envs/prod.tfvars
+- terraform show -json tfplan.binary > plan.json
+- opa eval --input plan.json --data policies/ 'data.infra.gatekeeper.violation' || exit 1
+
+Testing and validation
+
+- Unit tests: Module-level terratest suites for the most critical modules (accelerator-provisioning, vpc-egress). These should run in ephemeral cloud accounts in the CI sandbox pool.
+- Policy tests: Keep a policy-test-suite that validates policy behavior on representative plan.json fixtures.
+- Integration tests: Apply to canary accounts (preconfigured via ci/credentials) and run smoke tests that validate: GPU node readiness, KV cache warmup baseline, egress path strictly NATed if fenced, and cost reporting.
+
+Operational runbook: deploy and rollback
+
+Deploy (typical change to accelerator module):
+1) Open feature branch and push changes.
+2) Ensure module version bump and CHANGELOG entry.
+3) Open PR; CI will run plan/policy checks and annotate cost delta.
+4) When green, request approvals per policy.
+5) Merge -> triggers apply-canary.
+6) Monitor canary for 12 hours. Key checks: control-plane CPU, GPU allocation success rate > 99%, egress bytes metric staying in baseline.
+7) If canary passes, trigger promote-to-prod apply.
+
+Rollback (if canary or prod fails):
+- Immediate steps: halt promotion, revert the merge in the module repo (create revert PR), and open incident ticket with oncall.
+- If an applied change caused noisy neighbor effects, scale down the offending pool via the multi-tenant throttle API and re-run a safe re-provision with smaller gpu_pool_size.
+- Use our terraform-reconcile tool to compare cluster state vs desired and generate emergency plan to revert only the divergent resources.
+
+Monitoring and SLOs
+
+- Deployment SLO: 95% of small changes (<=3 GPUs) must complete policy-eval + apply-canary within 30 minutes of merge.
+- Safety SLO: No more than 1 policy-eval bypass per quarter. Bypasses must be recorded in the policy-audit log.
+- Cost SLO: Unauthorized cost delta alerts for > $1k/month must page infra-eng oncall.
+
+Ownership and escalation
+
+- Module owners: Every terraform module must list an OWNER file with at least two owners. If a module lacks owners for >60 days, infra platform auto-assigns a rotation owner.
+- Oncall: infra-eng-oncall handles escalations for failed canaries, policy violations in prod, or runaway egress.
+
+Appendix: sample terraform variable enforcement (example)
+
+# guard.tf (policy as code integration pseudo):
+locals {
+  requested = tonumber(var.gpu_pool_size)
+  max_for_tenant = lookup(var.account_limits, var.tenant_tag, var.account_limits.default)
+}
+resource "null_resource" "preflight" {
+  count = local.requested > local.max_for_tenant ? 1 : 0
+  provisioner "local-exec" {
+    command = "echo \"GPU request exceeds tenant quota\" && exit 1"
+  }
+}
+
+Appendix: quick CLI checks
+
+- Validate plan and policy locally:
+  terraform plan -out=tf.plan && terraform show -json tf.plan > plan.json && opa eval --input plan.json --data policies/ 'data.infra.gatekeeper.violation'
+
+- Estimate cost delta locally:
+  ./tools/cost-estimator --plan plan.json --out annotations.json
+
+Related references
+
+- See: gpu-topology-resilience-checklist-and-canary-protocol, gpu-demand-forecasting-and-ml-backed-scaling-playbook, and canary-gpu-provisioning-safety-net-pipeline.
+
+Notes and future work
+
+- Next iterations will integrate an automated remediation bot for small predictable policy violations (e.g., automatic pool size reduction to the nearest allowed value after manager approval).
+- We will also prototype a Terraform plugin that surfaces policy violations inline during `terraform plan` to reduce CI churn.
+
+Contact
+
+- Primary: Marina Patel (marina@redwood.ai)
+- Oncall: infra-eng-oncall@redwood.ai

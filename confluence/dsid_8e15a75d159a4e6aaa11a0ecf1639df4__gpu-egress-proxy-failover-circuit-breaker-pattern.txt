@@ -1,0 +1,160 @@
+GPU Egress Proxy Failover and Circuit-Breaker Orchestration Pattern
+
+Summary
+This document describes the GPU egress proxy failover orchestration pattern used by Redwood Inference to ensure predictable, SLA-aligned outbound egress for inference traffic from GPU pools. It codifies an automated circuit-breaker-style controller, manual runbook procedures, Terraform/IaC examples, and operational thresholds for safe failover and rapid recovery.
+
+Scope and goals
+- Scope: egress paths used by inference data planes (hosted and Dedicated), including cloud NAT/egress proxies, Transit Gateway or equivalent, and per-tenant egress sharding. Excludes internal service-to-service east-west traffic routing.
+- Goals:
+  - Keep token-response latency within 99th-percentile SLOs during partial egress failures.
+  - Limit cross-region and burst egress cost impact during failover.
+  - Provide safe automated fallback with circuit-breaker protections to avoid cascading failures.
+  - Provide clear manual remediation steps and IaC primitives for controlled rollouts.
+
+High-level architecture (textual diagram)
+- gpu-node -> local sidecar (egress-shard-manager) -> egress-proxy-fabric (regional) -> Transit Gateway / NAT / Internet -> external endpoints
+- egress-proxy-fabric contains:
+  - regional egress-proxies (k8s service autoscaled with HPA)
+  - egress-controller (Kubernetes operator + controller in control plane)
+  - egress-orchestrator (serverless Lambda / FaaS for cloud account-level orchestration)
+  - egress-metrics-bridge (pushes telemetry to metrics backend)
+
+Core components and responsibilities
+- egress-shard-manager (node sidecar): understands tenant egress sharding key; adds metadata to requests and does local rate-limiting.
+- egress-proxy (regional): terminates TLS, does connection pooling and long-lived keepalives to external vendors, and exposes health endpoints (/healthz, /metrics).
+- egress-controller (control plane): decides failover actions based on telemetry and policy, writes target routing decisions to configstore (S3/etcd) and triggers orchestrator.
+- egress-orchestrator: runs atomic actions (route table swaps, proxy pool drains, NAT re-ip mapping) and publishes change events.
+
+Failure modes considered
+1) Proxy pool partial outage (instance level or node crash)
+2) Regional egress path congested (AS path / Transit Gateway queueing)
+3) Cloud NAT gateway limits reached or rate limited by provider
+4) External vendor upstream throttling or blackhole
+5) Control plane misconfig / config propagation delays
+
+SLOs and operational thresholds
+- Latency SLO: 99th percentile tail < 1.1x baseline (baseline measured over last 7d) for generation endpoint.
+- Availability SLO: 99.9% regional egress availability per 30-day window.
+- Circuit-breaker triggers (examples):
+  - Proxy error rate > 5% for 5 minutes -> start degraded routing path evaluation.
+  - Endpoint-level 5xx rate > 2% & stable for 3m -> mark upstream as suspect.
+  - NAT connection failures > 1% for 10m -> begin NAT swap orchestration.
+
+Metric and alert mapping (recommended)
+- egress.proxy.errors (counter) — alert: p99 increase by factor >= 3 for 10m
+- egress.proxy.latency_ms (histogram) — alert: p99 > 1.1x baseline for 5m
+- egress.nat.active_connections (gauge) — alert: > 85% of configured limit
+- egress.orchestrator.failed_actions (counter) — alert: any non-zero for 5m
+
+Automated failover orchestration (principles)
+- Fail fast but bounded: the controller escalates from local retries -> regional fallback -> cross-region failover in stages, with progressive circuit breakers.
+- Safe, reversible IaC-driven actions: state changes are executed via the egress-orchestrator which runs pre-validated Terraform plan/apply against a locked account sandbox.
+- Progressive traffic shifting: 10% -> 50% -> 100% (5–10s pace between steps for steady-state; longer for cross-region transfers).
+- Cost-awareness: tag and limit cross-region steps for non-critical tenants.
+
+Runbook (detection -> remediation)
+1) Detection (automated)
+   - Pager triggers: egress proxy error-rate or latency alerts fire to infra/gpu-networking oncall.
+   - Oncall dashboard: open the egress incident board which contains heatmap, group-by-tenant error counts, and last orchestrator event.
+2) Initial validation (5 minutes)
+   - Run `curl -sS https://egress-proxy-regional-1.internal/healthz` from a bastion in the same AZ. Expect 200 + body {\"status\":\"ok\"}.
+   - Check orchestrator logs: `kubectl -n infra logs deploy/egress-orchestrator --since=10m | tail -n 200`.
+   - Query metrics: `promql: increase(egress_proxy_errors[5m])` and compare against threshold.
+3) Automated mitigation (if configured)
+   - The controller will run a staged reroute: update configstore routing table -> orchestrator executes drain/attach steps. Monitor `egress.orchestrator.events` for progress.
+4) Manual mitigation (if automation fails)
+   - Step A: Drain unhealthy proxy pool: `kubectl -n egress scale deployment/egress-proxy-regional-1 --replicas=0` (only if traffic already shifted).
+   - Step B: Trigger NAT swap: run `aws ec2 replace-route --route-table-id rtb-XXXX --destination-cidr-block 0.0.0.0/0 --network-interface-id eni-YYYY` from ops bastion (see IAM role: infra-egress-rotator).
+   - Step C: If cross-region fallback needed: toggle BGP policy in Transit Gateway with `egress-orchestrator` pre-approved plan (see IaC snippet).
+5) Post-incident recovery
+   - Reintroduce proxies gradually using progressive traffic shifting: 10% increments, 2–5m between steps.
+   - Validate error rate and latency are back to baseline for minimum 30m at each stage.
+
+Communication and ownership
+- Primary oncall: infra/gpu-networking (rotation leads listed in the oncall roster).
+- Secondary: infra-sre.
+- Incident comms: open incident in Statuspage and post summary in #infra-incidents Slack channel. Use template: incident summary, impact, mitigation taken, next steps.
+
+Terraform / IaC primitives (example usage)
+- We keep modular, small primitives for safe orchestration: `module.egress_proxy_pool`, `module.egress_route_table_swap`, `module.egress_tagged_limit`.
+- Example Terraform plan fragment (pseudo-code)
+```hcl
+module \"egress_proxy_pool\" {
+  source = \"git::ssh://git@repo/infra/terraform/modules//egress-proxy-pool\"
+  name   = \"egress-proxy-regional-1\"
+  size   = var.proxy_pool_size
+  tags   = { team = \"infra\" component = \"egress\" }
+}
+
+resource \"aws_route\" \"egress_default\" {
+  route_table_id         = var.route_table_id
+  destination_cidr_block = \"0.0.0.0/0\"
+  network_interface_id   = module.egress_proxy_pool.eni_id
+  depends_on             = [module.egress_proxy_pool]
+}
+```
+
+Kubernetes config snippet (egress-proxy health and draining)
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: egress-proxy
+  namespace: egress
+spec:
+  replicas: 3
+  template:
+    metadata:
+      annotations:
+        egress.redwood.io/drainable: \"true\"
+    spec:
+      containers:
+      - name: proxy
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+```
+
+Circuit breaker policy (recommended defaults)
+| Scope | Trigger condition | Action | Cooldown | Owner |
+|-------|-------------------|--------|----------|-------|
+| Proxy pool | p95 latency > 2s OR error rate > 5% for 5m | Reroute 10% traffic to fallback proxies | 5m | infra/gpu-networking |
+| Regional | NAT conn failures > 1% for 10m | Trigger NAT swap to spare gateway | 10m | infra/gpu-networking |
+| Cross-region | Persistent elevated tail latencies after 20m | Enable cross-region fallback for non-critical tenants | 30m | infra/sre |
+
+Notes on cost and tenant isolation
+- Tag every routed flow with tenant id to ensure chargebacks are accurate after a failover event.
+- Allow non-critical tenants to opt-out of cross-region fallback via tenant metadata; default for critical tenants is cross-region enabled.
+- Maintain soft budget caps per tenant to avoid runaway cross-region egress charges during prolonged incidents.
+
+Testing and exercises
+- Quarterly chaos tests: simulate partial proxy pool outage and validate orchestrator performs staged traffic shift (see test harness repo: infra/chaos/egress).
+- Preflight run: Run `terraform plan` in a dry-run sandbox and validate orchestrator preview events.
+
+Post-incident checklist
+1) Confirm root cause and write concise incident summary.
+2) Archive orchestrator events and attach `terraform plan`/`apply` outputs to incident.
+3) Identify any IaC gaps and open follow-up tasks with priority.
+4) Update this doc if thresholds or components change.
+
+Appendix: quick CLI commands
+- Check regional proxy health: `kubectl -n egress get pods -l app=egress-proxy -o wide`
+- Tail orchestrator logs: `kubectl -n infra logs deploy/egress-orchestrator -f`
+- Preview route replace (dry-run helper): `infractl egress preview --target rtb-XXXX`
+
+Appendix: contact matrix
+- infra/gpu-networking oncall: infra-gpu@redwood.internal (primary)
+- infra-sre escalation: infra-sre-escalate@redwood.internal (pager)
+
+References
+- [Ingress/Egress design principles](/confluence/eng-infra/cloud-accounts-and-networking/egress-path-harmonization-and-gpu-routing-playbook)
+- [Cross-region failover simulation playbook](/confluence/eng-infra/runbooks/cross-region-gpu-failover-simulation-playbook)

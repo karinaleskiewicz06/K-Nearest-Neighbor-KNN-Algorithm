@@ -1,0 +1,130 @@
+Ephemeral Eval GPU Attachment & Handshake Playbook
+
+Overview
+
+Purpose: This playbook documents the orchestration, network handoff, and emergency remediation steps for attaching ephemeral GPU accelerator sessions used by CI/eval jobs to tenant accounts. The playbook spans Terraform/IaC responsibilities, cross-account VPC attachment, IAM handshake, warm-pool allocation, and hotpatch steps to recover from common failure modes.
+
+Scope: Applies to ephemeral-eval GPU pools (namespace: eval-ephemeral), self-serve CI lanes, and internal benchmarking jobs. Not for production-hosted inference traffic.
+
+Owner and stakeholders
+
+- Primary owner: eng-infra GPU Fleet team
+- On-call escalation: infra-oncall (pager) -> GPU-fleet-SRE -> Platform Security
+- Consumers: eng-evals, ci-team, runtime-team
+
+SLOs and thresholds
+
+- Attachment latency (target): 95th percentile <= 12s
+- Warm-pool hit rate target: >= 86% for CI weekdays 06:00-22:00 PST
+- Failure-rate alert: >0.5% attach failures over rolling 5m window
+- Billing exposure alert: any attachment lasting >72h without owner tag
+
+Prerequisites (what must be true before attachment)
+
+1) Tenant account must have completed account-attach Terraform apply and have aws_role: "redwood-ephemeral-attach"
+2) VPC peering/privatelink established via cross-account networking modules
+3) Warm-pool warmers seeded and healthy (see metrics: gpu.warmpool.ready_count)
+4) CI job has a signed claim token from the claim-issuer service
+
+Standard Attachment Flow (summary)
+
+1. CI job requests a claim token from claim-issuer with job metadata.
+2. Claim-issuer validates quota and mints a short-lived signed claim (60s TTL).
+3. Provisioner service (gpu-attach-controller) calls allocator to pick a warm instance.
+4. Terraform-managed attachment module performs an account-assumerole step and applies network-attach resources.
+5. Provisioner verifies KV-cache mount, container preflight, and agent heartbeat.
+6. CI job begins run; on completion, teardown occurs and resources return to warm-pool or are terminated per policy.
+
+Detailed Run Steps (playbook)
+
+A. When a CI job cannot attach (failure mode: timed out waiting for allocation)
+
+1. Check metrics dashboard: gpu.attach.latency, gpu.attach.failures, allocator.queue_depth.
+2. Query claim-issuer logs for the job_id: /services/claim-issuer/logs?job_id=<id>
+3. If allocator.queue_depth > 100 and warmpool.ready_count < 5:
+   - Execute warm-pool scale-up: POST /internal/warmpool/scale?delta=+10 (must route through admin API)
+   - Run ``terraform apply -target=module.eval-warmpool[<region>]`` if automation fails.
+4. If IAM assume-role failures appear (403s): rotate temporary credentials via CI IAM helper and check role trust policy in the tenant account.
+5. Follow escalation: assign a P1 to the on-call if attach failures persist >10m with impact to >5% jobs.
+
+B. When network-attachment fails (peering/route missing)
+
+1. Check VPC status: aws ec2 describe-vpc-peering-connections --filters Name=status-code,Values=active
+2. Confirm routes: aws ec2 describe-route-tables --filters Name=vpc-id,Values=<tenant-vpc>
+3. If missing route: apply terraform run-from-state: ``terraform apply -auto-approve -var 'target_vpc=<tenant-vpc>'`` using workspace: network-fixes
+4. Temporary workaround: enable proxy-mode on attach-controller to tunnel traffic via relay-net (command: kubectl -n infra port-forward svc/relay-net 8100:8100)
+
+C. Hotpatch: runaway attachment or stuck claim
+
+1. Identify instance: list attachments via API: GET /internal/attachments?status=attached&age_gt=72h
+2. If stuck, run force-detach: POST /internal/attachments/<id>/force-detach with reason and owner.
+3. Reclaim bookkeeping: ensure claim ledger (S3: s3://redwood-infra/claims/ledger.csv) is updated and eviction hook processed.
+4. If force-detach fails due to kernel panic, open an immediate EC2 instance console and capture dmesg, then create task for hardware-replacement flow.
+
+Config Matrix (quick reference)
+
+| Component | Default Region | Warm-pool target | IAM role | Terraform module |
+|-----------|----------------|------------------:|---------|-----------------|
+| eval-ephemeral-warmpool | us-west-2 | 20 per AZ | redwood-eval-warmpool | module.eval-warmpool |
+| attach-controller | us-west-2 | N/A | redwood-attach-role | module.gpu-attach-controller |
+| claim-issuer | us-west-2 | N/A | redwood-claim-issuer | module.claim-issuer |
+
+Terraform example: attach module usage
+
+```hcl
+module "tenant-attach" {
+  source = "git::ssh://git@github.com/redwood-infra/terraform-modules.git//tenant-attach?ref=v1.8.2"
+  tenant_account_id = var.tenant_account_id
+  tenant_vpc_id     = var.tenant_vpc_id
+  attach_subnet_ids = var.attach_subnets
+  role_name         = "redwood-ephemeral-attach"
+  tags = {
+    owner = var.requester
+    purpose = "ci-ephemeral"
+  }
+}
+```
+
+CI/CD integration notes
+
+- Job runner must fetch claim token at least 30s before starting attach to allow controller backoffs.
+- Buildkite pipeline step example: ``plugins: [redwood/gpu-attach#v1.2.0]`` with env: ATTACH_CLAIM_TOKEN
+- Pipelines should set metadata: redwood.job.team and redwood.job.trace_id (used for billing reconciliation)
+
+Audit and Billing signals
+
+- Monitor s3://billing-exports/ephemeral-eval/ for daily attach-hour CSV; alert on anomalies (>20% uplift vs baseline)
+- Ensure each attachment has tags: owner, team, trace_id; missing tags trigger auto-detach after 24h
+
+Postmortem checklist (if this play caused customer-facing outage)
+
+1. Create incident ticket and notify GTM and Customer Success immediately.
+2. Collect traces: attach-controller logs (last 2h), cloudtrail entries for assume-role, and allocator audit logs.
+3. Recompute root cause and list corrective actions with owners and target dates.
+4. Schedule remediation runbook to harden the failing component (eg: add circuit-breaker, increase warm-pool floor).
+
+Troubleshooting cheatsheet (common error strings)
+
+- "InsufficientCapacity": scale warm-pool, check spot diversity placement
+- "AccessDenied": verify role trust and tenant IAM policy
+- "RouteNotFound": inspect route tables and VPC peering state
+- "ClaimExpired": increase claim TTL for high-latency regions or reduce preflight time
+
+Links and references
+
+- Terraform module: /confluence/eng-infra/terraform-and-iac/gpu-module-compatibility-and-deprecation-plan
+- Warm-pool metrics dashboard: grafana/redwood/gpu-warmpool
+- Claim-issuer service repo: git@github.com:redwood-infra/claim-issuer
+
+Appendix A: escalation contacts
+
+- infra-oncall (pager duty): +1 555-0102
+- GPU Fleet lead: Marcus Liu (marcus@redwood.com)
+- Platform Security: security-oncall@redwood.com
+
+Appendix B: change window and safeties
+
+- Any terraform changes to warmpool or attach-controller must be run in a maintenance window: weekdays 00:00-04:00 UTC, unless signed off by GPU Fleet lead.
+- Feature flag: feature.ephemeral-attach-circuit-breaker must be enabled in config-service before large-scale rollout.
+
+End of document.

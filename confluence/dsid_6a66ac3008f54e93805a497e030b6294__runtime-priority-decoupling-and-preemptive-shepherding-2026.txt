@@ -1,0 +1,144 @@
+Priority Decoupling and Preemptive Shepherding for Kernel Scheduling
+
+Summary:
+This document describes the design, configuration, and operational runbook for Priority Decoupling and Preemptive Shepherding — a scheduling pattern used by Redwood's serving runtime to meet tight p95/p99 latency SLOs while maximizing throughput. The pattern separates how priorities are assigned from how GPU kernels are chosen, and introduces a lightweight preemption shepherd that migrates or degrades low-priority work to background execution paths when kernel pressure threatens SLOs.
+
+Audience:
+- Runtime engineers (kernel & scheduler teams)
+- SREs oncall for inferencing clusters
+- Performance researchers tuning SLOs
+
+Goals and motivation:
+- Keep high-priority, interactive requests within configured latency SLOs (p95 <= 150ms for short-chat flows; p99 <= 400ms across mixed workloads).
+- Avoid priority inversion where low-priority batching choices delay high-priority requests.
+- Allow non-critical work (bulk embeddings, long-batched offline jobs) to consume spare capacity without impacting interactive tails.
+- Enable graceful degradation (quantized fallback kernels, truncated generation) rather than outright request drops.
+
+Key concepts:
+1) Priority decoupling:
+- Priority is an attribute on the request (e.g., priority=interactive, priority=batch, priority=background).
+- Kernel selection is done by the Kernel Mapper service (kernel-mapper), which considers model variant, sequence length, and GPU topology.
+- Decoupling means kernel-mapper ignores priority when computing feasible kernel candidates but exposes metadata about kernel latency and preemption cost to the Preemptive Shepherd.
+
+2) Preemptive Shepherd:
+- A lightweight controller running colocated with the scheduler (preempt-shepherd) that monitors kernel queue depth, tail-latency estimates, cache warmness, and current SLO burn-down.
+- When p95/p99 projections exceed thresholds, the shepherd triggers targeted actions: migrate in-flight low-priority requests to background kernels, reduce batch sizes for candidate kernels, enable quantized variants, or route affected requests to fallback model variants.
+
+Architecture overview (text diagram):
+- API Gateway -> router -> request-priority-evaluator -> scheduling-queue -> kernel-mapper -> preempt-shepherd -> runtime-worker (GPU)
+- Telemetry: metrics flow to metrics-backend; traces flow to jaeger; kernel telemetry to timeline-db.
+
+Operational details and metrics:
+- SLOs:
+  - interactive_short (<=128 tokens): p95 <= 150ms, p99 <= 350ms, error_rate <= 0.5%
+  - interactive_long (<=1024 tokens): p95 <= 450ms, p99 <= 900ms
+  - embeddings (batchable): throughput target 30k emb/s per A100x8 node (baseline)
+
+- Key metrics exposed by preempt-shepherd:
+  - shepherd.p95_projection (ms)
+  - shepherd.p99_projection (ms)
+  - shepherd.kernel_queue_depth (count)
+  - shepherd.low_priority_evictions (count/min)
+  - kernel-mapper.candidate_latency_estimates (ms, histogram)
+  - kvcache.hit_ratio_by_priority (0..1)
+
+Configuration table (knobs and defaults):
+| knob_name | description | default | safe-range | owner |
+|-----------|-------------|---------|------------|-------|
+| shepherd.enabled | enable the preemptive shepherd control loop | true | true/false | runtime-scheduling |
+| shepherd.p95_target_margin | trigger margin over p95 SLO (ms) | 30 | 10-100 | runtime-scheduling |
+| shepherd.max_evictions_per_min | max low-priority migrations per minute per node | 20 | 0-200 | runtime-scheduling |
+| kernel-mapper.quantized_threshold | if kernel latency > threshold -> allow quantized variant | 400 | 200-1200 | kernel-team |
+| scheduler.priority_age_limit_ms | promote aged low-priority tasks after this time | 1500 | 500-5000 | scheduler-team |
+
+Example YAML runtime config (used by scheduler agent):
+
+shepherd:
+  enabled: true
+  p95_target_margin_ms: 30
+  max_evictions_per_min: 20
+kernel_mapper:
+  quantized_threshold_ms: 400
+  prefer_shallow_batches_for: [interactive]
+
+Notes on quantization and fallbacks:
+- The shepherd prefers applying model quantized variants (int8 or q4_0) for low-priority request migration if the quality budget allows it. Quality checks are gated by the Optimize team’s per-model regression flags (optimize.quality_blocklist).
+- If KV cache warmness < 0.25 for a request (i.e., cold start), shepherd favors warmstart prioritization instead of eviction to avoid extra compute.
+
+Preemptive actions (ordered by preference):
+1) Slow-path migration: move request to a background kernel variant that runs with lower kernel priority (non-preemptible OS niceness + lower kernel scheduler credits).
+2) Batch-size reduction: reduce batch aggregator window for affected kernels to reduce latency at the expense of throughput.
+3) Quantized fallback: switch to quantized model variant for the request.
+4) Truncated generation / partial response: cap output tokens (operator-configurable) and queue continuation as background job.
+5) Reject with graceful HTTP 202 + background job token (last resort for overloaded systems).
+
+Behavioral examples:
+- Scenario A: Spike of interactive requests plus concurrent large embedding job.
+  - Shepherd sees kernel_queue_depth rising and p95_projection > SLO + margin.
+  - It migrates queued embedding batches to background kernels and reduces their batch sizes, freeing slots for interactive flows.
+
+- Scenario B: A cache-cold large interactive conversation triggers long latency estimates.
+  - If kvcache.hit_ratio_by_priority for interactive < 0.25, shepherd prioritizes warmstarts by assigning dedicated prewarmed slot for the conversation's worker shard (if prewarm budget available).
+
+Runbook: Investigating an SLO burn (oncall steps)
+1) Alert: shepherd.p95_projection > SLO_threshold for > 1 minute.
+2) Triage: query timeline-db for kernel-level latencies:
+   $ curl -s "https://metrics.internal/api/query?metric=kernel_latency&node_id=$NODE&from=-15m" | jq .
+3) Inspect preempt-shepherd decisions:
+   $ kubectl logs deployment/preempt-shepherd -n runtime --since=15m | grep Decision
+   Look for fields: decision_type, affected_priority, recommended_action, eviction_count
+4) Check kvcache health:
+   $ curl http://kvcache-$NODE.internal/metrics | grep hit_ratio
+5) If shepherd.eviction_count is saturated and errors increased, consider immediate mitigation: temporarily set shepherd.max_evictions_per_min to 100 (via configmap) to allow rapid rebalancing, or toggle shepherd.enabled=false to fall back to conservative scheduling while investigating.
+6) Post-incident: capture a flamegraph of GPU kernels from the time window and attach to incident page. Use nvprof or nsight-capture on an affected node (see profiling section).
+
+Profiling checklist and commands:
+- Lightweight traces (first call): enable per-request tracing: trace_sample_rate=0.1 on the router.
+- Kernel level profiling (when SLO-critical):
+  - On affected node, capture a 60s capture:
+    $ sudo /opt/runtime/tools/gpu-trace-capture.sh --duration 60 --out /tmp/gpu-trace.tgz
+  - Convert to flamegraph:
+    $ /opt/runtime/tools/convert-trace /tmp/gpu-trace.tgz --flame /tmp/flame.svg
+- NVPROF / Nsight examples (run in maintenance window):
+  - nv-nsight capture for a specific worker PID: nv-nsight-cu-cli --target-processes all --duration 30s --output /tmp/trace.nv
+- Collect kernel-mapper debug dump:
+  $ curl -s "http://kernel-mapper.$NS.internal/debug/dump" > /tmp/kernel-mapper-dump.json
+
+KPIs to include in postmortem:
+- p95 and p99 before/after mitigation
+- shepherd.eviction_count and eviction_success_rate
+- kernel_queue_depth and batch_size distribution
+- kvcache hit ratio by priority
+
+Rollout checklist for shepherd changes (careful staged rollout):
+1) Feature branch & unit tests covering decision logic and safe-fail behaviors.
+2) Canary on internal perf cluster (min 10% capacity) with synthetic mixed workload replay that includes: 60% interactive_short, 20% interactive_long, 20% embeddings.
+3) Collect metrics for 24h: p95/p99, error_rate, eviction_count, mean_batch_size. Set automatic rollback if p99 increases by >10% absolute.
+4) Gradually increase to 50% then 100% over 72h with checks at each step.
+5) Post-rollout: run 7-day monitoring dashboard and escalate if shepherd.low_priority_evictions > 5% of requests consistently.
+
+Known limitations and caveats:
+- Priority decoupling can increase overall tail variance if kernel latency estimators are stale. Ensure kernel-mapper latency profiles are refreshed every 6 hours for production models.
+- Preemptive migration costs: moving an in-flight request often discards warmed KV cache (if not preserved) causing additional compute; the shepherd prefers migrating queued—not running—work.
+- Quantized fallbacks may cause quality regressions; Optimize team must maintain per-model regression thresholds in optimize.quality_blocklist.
+
+Ownership and escalation:
+- Owner: runtime-scheduling@redwood.com (primary contact)
+- Secondary: kernel-team@redwood.com
+- Oncall: runtime-sre rotation (see /confluence/eng-sre/oncall-rotations)
+- If quality regressions observed after shepherd actions, tag the Optimize team (optimize@redwood.com) and create a severity-2 incident.
+
+Appendix: example alert rules (prometheus-style)
+- ALERT ShepherdP95ProjectionExceeded
+  IF shepherd.p95_projection > (interactive_short_p95_slo_ms + 30)
+  FOR 1m
+  LABELS {severity="page"}
+  ANNOTATIONS {summary="Shepherd projecting p95 > SLO+margin", runbook="/confluence/eng-serving-runtime/kernel-and-scheduling/runtime-priority-decoupling-and-preemptive-shepherding-2026#Runbook"}
+
+References:
+- See kernel-mapper design: /confluence/eng-serving-runtime/kernel-and-scheduling/priority-driven-kernel-scheduler-spec-2026
+- Fallbacks & degradation playbook: /confluence/eng-serving-runtime/runbooks/runtime-fallback-and-degradation-playbook-2026
+
+Change log:
+- 2026-01-15: Initial authored draft by Priya Anand.
+- 2026-02-03: Updated rollout checklist and added profiling commands (reviewed by Ethan Liu).

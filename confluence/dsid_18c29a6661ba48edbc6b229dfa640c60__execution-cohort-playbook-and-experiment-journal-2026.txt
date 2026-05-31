@@ -1,0 +1,249 @@
+Execution Cohort Playbook and Experiment Journal
+
+Purpose
+-----
+This document describes the "execution cohort" concept we use to group similar inference requests for improved latency predictability and cost efficiency. It combines architecture notes, scheduling policy pseudocode, a profiling playbook for cohort-related regressions, a benchmarking experiment design, a release checklist, a curated known-issues list, and incident runbooks.
+
+Audience
+--------
+- Runtime engineers implementing or tuning the scheduler and kernel selection.
+- SREs owning runtime availability and alerting.
+- Applied ML engineers designing workload-fit experiments.
+
+Goals and success criteria
+--------------------------
+- Reduce P99 tail latency variance for small/interactive models by >= 20% versus baseline.
+- Maintain per-tenant throughput within 10% of historical baseline while reducing per-token cost.
+- Provide deterministic, reproducible experiment artifacts for every scheduling change.
+
+Scope and non-goals
+-------------------
+- In scope: cohort creation heuristics, scheduling policy, kernel dispatch interaction, profiling and benchmark plans, runbook steps for cohort incidents.
+- Not in scope: model quantization strategy, private-deployment network setup (see eng-private-deployments docs).
+
+Architecture overview (text diagram)
+-----------------------------------
+Key services and components involved:
+- runtime-cohort-manager (component that classifies incoming requests into cohorts)
+- kernel-dispatcher (maps scheduled slots to GPU kernels/queues)
+- kv-cache-proxy (shared KV cache service for prefix reuse)
+- scheduler-ledger (global admission controller and capacity accounting)
+- telemetry-ingest (traces, events, metrics pipeline)
+
+Simple ASCII diagram:
+
+  client -> ingress-router -> runtime-cohort-manager --+--> scheduler-ledger --> kernel-dispatcher --> GPU
+                                                       |\
+                                                       +--> kv-cache-proxy (hot prefix reuse)
+
+Design intent:
+- Cohorts are immutable for the lifetime of a request. Classification is cheap and stable (hash + lightweight fingerprint).
+- Scheduler decisions are made at cohort granularity (batching, priority, slot reservation).
+- The kernel-dispatcher uses cohort metadata to select optimized kernels and execution paths (e.g., fused-attention, reduced-precision path).
+
+Cohort definition and metadata fields
+------------------------------------
+Each cohort record contains flat fields used by multiple subsystems:
+- cohort_id (string)
+- workload_family (string, e.g., "chat-short", "embedding-long")
+- model_variant (string)
+- target_slo_ms (numeric as string, e.g., "120")
+- prefer_low_latency (true/false as string)
+- suggested_batching (string, e.g., "auto|max_tokens:64|min_batch:1")
+- kv_cache_key_hint (short string)
+- owner (team/email)
+
+Cohort lifecycle
+----------------
+1. Classification: runtime-cohort-manager computes fingerprint and assigns cohort_id.
+2. Admission: scheduler-ledger evaluates slot credits and admission rules.
+3. Dispatch: kernel-dispatcher picks the kernel path and queue.
+4. Post-process: telemetry-ingest tags traces with cohort_id and quality signals.
+
+Priority and fairness policy (plain-language)
+-------------------------------------------
+- Priority is a function of (SLO attainment delta, observed tail risk, tenant SLAs).
+- Fairness is enforced by token-based credit accounting in scheduler-ledger.
+- Emergency preemption rules: high-priority control-plane traffic and SLA-protected cohorts can preempt best-effort cohorts up to a configured cap (default 15% of active slots).
+
+Scheduling policy pseudocode
+----------------------------
+// Simplified view used in design discussions
+function admit_request(request):
+  cohort = classify(request)
+  credits = ledger.peek_credits(cohort.owner)
+  if credits < cohort.min_credit_threshold:
+    if cohort.prefer_low_latency == "true":
+      // try fast-path hedging up to X times
+      return try_fast_path_hedge(request, cohort)
+    else:
+      return queue_in_backlog(request, cohort)
+  // apply latency headroom check
+  estimated_latency = kernel_dispatcher.estimate_latency(cohort, request.tokens)
+  if estimated_latency <= cohort.target_slo_ms * 1.2:
+    ledger.consume(credits, estimate_cost(request))
+    return schedule_on_queue(request, cohort.preferred_queue)
+  else:
+    return fallback_to_variant_or_degrade(request)
+
+Key tunables (table)
+--------------------
+- min_credit_threshold: smallest credit bucket to allow admission (default "5").
+- hedging_max_attempts: max hedges for low-latency cohorts (default "2").
+- preemption_cap_pct: percentage of slots reclaimable for SLAs (default "15").
+- kv_prefetch_window_ms: how far ahead to warm prefix cache (default "200").
+
+Profiling playbook for cohort regressions
+---------------------------------------
+When a cohort shows increased tail latency or error rate, follow these steps:
+1. Capture a deterministic traffic sample (10k requests) by inserting a traffic mirror rule for cohort_id.
+2. Run lightweight traces: set telemetry-ingest sampling to 100% for cohort_id for 1 minute.
+3. Collect kernel-level timelines: use kernel-trace-tool "ktctl sample --cohort <id> --duration 60s --out /tmp/kt.json".
+4. Correlate traces with ledger events: ledger.trace_id -> kernel-trace -> application trace.
+5. If KV cache miss rate > 30% for the cohort, run kv-cache-warmup script and re-evaluate.
+6. If kernel queuing time accounts for >50% of tail latency, escalate to kernel team with attached kt.json and sampled traces.
+
+Profiling commands and quick checks
+----------------------------------
+- Check admission backlog: curl -s http://scheduler-ledger.local/metrics | jq '.backlog_by_cohort["<cohort_id>"]'
+- Kernel queue times: ktctl histogram --cohort <id> --metric queue_ms
+- KV cache hit ratio: curl http://kv-cache-proxy/metrics | grep cohort_<id>_hit_ratio
+
+Benchmarking experiment design (template)
+---------------------------------------
+Objective: evaluate impact of cohort-aware scheduling on tail latency and cost.
+Experiment matrix (examples):
+- Variables: batch_size {1,4,8}, concurrency_shape {steady, bursty-10s, spiky-1s}, model_variant {v1, v1-quant}  
+- Metrics: P50, P95, P99 latency, CPU/GPU utilization, tokens/sec, tokens/cost, cohort_kv_hit_ratio, queue_time_ms.
+
+Sample YAML workload config:
+```yaml
+workload_name: chat-short-burst-test
+model: gptx-chat-v1
+cohort_label: chat-short
+duration_s: 900
+phases:
+  - name: warmup
+    qps: 50
+    duration_s: 120
+  - name: burst
+    qps: 1200
+    duration_s: 30
+  - name: steady
+    qps: 200
+    duration_s: 660
+request_shape:
+  avg_tokens: 48
+  seed_variability: high
+batch_policy:
+  enabled: true
+  max_batch_tokens: 256
+  max_batch_requests: 8
+```
+
+Benchmark collection checklist:
+- Mirror production ingress for the cohort (shadow-mode)
+- Collect kernel-trace logs (ktctl) and telemetry traces for entire run
+- Snapshot scheduler-ledger state before/after test
+- Record cost estimate via runtime-cost-sim tool
+
+Release checklist for scheduler/cohort changes
+--------------------------------------------
+1. Update unit tests for scheduler policy language and cohort classification.
+2. Run local microbenchmarks (microbench-suite) and record baseline artifacts.
+3. Create canary branch with new policy and schedule canary deployment across 1% of requests for 24 hours.
+4. Monitor KPIs: P95, P99, queue_time_ms, kernel_queue_depth, error_rate.
+5. If regressions are detected, revert using feature-flag rollback or scale down new variants.
+6. Post-mortem experiment: reproduce with synthetic workload within 72 hours.
+
+Known issues (curated)
+---------------------
+1) Cohort oscillation under mixed bursty traffic
+- Symptom: cohort membership toggles for identical request fingerprints leading to cache fragmentation.
+- Probable root cause: fingerprint window too short (default 30s).
+- Mitigation: increase fingerprint stability window to 5 minutes for high-throughput cohorts; schedule a follow-up stability test.
+
+2) Hedging-created duplicate kernel load
+- Symptom: hedged fast-path attempts increase GPU occupancy and raise queue times for best-effort cohorts.
+- Root cause: lack of cross-cohort hedging circuit-breaker.
+- Mitigation: enforce global_hedge_inflight limit and introduce per-node hedging accounting.
+
+3) KV prefetch storm on rollout
+- Symptom: massive KV warmups when a variant is rolled out, causing transient I/O saturation.
+- Root cause: naive prefetch for all cohorts on deploy.
+- Mitigation: stagger kv_prefetch_window and use probabilistic prefetch sampling (10% initially).
+
+4) Scheduler-ledger stale view after partial-network-partition
+- Symptom: admission decisions based on outdated credits causing over-admission.
+- Root cause: optimistic-local-ledger without timely reconciliation.
+- Mitigation: enable short reconciliation heartbeat (default 2s) and fall back to conservative admission if heartbeat missed > 3x.
+
+Runbook: Cohort starvation incident
+----------------------------------
+Trigger: alert "cohort_p99_latency > 2x target for 5 minutes" or backlog growth > 5000 requests.
+Immediate steps (0–5 minutes):
+1. Pager to oncall runtime engineer.
+2. Run quick health checks:
+   - curl http://scheduler-ledger.local/health
+   - ktctl histogram --cohort <id> --metric queue_ms --last 5m
+3. If kernel queue_ms > 300ms and backlog growing, scale temporary admission down: curl -XPOST http://scheduler-ledger.local/actuate "{\"action\":\"throttle_cohort\",\"cohort\":\"<id>\",\"pct\":\"50\"}"
+4. If KV miss ratio > 40%, trigger kv-cache warmup and allocate one prefetch worker: kvprefetchctl start --cohort <id> --workers 1
+5. If situation persists beyond 15 minutes, revert recent scheduler changes (feature flag) and roll back canary.
+
+Post-incident actions (within 72 hours):
+- Run profiling playbook and attach artifacts to incident ticket.
+- Schedule a postmortem and update cohort stability parameters.
+
+Telemetry and dashboards (recommended)
+-------------------------------------
+Essential metrics (metric names follow internal conventions):
+- cohort.<cohort_id>.p50_ms, p95_ms, p99_ms
+- cohort.<cohort_id>.queue_time_ms
+- cohort.<cohort_id>.kv_hit_ratio
+- scheduler.ledger.backlog_by_cohort
+- kernel.queue_depth, kernel.exec_time_ms_histogram
+- runtime.coalesced_batch_size_by_cohort
+
+Suggested alert thresholds (example)
+- cohort.<id>.p99_ms > target_slo_ms * 2 for 5m -> P1
+- cohort.<id>.kv_hit_ratio < 0.5 for 10m -> P2
+- scheduler.ledger.backlog_by_cohort > 1000 -> P1
+
+Experiment journal template (copy into new experiment ticket)
+------------------------------------------------------------
+- experiment_id: (auto)
+- lead: name/email
+- hypothesis: short sentence
+- cohort_ids: list
+- config_snapshot: (link to S3 / artifact)
+- benchmark_matrix: (variables & ranges)
+- start_time / end_time
+- raw_artifacts: list of links (ktctl, traces, ledger snapshots)
+- outcome: pass/fail/observations
+- followups: actionable items
+
+Ownership and contacts
+----------------------
+- runtime-cohort-manager: @runtime-team (primary)
+- kernel-dispatcher: @kernels-team (secondary)
+- scheduler-ledger: @sre-runtime
+- telemetry and traces: @observability
+
+Appendix: quick reference commands
+---------------------------------
+- classify example: curl -XPOST http://runtime-cohort-manager/classify -d '{"request": "..."}'
+- ledger peek: curl http://scheduler-ledger.local/credits?owner=<team>
+- start a focused trace: tracectl start --filter cohort_id=<id> --duration 60s
+- canary rollback: ffctl disable feature.scheduler_new_policy
+
+Notes and change history
+------------------------
+- 2026-02-15: Created by Aisha Khatri.
+- 2026-03-01: Added hedging limits and incident runbook; reviewers Marcus Li, Sofia Alvarez, Dmitri Petrov.
+
+Related reading
+---------------
+- See runtime-architecture/runtime-decision-graph-and-observed-behaviour-catalog-2026 for decision graphs.
+- See kernel-and-scheduling/scheduler-policy-language-declarative-profiles-2026 for policy language reference.
+
+End of document.

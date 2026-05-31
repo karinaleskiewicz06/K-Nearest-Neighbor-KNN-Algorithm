@@ -1,0 +1,144 @@
+Predictive Tenant Priority Rebalancer — Design & Operator Handbook
+
+Overview
+
+Purpose: This document describes the Predictive Tenant Priority Rebalancer (PTPR), a platform service that dynamically adjusts tenant priority and active allocation across GPU pools to preserve SLOs while minimizing cost and noisy neighbor effects. It is a combined design doc and operator handbook intended for platform engineers and on-call operators.
+
+Scope: PTPR covers multi-tenant real-time inference workloads (hosted + dedicated), burst-credit interactions, and short-term predictive eviction/rebalancing decisions. It does NOT govern long-term contractual quota changes (those remain the responsibility of billing/commitment workflows).
+
+Design goals
+
+- Preserve foreground SLOs: 99th percentile tail latency target <= 350ms for interactive routes; throughput targets per tenant per model family.
+- Minimize involuntary evictions: aim for <1 involuntary eviction per tenant per 30 days in steady-state.
+- Cost-aware: prefer soft throttles and CPU-side shaping before spinning new nodes.
+- Predictive vs reactive: use short-horizon forecasting (30s–5m) to avoid oscillation.
+- Explainable decisions: every rebalancing decision must include a succinct rationale and metric snapshot for audits and postmortems.
+
+High-level architecture
+
+1. Telemetry Ingest: collects per-tenant, per-model generation metrics (req/s, token/s, tail latency, queue depth, KV cache hit-rate, burst-credit balance). Metrics aggregated to 5s and 60s rollups.
+2. Predictor Engine: lightweight time-series predictor (EWMA + seasonality heuristic) producing 30s and 5m demand forecasts per tenant & route.
+3. Policy Evaluator: translates forecasts into actions based on configured policies (priority bump, soft-throttle, migrate-prefix-cache, move-queue, allocate-burst-credit, hard-evict).
+4. Planner & Actuator: produces safe plans, runs safety checks (cooldown windows, minimum runway), and issues actions through the Cluster Control Plane (CCP) via idempotent command API.
+5. Audit Log & Explainability: every decision recorded with cause, metrics snapshot, and plan diff.
+
+Component diagram (textual)
+
+Telemetry -> Predictor -> Policy Evaluator -> Planner -> CCP -> Execution; Audit Log receives decision records and operator annotations.
+
+Key concepts and terminology
+
+- Priority Token: an internal numeric score (0–100) assigned to tenant-route pairs. Higher tokens receive preferential scheduling and preemptive resources during contention.
+- Soft-throttle: a controlled token-rate limiter applied at the ingress SDK to preserve tail latency while degrading throughput gracefully.
+- Hard-evict: forced preemption of running model containers to free GPUs; only used as last resort for safety-critical SLO preservation.
+- Cooldown window: minimum time after a rebalancing action before the same tenant/worker can be adjusted again (default 10 minutes).
+
+Operational SLOs and metrics to monitor
+
+- Tail latency (p99) per tenant route: Target <= 350ms (alert when > 420ms sustained for >2 minutes).
+- Involuntary eviction rate: Target < 1/tenant/30d (alert when > 5 evictions across any 24h window).
+- Rebalancer decision accuracy: % actions that result in improved target SLO within 5m (target > 85%).
+- False positive soft-throttles: % of soft-throttle events that are rolled back within cooldown due to overreaction (target < 10%).
+
+Policy configuration (recommended defaults)
+
+| policy_field | description | default |
+|---|---|---|
+| prediction_horizon_secs | forecast window used by evaluator | "300" |
+| soft_throttle_threshold_p99_ms | p99 latency at which soft-throttle considered | "420" |
+| hard_evict_threshold_p99_ms | p99 latency that permits hard-evict | "800" |
+| cooldown_secs | window before reapplying to same tenant | "600" |
+| min_runway_secs | minimum time planner ensures before action | "120" |
+| max_concurrent_evictions | global safety cap per region | "2" |
+| priority_token_floor | minimum token value for system tenants | "10" |
+
+Operator runbook: common incidents
+
+1) Symptom: Multiple tenants show rising tail latency on a region; PTPR is issuing frequent soft-throttles and a hard-evict was triggered.
+
+Steps:
+  a. Verify region telemetry: run `curl -s "${MONITORING}/api/metrics?region=us-west-2&window=5m&metric=p99_latency" | jq .` and inspect tenants over threshold.
+  b. Check PTPR decision log: `rds query ptpr_decisions --region us-west-2 --since 10m` (fields: decision_id, tenant, route, reason, action, before_metrics, after_metrics).
+  c. Confirm if predictor overreacted: compare forecast vs actual (look at 30s vs 300s lanes). If predictor overshot, temporarily disable predictive mode: `ptprctl set-mode --region us-west-2 --mode reactive`.
+  d. If hard-evict executed and impacted customers, immediately run compensation flow to reallocate capacity (see Recovery below) and create incident ticket with `#platform-ops` and customer success.
+
+2) Symptom: Eviction loop — repeated evictions across a pool.
+
+Steps:
+  a. Pause automated evictions: `ptprctl set-policy --region us-west-2 --max_concurrent_evictions 0`.
+  b. Inspect GPU metrics for interference (PCIe error rates, GPU util, memory pressure). If interference present, escalate to gpu-fleet oncall with `@gpu-fleet` and attach the `ptpr_decision` record.
+  c. If no hardware causes, rollback recent policy changes and restore a checkpointed priority map: `ptprctl restore-priority-map --checkpoint 2026-01-15T03:00Z`.
+
+Recovery procedures
+
+- Refill runway: create temporary dedicated burst pool via CCP: `ccp allocate-pool --region us-west-2 --gpus 8 --purpose ptpr-temp` and assign affected tenants with temporary priority token +30 for 30m using `ptprctl bump-priority --tenant T123 --delta 30 --expires 30m`.
+- Rollback: planner supports staged rollback. To rollback the last plan: `ptprctl rollback --plan-id PLAN-abcdef --region us-west-2`.
+
+Safe rollout checklist (for changes to policies or predictor models)
+
+1. Unit tests: predictor backtests on last 90d workload; assert RMSE improvement over baseline >= 5%.
+2. Staging rollout: scale to 5% traffic in one region; monitor decision accuracy and false positives for 24h.
+3. Canary: 20% traffic in two regions for 48h; require no more than 2 involuntary evictions and decision_accuracy >= 82%.
+4. Global rollout: 100% after signoff by platform SRE and product.
+
+Testing harness & commands
+
+- Local simulator: `python -m ptpr.simulator --workload profiles/saas-burst.json --duration 600`.
+- Replay production samples: `ptprctl replay --profile last-7d --tenants T123,T456 --dry-run`.
+- Generate decision diagnostics: `ptprctl diagnose --plan PLAN-abcdef --format json | jq .`.
+
+Configuration examples
+
+JSON policy example (idempotent config applied via config-service API):
+
+{
+  "policy_name": "default-predictive",
+  "prediction_horizon_secs": 300,
+  "soft_throttle_threshold_p99_ms": 420,
+  "hard_evict_threshold_p99_ms": 800,
+  "cooldown_secs": 600,
+  "min_runway_secs": 120,
+  "max_concurrent_evictions": 2
+}
+
+Ownership and escalation
+
+- Primary owner: eng-platform/scheduling (oncall rotation in PagerDuty: eng-platform-scheduling)
+- Backup: eng-sre (pagerduty: eng-sre-oncall)
+- Escalation: if more than 2 regions impacted or any customer-facing outage, page Director on-call and notify Customer Success.
+
+Auditability and post-incident analysis
+
+- All decisions are persisted to the `ptpr_decisions` table keyed by decision_id. Operators must annotate decisions they manually override.
+- Post-incident checklist: collect decision_ids, telemetry snapshot (5m pre/post), predictor version, policy_id, and planner state. Submit to `#platform-postmortems` with the tag `ptpr-incident`.
+
+Open design questions and roadmap items
+
+- Multi-horizon coordination: how to safely combine 30s and 5m horizons without oscillation under heavy burst traffic. Prototype in Q2 2026 includes damping factor experiments.
+- Tenant fairness math: integrate per-tenant utility functions that consider revenue tier, contract, and SLA; planned for Q3 2026.
+- Model-driven eviction cost estimation: improve cost-model to predict customer-visible degradation from evictions.
+
+Appendices
+
+A. Example decision record (simplified)
+
+decision_id: PLAN-abcdef
+tenant: T123
+route: /v1/chat
+reason: predicted 3x baseline traffic for next 300s, p99 forecast 520ms
+action: soft-throttle 30% + bump priority token +10
+metrics_before: {p99: 460, rps: 12}
+metrics_after: {p99: 390, rps: 9}
+
+B. Troubleshooting quick commands
+
+- List recent decisions: `rds query ptpr_decisions --limit 50 --region us-west-2`
+- Disable planner in region: `ptprctl set-enabled --region us-west-2 --enabled false`
+- Restore priorities from checkpoint: `ptprctl restore-priority-map --checkpoint <ts>`
+
+C. Related docs
+
+- Tenant isolation economics playbook (see related pages)
+- Predictive scale and eviction playbook
+
+Last updated by Asha Iyer — contact via Slack @asha or pager on eng-platform-scheduling oncall.

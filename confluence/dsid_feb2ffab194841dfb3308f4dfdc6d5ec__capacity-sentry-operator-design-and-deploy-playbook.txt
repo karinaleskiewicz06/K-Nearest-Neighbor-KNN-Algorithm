@@ -1,0 +1,200 @@
+Capacity Sentry: SLA-driven GPU Rebalancer operator — design & deploy playbook
+
+Summary
+
+This playbook describes the Capacity Sentry operator: a lightweight, opinionated controller that monitors GPU pool health, enforces per-tenant SLOs, and triggers safe rebalancing actions across accounts/regions using Terraform-managed allocation primitives. It is meant to be a production-safe, auditable mechanism to reduce SLA incidents caused by capacity skew, noisy neighbors, and spot preemption waves.
+
+Why we built Capacity Sentry
+
+- Multiple customers experienced performance regressions during burst/spot events when capacity was unevenly distributed.
+- Existing allocators are good at initial packing but lack continuous SLO-driven rebalancing and auditability for cross-account moves.
+- We need an operator that integrates with our IaC modules and CI/CD guardrails so any reallocation is reversible and visible.
+
+Goals and non-goals
+
+Goals:
+- Detect capacity SLO drift per-tenant (latency P95, queue length, warm pool hit rate).
+- Calculate safe rebalancing actions (move warm slots, drain/evict, increase burst budget).
+- Apply changes via Terraform modules or orchestration APIs with a recorded change set.
+- Provide playbooked runbook steps for oncall to verify and rollback.
+
+Non-goals:
+- Not a replacement for long-term capacity planning/ordering.
+- Not intended to perform mass node reclamations; actions are incremental and conservative.
+
+High-level architecture
+
+Components:
+1) Capacity Sentry controller (K8s operator) — continuous loop reading telemetry, SLO engine, action planner.
+2) Rebalancer action engine — uses our Terraform operator (tf-operator) to apply minimal terraform plans for allocation changes or calls the Burst Orchestrator service for runtime moves.
+3) Audit store (S3 + event log) — records detected drifts, proposed plans, approvals, and applied changes.
+4) Dashboard/alerting — Grafana dashboards and Alertmanager rules for SLO breaches and plan failures.
+
+Data flows:
+- Telemetry -> SLO engine -> Action planner -> Plan preview -> (auto-apply / require-approval) -> Terraform or API call -> Audit log -> Telemetry verifies effect.
+
+Service names and ownership
+
+- capacity-sentry-controller (K8s deployment) — owner: eng-infra/gpu-fleet.
+- tf-operator (existing) — owner: eng-infra/terraform-and-iac.
+- burst-orchestrator (runtime move API) — owner: eng-infra/gpu-fleet-and-capacity.
+- capacity-sentry-audit-bucket (s3) — owner: eng-infra/cloud-accounts-and-networking.
+
+SLOs and thresholds the operator enforces
+
+- Per-tenant tail latency SLO: P95 <= 1200ms for interactive generation; alert at 1500ms.
+- Queue length SLO: average queued requests <= 8 per minute; alert at 16.
+- Warm pool hit rate SLO: >= 75% for reserved workloads; alert at 60%.
+- Rebalancer action rate: <= 3 plan-applies per tenant per 24h (safety throttle).
+
+Configuration (table)
+
+- Pool selector labels: k8s labels used to identify candidate pools (e.g., node.kit=gpu, pool.tier=dedicated).
+- Scoring weights: latency:0.5, queue:0.3, warm_hit:0.2.
+- Max concurrent moves: 2 per region.
+- Terraform plan approval mode: auto | manual | staged.
+
+(Example configuration YAML)
+
+apiVersion: infra.redwood.ai/v1
+kind: CapacitySentryConfig
+metadata:
+  name: default
+spec:
+  poolSelector:
+    matchLabels:
+      node.kit: gpu
+      pool.tier: dedicated
+  sloTargets:
+    latencyP95Ms: 1200
+    queueMax: 8
+    warmHitRatePercent: 75
+  scoringWeights:
+    latency: 0.5
+    queue: 0.3
+    warm_hit: 0.2
+  maxConcurrentMoves: 2
+  tfApplyMode: staged
+
+Terraform / IaC integration patterns
+
+- Use existing allocation modules: tenant-gpu-claim, warm-pool-provisioner. Capacity Sentry generates a minimal patch to the tenant-gpu-claim module (delta in vCPU/GPU units or burst budget) rather than replacing full state.
+- Plan preview artifacts are stored in the audit S3 bucket with a digest and linked to the change request.
+- Apply modes:
+  - auto: controller performs terraform apply as long as plan has no breaking changes and action rate is below throttle.
+  - staged: controller opens a PR to the tenant iac repository with the plan attached; CI runs tf-plan and policy checks; human approves to merge.
+  - manual: controller only posts recommended plan to the dashboard for oncall to action.
+
+CI/CD and release gating
+
+- Operator image build pipeline: buildkite-gpu-pipeline -> image registry (signed).
+- IaC PR gating: every staged change must pass terraform-policy (OPA) checks, unit tests in terra-test suite, and run tf plan in a sandbox account.
+- Canary rollout: 5% of tenants (selector label canary=true) for 24h; monitor warm_hit_rate and P95 regressions.
+- Rollback policy: automated rollback triggered if P95 increases by > 25% for canary or if warm_hit rate drops > 15%.
+
+Runbook: common incident scenarios
+
+1) SLO breach due to sudden preemption wave
+
+- Symptoms: P95 spikes above 1500ms, queue grows > 16, warm hit rate drops below 60%.
+- Immediate steps (oncall):
+  1. Acknowledge alert and check capacity-sentry dashboard for active plans.
+  2. If a plan is in-flight, check tf-operator logs: kubectl -n infra logs deploy/tf-operator | grep "capacity-sentry".
+  3. If no plan, trigger emergency plan generation: POST /api/v1/sentry/plan?mode=auto&throttle_override=true (requires 2FA).
+  4. Monitor plan apply: tail the audit log in S3 or use the dashboard link.
+  5. If apply fails, revert using saved plan snapshot: tfcli apply --state-backup s3://capacity-sentry/backups/<plan-id>.
+  6. Notify customers via status page if degradation > 30 minutes.
+
+2) Failed Terraform apply in staged mode
+
+- Symptoms: PR created but CI plan step fails OPA checks or sandbox plan shows drift.
+- Steps:
+  1. Inspect PR and policy failures.
+  2. If policy failure is false positive, add an exception following the policy-exception process (see related page: terraform-policy-exceptions).
+  3. If drift indicates a broader infra issue, pause further automated plans: kubectl annotate deployment capacity-sentry-controller infra.redwood.ai/paused=true.
+
+3) Rebalancer oscillation (flip-flop moves)
+
+- Symptoms: multiple opposite plans for same tenant within 4h.
+- Steps:
+  1. Increase action cooldown for the tenant: kubectl patch capacitysentryconfig default --type=json -p '[{"op":"replace","path":"/spec/maxConcurrentMoves","value":1}]'.
+  2. Mark tenant as manual-mode until human review.
+  3. Run forensic comparison of telemetry to detect noisy neighbor root cause.
+
+Safety controls and rate limits
+
+- Global action throttle: 10 plan-applies per hour across all tenants.
+- Per-tenant cooldown: 24h by default after a plan is applied.
+- Drift severity classification: informational / warning / critical determines auto-apply eligibility.
+- Policy checks: every generated plan runs OPA policies and a terraform-diff validator to ensure no destructive node deletions unless explicitly required and approved.
+
+Observability and telemetry
+
+Dashboards to create:
+- capacity-sentry: SLO heatmap, per-tenant scorecard, active plans list.
+- rebalancer-playbook: recent plan outcomes, tf-operator success rate, apply latency distribution.
+
+Key metrics (prometheus labels):
+- capacity_sentry_tenant_score (tenant,score)
+- capacity_sentry_active_plans_total
+- tf_operator_plan_apply_success_total
+- warm_pool_hit_rate{tenant}
+
+Alerting rules (examples)
+- alert:CapacitySentry_Tenant_SLO_Breach
+  expr: capacity_sentry_tenant_score < 0.6 for 5m
+  severity: page
+- alert:TerraformPlanApply_Failure
+  expr: increase(tf_operator_plan_apply_failures_total[10m]) > 0
+  severity: ticket
+
+Operational play: escalation matrix
+
+- First responder (oncall infra): own the dashboard and initial mitigation.
+- Secondary (gpu-fleet engineer): investigate tf-operator or runtime move failures.
+- Tertiary (platform reliability): pause operator and coordinate cross-account interventions.
+
+Ownership and rollout plan
+
+Phase 0 (Q4 2025): prototype in staging with canary tenants; limited to non-critical accounts.
+Phase 1 (Q1 2026): staged mode for all tenants with human approval via IaC PRs.
+Phase 2 (Q2 2026): enable auto mode for low-risk tenants and burst budgets.
+
+Checklist before production enablement
+
+- [ ] OPA policies written and tested for tenant-claim module.
+- [ ] Audit S3 bucket and lifecycle policy in place.
+- [ ] CI gating for tf-plan sandbox runs.
+- [ ] Grafana dashboards and Alertmanager rules added.
+- [ ] Oncall runbook training and short game-day executed.
+
+Appendix: example tf patch (pseudo)
+
+module "tenant_claim" {
+  source = "git::ssh://git@repo/infra-terraform//tenant-gpu-claim?ref=stable"
+  tenant_id = "tenant-123"
+  gpus_allocated = 12 // previous 8 -> delta +4
+  burst_budget = 600 // seconds
+}
+
+Commands quick reference
+
+- Check controller logs: kubectl -n infra logs deploy/capacity-sentry-controller -f
+- List active plans: curl -sS https://sentry.internal/api/v1/plans | jq .
+- Force a staged PR: curl -X POST https://sentry.internal/api/v1/plan -d '{"tenant":"tenant-foo","mode":"staged"}'
+
+References and related pages
+
+- terraform-and-iac/gpu-allocator-operator-terraform-primitive-spec (terraform primitives we patch)
+- runbooks/gpu-provisioning-contracts-and-sla-alignment-playbook (SLA mappings)
+- cloud-accounts-and-networking/gpu-mesh-egress-iac-and-cicd-gatekeeping (cross-account apply constraints)
+
+Document maintenance
+
+- Owner: eng-infra/gpu-fleet (Elliot Chen).
+- Review cadence: quarterly or after any major preemption incident.
+- When updating: bump last_updated and add changelog entry to audit S3 with plan-id.
+
+Feedback
+
+If you find false positives in the scoring, file an issue in the infra jira under component=capacity-sentry and add label triage-capacity.

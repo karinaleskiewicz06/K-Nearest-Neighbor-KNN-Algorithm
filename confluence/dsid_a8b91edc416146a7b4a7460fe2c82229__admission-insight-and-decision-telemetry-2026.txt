@@ -1,0 +1,152 @@
+Admission Insight and Decision Telemetry for Scheduler
+
+Summary:
+This page documents the admission and decision-level telemetry requirements for Redwood's kernel scheduler admission controller. It defines the health signatures we rely on for proactive alerting, the canonical decision trace payloads emitted by the scheduler, guidance for downstream consumers (SRE, monitoring, and profiling pipelines), and an operational runbook for incidents that start with admission anomalies.
+
+Goals:
+- Make admission behavior observable, debuggable, and auditable without heavy sampling.
+- Provide deterministic signals for automated scaling and QoS fallbacks.
+- Standardize the decision payload so cross-team tooling (benchmarks, profilers, incident triage) can reason about admission outcomes.
+
+Scope:
+Applies to: kernel admission controller (admission-layer that decides whether a request is accepted, queued, shed, or routed to fallback), prioritization hooks, and admission-related sidecars that mediate kernel selection. Does not include: detailed kernel internal telemetry (see profiling playbooks) or application-layer traces.
+
+Owner and SLAs:
+- Owner: Kernel Scheduling Team (oncall: kernel-scheduling@redwood.com)
+- SLOs for telemetry availability: 99.9% of admission decision events delivered to the trace/telemetry bus within 30s.
+- Required retention: 90 days for aggregated metrics; 7 days for full decision traces (default).
+
+Signals and Metrics (what to emit)
+1) Admission Counters (per pool, per priority):
+- admitted_total: counter of accepted requests
+- queued_total: counter of requests placed into the admission queue
+- shed_total: counter of requests rejected due to admission policy (backpressure/cost-governor)
+- fallback_routed_total: counter of requests routed to lower-fidelity model variant or region
+
+2) Latency Distributions:
+- admission_latency_ms: histogram of time spent in admission decision (ms). Important percentiles: p50, p95, p99, p999.
+
+3) Decision Quality Signals:
+- kv_prefetch_miss_rate: fraction of requests where the admission decision triggered a KV-prefetch because candidate placement lacked warmed cache
+- kernel_mismatch_rate: fraction of admissions where selected kernel was replaced by fallback before execution (indicates race or topology mismatch)
+
+4) Resource Pressure Correlates (per node/pool):
+- gpu_memory_pressure_pct: sampled as gauge
+- dispatch_credit_deficit: gauge tracking pending credit shortfall that affected admission decisions
+
+5) Decision Trace Payload (one JSON event per decision):
+- Fields (canonical):
+  - event_id (string): stable UUID for decision event
+  - ts (ISO8601 string): time decision completed
+  - tenant_id (string): opaque tenant identifier (hashed)
+  - request_id (string): request correlation id
+  - pool_id (string): scheduler pool or capacity unit
+  - intent (string): e.g., text_generation|embedding|chat|rerank
+  - priority (string): e.g., realtime|batch|background
+  - decision (string): accept|queue|reject|route_fallback|defer
+  - reason_codes (list[string]): machine-parsable reasons: e.g., ["memory_limit","slot_saturation","policy_quota"]
+  - chosen_kernel (string|null): kernel identifier requested
+  - effective_kernel (string|null): kernel actually scheduled (if different)
+  - kvcache_state (string): warm|cold|partial
+  - estimated_cost_units (number as string): pre-decision estimate of compute units consumed
+  - admission_latency_ms (number as string)
+  - upstream_routing_hint (string|null): e.g., region/alt-model
+  - preemptible (bool as string): "true"|"false"
+  - annotations (list[string]): freeform, but limited length
+
+Note: because Confluence JSON schema here requires flat types, the representation above is a spec; emitted traces follow this exact key set. All numeric values are emitted as numbers in telemetry producers; logging pipelines will transform to strings for indexing where necessary.
+
+Alerting and Health Signatures
+High-signal alerts (severity: P0/P1):
+- Admission rejection spike: shed_total / (admitted_total + queued_total) > 5% sustained for 2m in a customer-facing pool -> P1
+- Admission latency growth: p99 admission_latency_ms increases > 3x baseline (baseline = rolling 24h p99) for >5m -> P1
+- Kernel flipstorm: kernel_mismatch_rate > 1% sustained for 10m -> P1 (indicates routing or topology bug)
+- Decision trace backlog: telemetry queue depth > 1M events or delivery latency > 2m -> P1
+Lower-signal alerts (severity: P2):
+- kv_prefetch_miss_rate increased by > 2x baseline for 15m -> P2 (may indicate cold start wave)
+- dispatch_credit_deficit per pool > threshold -> P2 (operator action may be required)
+
+Alert definition table (example):
+| Alert name | Query sketch | Threshold | Oncall |
+| Admission rejection surge | rate(shed_total[2m]) / rate(admitted_total[2m] + queued_total[2m]) | > 0.05 | kernel-scheduling |
+| Admission latency p99 rise | p99_over_window(admission_latency_ms, 5m) / p99_baseline(24h) | > 3x | kernel-scheduling |
+
+Downstream Consumers and Use Cases
+- SRE dashboards: per-customer admission heatmap, queue depth, and rejection ratios.
+- Auto-scaling controller: uses admitted_total, queued_total, and dispatch_credit_deficit to decide burst capacity vs. preemptible fallbacks.
+- Profiling & perf lab: decision traces are sampled (adaptive) and sent to the profiler to reproduce admission-to-kernel mapping regressions.
+- Billing correlation: estimated_cost_units used to flag unexpectedly large requests.
+
+Trace Sampling Policy
+- Deterministic sampling: keep 1 in 1000 decisions per pool always (for long tail analysis).
+- Adaptive tail-sampling: if admission_latency_ms > p99_baseline * 2 or decision==reject or kernel_mismatch, mark for full capture.
+- Anonymization: all user-provided tokens must be scrubbed before final trace storage using the standard PII redaction pipeline.
+
+Runbook: Admission Anomaly (triage flow)
+1) Detection: Pager triggers for admission rejection surge or p99 latency growth.
+2) Initial scoring (5 min): check related metrics: gpu_memory_pressure_pct, dispatch_credit_deficit, kernel_mismatch_rate.
+3) Correlate with recent deploys: check canary flags and kernel rollout tags (CI/CD).
+4) Fetch decision traces: pull decision_trace events for the affected pool (last 15m). Commands:
+- cli: rtel telemetry query --pool <pool_id> --since 15m --filter decision!=accept --output json | jq .
+- dashboard: Admission -> Pool -> "Decision Traces" (time range)
+5) If kernel_mismatch_rate high -> rollback kernel rollout or toggle routing to safe kernel variant.
+6) If memory pressure -> trigger eviction playbook (link: /confluence/eng-serving-runtime/runbooks/memory-pressure-incident-triage-and-recovery-playbook-2026).
+7) If dispatch_credit_deficit -> increase pool burst quota or enable preemptible routing for low-priority classes.
+8) Post-incident: attach decision trace artifacts to the incident and run a 72h regression watch.
+
+Implementation Notes and Instrumentation Examples
+- Emit decision events synchronously to the local agent (lightweight UDP forwarder) and batch to the telemetry bus. Use backpressure strategy: if telemetry channel is congested, still accept requests but mark decision.trace_sampled=false and increment shed_telemetry_backpressure counter.
+
+Example pseudocode for emitting decision event (Go-like):
+```go
+type DecisionEvent struct {
+  EventID string
+  TS string
+  TenantID string
+  RequestID string
+  PoolID string
+  Intent string
+  Priority string
+  Decision string
+  ReasonCodes []string
+  ChosenKernel string
+  EffectiveKernel string
+  KVCacheState string
+  EstimatedCostUnits float64
+  AdmissionLatencyMs float64
+  UpstreamRoutingHint string
+  Preemptible bool
+  Annotations []string
+}
+
+func emitDecision(e DecisionEvent) error {
+  // light validation, then enqueue to local forwarder
+  payload, _ := json.Marshal(e)
+  localAgent.Enqueue(payload)
+}
+```
+
+Telemetry Elasticity and Cost Considerations
+- Full decision traces are expensive. Default policy: 99.9% of decisions reduce to counters/metrics; full JSON trace capture limited by sampling policy above.
+- Provide an opt-in "forensic capture" mode for support tickets (time limited, customer-scoped). Forensic captures require approval and generate a special marker in the trace header.
+
+Backwards Compatibility and Migration
+- New fields must be optional. The ingestion pipeline tolerates missing keys. Consumers should prefer name-based lookup, not positional parsing.
+- Migration plan for any field rename: maintain alias mapping in the telemetry ingest layer for 90 days and emit both keys for the transition period.
+
+References and Links
+- Kernel policy language: /confluence/eng-serving-runtime/kernel-and-scheduling/scheduler-policy-language-declarative-profiles-2026
+- Memory pressure runbook: /confluence/eng-serving-runtime/runbooks/memory-pressure-incident-triage-and-recovery-playbook-2026
+- Profiling playbook (decision-to-kernel mapping): /confluence/eng-serving-runtime/profiling-playbook/kv-prefetch-audit-and-experiment-guide-2026
+
+Appendix: Quick queries
+- Rejection ratio (PromQL sketch): sum(rate(shed_total[2m])) / (sum(rate(admitted_total[2m])) + sum(rate(queued_total[2m])))
+- Kernel mismatch rate: sum(rate(kernel_mismatch_count[5m])) / sum(rate(admitted_total[5m]))
+
+Contact and escalation
+- Kernel Scheduling oncall: kernel-scheduling@redwood.com
+- Telemetry infra: telemetry-platform@redwood.com
+
+Change log:
+- 2025-11-10 — Initial draft (Priya Raman)
+- 2026-02-15 — Added sampling policy, alert thresholds, and runbook actions (Ethan Walker)

@@ -1,0 +1,291 @@
+Authorization check patterns (RBAC v2) — gateway vs service, annotations, errors, and tests
+
+## Purpose
+This page defines the engineering standard for **enforcing authorization checks** across Redwood Inference’s product surface area (Hosted API, Console, Control Plane, Dedicated, and Private). It covers:
+- Where checks must occur (**API Gateway vs service**) and how we handle internal-to-internal calls
+- Required **endpoint annotations** (permission + resource scope)
+- Standard **deny-by-default** behavior
+- **Error semantics** (HTTP/gRPC status, response shape, reason codes, and debug headers)
+- **Audit logging** requirements for authorization decisions
+- **Testing and CI** requirements to prevent regressions
+
+This standard is mandatory for all endpoints that mutate state or return sensitive data.
+
+## Scope
+Applies to:
+- API Gateway routes that front the Hosted API and Control Plane APIs
+- Control Plane services (org/project/environment/user/role management, routing policies, model pinning/rollouts, key management, audit export, retention/residency)
+- Console backend endpoints (admin tooling)
+- Dedicated/Private admin operations exposed via the same control plane APIs or private installer/admin APIs
+
+Non-goals:
+- Defining permission names and deprecation policy (see ADR-014)
+- Exposing a customer-authored policy language (out of scope for RBAC v2)
+
+## Definitions
+- **Subject**: authenticated principal (user, service account, API key, or internal service identity)
+- **Action**: permission string (e.g., `org.api_keys.rotate`, `audit.export`, `routing.policy.update`)
+- **Resource scope**: the scope the action is evaluated against (org/project/environment/cluster)
+- **Policy bundle**: versioned set of roles/permissions/templates used by the evaluator
+
+## Principles
+1) **Deny by default**
+   - Every non-public endpoint MUST declare its required permission(s) and scope.
+   - Unannotated endpoints are treated as non-compliant and must fail CI (see “Coverage gating”).
+
+2) **Enforce at the edges AND at the source of truth**
+   - Gateway enforcement protects shared infrastructure and provides consistent errors.
+   - Service enforcement prevents bypass via internal routing, misconfigured gateways, or alternate ingress.
+
+3) **Be explicit about scope and resource identifiers**
+   - The authorization system is only as correct as the scope we pass to it.
+   - Endpoints must consistently extract `org_id`, `project_id`, `environment_id`, and/or `cluster_id` and include them in authz input.
+
+4) **Do not leak sensitive authorization details to unprivileged callers**
+   - Standard error responses must be safe by default.
+   - Debug details are only available behind explicit controls (see “Debug headers and ‘why denied’”).
+
+5) **Auditability is part of the definition of done**
+   - Authorization decisions for security-relevant actions must be logged with enough context for SOC2/enterprise evidence.
+
+## Where to enforce authorization (gateway vs service)
+### Required enforcement points
+| Request type | Gateway check | Service check | Notes |
+|---|---|---|---|
+| External client → Redwood (Hosted API / Console / Control Plane) | REQUIRED | REQUIRED | Standard for all sensitive actions and data access. |
+| Internal service → internal service (within Redwood) | Optional (if routed via gateway) | REQUIRED | Trust boundary is the service, not the network. |
+| Batch jobs / async workers (no gateway) | N/A | REQUIRED | Worker identity must be a subject with roles/permissions. |
+| Private deployment (customer VPC/on-prem) | REQUIRED where gateway exists | REQUIRED | Same semantics; may differ in identity source, not in authz behavior. |
+
+### Guidance: what belongs in gateway checks
+Gateway should:
+- Authenticate the caller and construct an **AuthContext** (subject + org + request metadata)
+- Enforce authorization for the route using the declared permission/scope
+- Emit metrics and standardized error responses
+- Apply safety controls (rate limits, allowlists, abuse controls) independent of authz
+
+Gateway should NOT:
+- Implement business logic for resource lookups (beyond extracting IDs from path/body)
+- Perform multi-step authorization that depends on internal state not available at the edge
+
+### Guidance: what belongs in service checks
+Services must:
+- Re-check authorization using the same declared permission(s) and scope
+- Validate that resource IDs used in business logic match the scope used for authz
+- Enforce row-level restrictions by scoping queries (e.g., `WHERE org_id = :org_id`) in addition to permission checks
+
+### Exception policy
+Exceptions are allowed only with explicit approval from Security Eng (Marcus Lin) and the owning Platform TL (Ethan Park for Control Plane; Amara Diallo for Gateway). Approved exceptions MUST:
+- Be documented in the service README or endpoint docstring
+- Include compensating controls
+- Include additional tests
+
+Examples of potentially acceptable exceptions:
+- High-volume public/anonymous endpoints (e.g., a health check) that are explicitly annotated as public (see “Public endpoints”) 
+- Internal-only endpoints not exposed via any external ingress AND protected by mTLS + service identity + service-level authz
+
+## Endpoint annotations (required)
+### Required annotation fields
+Every non-public endpoint MUST declare:
+1) **permission**: a single RBAC permission string (or an ordered list; see “Multiple permissions”)
+2) **scope_type**: one of `org`, `project`, `environment`, `cluster`, `global`
+3) **scope_resolver**: how to derive the scope ID(s) from the request
+
+This enables:
+- Consistent enforcement (gateway + service)
+- Coverage checks (no “forgotten” endpoints)
+- Audit log enrichment
+- Permission viewer/search in Console
+
+### Annotation formats (HTTP and gRPC)
+We support either of the following patterns depending on stack.
+
+**HTTP example (pseudo-annotation):**
+- `@Authz(permission="routing.policy.update", scope_type="environment", scope_resolver="path:env_id")`
+
+**gRPC example (proto option):**
+- `option (redwood.authz.permission) = "org.roles.update";`
+- `option (redwood.authz.scope_type) = "org";`
+- `option (redwood.authz.scope_field) = "org_id";`
+
+### Scope resolver rules
+Scope resolvers MUST be deterministic and avoid partial parsing:
+- Prefer **path parameters** (`/orgs/{org_id}/…`, `/projects/{project_id}/…`)
+- If the ID is in JSON body, the request schema MUST require it (no optional org_id for scoped actions)
+- If scope is derived via lookup (e.g., `model_deployment_id → env_id`), the service MUST:
+  1) load the parent scope
+  2) enforce authorization using the resolved scope
+  3) ensure the loaded resource belongs to that scope
+
+### Public endpoints
+Public endpoints MUST be explicitly annotated as public.
+- `@PublicEndpoint(reason="/healthz is used by load balancers")`
+
+Rules:
+- Public endpoints may not return customer data.
+- Any endpoint used by the Console, SDKs, or customers is not “public” unless product explicitly defines it.
+
+### Multiple permissions
+Prefer a single permission per endpoint. If multiple permissions are required:
+- Use ordered evaluation: the first matching allow grants access.
+- Do not create “permission soups” in code; refactor into separate endpoints if the semantics differ.
+
+Acceptable cases:
+- Backwards compatibility during migration (RBAC v1 + v2 dual-read)
+- Soft transitions where `permission_A` is deprecated but still recognized
+
+## Authorization evaluation flow (standard)
+1) **Authenticate** → build `AuthContext`:
+   - subject type: user | service_account | api_key | internal_service
+   - subject id
+   - org id (if applicable)
+   - request id / trace id
+   - deployment mode: hosted | dedicated | private
+
+2) **Resolve scope** from request:
+   - scope type + scope id(s)
+
+3) **Evaluate** with policy evaluator:
+   - input: (subject, permission, scope, policy_version)
+   - output: allow/deny + denial reason code + policy metadata
+
+4) **Enforce**:
+   - allow → proceed
+   - deny → return standardized error (and optionally debug metadata for admins)
+
+5) **Audit log**:
+   - emit authz decision fields (see below)
+
+## Error semantics (HTTP and gRPC)
+### HTTP status codes
+- **401 Unauthorized**: authentication missing/invalid (no subject)
+- **403 Forbidden**: authenticated, but not authorized
+- **404 Not Found**: only used when the resource truly does not exist OR when product intentionally masks existence; do not use 404 as a substitute for 403 unless explicitly documented
+
+### Error response shape (HTTP)
+All authorization failures must return a structured payload:
+- `error.code = "RBAC_PERMISSION_DENIED"`
+- `error.message` is safe and user-readable
+- `error.request_id` is included
+- `error.denial_reason_code` is included (safe subset; see below)
+
+Suggested message:
+- “You don’t have permission to perform this action. Contact your admin if you believe this is a mistake.”
+
+### Denial reason codes
+Denial reasons are standardized to support troubleshooting and analytics. The gateway/service may map evaluator output to one of:
+- `SUBJECT_UNBOUND` (no applicable role bindings in scope)
+- `PERMISSION_MISSING` (bindings exist, but none grant the permission)
+- `SCOPE_MISMATCH` (request attempted action outside bound scope)
+- `POLICY_NOT_LOADED` (transient; should be rare; alerts required)
+- `EVALUATOR_ERROR` (internal error; should surface as 500 if we cannot safely decide)
+
+Safety rule:
+- Only expose denial reason codes that do not leak sensitive policy details. The above set is approved for general exposure.
+
+### Debug headers and “why denied”
+To support admin workflows (“why was I denied?”), services/gateway MAY include a debug header only when all conditions are true:
+- Caller is an authenticated user (not an API key) AND
+- Caller has an admin-grade permission (e.g., `org.roles.read` or `org.security_admin`) AND
+- The request includes `X-Redwood-Authz-Debug: 1`
+
+If enabled, add:
+- `X-Redwood-Authz-Debug-Info: <opaque token>`
+
+The token must be opaque and retrievable via internal tooling/log correlation (not raw role names/IDs). This prevents policy enumeration.
+
+### gRPC mapping
+- Authn failure → `UNAUTHENTICATED`
+- Authz deny → `PERMISSION_DENIED`
+- Evaluator/system failure (cannot decide) → `INTERNAL`
+
+All gRPC denies must include:
+- `redwood.error_code = RBAC_PERMISSION_DENIED`
+- `request_id`
+- optional `denial_reason_code`
+
+## Audit logging requirements
+For security-relevant actions and sensitive reads, emit an audit event that includes authz decision context.
+
+Minimum required fields (see audit logging schema page for the canonical list):
+- subject: type + id
+- action: permission string
+- scope: type + id
+- resource identifiers (when applicable): e.g., api_key_id, role_id, routing_policy_id
+- decision: allow | deny
+- denial_reason_code (if deny)
+- policy_version identifier
+- enforcement_point: gateway | service | both
+- request_id / trace_id
+
+Rules:
+- If gateway denies, the gateway must log the deny.
+- If gateway allows but service denies (mismatch), the service must log the deny AND emit a metric `authz_mismatch_total` tagged by route.
+
+## Caching and performance rules
+- Caching is allowed only in the evaluator client/library and must be **scoped** to:
+  - subject id + permission + scope id + policy version
+- Cache TTL must be short and safe (default: 30–120s). Longer TTL requires justification.
+- Cache invalidation triggers must include:
+  - role binding changes
+  - role template/policy bundle version updates
+  - subject deactivation
+- Never cache “allow” without including the policy version.
+
+## Testing and CI requirements
+### Minimum test requirements
+For each sensitive endpoint:
+1) **Unit test**: verifies the handler is annotated and calls authz enforcement with expected permission + scope
+2) **Negative auth test**: denies when permission is missing
+3) **Positive auth test**: allows when permission is present
+
+For critical workflows (at minimum):
+- API key creation/rotation/revocation
+- user/role/role-binding changes
+- routing policy edits and rollout/model pinning changes
+- audit log export
+- data retention/residency configuration
+
+…we require an **end-to-end integration test** that exercises the request through gateway → service.
+
+### Coverage gating (no unannotated sensitive endpoints)
+- All routes in the gateway routing table and all gRPC methods in Control Plane services MUST be registered in the permission registry.
+- CI must fail if:
+  - a new endpoint is added without authz annotation
+  - an endpoint is annotated with an unknown permission
+  - a permission string violates naming/versioning rules
+
+### Regression tests for streaming endpoints
+Streaming and long-lived requests are high risk.
+- Streaming endpoints MUST perform authz checks before initiating stream.
+- Add a regression test that verifies a request without permission cannot receive any streamed tokens/bytes.
+
+## Implementation checklist (for new endpoints)
+1) Define or reuse the permission (per ADR-014).
+2) Add endpoint annotation (permission + scope type + resolver).
+3) Enforce in gateway (route config must include permission metadata).
+4) Enforce in service (middleware/interceptor + handler-level scope resolution).
+5) Add unit tests (positive/negative) and update coverage registry.
+6) Ensure audit logging includes authz decision fields.
+7) If endpoint is customer-facing, confirm error message and denial reason code are user-safe.
+
+## Operational signals (required)
+Each service/gateway must emit:
+- `authz_eval_latency_ms` (p50/p95/p99)
+- `authz_denies_total` tagged by permission + scope_type + route
+- `authz_errors_total` (evaluator failures)
+- `authz_cache_hit_rate` (if caching enabled)
+- `authz_mismatch_total` (gateway allow, service deny)
+
+## Ownership and changes
+- Owner: Platform Engineering (Gateway + Control Plane)
+- Security review required for changes to:
+  - denial reason code exposure
+  - debug header behavior
+  - public endpoint annotations
+  - caching TTL defaults and invalidation behavior
+
+Changelog (high-level):
+- 2025-03-18: clarified debug header gating and added streaming endpoint requirements.
+- 2025-02-26: added mismatch metric requirement and scope resolver rules for lookup-derived scopes.
+- 2025-01-24: initial published standard for RBAC v2 enforcement patterns.

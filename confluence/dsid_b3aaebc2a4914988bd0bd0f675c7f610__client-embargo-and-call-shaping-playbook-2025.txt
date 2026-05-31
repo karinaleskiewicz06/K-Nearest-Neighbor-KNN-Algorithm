@@ -1,0 +1,157 @@
+Client Embargo and Call Shaping Playbook
+
+Summary:
+
+This playbook defines the Client Embargo protocol and recommended client-side call shaping patterns to protect runtime SLOs and reduce cascading overloads. It is designed for external and internal SDKs that call Redwood inference endpoints (hosted, dedicated, and private), and for intermediate proxies and edge adaptors.
+
+Goals:
+
+- Provide a deterministic, low-latency friendly approach for clients to react to transient backpressure and service-driven embargo signals.
+- Minimize wasted retries and noisy fanout during partial outages or capacity constraints.
+- Preserve compatibility across client versions and server-side rollout stages with minimal coupling.
+- Offer observability hooks and testing guidance so teams can validate behavior during rollouts.
+
+Problem statement:
+
+When runtime capacity is constrained, naive client retry/backoff patterns often amplify load (retry storms), increase tail latency, and undermine SLOs for foreground traffic. Existing guidance covers hedging and timeouts, but lacks a concise, implementable handshake that: (a) communicates temporary embargo windows from server to client, (b) permits clients to shape traffic predictably, and (c) degrades safely when either side is upgraded independently.
+
+Scope and applicability:
+
+- Applies to all text generation, chat, and embeddings REST endpoints exposed by Redwood API and to on-prem sidecar runtimes that implement the Embargo Header contract.
+- Not intended for long-running batch jobs (use dedicated bulk endpoints and the Batch Escrow pattern).
+
+Embargo protocol overview:
+
+- Server signals short-term “embargo windows” via standard response header: X-Redwood-Embargo: <until-timestamp-ms>.<priority-hint>
+- Header semantics:
+  - until-timestamp-ms: absolute epoch ms when embargo ends (clients may apply jitter/holdoff to resume).
+  - priority-hint: optional token (low|normal|high) that suggests preferred routing or client-level throttling.
+- When present with a future timestamp, clients must treat the endpoint as "embargoed" for the given resource, and follow client-side shaping rules below.
+
+Handshake and call shaping sequence (text diagram):
+
+1. Client issues request -> runtime responds 503 with X-Redwood-Embargo: 1700000000000.low
+2. Client marks resource embargoed until timestamp and records embargo-origin and reason (if returned in body).
+3. Client enters shaped holdoff path for that resource: apply local embargo policy (see policy matrix).
+4. Client either (A) route to fallback compatible model/region or (B) queue with exponential-jittered resume windows under a cap.
+5. When local embargo expires, client issues a single probe request (fast-path) to validate service health. If probe is successful, resume; otherwise re-enter embargo with exponential backoff up to max-holdoff.
+
+Client policy matrix (recommended defaults):
+
+| Client tier | Action on "low" hint | Action on "normal" hint | Probe cadence after expiry | Max holdoff |
+|-------------|-----------------------|--------------------------|---------------------------:|-----------:|
+| SDK (PLG)   | Route to fallback model; queue small UI-friendly retry | Queue with capped jitter (base 150ms) | single probe after expiry | 30s |
+| Server-to-server (high throughput) | Queue and downgrade weight to 10% of baseline; stream-level pause | Throttle to 50% of baseline | probe every 500ms up to 5 probes | 120s |
+| Edge proxy | Route to alternate region; if none, return controlled 503 with embargo header | Prioritize high-fidelity traffic, degrade others | 1 probe after expiry | 60s |
+(Notes: teams may tighten defaults per product risk profile. See "SLOs and metrics" below.)
+
+Embargo header examples (HTTP):
+
+- Single header, low priority: X-Redwood-Embargo: 1710000000000.low
+- With server reason in body (JSON):
+
+```json
+HTTP/1.1 503 Service Unavailable
+X-Redwood-Embargo: 1710000000000.normal
+Content-Type: application/json
+
+{
+  "error": "capacity_exhausted",
+  "embargo_reason": "zone_bursting",
+  "recommended_fallback": "gptl-quantized-v2"
+}
+```
+
+Compatibility and versioning rules:
+
+- Embargo header is additive and optional for older clients. Older clients that do not recognize the header must fall back to existing 5xx retry/backoff behavior.
+- Server-side must not rely on client support during migration: always provide a standard 5xx response body and a machine-readable embargo header.
+- When adding new priority hints, servers must ensure: default behavior for unknown hints is the same as "normal".
+
+Fallback routing guidance:
+
+- Primary choices for fallback: cheaper quantized variant (same schema), lower-fidelity model with same output envelope, or regional reroute.
+- Maintain model-compatibility manifest for each public model describing safe downgrade models (see Related Pages).
+
+Configuration and sample settings (example YAML style shown as table of safe defaults):
+
+| config_key | default | description |
+|------------|---------|-------------|
+| embargo.enabled | true | enable client embargo handling in SDKs/proxies |
+| embargo.jitter_ms | 120 | additional random holdoff to avoid synchronized resume |
+| embargo.probe_retries | 3 | probes after embargo expiry before backoff escalation |
+| embargo.max_holdoff_ms | 120000 | upper bound of holdoff for S2S clients |
+| embargo.fallback_preference | [quantized,region,model] | ordered fallback choices |
+
+Implementation snippets:
+
+- SDK pseudocode (recommended):
+
+```python
+def handle_response(resp, resource_key):
+    embargo_hdr = resp.headers.get("X-Redwood-Embargo")
+    if embargo_hdr and resp.status_code >= 500:
+        until_ms, hint = parse_embargo(embargo_hdr)
+        if until_ms > now_ms():
+            record_embargo(resource_key, until_ms, hint)
+            apply_local_shaping(resource_key, hint)
+            return EMBARGOED_RESPONSE
+    return resp
+```
+
+- Probe example (curl):
+
+curl -i -H "Authorization: Bearer $TOKEN" \\  \
+  -H "X-Redwood-Embargo-Probe: 1" \\  \
+  "https://api.redwood.ai/v1/models/gpt-infer/probe"
+
+Operational SLOs and metrics to publish:
+
+- Runtime must emit embargo events to telemetry pipeline with these fields: service, resource_key, embargo_until_ms, hint, origin_zone, backing_model.
+- Client-side metrics to capture in SDKs/proxies: embargo_received_count, embargo_duration_histogram, probe_success_rate, fallback_routed_count, embargo_abort_count.
+- Alerting thresholds (suggested):
+  - If embargo_received_count increases by >200% over 15m and probe_success_rate < 10% -> paging to runtime oncall.
+  - If fallback_routed_count > 5% of requests for 30m -> product/infra review for capacity or model degradations.
+
+Testing and verification:
+
+1. Unit tests: ensure SDK parses header variants and honours unknown hints.
+2. Integration test: simulate server returning embargo header with different timestamps and measure client holdoff and probe behavior.
+3. Chaos/Sim lab: inject embargo signals across regions to verify routing and telemetry. Include synthetic workloads that simulate 10% of clients resuming simultaneously to validate jitter strategies.
+
+Rollout and migration plan (recommended):
+
+1. Implement client handling behind feature flag and enable for internal sandbox customers.
+2. Enable embargo header emission in runtime for a small percentage (canary) of requests with low priority hints.
+3. Monitor embargo metrics and iterate defaults for jitter and max holdoff.
+4. Expand client SDK rollout to default-on once 72h canary shows stable probe_success_rate > 95% and no spike in tail latency.
+
+Ownership and responsibilities:
+
+- Runtime teams: emit embargo header consistently and publish recommended fallback in response body.
+- SDK teams: implement shaping, metrics, and probe behavior; expose configuration knobs to integrators.
+- Observability: create dashboard named "Embargo Signals & Client Behavior" and maintain alert rules described above.
+
+Security and privacy considerations:
+
+- Embargo headers and reasons are operational metadata and must not contain PII. Avoid including tenant-identifying strings in embargo_reason.
+- Telemetry containing embargo events should follow existing retention and redaction policies.
+
+Open decisions (ADR candidates):
+
+- Should embargo originate only from edge proxies or also from runtime backends? (Consequence: wider surface area vs earlier signaling).
+- Standardize a machine-readable reason code set (e.g., zone_bursting, model_transient, maintenance_window) and publish mapping.
+
+References and related pages:
+
+- See client-backpressure-hedging-and-timeouts-standards for baseline retry patterns.
+- See runtime-workload-signatures-and-slo-derivation-playbook for SLO alignment.
+
+Appendix A: Quick checklist for oncall when embargo signals surface:
+
+- Confirm embargo origin and scope (zone, model, global).
+- Check capacity spikes, recent rollouts, and preemption events.
+- Validate fallback models are healthy and that probe endpoints respond.
+- If embargo persists beyond configured max_holdoff for core customers, trigger capacity escalation and provide recommended communication script to affected teams.
+
+This playbook should be treated as the canonical engineering guidance for client-side embargo behavior. Teams that change defaults must document differences and add them to the Related Pages list.

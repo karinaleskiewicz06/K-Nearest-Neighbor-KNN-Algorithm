@@ -1,0 +1,204 @@
+Microburst capacity doctrine and priority-lane runbook
+
+Summary
+-------
+This runbook documents our operational doctrine for short-lived, high-concurrency traffic spikes ("microbursts") that can temporarily saturate inference capacity and cause SLO violations. It covers detection, immediate mitigation, capacity hedges, priority-lane controls (token-priority lanes), incident evidence requirements, post-incident review standards, and recommended reliability initiatives to reduce recurrence.
+
+Why this matters
+----------------
+Microbursts are distinct from sustained load growth: they are typically 30s–10m, high fanout bursts that overwhelm warm pools, KV caches, or cause tail latency regressions. Left unhandled, microbursts:
+- Consume disproportionate error budget in minutes
+- Trigger large cross-tenant evictions or noisy autoscale reactions
+- Cause cascading SLO failures across dependent services
+
+SLOs / Error-budget boundaries referenced
+------------------------------------
+- Service availability SLO (page-level): 99.95% monthly
+- Latency SLOs (per-route): p50 < 60 ms, p95 < 120 ms, p99 < 350 ms (inference-serving path)
+- Error budget burn alert: 30% of monthly budget consumed in a rolling 24h 
+- Immediate mitigation threshold: 5x baseline QPS sustained for 2 minutes or 20x baseline QPS for 30s
+
+Detection and alerts (automated signals)
+-------------------------------------
+Primary automated triggers (Prometheus/observability):
+- microburst_qps_ratio = rate(req_count[1m]) / rate(historical_baseline_1m) > 5 for 120s
+- p99_latency_increase = increase(p99_latency[3m]) > 200ms
+- warm_pool_eviction_rate > 1 / min per host over 1m
+- error_budget_burn_rate > 0.3 (24h window)
+
+Alert routing: fire the "microburst-guard" alert to SRE on-call and the model-serving on-call channel; open a command channel: #sre-microburst-runbook.
+
+Immediate on-call checklist (first 10 minutes)
+---------------------------------------------
+1) Acknowledge alert and set incident severity: microburst incidents default to Sev-2 unless customer-impact shows SLA breach.
+2) Identify scope: run these queries (PromQL examples):
+   - Baseline QPS: sum(rate(redwood.requests_total{route=~".*"}[1m])) by (route)
+   - Burst QPS: same over last 1m, compare ratio to baseline stored in historical_baseline metric
+3) Attach minimal evidence to the incident ticket: top 10 routes by delta, sample request IDs (see Evidence section)
+4) Enable automatic mitigation (if not already active): toggle priority-lanes.sh --enable --reason microburst
+5) If priority lanes are already enabled, escalate to scale hedges (see Mitigations).
+
+Priority-lane controls (token-priority lanes)
+-------------------------------------------
+Purpose: preserve SLOs for high-priority tenants/routes while shedding or throttling best-effort traffic.
+Design principles:
+- Three lanes: premium, standard, best-effort
+- Admission control uses token-bucket with separate buckets per lane and per-tenant fairness slots
+- Default allocation: premium 40%, standard 40%, best-effort 20% of transient burst capacity
+- Token accounting includes estimated downstream token consumption (tokens per requested output token)
+
+Operational commands (CLI examples):
+- Enable lanes: /opt/sre/bin/priority-lanes --action enable --config /etc/priority-lanes/current.json
+- Query state: curl -s http://platform-admin/api/priority-lanes/status | jq
+- Immediate reweight: priority-weight-set --lane standard --percent 30
+
+Safe defaults in config (snippet):
+-----
+{
+  "lanes": [
+    { "name": "premium", "min_pct": 30, "max_pct": 60 },
+    { "name": "standard", "min_pct": 20, "max_pct": 50 },
+    { "name": "best-effort", "min_pct": 0, "max_pct": 20 }
+  ],
+  "eviction_policy": "soft-preempt",
+  "fairness_window_secs": 60
+}
+-----
+(When updating config in an incident, commit to a short-lived feature-flagged rollout and document the reason.)
+
+Immediate mitigations (ordered by recommended sequence)
+----------------------------------------------------
+1) Priority lanes: enable / reweight to preserve premium traffic.
+2) Traffic shaping: apply 5xx-backpressure for best-effort routes (scale down token bucket size).
+3) Route fallback: change model routing policy for affected routes to lower-cost, faster variants (e.g., fp16 -> int8) or shorter context models via routing quickswitch: route-switch --to-model model-int8-v2 --routes id1,id2
+4) Warm-pool expansion: trigger warm-pool scale-up for hot models (warmpool-scale --add 10) — prefer warm pool to autoscale where possible (faster).
+5) Cross-region drain/fallback: if local region capacity exhausted, run region-fallback --target eu-west-1 --routes idX .
+6) If all mitigation fails and SLO impact persists > 10m, declare a Sev-1 and perform pre-approved customer notifications.
+
+When to escalate to severe incident
+----------------------------------
+- Any customer-facing SLA breach (availability SLO failure)
+- Sustained error budget burn > 50% in 1h
+- Multiple dependent services showing cascading p99 increases
+
+Forensics and evidence collection (required artifacts)
+----------------------------------------------------
+Every microburst incident must capture and attach the following before postmortem:
+- Chronological timeline (UTC) with step-by-step actions and timestamps.
+- Top 20 request IDs during peak with associated model, route, tenant, token count.
+- Traces: distributed traces showing start->inference runtime->response for 100 sampled requests across lanes.
+- Heap/EV stats: warm-pool occupancy, KV cache hit/miss rates, GPU memory pressure timeline.
+- Autoscale events: instance add/remove timestamps and reason codes.
+- Priority-lane config at time-of-incident (diff against last good).
+- CLI toggles or ops commands executed (with git SHAs/config refs).
+
+Post-incident review standard (postmortem template)
+------------------------------------------------
+Required sections:
+- Executive summary (1–3 sentences)
+- Impact (routes, customers, duration, SLO loss)
+- Timeline (annotated)
+- Root cause hypothesis and evidence mapping
+- Contributing factors (operational, telemetry, capacity, model changes)
+- Corrective actions (short-term and long-term) with owners and ETA
+- Error budget accounting and whether SLA credits apply
+- Lessons learned and next rehearsal date
+
+Postmortem scoring: assign a confidence score (1–5) on the root cause mapping and mark action items as either 'mitigated', 'in-flight', or 'pending'. Postmortem should be completed within 7 calendar days.
+
+Capacity planning and headroom calculus for microbursts
+-----------------------------------------------------
+Headroom target: maintain enough pre-warmed inference workers and preallocated priority lane capacity to absorb the 95th percentile microburst without invoking heavyweight autoscale (slow path).
+Formulas (simplified):
+- Expected transient headroom (tokens/sec) = baseline_qps * transient_multiplier
+- Warm pool size = ceil((expected_transient_headroom * avg_token_cost) / avg_concurrency_per_worker) + safety_margin
+Example table:
+---
+| Metric | Baseline | Burst multiplier (95th) | Headroom tokens/sec | Warm pool nodes | Notes |
+|---|---:|---:|---:|---:|---|
+| route-A | 200 qps | 6x | 1200 | 8 | avg_token_cost=1.2, concurrency=160 |
+| route-B | 50 qps | 8x | 400 | 3 | embedding-heavy, higher mem |
+---
+Planning cadence: include microburst stress expectations in quarterly capacity reviews; model owners must provide a 90-day burst-profile when onboarding models.
+
+Reliability initiatives (recommended programs)
+-------------------------------------------
+- Microburst drills: simulate 5–10 microbursts per quarter across routes (chaos-sim tool) and validate priority-lane correctness.
+- Telemetry uplift: instrument lane-rejection reasons, per-tenant token accounting, and warm-pool lag metric.
+- SLO experiment: run a controlled test that intentionally reduces best-effort allocation to measure customer-visible effect.
+- Model admission playbook: require a burst-profile and token-cost estimate during candidate model onboarding.
+
+Operational tooling and automation playbook
+-----------------------------------------
+Key tooling components:
+- priority-lanes service (control plane for runtime admission)
+- warmpool-manager (fast path pre-warm orchestration)
+- microburst-simulator (chaos harness for local/regional replay)
+- telemetry adapters (prometheus exporters, trace sampling triggers)
+Sample automation recipes:
+1) Auto-enable priority lanes when microburst_qps_ratio > 3 for 60s (feature-flagged):
+   - Automation job: /ops/runbooks/auto-priority-lanes.json -> POST to admin API
+2) Warm-pool fast-forward: when p99_latency spikes + warm_pool_fill_rate < 80% -> warmpool-scale --fast 5
+3) Safe rollback: route-switch commands are reversible via git-ops; all route switches must be annotated with runbook-ID and change-URL.
+
+Runbook play example (operator script)
+-------------------------------------
+1) runbook start: create incident ticket using new-incident --template microburst
+2) collect scope: run /opt/sre/bin/collect-evidence --since now-10m --filter microburst
+3) enable lanes: priority-lanes --action enable --reason "auto-mitigation via runbook"
+4) if lanes ineffective in 3m, run warmpool-scale --add 20% and re-evaluate
+5) if still failing in additional 5m, execute region-fallback and notify customer-ops.
+
+Retro and follow-up (ownerable actions)
+-------------------------------------
+Short-term (owner within 72h):
+- Add additional synthetic canaries pegged at 2x baseline for critical routes (owner: SRE-runbook squad)
+- Add richer sampling to traces during burst windows (owner: observability)
+Long-term (owner within 90d):
+- Implement predictive headroom model in capacity planner (owner: capacity planning)
+- Expand warm pool APIs to support per-tenant fast prewarming (owner: serving runtime)
+
+Runbook governance and change control
+------------------------------------
+- Any changes to priority-lane defaults must be reviewed by SRE and Serving Runtime and deployed behind a feature flag.
+- Emergency patches during an incident must be recorded in the incident ticket and a retrospective review scheduled.
+
+Appendices
+----------
+A) PromQL examples
+- burst_ratio: sum(rate(redwood.requests_total[1m])) by (route) / sum(historical_baseline_1m) by (route)
+- warm_pool_fill: avg_over_time(warmpool.occupied[5m])
+
+B) Quick command cheat-sheet
+- Enable lanes: /opt/sre/bin/priority-lanes --action enable
+- Reweight: priority-weight-set --lane standard --percent 30
+- Warmpool scale: warmpool-scale --add 10
+- Route switch: route-switch --to-model model-int8-v2 --routes <id-list>
+
+C) Decision log excerpts
+- 2025-09-14: Adopted three-lane token-priority design to prevent eviction storms
+- 2026-01-30: Added warm-pool fast path to reduce microburst tail latency
+
+D) Postmortem checklist (short)
+- Attach evidence artifacts (see Forensics)
+- Fill RCA confidence score
+- Create action items with owners and ETA
+- Schedule follow-up drill date
+
+Contacts and ownership
+----------------------
+- On-call SRE: platform-sre@redwood.ai (primary)
+- Serving runtime lead: marco.rivera@redwood.ai
+- Observability: leah.oneill@redwood.ai
+- Capacity planning: capacity-planning@redwood.ai
+
+Related pages
+-------------
+- Capacity planning templates and budgeting
+- Priority-lanes implementation design doc (serving-runtime)
+
+Document history
+----------------
+- 2026-02-12: Created by Riley Chen
+- 2026-03-03: Revised mitigation sequencing and added headroom example (reviewers: Asha Patel, Marco Rivera)
+

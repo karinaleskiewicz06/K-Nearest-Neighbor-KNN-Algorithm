@@ -1,0 +1,136 @@
+GPU demand throttling and accounting sidecar pattern
+
+Summary:
+
+This document describes the GPU Demand Throttling and Accounting Sidecar pattern: a lightweight, per-tenant sidecar service that enforces soft throttles, emits accounting events for finOps, and acts as a local SLA-proxy for tenant-level GPU allocation decisions. It complements global placement and quota systems by providing fast local enforcement and robust telemetry for chargeback and fairness decisions.
+
+Goals:
+- Provide sub-second enforcement of tenant request rate limits and fractional GPU quotas at the edge of the serving runtime.
+- Ensure accurate, auditable accounting of consumed GPU-time and capacity credits.
+- Allow safe, incremental rollout via feature flags and Terraform modules.
+- Integrate with existing Prometheus, Kafka, and billing pipelines without requiring global consensus on every request.
+
+When to use this pattern:
+- Multi-tenant deployments where a single GPU server hosts multiple customer workloads (fractional GPU or multiplexed containers).
+- When global quota checks add unacceptable latency to inference requests (target: <= 5ms added p99).
+- When accurate per-tenant billing and fairness is required (enterprise customers with reserved capacity or committed spend).
+
+Components and responsibilities:
+1) gpu-accounting-sidecar (service):
+   - Local enforcement agent deployed alongside the model-serving container (pod sidecar or adjacent process on VM).
+   - Tracks token-level and time-based consumption (e.g., GPU-ms per request, peak memory footprint).
+   - Implements soft throttles, burst tokens, and fair-share backoff.
+   - Exposes local /health, /metrics, /consume endpoints.
+
+2) global-credit-service (GCS):
+   - Centralized store of tenant credit allocations and policy (existing service: "credit-store" in the infra catalog).
+   - Emits periodic delta updates to sidecars via Kafka topic gpu.credit.updates for low-latency sync.
+
+3) observability and billing pipeline:
+   - Sidecars forward compact accounting events to kafka topic gpu.accounting.events and to Prometheus (derived gauges).
+   - Billing lane consumes kafka topic and writes aggregated records to the billing DB (hourly and daily rollups).
+
+4) Terraform module and Helm chart:
+   - Sidecar packaged as container image and deployed via a dedicated Helm subchart or a terraform module that attaches the sidecar container spec to tenant workloads.
+
+Operational SLOs and thresholds:
+- Enforcement latency: sidecar consume path must add <= 5ms p50 and <= 20ms p99 to request path (measured end-to-end).
+- Accounting event delivery: 99.9% of accounting events should appear in Kafka topic within 30s.
+- Credit sync lag: no sidecar should be stale > 2 minutes relative to GCS updates under normal conditions.
+- Fairness target: when all tenants saturated, deviation of allocated GPU-ms per tenant vs target share should be <= 10% over 10-minute windows.
+
+Prometheus metrics (recommended):
+| metric name | type | description | alert threshold |
+|---------------|------|-------------|-----------------|
+| gpu_sidecar_enforce_latency_seconds_bucket | histogram | Enforcement call latency | p99 > 0.02 -> page oncall |
+| gpu_sidecar_accounting_events_failed_total | counter | Failed attempts to publish accounting events | rate > 5/min -> create alert |
+| gpu_sidecar_credit_staleness_seconds | gauge | Age of last credit update from GCS | > 120s -> warn |
+| gpu_sidecar_burst_tokens_available | gauge | Tokens available for tenant bursts | < 1 for 5m -> warn |
+
+Terraform module snippet (conceptual):
+```hcl
+module "gpu_sidecar_attachment" {
+  source = "git::ssh://git@repo.internal/infra/terraform-modules.git//gpu-sidecar?ref=v1.2.0"
+
+  tenant_id                 = var.tenant_id
+  sidecar_image             = "registry.internal/redwood/gpu-sidecar:v1.2.0"
+  default_quota_gpu_ms_per_hour = 3600000 # example: 1 GPU-hour
+  enable_accounting_kafka   = true
+  kafka_topic_accounting    = "gpu.accounting.events"
+}
+```
+
+Helm values (conceptual):
+- sidecar.enabled: true
+- sidecar.image: registry.internal/redwood/gpu-sidecar:v1.2.0
+- sidecar.resources: requests.cpu=100m, limits.cpu=300m
+- sidecar.env: CREDIT_STORE_ENDPOINT, KAFKA_BOOTSTRAP, BILLING_TAGS
+
+Sidecar API (HTTP endpoints):
+1) POST /consume  - Body: {tenant_id, request_id, estimated_gpu_ms}
+   - Response 200: {allowed: true, reason: "ok", tokens_remaining: 42}
+   - Response 429: {allowed: false, reason: "quota_exhausted", retry_after_seconds: 30}
+2) GET /credits?tenant_id=... - Returns nominal credit balances and last_sync_timestamp
+3) POST /events - Accepts batched accounting events for immediate forward to kafka (used in offline mode)
+
+Request flow (normal):
+1. Inference request arrives at serving runtime.
+2. Runtime calls sidecar POST /consume synchronously (timeout 50ms). Sidecar decides allowed/block and returns decision.
+3. If allowed, runtime proceeds to GPU invocation and logs actual GPU-ms to sidecar via /events (best-effort).
+4. Sidecar forwards events to kafka; billing lane aggregates and writes committed records hourly.
+
+Local-mode vs enforced-mode:
+- Local-mode (default during rollout): sidecar returns decision but does not block requests. It tags events with "allowed=false" for post-hoc policy enforcement.
+- Enforced-mode (production): sidecar returns 429 when budgets exhausted; runtime treats 429 as a hard throttle and returns HTTP 429 to customers or falls back to lower-cost model variant.
+
+Rollout plan (safe incremental):
+1) Canary build: deploy sidecar to a small set of non-critical tenants in local-mode. Verify accounting events and latency impact.
+2) Telemetry validation: ensure event delivery SLA met and billing consumer parses events correctly (>= 95% fidelity in first 24h).
+3) Feature-flag enforcement: flip individual tenants to enforced-mode behind a tenant-level feature flag.
+4) Gradual ramp: increase percentage of tenants with enforced-mode from 1% -> 10% -> 50% over multiple days while watching fairness metrics.
+5) Full enforcement: enable by default for new tenants; run for 30 days before migrating older tenants.
+
+Runbook: incident scenarios and playbook:
+- Symptom: sudden spike in gpu_sidecar_accounting_events_failed_total and backlog in Kafka.
+  - Impact: billing gaps, possible overuse of GPU capacity by tenants.
+  - Immediate actions:
+    1) Pager oncall and post incident on #infra-gpu-alerts with initial hypothesis.
+    2) Check sidecar logs for serialization errors and TLS/Kafka auth errors (journal: /var/log/gpu-sidecar.log).
+    3) If root cause is Kafka broker unavailability, temporarily switch sidecars to write to local durable file (sidecar supports file buffer) and enable admin script to drain to kafka when healthy: /usr/local/bin/gpu-sidecar-drain.sh
+    4) If sidecars are overloaded (cpu throttling), scale sidecar resources via Helm override: resources.requests.cpu += 100m and restart pods in the affected node pool.
+  - Post-incident steps:
+    - Run auditing job that reconciles sidecar file-buffered events with billing DB (script: tools/reconcile_gpu_accounting.py --from <timestamp>).
+    - Create a PagerDuty follow-up ticket and update incident review doc with timeline and RCA.
+
+Security and compliance considerations:
+- Accounting events must be signed with service identity and sent over TLS to Kafka; KMS-backed keys must rotate every 90 days.
+- Sensitive tenant identifiers must be hashed before forwarding to external billing consumers unless customer contract allows PII in billing exports.
+- Sidecar health endpoints must be guarded by mTLS when exposed outside the node (not required for loopback).
+
+Testing and validation matrix:
+| Test | Purpose | Pass criteria |
+|------|---------|--------------|
+| Unit: token bucket correctness | Ensure sidecar enforces quota logic | Simulated bursts up to 10x nominal; tokens consumed/returned deterministic |
+| Integration: Kafka delivery | Ensure events published and consumed | 99.9% of test events seen by consumer within 30s |
+| Load: enforcement latency | Measure added latency at p50/p99 | p99 <= 20ms for 1000 rps on a representative node |
+
+Ownership and contact list:
+- Service owner: Marcus Chen (eng-infra / GPU platform)
+- Backup owner: Priya Rao (eng-infra / Costing)
+- Oncall rotation: gpu-sidecar-sre (primary), listed in team roster
+- Billing integration owner: Eunice Mercado (finance-legal integration)
+
+Open issues and roadmap items:
+- Implement adaptive backoff based on node thermal signals (v2).
+- Provide gRPC native sidecar for lower overhead in certain runtimes.
+- Add tenant-level historical smoothing for fairness when tenants have bursty traffic.
+
+Appendix: example accounting event (JSON line - compact):
+{"tenant_id":"t-123","request_id":"r-20251108-01","gpu_ms":45,"model":"mix-7b-v2","node_id":"gpu-node-77","timestamp":"2025-11-08T14:12:03Z","sidecar_version":"v1.2.0"}
+
+References:
+- credit-store design doc: /eng-infra/terraform-and-iac/remote-state-segmentation-and-cross-account-locking-primer.json (for service discovery notes)
+- existing throttling patterns: /eng-infra/runbooks/gpu-tenant-backpressure-and-queue-smoothing-runbook.json
+- Kafka accounting topic spec: infra-messaging/docs/gpu-accounting-topic.md
+
+If you are preparing a migration or have questions about tenant-level quotas, contact the service owner before making changes to global placement rules.

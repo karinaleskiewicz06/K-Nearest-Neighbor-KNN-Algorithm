@@ -1,0 +1,163 @@
+Adaptive Kernel Mapper and Capacity Scaling Playbook
+
+Summary:
+
+This playbook describes the Adaptive Kernel Mapper (AKM) and associated capacity-scaling procedures used by the Redwood serving runtime to dynamically select execution kernels and right-size GPU capacity for diverse LLM workloads. The AKM is a runtime component that maps model characteristics and live workload signals to a kernel/quantization/placement profile and triggers scale decisions or fallback policies when thresholds are crossed.
+
+Purpose and scope:
+- Document how the AKM makes decisions (inputs, scoring, policies).
+- Provide concrete configuration examples and CLI commands for ops.
+- Prescribe runbook procedures for performance regressions and capacity incidents.
+- Link to profiling and benchmarking artifacts used to tune AKM heuristics.
+
+Intended audience:
+- Serving runtime engineers (primary)
+- SRE and capacity planners
+- Model onboarding and perf benchmarking teams
+
+Key concepts (brief):
+- Kernel candidate: a specific combination of operator implementation (CUDA/cuBLAS/cutlass), data type/quantization (fp16/int8), and fusion knobs.
+- Profile: measured perf/latency/cost numbers for a model + sequence length distribution + batch shape.
+- Cost-utility score: composite metric combining tokens/sec (throughput), p95 latency, and estimated cloud cost per token.
+- Mapping policy: a set of rules that prefer lower-latency kernels for low-concurrency, and higher-throughput kernels for high-concurrency.
+
+Architecture overview:
+1) Telemetry inputs to AKM:
+   - Model metadata: architecture family, layer count, head size, weight dtype (fp32/ptq/q4).
+   - Serving signals: current concurrent requests per model, average request size, observed prefix cache hit rate.
+   - Perf probes: fast microbenchmarks executed in the background on warm workers to validate kernel latency for target sequence length.
+   - Historical profiles: offline benchmark results indexed by model hash and quantization profile.
+
+2) Decision pipeline (high-level):
+   - Normalize signals -> derive workload fingerprint.
+   - Fetch candidate kernels from catalog filtered by model compatibility.
+   - Score candidates using cost-utility function.
+   - Run safety checks: memory headroom, kernel stability records, mismatch with policy exclusions (e.g., avoid int8 if regression alert exists).
+   - Commit selection to local worker and report to central control-plane for observability and rollouts.
+
+Scoring function example (pseudo):
+   score = w1 * norm(tokens_per_sec) - w2 * norm(p95_latency) - w3 * norm(cost_per_token)
+Weights (w1..w3) are configurable per customer tier (e.g., enterprise might set w2 higher to prioritize latency).
+
+Kernel catalog (recommended fields):
+| kernel_id | dtype | impl | ideal_seq_len | mem_delta | notes |
+| KERN_CUTLASS_F16 | fp16 | cutlass-v3 | 512 | +0.2GB | good single-stream latencies |
+| KERN_INT8_FUSED | int8 | fused-ops-v2 | 1024 | -1.0GB | best throughput at high concurrency |
+
+Configuration file example (YAML):
+```yaml
+akm:
+  scoring_weights:
+    tokens_per_sec: 0.5
+    p95_latency_ms: 0.35
+    cost_per_token: 0.15
+  concurrency_thresholds:
+    single_stream: 1
+    medium: 4
+    high: 32
+  safety_filters:
+    - max_memory_overcommit: 0.85
+    - banned_kernels: [KERN_INT8_FUSED] # temporary blocklist if regression detected
+```
+
+Operational runbook: when to invoke the AKM incident procedure
+1) Alert types that trigger the runbook:
+   - p95 latency breach for a model route > SLO for 10 minutes.
+   - Sudden drop in tokens/sec per GPU of > 25% over 5 minutes without matching traffic drop.
+   - Repeated OOMs on a worker (>= 3 in 12 hours).
+
+2) Immediate triage steps (first-responder, 0–15 mins):
+   1. Check service dashboard: model route, worker hostids, recent kernel changes (control-plane audit).
+   2. Run quick perf probe against affected worker: akmctl probe --worker <id> --seq 512 --batch 1 --kernel all.
+   3. If probe shows kernel regression vs baseline, add kernel to temporary blocklist and restart worker:
+      - akmctl block-kernel --kernel KERN_XYZ --reason "p95 regression"
+      - systemctl restart redwood-runtime@<worker>
+   4. If OOMs present, reduce per-worker concurrency and enable fallback profile: akmctl set-profile --worker <id> --profile conservative
+
+3) Escalation (15–60 mins):
+   - Notify capacity-oncall and SRE (pager duty).
+   - Spin up dedicated burst capacity pool for the model (if autoscale failed):
+     - terraform apply -var "burst_pool_for=model-abc" ... (link to runbook snippet)
+   - If root cause appears to be a kernel regression from a recent rollout, initiate rollback of AKM rollout: akmctl rollback --rollout <id>
+
+4) Post-incident (60+ mins):
+   - Collect traces: kernel-specific traces, perf probes, flamegraphs.
+   - Run A/B microbenchmarks against candidate kernels offline to validate production behavior.
+   - Open a regression investigation (link to regression-triage playbook) and add labels and owners.
+
+Profiling and microbenchmarks (how to reproduce locally)
+- Use the perf harness to generate representative requests and measure per-kernel latencies.
+- Example command to run a microbenchmark on a dev node:
+```bash
+python perf/harness/run_microbench.py \
+  --model /models/llama-70b/ --sequence 1024 --batch 1 \
+  --kernels KERN_CUTLASS_F16,KERN_INT8_FUSED --measure p50,p95
+```
+- Record results into the benchmark catalog JSON and tag with commit/hash.
+
+Benchmarking suite tie-ins:
+- The AKM relies on the benchmarking catalog (benchmarks indexed by model fingerprint). When adding a new model or quant profile, the onboarding pipeline must run the benchmark suite at scale and publish profiles. See related_pages for the canonical onboarding docs.
+
+SLOs and operational thresholds (suggested defaults):
+- p50 latency target: <= 30ms for single-stream configs; p95 <= 120ms.
+- Throughput target: configurable per model; default tokens/sec >= baseline_profile * 0.85.
+- Kernel stability: <= 0.5% error/exception rate in a 24-hour window.
+
+Observability (metrics the AKM emits):
+- akm.selected_kernel{model,worker} -> kernel_id
+- akm.score_breakdown{model,kernel} -> tokens_per_sec, p95_ms, cost_per_token
+- akm.probe_status{worker,kernel} -> ok|regression|oom
+- akm.rollback_events -> rollout_id, reason, initiated_by
+
+Common troubleshooting scenarios:
+1) p95 spike after kernel swap:
+   - Rollback kernel selection and re-run probes. Check NVTX traces for unexpected operator fusion costs.
+2) Throughput drop under high concurrency:
+   - Ensure batching logic is not constrained by small max_batch_size; inspect batching histograms.
+3) Memory headroom dangerously low after selecting int8 path on certain models:
+   - Verify quantization table match; fall back to fp16 profile for that model.
+
+Controlled rollouts and safety knobs:
+- Rollouts are performed by control-plane and are slow by default (10% of workers every 10 minutes).
+- Safety rollback triggers:
+  - kernel p95 > baseline * 1.4 for 5m
+  - error rate spike > 1% for 10m
+  - manual abort by oncall
+
+Example rollout command (ops):
+```bash
+akmctl rollout --kernel KERN_INT8_FUSED --models "llama-13b,redwood-turbo" --rate 10% --monitor p95:120ms
+```
+
+Ownership and contacts:
+- Component owner: Priya Nair (serving runtime)
+- Supporting teams: perf-benchmarks, model-onboarding, eng-sre
+- Oncall rotation: runtime-oncall (see eng-sre oncall roster)
+
+Maintenance and tuning cadence:
+- Quarterly review of scoring weights and kernel catalog (Q1/Q2/Q3/Q4).
+- Monthly automated probes running across representative model set to detect silent regressions.
+
+Appendix A — Useful CLI references:
+- akmctl probe --worker <id> --seq <n> --batch <b> --kernel <id|all>
+- akmctl set-profile --worker <id> --profile {conservative,balanced,aggressive}
+- akmctl block-kernel --kernel <id> --reason "<text>"
+- akmctl rollout --kernel <id> --models "<csv>" --rate <pct> --monitor "<metric:threshold>"
+
+Appendix B — Example audit log snippet (control-plane):
+[2026-02-18T09:12:34Z] rollout: id=rl-20260218-003 kernel=KERN_INT8_FUSED models=[llama-13b] initiated_by=ci-bot status=partial
+[2026-02-18T09:18:05Z] probe: worker=w-130 akm.probe_status=regression kernel=KERN_INT8_FUSED p95_ms=162 baseline_p95=98
+
+Appendix C — Quick checklist for model onboarding teams:
+1. Run full benchmark suite (seq 128/512/1024, batch 1..16) and publish catalog entries.
+2. Attach profiling traces and memory maps to the profile artifact.
+3. If quantizing, run stability validation for 72 hours at low load.
+4. Provide recommended default profile for AKM.
+
+Notes and future work:
+- Planned: add ML-driven scoring function that learns from production regressions to adjust weights automatically.
+- Planned: finer-grained per-operator fallbacks to allow mixed-precision within layers.
+
+References:
+- See runtime-architecture and kernel scheduler spec for deeper details on placement and preemption semantics.
+- Regression triage playbook for root-cause workflow (related_pages).

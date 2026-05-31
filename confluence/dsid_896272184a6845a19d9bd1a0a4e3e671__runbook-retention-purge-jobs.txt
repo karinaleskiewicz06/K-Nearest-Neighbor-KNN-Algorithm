@@ -1,0 +1,325 @@
+Runbook: Retention purge jobs (TTL enforcement + verification)
+
+## Purpose
+This runbook covers day-2 operations for Redwood’s retention purge jobs (TTL enforcement) across supported data stores. It explains how to:
+- Monitor purge health and retention “TTL lag”
+- Safely re-run purge jobs (idempotent execution)
+- Handle purge backlog without causing database pressure or telemetry regressions
+- Verify deletions and produce internal evidence for audits/customer requests
+
+This is the on-call reference for incidents like “TTL enforcement delayed in a region” or “purge backlog after maintenance”.
+
+## Scope (what this runbook covers)
+In-scope purge jobs (v1):
+- Request/response logs store (a.k.a. request logs)
+- Audit logs store
+- Console traces (where enabled) and related metadata indexes
+- Metrics retention (downsampling/expiration where applicable)
+
+Out of scope (handled by separate runbooks or vendor lifecycle policies):
+- Customer-managed object stores in Private deployments (unless the Private installer deployed Redwood-managed TTL workers)
+- Customer’s own exports (e.g., downloaded audit log export bundles)
+- Arbitrary per-field redaction
+
+## Definitions
+- **Retention policy**: Customer-configurable TTL/retention settings by data class, evaluated in the control plane. Policy changes are audited.
+- **TTL enforcement**: Scheduled deletion of records older than the configured TTL.
+- **TTL lag**: How far behind we are in applying TTL deletions (measured as “oldest not-yet-deleted record age - TTL”).
+- **Legal hold / incident hold**: A policy override that prevents purging for scoped data classes/tenants. Holds must be auditable and approved (see Legal Hold page).
+- **Idempotent purge job**: Re-running the same job does not delete “too much” and does not fail if records are already deleted.
+
+## Ownership and escalation
+Primary owner: **SRE (Eng Platform On-Call)**
+Supporting teams:
+- Telemetry/Observability: Logan Wright / Allison Grant
+- Security & Compliance (policy semantics, holds): Marcus Lin / Olga Petrov
+- Audit log exporter integrations: Kevin Osei
+
+Escalate immediately if:
+- Purge operations are deleting newer-than-TTL data (severity 0)
+- A legal hold appears to be bypassed (severity 0)
+- Purge jobs are causing sustained DB saturation or widespread request latency impact (severity 1)
+
+## Systems overview (high level)
+Purge pipeline components:
+1) **retention-policy-service** (control plane)
+   - Stores tenant retention policies
+   - Evaluates effective TTL per tenant/data class/region
+   - Exposes “policy snapshot” used by purge workers
+
+2) **purge-job-runner** (shared framework)
+   - Schedules purge tasks per store/region
+   - Ensures job idempotency via watermarks/checkpoints
+   - Enforces safety limits (row caps, time caps)
+
+3) Store-specific deleters
+   - request-logs-deleter
+   - audit-logs-deleter
+   - traces-index-deleter
+   - metrics-expirer
+
+## Dashboards, alerts, and key metrics
+Primary dashboard:
+- **Retention Controls: Verification** (Grafana): TTL lag, purge throughput, error rates, backlog size, policy drift.
+
+Key metrics (names may differ slightly by store; search prefix `retention_` and `purge_`):
+- `retention_ttl_lag_seconds{store,region}`
+  - Target: p50 < 6h; p95 < 24h (normal operations)
+  - Page threshold: p95 > 72h for any store/region for > 30m
+- `purge_rows_deleted_total{store,region}`
+  - Healthy if steadily increasing and correlated with ingest volume
+- `purge_failures_total{store,region,reason}`
+  - Page if sustained failures > 5/min for 10m, or any spike correlated with backlog growth
+- `purge_backlog_estimated_rows{store,region}` or `purge_backlog_seconds{store,region}`
+  - Page if backlog is monotonically increasing for > 60m
+- `purge_job_duration_seconds{store,region}`
+  - Watch for step-function increases (often indicates missing index, lock contention, or larger batch sizes)
+
+Related DB health signals (to avoid self-inflicted incidents while purging):
+- DB CPU/utilization, replication lag, lock timeouts, slow query rate
+- Queue/worker utilization for telemetry pipelines
+
+## Normal schedules and expectations
+Purge jobs run continuously in small batches to avoid pressure spikes.
+
+Typical cadence (default):
+- Request logs: every 5 minutes per region shard
+- Audit logs: every 10 minutes per region shard
+- Traces/metadata: every 15 minutes
+- Metrics expiration: hourly (store-dependent)
+
+Notes:
+- During maintenance windows, backlog is expected to increase. The goal is to recover within 24–48 hours without saturating the DB.
+- Dedicated and Private deployments may have different cadences due to sizing and customer-defined retention.
+
+## Prerequisites and access
+You will need:
+- On-call access to Grafana dashboards and alert details
+- Read access to retention-policy-service and purge-job-runner logs
+- Ability to trigger a controlled re-run for a specific store/region (break-glass approval may be required in production)
+
+Do NOT:
+- Manually run ad-hoc deletion SQL in production unless explicitly approved by SRE lead + data owner. Use the job framework to preserve auditability and safety limits.
+
+## Quick triage checklist (first 10 minutes)
+1) Confirm which **store** and **region** is impacted (request logs vs audit logs vs traces/metrics).
+2) Check for **legal hold** or **policy change** around the start time:
+   - Look for `retention_policy_changed` audit event and policy snapshot version bumps.
+3) Inspect current **TTL lag** and whether it’s increasing or stable.
+4) Check purge job health:
+   - Are jobs running? Are they failing? Are they timing out?
+5) Check DB/telemetry health:
+   - CPU, lock timeouts, replication lag; ensure we’re not overwhelming dependencies.
+6) Decide on action:
+   - If jobs are failing: fix underlying error (permissions, schema/index issues, dependency outage).
+   - If jobs are slow: throttle safely or increase capacity carefully.
+   - If backlog is growing due to maintenance: run controlled catch-up.
+
+## Common scenarios and procedures
+
+### Scenario A: TTL lag increasing but jobs are succeeding (slow deletion)
+Symptoms:
+- `retention_ttl_lag_seconds` steadily rising
+- Low `purge_failures_total`
+- `purge_rows_deleted_total` not keeping up with ingest
+
+Likely causes:
+- Backlog after maintenance
+- Increased ingest volume (customer ramp)
+- Batch size too conservative for current load
+- DB pressure causing queries to run slower
+
+Actions (in order):
+1) Validate DB health. If DB is already hot, do NOT increase purge aggressiveness. Consider throttling purge to protect prod.
+2) Check current purge configuration for the affected store:
+   - Batch size (rows per transaction)
+   - Max runtime per job iteration
+   - Concurrency (number of workers per region)
+3) Catch-up strategy (safe default):
+   - Increase concurrency by +1 worker per region shard (max +2) OR increase batch size by 25%.
+   - Monitor DB lock timeouts and query latency for 15 minutes.
+   - If stable, step again.
+4) If DB pressure increases:
+   - Roll back configuration changes.
+   - Prefer adding workers in off-peak hours rather than larger transactions.
+5) Track recovery:
+   - TTL lag should plateau within 1–2 job cycles, then decline.
+
+Verification:
+- TTL lag downtrend and stable job durations
+- No increase in `purge_failures_total{reason=lock_timeout|deadlock}`
+
+
+### Scenario B: Purge job failures spiking
+Symptoms:
+- Alert firing on `purge_failures_total`
+- Job logs show repeated retries
+
+Procedure:
+1) Identify dominant failure reason label (e.g., `db_timeout`, `permission_denied`, `schema_mismatch`, `dependency_unavailable`).
+2) Check for deploys/config changes:
+   - Purge-job-runner or store schema migrations within the window.
+3) If `schema_mismatch` or query errors:
+   - Roll back recent schema changes if safe.
+   - Confirm required indexes exist for TTL query paths.
+4) If `permission_denied`:
+   - Verify service account access to the target table/index.
+5) If dependency outage:
+   - Pause purge (see “Throttle/Pause”) and resume after dependency recovery.
+
+When to pause purge:
+- If failure mode causes resource amplification (e.g., tight retry loops causing DB pressure)
+- If jobs are deleting incorrectly (rare; treat as severity 0 and disable immediately)
+
+
+### Scenario C: Need to re-run a purge job (manual trigger)
+Purge jobs are designed to be idempotent. Re-runs are safe when executed through the job framework.
+
+Use cases:
+- A region shard fell behind due to a stuck worker
+- A fixed bug needs a one-time backfill for deletions
+
+Pre-checks (required):
+- Confirm there is no legal hold for the tenant/data class.
+- Confirm the effective retention policy snapshot is correct for the target tenant/region.
+- Confirm DB health is acceptable.
+
+Recommended method (control plane / job runner):
+1) Trigger a targeted run for `{store, region}` with conservative settings:
+   - limit to one shard
+   - default batch size
+   - time cap 10–15 minutes
+2) Observe:
+   - rows deleted
+   - job duration
+   - error rate
+3) If healthy, extend time cap or trigger next shard.
+
+Logging requirements:
+- Record incident ticket (or change ticket) reference in the manual run reason.
+- Ensure the manual trigger is captured in audit logs (job framework should emit `purge_job_manual_triggered`).
+
+
+### Scenario D: Backlog after a maintenance window (catch-up without melting the DB)
+Goal: reduce TTL lag within 24–48 hours while preserving platform SLOs.
+
+Step-by-step:
+1) Confirm the maintenance cause is resolved (no ongoing replication lag / throttling).
+2) Choose an incremental plan:
+   - Option 1: Increase concurrency gradually (preferred)
+   - Option 2: Increase batch size gradually (use with caution)
+3) Set a “guardrail window”:
+   - 15-minute evaluation intervals
+   - rollback triggers: lock timeout rate, p95 query latency, application error rate
+4) Apply changes and monitor:
+   - TTL lag trend
+   - DB lock timeouts/deadlocks
+   - purge job duration
+5) If lag is extremely high (> 7 days), coordinate with platform + telemetry leads:
+   - we may need off-peak catch-up, shard-by-shard, to avoid saturating the fleet
+
+Post-recovery:
+- Open a follow-up task to ensure maintenance playbook includes purge backlog expectations and any needed throttles.
+
+
+### Scenario E: Verifying deletions (customer/internal audit support)
+Verification has two parts: (1) policy evidence and (2) enforcement evidence.
+
+1) Policy evidence (what should happen)
+- Export effective retention configuration for the tenant and time window.
+- Confirm defaults vs overrides match the customer tier (Hosted/Dedicated/Private).
+
+2) Enforcement evidence (what did happen)
+- Provide:
+  - TTL lag chart for the time period
+  - purge job success rate and throughput
+  - deletion counts (aggregate) for the store
+
+Important: We do not provide raw internal identifiers beyond what is needed. Follow Security guidance for customer-facing artifacts.
+
+## Throttling / pausing purge jobs (break-glass)
+Pausing purge is allowed only to protect platform stability or prevent suspected incorrect deletion.
+
+Valid reasons:
+- DB saturation caused by purge workload
+- Suspected misconfiguration (e.g., TTL set unexpectedly low)
+- Suspected bypass of hold semantics
+
+Procedure:
+1) Announce in #eng-sre and #eng-platform with:
+   - store, region(s)
+   - reason
+   - expected duration
+2) Apply the pause at the job-runner level (do not kill pods as the primary mechanism).
+3) Confirm pause is effective:
+   - job runner logs show “paused by config”
+   - no new `purge_rows_deleted_total` increments
+4) Create a follow-up reminder to re-enable.
+
+Auditability:
+- Record the pause/unpause action in a change ticket.
+- Ensure the pause action emits an auditable event.
+
+## Legal hold and retention exceptions
+Purge jobs MUST respect legal hold / incident hold.
+
+Operational notes:
+- Holds are evaluated in the control plane and reflected in the policy snapshot.
+- If a purge job is attempting to delete held data, treat as severity 0:
+  1) Pause the job for the affected store/tenant scope
+  2) Confirm effective policy snapshot
+  3) Escalate to Security (Marcus Lin) and Legal (Sofia Mendes) as needed
+
+Do not create ad-hoc “temporary hold” flags in data stores. Use the documented hold workflow so approvals and audit trails are preserved.
+
+## Store-specific notes
+
+### Request/response logs store
+- Most sensitive to DB pressure due to higher ingest volume.
+- Preferred tuning: increase concurrency slightly; keep batch sizes moderate to avoid lock contention.
+- Verification: ensure `purge_rows_deleted_total{store=request_logs}` correlates with ingest; TTL lag should track retention settings.
+
+### Audit logs store
+- Must be highly reliable and complete for compliance reporting.
+- Extra caution: never delete within configured retention; watch for timezone/windowing issues.
+- If customers report missing event types, that is usually exporter filtering/schema, not purge. Coordinate with Audit Export owner.
+
+### Traces/metrics
+- May be stored in a mix of internal indexes and time-series backends.
+- TTL enforcement may be implemented as expiration policies vs explicit deletes.
+- Ensure verification metrics reflect the backend’s semantics (expiration lag, compaction time).
+
+## Safety rules (do not skip)
+- Never increase purge concurrency/batch sizes across all regions at once. Change one region first.
+- Make one change at a time; observe for at least 15 minutes.
+- Roll back at the first sign of DB distress (lock timeout spike, replication lag, increased API error rates).
+- Do not run direct deletes in production unless last resort and explicitly approved.
+
+## Post-incident / follow-up checklist
+After mitigation:
+- Document root cause (dependency outage, bad config, missing index, deployment regression).
+- Capture graphs: TTL lag, purge failures, DB health.
+- File action items:
+  - add/adjust alerts
+  - improve guardrails in job runner
+  - fix indexing/schema
+  - update maintenance playbooks
+
+## Appendix: Useful log queries (examples)
+Use your standard log explorer; search for these patterns:
+- `component=purge-job-runner AND level=error`
+- `msg:"policy snapshot" AND tenant_id:<TENANT>`
+- `event_type:purge_job_* AND region:<REGION> AND store:<STORE>`
+- `reason:(lock_timeout OR deadlock OR permission_denied OR schema_mismatch)`
+
+## Appendix: What “good” looks like
+- TTL lag p95 < 24 hours per store/region under steady state
+- Purge failures are rare and non-spiky
+- Backlog recovers within 48 hours after planned maintenance
+- Manual triggers are auditable and used sparingly
+
+---
+Changelog:
+- 2025-03-12: Added legal hold severity guidance and catch-up guardrails after purge backlog incident.
+- 2025-02-24: Expanded verification section to align with baseline compliance reporting pack outputs.
+- 2025-01-17: Initial version.

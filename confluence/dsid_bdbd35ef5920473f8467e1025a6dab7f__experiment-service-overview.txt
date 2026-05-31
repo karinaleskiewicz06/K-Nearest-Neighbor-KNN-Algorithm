@@ -1,0 +1,257 @@
+Experiment Service Overview (Control Plane) — Route-level Experiments
+
+## Summary
+The **Experiment Service** (internal name: `experiment-svc`) is the control-plane component that stores and validates route-level experiment configuration and publishes a fast, deterministic representation to the policy/routing layer.
+
+This document covers:
+- What `experiment-svc` owns vs. what the policy engine/router owns
+- API surface (Console + internal)
+- Storage model and versioning
+- Validation rules and safety guardrails
+- Interaction with the policy engine (config propagation)
+- Caching strategy (server-side and data-plane)
+- Failure modes and degraded behaviors
+
+## Background and goals
+Route-level A/B testing requires customers to define experiments at the **route** boundary (endpoint + traffic policy), assign requests deterministically to a **variant**, and then attribute telemetry by `{route, experiment_id, variant}`.
+
+Control-plane requirements:
+- Single source of truth for experiment definitions and lifecycle state
+- Strong validation to prevent unsafe/ambiguous routing behavior
+- Auditable change history (enterprise requirement)
+- Predictable propagation of config to routers (staleness bounds)
+
+Non-goals (for GA):
+- Statistical significance engine
+- Customer-defined custom metrics ingestion
+
+## Ownership and boundaries
+**Experiment Service owns**:
+- Canonical experiment spec + lifecycle state machine
+- Validation and invariants (splits, eligibility rules, overlap constraints)
+- Versioning, change diffs, and audit events
+- Publishing compiled config to the policy config channel
+- Read APIs for Console (list/detail, status, audit trail)
+
+**Policy engine / routing layer owns**:
+- Deterministic bucketing implementation and precedence rules (see ADR-047)
+- Evaluating eligibility rules at request time
+- Applying experiments in the request path with low latency
+- Emitting attribution fields to request context and telemetry (see ADR-048)
+
+**Telemetry/Analytics owns**:
+- Aggregations and results datasets consumed by Console
+
+## High-level architecture
+### Components
+- `console-api` (Console backend): calls `experiment-svc` for experiment CRUD/start/stop and reads status/results.
+- `experiment-svc`: validates and persists experiment config; publishes compiled config snapshots.
+- `policy-engine`: consumes published experiment config and evaluates experiments during routing decisions.
+- `router` / `gateway`: calls policy engine and applies the chosen variant (model/route policy) before fallback.
+- `audit-log-svc`: receives structured audit events for compliance retention/export.
+- `metrics-pipeline`: consumes request spans/events with experiment dimensions.
+
+### Data flow (control plane → data plane)
+1) User creates/updates experiment in Console.
+2) `console-api` performs RBAC checks and calls `experiment-svc`.
+3) `experiment-svc` validates the spec, persists changes, writes audit events.
+4) `experiment-svc` compiles an “evaluation-ready” config and publishes it (with a monotonic `config_version`).
+5) `policy-engine` subscribes/pulls config updates and updates its in-memory store.
+6) Routers use the policy engine evaluation result and attach `experiment_id`/`variant_id` to request context.
+
+## Service interface
+### Authentication and authorization
+- Requests originate from `console-api` with a service-to-service identity.
+- End-user permissions are evaluated in `console-api` and forwarded as signed principal context.
+- `experiment-svc` enforces an additional “defense in depth” check on:
+  - organization/account scope
+  - environment scope (prod/staging)
+  - mutation operations (create/update/start/stop/delete)
+
+### Public (Console) APIs
+Base path: `/v1/experiments`
+
+**Write APIs (mutations)**
+- `POST /v1/experiments` — create draft experiment
+- `PUT /v1/experiments/{experiment_id}` — update draft (or update running if allowed by policy)
+- `POST /v1/experiments/{experiment_id}:start` — transition to RUNNING
+- `POST /v1/experiments/{experiment_id}:stop` — transition to STOPPED (optionally with drain)
+- `DELETE /v1/experiments/{experiment_id}` — delete (restricted; typically only if never RUNNING)
+
+**Read APIs**
+- `GET /v1/experiments` — list experiments (filters: route_id, status, created_by, updated_since)
+- `GET /v1/experiments/{experiment_id}` — detail view (spec + status + guardrails)
+- `GET /v1/experiments/{experiment_id}/audit-events` — audit trail (paginated)
+- `GET /v1/experiments/{experiment_id}/status` — runtime status + last publish + propagation health
+
+Notes:
+- Results metrics are served by the results API/analytics layer; `experiment-svc` only returns identifiers needed for attribution and links.
+
+### Internal APIs
+- `GET /internal/v1/experiments/{experiment_id}/compiled` — compiled evaluation config (for debugging/tools)
+- `POST /internal/v1/assignment:explain` — explain assignment decision given inputs (gated; see debug endpoint guidance)
+
+## Experiment spec model (conceptual)
+The canonical spec is stored as JSON but compiled into a restricted schema for the data plane.
+
+Key fields:
+- `experiment_id` (UUID)
+- `account_id` / `org_id`
+- `env` (prod/staging)
+- `route_id` (normalized route identifier; see route normalization guidance)
+- `status` (DRAFT, RUNNING, STOPPING, STOPPED, ARCHIVED)
+- `eligibility_rules` (header presence, customer tier, region allowlist, etc.)
+- `stickiness` (key precedence; hashing namespace)
+- `variants[]` (variant_id, target policy/model reference)
+- `allocation[]` (variant_id → weight)
+- `guardrails` (thresholds and actions)
+- `created_by`, `updated_by`
+
+Compilation output includes:
+- normalized route match key(s)
+- pre-validated weight ranges and cumulative bucket boundaries
+- allowed regions
+- compatible model set (if constrained)
+
+## Storage model
+Primary store: Postgres (`controlplane-pg`) with logical tables:
+
+| Table | Purpose | Notes |
+|---|---|---|
+| `experiments` | Current canonical spec and status | Includes `spec_json`, `status`, `account_id`, `route_id`, `config_version` |
+| `experiment_versions` | Immutable history of spec revisions | Used for diff/audit, rollback to previous config |
+| `experiment_audit_events` | Denormalized audit event store | Also forwarded to `audit-log-svc` for long-term retention/export |
+| `experiment_publish_log` | Publish attempts and outcomes | Includes timestamps, target channel, error, propagation hints |
+
+Versioning:
+- `spec_version` increments on every accepted mutation.
+- `config_version` increments on every successful publish. `config_version` is the reference used by the policy engine and routers.
+- Console displays both versions to help correlate “saved vs. deployed” state.
+
+Retention:
+- `experiment_versions` retained for 90 days by default (subject to enterprise overrides).
+- Audit events follow security/compliance retention rules (see audit logging page).
+
+## Validation and guardrails
+Validation happens synchronously on create/update/start.
+
+### Hard validation (request rejected)
+- Allocation weights sum to 1.0 (±0.0001) and each weight is within [0,1].
+- Minimum allocation per non-control variant (default: >= 1%) when RUNNING (configurable; prevents “variant 0 traffic”).
+- Variant count <= 5 (GA default) to reduce operational complexity and metrics cardinality.
+- Each variant references a valid target (model_id / rollout policy / routing policy reference) in the same account/environment.
+- Model compatibility checks when the experiment is scoped to a route with fixed request/response schema.
+- Eligibility rules must be evaluable in the data plane (no arbitrary expressions).
+- Overlap constraints:
+  - By default, only one RUNNING experiment per `{account_id, env, route_id}`.
+  - Additional experiments require explicit priority and must be non-overlapping by eligibility rules (restricted feature).
+
+### Warnings (accepted but flagged)
+- Stickiness key missing or low entropy risk (e.g., defaulting to IP alone).
+- Narrow region allowlist that may cause small sample sizes.
+- Guardrail thresholds that are unusually strict vs. baseline noise.
+
+### Start/stop semantics
+- **Start**: DRAFT → RUNNING. Publishes compiled config and returns `publish_id`.
+- **Stop**:
+  - STOPPING is used when a drain period is requested (to reduce abrupt changes for long-lived streams).
+  - STOPPED removes the experiment from the published config.
+
+Guardrail behavior (GA default):
+- Soft-stop only (mark degraded + notify). Hard-stop is available behind a kill-switch and requires explicit enablement.
+
+## Publishing and propagation
+### Compiled config channel
+`experiment-svc` publishes the compiled experiment config to the policy config distribution system (internally: `policy-config-store`).
+
+The published payload is keyed by `{account_id, env}` and contains:
+- all RUNNING experiments for that scope
+- per-experiment `config_version`
+- a compact representation optimized for fast evaluation
+
+### Propagation expectations
+- Target p95 propagation time (publish → policy engine updated): defined in the control-plane SLO document.
+- Routers consume policy engine decisions; they do not pull config directly from `experiment-svc`.
+
+### Backward/forward compatibility
+- Compiled schema is versioned (`compiled_schema_version`).
+- Policy engine supports N and N-1 compiled schema versions during rollout windows.
+- Migrations:
+  - `experiment-svc` can recompile specs into both schemas during transitions.
+
+## Caching strategy
+### Server-side caching (`experiment-svc`)
+Goals: reduce DB load for list/detail views and avoid repeated compilation work.
+
+- Read-through cache for `GET /v1/experiments/{id}` and list queries by account/env.
+- Cache TTL: 10–30s (tunable); cache invalidated on mutation.
+- Compiled config cache keyed by `{account_id, env, config_version}`.
+
+### Data-plane caching (policy engine)
+- In-memory map keyed by `{account_id, env, route_id}` for fast lookup.
+- Periodic refresh + event-driven updates from the config channel.
+- Safe defaults on cache miss:
+  - If config unavailable, policy engine returns “no experiment” and routing proceeds with baseline rollout/fallback policies.
+
+## Failure modes and degraded behavior
+### Control-plane failures
+1) **DB unavailable / high latency**
+- Impact: experiment mutations fail; reads may serve stale cache.
+- Mitigation: serve cached read responses where possible; retryable errors on mutation.
+
+2) **Publish channel degraded**
+- Impact: saved spec may not reach data plane; Console shows “Not yet propagated”.
+- Mitigation: publish retries with exponential backoff; emit propagation lag metrics and alerts.
+
+3) **Audit log sink unavailable**
+- Impact: audit export incomplete if not buffered.
+- Mitigation: `experiment-svc` persists audit events locally first, then forwards asynchronously; if forwarding fails, alert but do not block the mutation (unless required by specific enterprise policy).
+
+### Data-plane failures
+1) **Policy engine cannot load config**
+- Behavior: no experiment applied; baseline routing continues.
+- Risk: experiment traffic may drop to 0%. Console indicates “data plane not applying” via propagation health.
+
+2) **Deterministic bucketing mismatch across regions**
+- Behavior: inconsistent assignment.
+- Mitigation: hashing namespace + stickiness precedence standardized (ADR-047); debug endpoint provides explain output.
+
+3) **Metrics attribution drop / missing dimensions**
+- Impact: results dashboards appear inconsistent.
+- Mitigation: attribution drop rate alerting; known streaming retry edge cases documented in runbook.
+
+## Observability
+### Key metrics (emitted by `experiment-svc`)
+- API availability and latency per endpoint
+- Validation failures by category
+- Publish success rate, retry count
+- Propagation lag (publish timestamp → first observed policy engine config version)
+- Cache hit ratio
+
+### Logging
+- Structured logs include `experiment_id`, `account_id`, `env`, `route_id`, `spec_version`, `config_version`.
+- Sensitive fields are redacted (eligibility rules that include customer identifiers, etc.).
+
+### Tracing
+- All mutation endpoints create a span with:
+  - validation sub-spans
+  - DB write
+  - audit emit
+  - publish attempt
+
+## Operational playbooks
+- For split anomalies, skew, or stickiness issues: see *Experiment assignment debugging runbook*.
+- For propagation lag alerts: see *Experiment health dashboards spec* and linked runbooks.
+
+## Implementation notes and constraints
+- Cardinality control: `experiment_id` and `variant_id` are allowed on spans and selected metrics; high-cardinality expansions are sampled (see metrics attribution ADR and observability PRs).
+- Multi-tenant isolation: all queries and publishes are scoped to `{account_id, env}` with explicit enforcement.
+- Schema evolution: compiled output is the stability boundary for the data plane; canonical spec can evolve with migrations as long as it compiles to supported schema versions.
+
+## Appendix: Status state machine
+- DRAFT → RUNNING → STOPPING → STOPPED → ARCHIVED
+
+Constraints:
+- Updates are unrestricted in DRAFT.
+- Updates in RUNNING are restricted to safe fields (e.g., allocation ramp within bounds, guardrail threshold changes) unless explicitly forced by admin.
+- STOPPED experiments cannot be restarted without creating a new experiment (default) to preserve interpretability; exceptions may be granted for internal testing.

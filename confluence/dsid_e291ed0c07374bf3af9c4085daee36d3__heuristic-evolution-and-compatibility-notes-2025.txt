@@ -1,0 +1,153 @@
+Kernel Heuristic Evolution & Compatibility Notes
+
+Overview
+
+This document captures the working journal and operational notes from kernel heuristic experiments conducted between Q2 2025 and Q1 2026. It is intended for runtime engineers, kernel authors, and SREs who are responsible for scheduler hooks, kernel rollout, and profiling-to-benchmark translation. The goal is to document what changed, why it changed, compatibility tradeoffs we've observed, and the reproducible steps to validate behavior on staging and canary fleets.
+
+Sections
+- Summary of heuristic families and intent
+- Compatibility matrix and known cross-variant issues
+- Profiling experiment recipes (how to reproduce)
+- Benchmark signatures and quick-check heuristics
+- Minimal rollout / rollback runbook for kernel heuristics
+- Investigation checklist and escalation paths
+
+1) Heuristic families (short descriptions)
+
+A. Admission heuristics
+- Purpose: decide which slot/queue a request is admitted into (latency-tiered vs throughput-tiered).
+- Key signals: request_sequence_length, token_budget_estimate, tenant_priority_score, kv_cache_hit_prob.
+- Typical knobs: admission_timeout_ms (default 10ms), prefetched_kv_threshold (fraction), min_gpu_headroom_pct.
+
+B. Kernel selection heuristics
+- Purpose: pick the kernel implementation variant (e.g., tiled-attention-32, fused-attn-v2, sparse-approx) for a request at dispatch time.
+- Signals: sequence_length, kv_cache_present, past_runtime_profile_id.
+- Decision pattern: prefer lower-latency kernel for sequence_length <= 512 unless kv_cache_present==true and batch_size>1 then prefer batch-optimized kernel.
+
+C. Eviction and prefetch heuristics
+- Purpose: maintain KV cache / activations with minimal disruption for hot tenants.
+- Signals: kv_access_frequency, slot_age_seconds, pending_warmups.
+- Knobs: eviction_granularity (shard|page), prefetch_aggressiveness (0..10).
+
+2) Compatibility matrix (summary table)
+
+| Heuristic | Compatible kernel families | Known incompatibility | Mitigation |
+|---|---:|---|---|
+| aggressive-prefetch-v1 | fused-attn-v2, tiled-attn-32 | causes memory oversubscription on fractional-quant kernels | bound prefetch by quantization_profile memory cap |
+| priority-admission-v2 | all CPU/GPU kernels | starvation observed for low-priority tenants under bursty load | enforce per-tenant minimal throughput token guarantees |
+| kv-evict-cohorting-2025 | quantized kernels (int8/4) | rare KV corruption during async handoff on older dispatcher | require SDK handshake >= 1.7.3 or enable sequential handoff flag |
+
+Notes: the matrix is intentionally conservative. When in doubt, run the profiling recipe in section 3 before enabling on Dedicated/Private fleets.
+
+3) Profiling experiment recipes (repro steps)
+
+Each recipe below produces an artifact (trace tarball + annotated flamegraph + request-level SLO CSV) that should be attached to the release ticket. Use the runtime profiling agent (rprof) with sample-rate 1/10 for microbursts and 1/100 otherwise.
+
+Recipe A — Admission stress with mixed fidelity
+1. Configure a 4-node staging pool with mixed kernels: [tiled-attn-32, fused-attn-v2, quant-int8].
+2. Set admission policy: priority-admission-v2 with min_guarantee_tokens=1000 per minute.
+3. Inject traffic: 60% short chat (seq <= 256), 30% completion (seq 512-1024), 10% long (seq 2048+). Burst pattern: 5000 req/min for 2m every 10m for 1h.
+4. Run: rprof --pool staging-mixed --sample-rate 0.1 --outfile admission-stress.tar.gz
+5. Post-process: run tools/trace-summarize admission-stress.tar.gz --quantize=kernel_variant > admission-stress-summary.csv
+
+Recipe B — KV handoff integrity test
+1. Deploy kv-evict-cohorting-2025 flag on a 2-node canary.
+2. Warm-up: load 1M small sessions across tenants using kv-warmup tool.
+3. Simulate preemption waves: send preempt signals to nodes (use node-chaos inject-preempt --pattern=short-burst).
+4. Collect logs and run kv-checker against snapshot. Expected artifact: small list of inconsistencies (should be zero).
+
+4) Benchmark signatures and quick-check heuristics
+
+When evaluating kernel-heuristic changes, we look for three canonical signatures in the benchmark suite:
+- Latency median shift > 5% for P50 or P95 on chat-short baseline.
+- Tail-energy degradation: per-token GPU cycles increase > 4% for long sequences.
+- Token-level QoR deviation: top-1 token distribution KL > 0.02 for generation tasks (indirect check for quant/approx kernel behavior).
+
+Quick-check commands:
+- Run the lightweight SLO smoke test: ./bench/slo-smoke --profile chat-short --runs 50
+- Compute kernel-sensitive regressions: bench/regression-check --baseline v2025-04 --target HEAD --signal kernel_variant,kernel_latency,kvcache_hit
+
+Example expected outputs:
+- If a change regresses P95 by >7% or increases per-token cost by >6% we mark it -blocker and require detailed kernel traces.
+
+5) Minimal rollout + rollback runbook for heuristic flips
+
+Purpose: safe pattern to flip a heuristic gate and recover quickly if problems appear.
+
+Prerequisites:
+- Canary pool with telemetry baseline for last 24h.
+- Canary alerting: P95 latency > baseline * 1.2, QoR-regression alert, error-rate > 0.5% absolute.
+
+Steps to rollout (target: canary -> regional -> global):
+1. Create a canary feature flag (ffctl create heuristic-X --scope canary-pool).
+2. Enable on 1% of canary traffic for 30 minutes. Monitor: rprof traces + perf dashboards.
+3. If stable, increase to 10% for 1 hour, then 50% for 2 hours.
+4. Promote to regional pool and repeat the 10%/50% ramp.
+5. Global enable only after 24h stability on regionals.
+
+Rollback quick path (if any alert triggers):
+1. ffctl disable heuristic-X --immediate.
+2. Trigger rollback ticket and attach the canary artifact.
+3. If errors persist, run node-repro replay using trace artifacts and escalate to kernel-oncall.
+
+6) Investigation checklist and ownership paths
+
+Initial triage (oncall):
+- Collect artifacts: rprof archive, scheduler decision log, kernel dispatch trace.
+- Validate compatibility: check quant_profile and dispatcher SDK version.
+- Check metrics: per-tenant P95, kernel_variant distribution, kvcache hit rate.
+- Run quick smoke bench against canary snapshot.
+
+Ownership map:
+- Kernel scheduling bugs -> kernel-team (oncall: kernel-scheduling@redwood.com)
+- KV cache handoff -> runtime-cache team (oncall: runtime-cache@redwood.com)
+- Dispatcher/Admission -> runtime-orch team (oncall: runtime-orch@redwood.com)
+
+Escalation path: if investigation cannot conclude within 60 minutes, escalate to SRE lead and open an incident with severity determined by user impact. Attach the artifact bundle and the canary runbook link.
+
+7) Example config snippets
+
+Admission policy YAML (example):
+```yaml
+admission_policy:
+  name: priority-admission-v2
+  admission_timeout_ms: 12
+  min_guarantee_tokens_per_min: 1000
+  backpressure_slope: 0.6
+  enforcement_mode: soft
+```
+
+Kernel selection override (runtime flag):
+```json
+{
+  "selector_policy": "sequence_length_primary",
+  "overrides": [
+    {"if": "sequence_length > 1024", "use": "fused-attn-v2"},
+    {"if": "kv_cache_present == true && batch_size >= 2", "use": "batch-optimized-quant"}
+  ]
+}
+```
+
+8) Postmortem learnings (short list)
+
+- Heuristic changes that interact with quantized kernels require an explicit memory cap to avoid unexpected OOMs when prefetching is aggressive.
+- Admission logic that uses only token budget without considering batch shape introduced per-tenant starvation in multi-tenant canaries. The fix: add a batch-aware floor to admission scores.
+- Async KV handoff needs versioned handshakes; older dispatcher clients (pre-1.7.3) must be blocked or migrated.
+
+9) Appendices: artifacts, dashboards, and links
+
+- Recommended artifacts to attach to any heuristic change PR: rprof tarball, bench/regression-check output, kernel-variant flamegraph (SVG), canary alert timeline.
+- Dashboards: kernel-variant-distribution, admission-latency-by-priority, kvcache-hit-heatmap.
+- Helpful commands: ffctl status heuristic-X --history, rprof collect --pool <pool> --since 1h, bench/regression-check --target HEAD.
+
+Contact and ownership
+- Primary author: Maya Chen (maya@redwood.com)
+- Kernel scheduling owners: kernel-team@redwood.com
+- Runtime orchestration owners: runtime-orch@redwood.com
+
+Revision history
+- 2025-06-15: initial draft of heuristic families and recipes.
+- 2025-10-09: added KV handoff integrity recipe and compatibility matrix updates.
+- 2026-01-10: tightened rollout thresholds and added quick-check commands.
+
+End of document

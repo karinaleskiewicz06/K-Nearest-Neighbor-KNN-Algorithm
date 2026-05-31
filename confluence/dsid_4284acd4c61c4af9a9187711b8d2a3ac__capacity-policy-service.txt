@@ -1,0 +1,357 @@
+Capacity Policy Service (CPS) — Control Plane service for scaling policy evaluation
+
+## Overview
+Capacity Policy Service (CPS) is an internal control plane service responsible for storing, validating, and *deterministically evaluating* per-deployment scaling policies for **Redwood Dedicated**.
+
+CPS exists to ensure consistent, auditable scaling semantics across:
+- Console + API configuration (writes)
+- Fleet autoscaler loops (reads/evaluations)
+- Smart routing and downstream consumers that need a canonical “bounded” capacity state
+
+**Primary responsibilities**
+1. Persist per-deployment scaling policy configuration (min/max bounds, cooldowns, predictive mode settings).
+2. Provide an evaluation API that resolves **effective policy** (customer config + platform defaults + feature flags) and returns a canonical, deterministic result.
+3. Emit audit events for config changes and evaluations (who/when/what/why) to support enterprise change management.
+4. Provide caching and rate-limiting primitives to keep evaluation latency low and protect storage.
+
+**Non-responsibilities**
+- CPS does not make scaling decisions (desired replicas) itself. It evaluates and clamps/scopes inputs from autoscaler and signal pipelines.
+- CPS does not generate forecasts. It only consumes forecast metadata where needed for policy semantics (e.g., “predictive mode enabled”).
+
+---
+
+## Terminology
+- **Deployment**: A Dedicated customer deployment (account_id + deployment_id + region).
+- **Policy config**: The customer-configurable settings stored by CPS.
+- **Platform defaults**: Redwood-defined defaults (per region, hardware class, or SKU) applied when policy fields are unset.
+- **Effective policy**: The resolved policy used at runtime after defaults and feature-flag gating.
+- **Requested desired**: Desired replicas computed by the autoscaler prior to clamping.
+- **Bounded desired**: Desired replicas after enforcing min/max + safety invariants.
+
+---
+
+## Ownership and on-call
+- **Owning team:** Platform Control Plane
+- **DRI (engineering):** Ethan Park
+- **Secondary DRIs:** Benji Okafor (API + RBAC), Jordan Lee (policy evaluation engine)
+- **SRE partner:** Rafael Mendes
+
+Support model:
+- CPS is a Tier-1 dependency for Dedicated autoscaling. Platform on-call owns first response; SRE is engaged for sustained error budget burn or customer-impacting incidents.
+
+---
+
+## Architecture summary
+CPS is deployed as a stateless service in each primary control plane region.
+
+### Dependencies
+- **Storage:** Postgres (control-plane cluster) for policy configs + change history.
+- **Cache:** Redis for hot reads of effective policies and “last known good” results.
+- **Eventing/audit:** Internal audit-log pipeline (Kafka → log archive + SIEM export) for policy change events and scaling evaluation events.
+- **AuthZ:** Control-plane RBAC service.
+
+### Data flow (high level)
+1. Console/API updates policy → CPS validates → persists → emits **CapacityPolicyChanged** audit event.
+2. Fleet autoscaler requests evaluation (or fetches effective policy) → CPS returns effective policy and (optionally) clamped result for a requested desired capacity.
+3. CPS emits **ScalingPolicyEvaluated** audit event when evaluation is requested with a desired input (used for deterministic “why” trails).
+
+---
+
+## Public (internal) APIs
+CPS is internal-only; customers interact via Console and the Dedicated management API, which calls CPS.
+
+### API surface
+CPS exposes:
+- **REST** for control plane + Console backend.
+- **gRPC** for high-QPS internal consumers (fleet autoscaler).
+
+All APIs are idempotent and require request IDs.
+
+### Resource identifiers
+- account_id (string)
+- deployment_id (string)
+- region (string; e.g., us-east-1, eu-west-1)
+
+Canonical resource key: `account_id/deployment_id/region`.
+
+### Endpoints (REST)
+**GET /v1/accounts/{account_id}/deployments/{deployment_id}/regions/{region}/scaling-policy**
+- Returns stored policy config and resolved effective policy metadata.
+
+**PUT /v1/accounts/{account_id}/deployments/{deployment_id}/regions/{region}/scaling-policy**
+- Updates policy config.
+- Requires RBAC permission: `dedicated.scaling_policy.write`.
+- Emits CapacityPolicyChanged audit event.
+
+**POST /v1/scaling-policy:evaluate**
+- Input: deployment identity + evaluation context.
+- Output: effective policy + bounded result (if requested_desired is provided) + reasons.
+- Primary caller: fleet autoscaler.
+
+**GET /v1/scaling-policy:effective**
+- Batch variant (up to 200 deployments per request) returning effective policy only.
+- Used by routing and periodic reconcilers.
+
+### gRPC methods (canonical)
+- `GetScalingPolicy(GetScalingPolicyRequest) returns (ScalingPolicyResponse)`
+- `UpdateScalingPolicy(UpdateScalingPolicyRequest) returns (ScalingPolicyResponse)`
+- `EvaluateScalingPolicy(EvaluateScalingPolicyRequest) returns (EvaluateScalingPolicyResponse)`
+- `BatchGetEffectivePolicy(BatchGetEffectivePolicyRequest) returns (BatchGetEffectivePolicyResponse)`
+
+---
+
+## Policy schema (stored config)
+The stored policy config is intentionally small and stable. The *evaluation response* may include additional derived fields.
+
+### Stored fields
+- `min_replicas` (int, optional): Hard floor for replicas.
+- `max_replicas` (int, optional): Hard ceiling for replicas.
+- `cooldown_up_seconds` (int, optional): Minimum time between scale-up actions.
+- `cooldown_down_seconds` (int, optional): Minimum time between scale-down actions.
+- `predictive_mode` (enum): `OFF | ADVISORY | ENFORCED` (see semantics below).
+- `predictive_timezone` (string, optional): IANA TZ (e.g., America/Los_Angeles). Used only for interpreting customer schedules and for UI consistency.
+- `notes` (string, optional): Customer-visible notes (limited length; sanitized; stored for change management).
+
+### Validation rules (server-side)
+- min/max:
+  - If both set: `min_replicas <= max_replicas`.
+  - `min_replicas >= 1` (Dedicated does not support scale-to-zero).
+  - `max_replicas <= platform_absolute_max` (per SKU/region).
+- cooldowns:
+  - Range: 0–3600 seconds.
+  - `cooldown_down_seconds >= cooldown_up_seconds` is recommended but not required; CPS returns a warning when violated.
+- predictive:
+  - Predictive mode requires feature flag enablement on the account (and sometimes per-deployment) to be effective.
+  - If predictive mode is set but the flag is disabled, CPS treats it as OFF in *effective policy* and returns `effective_predictive_mode=OFF` with reason.
+
+### Semantics of predictive_mode
+- **OFF**: autoscaler uses reactive signals only.
+- **ADVISORY**: predictions may bias scale-up/scale-down targets, but reactive saturation/queue triggers override prediction. CPS reports prediction availability in evaluation response; autoscaler is expected to continue operating normally if predictions are stale.
+- **ENFORCED**: autoscaler is permitted to use predictions as a primary driver, but must still respect:
+  - min/max bounds
+  - cooldowns/anti-oscillation constraints
+  - reactive “safety overrides” (e.g., queue depth sustained high) when prediction underestimates demand
+
+Authoritative precedence and safety invariants are defined in the ADR listed in Related Pages.
+
+---
+
+## Evaluation API semantics
+CPS evaluation is designed to be **deterministic and auditable**.
+
+### Evaluate request (conceptual)
+- deployment identity (account_id, deployment_id, region)
+- `requested_desired_replicas` (int, optional)
+- `signals` (optional metadata; not used for decisions in CPS, only for logging/reasoning)
+  - `queue_depth` (float, optional)
+  - `saturation` (float 0..1, optional)
+  - `forecast_timestamp` (RFC3339, optional)
+  - `forecast_horizon_seconds` (int, optional)
+  - `forecast_staleness_seconds` (int, optional)
+- `request_id` (string)
+- `actor` (service identity; e.g., dedicated-autoscaler)
+
+### Evaluate response (conceptual)
+- `effective_min_replicas` (int)
+- `effective_max_replicas` (int)
+- `effective_cooldown_up_seconds` (int)
+- `effective_cooldown_down_seconds` (int)
+- `effective_predictive_mode` (enum)
+- `bounded_desired_replicas` (int, optional)
+- `reasons` (list of strings; stable reason codes)
+- `warnings` (list of strings)
+- `policy_version` (string; monotonic per deployment)
+
+### Determinism requirements
+For a given:
+- policy_version
+- platform defaults version
+- feature-flag snapshot
+- requested_desired_replicas
+
+CPS must return the same bounded result and reason codes.
+
+**Reason codes (examples)**
+- `CLAMPED_TO_MIN`
+- `CLAMPED_TO_MAX`
+- `PREDICTIVE_DISABLED_BY_FLAG`
+- `DEFAULT_MAX_APPLIED`
+- `DEFAULT_COOLDOWN_APPLIED`
+- `INVALID_INPUT_COERCED` (only for internal callers; Console should receive a 4xx instead)
+
+---
+
+## Storage model
+### Tables (Postgres)
+- `scaling_policy`
+  - primary key: (account_id, deployment_id, region)
+  - columns: min_replicas, max_replicas, cooldown_up_seconds, cooldown_down_seconds, predictive_mode, predictive_timezone, notes
+  - metadata: created_at, updated_at, updated_by_actor, updated_by_user_id (nullable), policy_version
+- `scaling_policy_change_history`
+  - append-only record of changes (normalized diff + full snapshot)
+  - used for internal investigations and compliance exports
+
+### Consistency
+- CPS provides **read-after-write** consistency for a single deployment within a region.
+- Cross-region reads are eventually consistent; Console traffic is routed to the authoritative region for the deployment.
+
+### Backward compatibility
+When new fields are added:
+- default behavior must match legacy behavior until explicitly enabled by feature flag and/or customer config
+- schema migrations must be additive first (expand), then backfill, then contract (per standard migration policy)
+
+---
+
+## Caching strategy
+CPS caches effective policy results to reduce load and tail latency.
+
+### Cache keys
+- `effective_policy:{account_id}:{deployment_id}:{region}:{policy_version}:{defaults_version}:{flag_snapshot_hash}`
+
+### TTLs
+- Effective policy cache TTL: 60 seconds (sliding)
+- “Last known good” (LKG) effective policy: 15 minutes (used only when storage is degraded; must be explicitly marked as LKG in responses)
+
+### Cache invalidation
+- On policy update, CPS publishes an internal invalidation message and evicts keys by prefix (deployment-scoped).
+- Default-version changes and flag changes are naturally reflected via the key components.
+
+### Failure behavior
+- If Redis is down: CPS falls back to Postgres reads (with rate limiting).
+- If Postgres is impaired: CPS may serve LKG effective policy for up to 15 minutes, but **must not** accept writes.
+
+---
+
+## Audit logging
+Auditability is a core requirement for enterprise Dedicated.
+
+### Event types
+1. **CapacityPolicyChanged**
+   - Emitted on successful writes.
+   - Fields (minimum): timestamp, account_id, deployment_id, region, actor_type (user/service), actor_id, request_id, previous_policy_hash, new_policy_hash, diff_summary, policy_version.
+
+2. **ScalingPolicyEvaluated**
+   - Emitted when Evaluate is called with a requested_desired.
+   - Fields (minimum): timestamp, account_id, deployment_id, region, actor_service, request_id, policy_version, requested_desired, bounded_desired, reasons, effective_predictive_mode, forecast_metadata_present (bool).
+
+### Retention
+- Default retention: 90 days in hot search
+- Archive retention: 400 days for enterprise Dedicated accounts (aligned with audit log product tier)
+
+### Privacy and data handling
+- Do not log raw customer prompts or model outputs.
+- `notes` is customer-visible and may contain sensitive content; it is stored but must be redacted in broad internal search indices. Audit events should include a hash and truncated preview only.
+
+---
+
+## RBAC and authorization
+- Read permission: `dedicated.scaling_policy.read`
+- Write permission: `dedicated.scaling_policy.write`
+
+Console writes require:
+- Account Admin or Dedicated Operator role
+- MFA enforced per enterprise policy (handled upstream by Console auth)
+
+Service-to-service access:
+- Autoscaler: read + evaluate
+- Routing: read effective policy only (no writes)
+
+All requests must include:
+- request_id
+- actor identity
+- source service name
+
+---
+
+## Rate limiting and abuse protection
+CPS protects itself and downstream dependencies using:
+- Per-account write limits (default: 10 updates/minute/deployment; bursts allowed with token bucket)
+- Global write circuit breaker during incidents
+- Evaluate QPS shaping by caller (autoscaler is allowlisted with higher quota)
+
+If a caller exceeds limits:
+- Return 429 with `Retry-After`
+- Emit audit event `ScalingPolicyRateLimited` (internal)
+
+---
+
+## Reliability: SLOs and expectations
+CPS is a critical dependency for Dedicated autoscaling. The following SLOs apply per region.
+
+### Service level objectives
+- **Availability SLO:** 99.95% monthly for Get/Evaluate endpoints
+- **Latency SLO:**
+  - Evaluate: p99 < 50ms
+  - GetEffective (batch): p99 < 150ms for 200 deployments
+- **Durability:** Policy writes are committed to Postgres before acknowledging success.
+
+### Error budget policy
+- During feature rollout (predictive mode + bounds GA), CPS changes are gated behind feature flags and can be rolled back per account.
+- If CPS error budget burn exceeds thresholds defined in the SRE doc (Related Pages), freeze non-urgent changes and prioritize mitigation.
+
+### Degraded modes
+- Cache degraded: allowed; expect higher latency but no functionality loss.
+- Storage degraded: reads may serve LKG; writes disabled.
+
+---
+
+## Observability
+CPS follows the scaling/capacity metric naming standard (Related Pages).
+
+### Key metrics
+- Request metrics:
+  - `controlplane.cps.request.count` (labels: endpoint, status_code, caller)
+  - `controlplane.cps.request.latency_ms` (histogram)
+- Policy evaluation outcomes:
+  - `controlplane.cps.evaluation.clamped_to_min.count`
+  - `controlplane.cps.evaluation.clamped_to_max.count`
+  - `controlplane.cps.evaluation.predictive_disabled_by_flag.count`
+- Dependency health:
+  - `controlplane.cps.redis.errors.count`
+  - `controlplane.cps.postgres.errors.count`
+
+### Logs
+- Structured logs include request_id, deployment key, policy_version, reasons, and caller.
+- Sensitive fields are hashed or omitted.
+
+### Alerts (summary)
+- p99 latency regression (Evaluate > 50ms for 10 minutes)
+- 5xx rate > 0.5% for 5 minutes
+- Postgres connection saturation
+- Redis error spikes (non-paging unless correlated with latency/5xx)
+
+---
+
+## Operational guidelines
+### Safe rollout checklist (CPS changes)
+1. Validate backward compatibility (no behavior change without flag).
+2. Add reason codes for any new evaluation behavior.
+3. Ensure audit events include required fields and remain stable.
+4. Load test Evaluate path (target: autoscaler peak QPS + 30%).
+5. Canary in one region; monitor latency, 5xx, and clamping reason distribution.
+
+### Common failure modes
+- Misconfiguration: min > max (blocked at write time; Console shows validation error)
+- Flag mismatch: customer sets predictive but feature flag disabled (effective mode OFF with reason)
+- Storage incidents: inability to read policy (serve LKG, emit warnings; autoscaler should continue using last effective policy cached on its side if available)
+
+---
+
+## Appendix: Example evaluation (human readable)
+Input:
+- requested_desired_replicas: 40
+- stored: min=10, max=32, predictive_mode=ADVISORY
+- flags: predictive enabled
+
+Output:
+- effective_min_replicas: 10
+- effective_max_replicas: 32
+- bounded_desired_replicas: 32
+- reasons: ["CLAMPED_TO_MAX"]
+
+---
+
+## Changelog
+- 2025-06-20: Initial service doc created (bounds + predictive mode rollout planning).
+- 2025-08-01: Added LKG behavior and explicit retention guidance for audit events.
+- 2025-09-09: Updated SLO targets and cache key versioning to include flag snapshot hash.

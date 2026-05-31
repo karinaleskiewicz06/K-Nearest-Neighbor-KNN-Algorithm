@@ -1,0 +1,150 @@
+SLA-aware GPU Node Lifecycle Orchestrator: design, TF modules & CI pipeline
+
+Design and runbook for an SLA-aware node lifecycle orchestrator that combines Terraform modules, gated CI/CD promotion, and operational runbooks to perform safe GPU node image upgrades, reprovisioning, and controlled decommissioning for multi-tenant inference pools.
+Overview:
+This document specifies the design and operational playbook for the GPU Node Lifecycle Orchestrator (GNLO): a set of Terraform modules, CI/CD pipelines, and runbook procedures that automate safe node image promotion, controlled drains, and capacity-aware rollouts while respecting tenant SLAs and cross-account networking constraints. GNLO is intended for the shared GPU fleets used by Redwood-hosted inference and internal eval grids.
+
+Goals and scope:
+- Automate node lifecycle actions (image promotion, kernel/driver updates, reprovision, retire) with documented safety checks.
+- Ensure rollouts are SLA-aware: respect per-tenant latency SLOs and burst runway budgets.
+- Integrate with existing TF modules and the burst orchestrator; reuse tagging, egress-shaping, and warm-pool primitives.
+- Provide a CI/CD gating flow (Buildkite + Terraform) that requires synthetic traffic verification and cross-account network checks before promotion.
+- Produce an oncall-friendly runbook for emergency rollback and rapid safe-revert.
+
+High-level architecture:
+- Terraform modules (tf-module/gpu-node-lifecycle): encapsulate node image resources, maintenance policies, and graceful-drain hooks.
+- Promotion pipeline (ci/pipelines/gpu-image-promotion.yml): builds artifacts, runs integration-e2e, executes dry-run Terraform plan in shadow account, and promotes via a coordinated Apply run.
+- Orchestrator controller (k8s job or serverless step function): schedules staged node groups, executes drain semantics, and verifies capacity signals.
+- Monitoring & observability: metrics and synthetic probes drive canary thresholds and rollback decisions.
+
+Key SLOs and safety thresholds:
+- Fleet availability SLO: 99.95% per-region for node control-plane reachability.
+- Tail latency SLO (inference 95p): < 120ms for standard small requests; 95th measured per-tenant must not regress by > 15% during a rollout.
+- Backpressure runway: at least 20% spare warm-pool capacity in each burst zone before starting non-emergency drains.
+- Canary health pass criteria: no increased 5xx spike > 2x baseline and no P95 regression > 10% in 10-minute window.
+
+Terraform module design (tf-module/gpu-node-lifecycle):
+- Exports / inputs (primitive names):
+  - inputs: node_image_id, maintenance_window_cron, drain_grace_seconds, warm_pool_selector_tags, allowed_egress_ranges (CIDR list), account_role_arn
+  - outputs: lifecycle_group_id, drain_hook_url, predrain_check_id
+
+Example usage snippet:
+```
+module "gpu_node_lifecycle" {
+  source = "git::ssh://git@repo/internal/tf-modules//gpu-node-lifecycle?ref=v1.3.0"
+
+  node_image_id            = var.node_image_id
+  maintenance_window_cron  = "0 3 * * 0"
+  drain_grace_seconds      = 300
+  warm_pool_selector_tags  = { pool = "inference-warm" }
+  allowed_egress_ranges    = var.allowed_egress_ranges
+  account_role_arn         = data.aws_iam_role.cross_account_role.arn
+}
+```
+
+Safety checks implemented in TF modules (policy-as-code hooks):
+1) predrain_check: verifies warm-pool reserved capacity and recent synthetic success rate (last 10m).
+2) cross-account-network-assert: confirms tunnel/privatelink to tenant regions is healthy and BGP/egress probes are green.
+3) tag-and-annotation policy: nodes without required billing tags are excluded from drain operations.
+
+Promotion CI/CD pipeline (Buildkite oriented):
+1) Build & sign image: nightly runner builds containerized node image, signs with HSM, uploads to image registry.
+2) Integration-e2e: run small synthetic inference workloads against a staging warm-pool (10% of pool) — collects latency/5xx and jitter stats.
+3) Shadow TF plan: run `terraform plan` in the shadow account and produce change RFC with diff and affected-count.
+4) Canary apply: apply to a single placement group (3–10 nodes) with scheduled drain.
+5) Canary verification: 30–60 minute monitoring window; automated pass/fail based on P95 and 5xx thresholds.
+6) Staged rollout: expand 3x groups per region with automated checks between stages.
+7) Final promote: full fleet application gated by manual approval if any non-zero tenant impact is expected.
+
+Sample Buildkite job steps (simplified):
+```
+steps:
+  - label: ":docker: build & sign"
+    command: |
+      ./scripts/build-node-image.sh
+      ./scripts/sign-image.sh --kms $KMS_KEY
+  - label: ":test_tube: integ-e2e"
+    command: ./ci/integration/run_synthetic_tests.sh --pool staging
+  - label: ":terraform: shadow-plan"
+    command: ./ci/terraform/shadow_plan.sh --overlay=canary
+  - wait
+  - label: ":terraform: apply-canary"
+    command: ./ci/terraform/apply_canary.sh --target-group $CANARY_GROUP
+    branches: master
+```
+
+Operational runbook: Routine upgrade (non-emergency)
+1) Preflight (owner: infra-release-engineer)
+   - Verify cross-account role and network tunnels: run `tools/netcheck --account-region us-west-2 --target privatelink` (expect 0 packet loss / <5ms RTT).
+   - Confirm warm-pool runway: `kgctl warmpool status --selector=pool=inference-warm` must show spare >= 20%.
+   - Check synthetic health: query `sum(rate(synthetic_success[5m])) / sum(rate(synthetic_total[5m])) > 0.995`.
+2) Kick off pipeline: trigger Buildkite promotion pipeline.
+3) Observe canary: monitor metrics dashboards:
+   - Prometheus alert `gpu_node_canary_error_rate` < 0.02
+   - P95 inference latency panel per-tenant: no >10% regression over baseline.
+4) If canary fails: abort and run emergency rollback: `ci/terraform/rollback_to_last_known_good.sh --group $CANARY_GROUP`.
+5) If canary passes: continue staged rollout with 15–30 minute windows and automated predrain checks.
+
+Emergency decommission (unhealthy node isolation):
+- Trigger conditions: repeated kernel panics, PCIe device error, or silent health-check fail for 3 consecutive probes.
+- Immediate action: cordon node, attach ephemeral placeholder capacity from pre-provisioned burst buffer, then drain.
+- Postmortem tags: label incident with `gpu-lifecycle-emergency` and include culprit driver/kernel versions.
+
+Monitoring queries & alerts (examples):
+- Canary failure (PromQL):
+  - expr: `increase(node_pool_canary_failures[15m]) > 0`
+  - severity: P1 if >1 canary group fails in 30m, otherwise P2.
+- Warmpool runway (PromQL):
+  - expr: `((sum(gpu_warmpool_capacity) - sum(gpu_warmpool_in_use)) / sum(gpu_warmpool_capacity)) < 0.20`
+  - create alert: `gpu_warmpool_low_runway` -> page infra oncall.
+- Tenant impact detection: compare tenant_p95_baseline and current: `tenant_p95_current / tenant_p95_baseline > 1.15` -> automatic rollback.
+
+Ownership and roles:
+- Module owners: infra-iac team (primary), serving-runtime (consult).
+- Runbook owner: oncall infra-release-engineer rota.
+- CI pipeline owner: ci-cd team.
+
+Rollout governance and approvals:
+- Small Patch (<= 5% fleet): auto-approved after automated canary pass.
+- Medium Patch (>5% and <= 25%): requires a designated release approver sign-off.
+- Large Patch (>25%): requires cross-team staging sign-off (SRE, Serving, Customer Success) and announced maintenance window.
+
+Testing checklist (pre-promotion):
+- Unit tests for TF modules and OPA policies.
+- Integration-e2e synthetic suite passing at 99%+ success.
+- Cross-account network smoke tests green.
+- Canary plan shows affected nodes <= expected threshold.
+
+Post-upgrade validation and telemetry retention:
+- Keep canary telemetry and synthetic windows retained for 30 days.
+- Attach tag `lifecycle-promotion=X.Y` to all changed resources for billing and audit.
+
+Appendix - Troubleshooting snippets:
+- Force revert after partial apply:
+```
+# Prevent further drains and restore image id
+./scripts/set_node_image.py --group $GROUP --image $LAST_KNOWN_GOOD
+# Rollback terraform state
+terraform apply -var-file=rollback-vars.tfvars -target=module.gpu_node_lifecycle
+```
+- Extract recent kernel oops from node logs:
+```
+journalctl -u nv_peer_mem -S -2h | sed -n '1,200p'
+```
+
+Related work and references:
+- Reuse warm-pool selectors and egress shims from existing TF libraries; see related pages above.
+- See `gpu-node-image-supply-chain` for image signing and HSM integration.
+
+Contributors:
+- Author: Ava Martinez (infra-iac)
+- Reviewers: Ravi Patel, Lena Cho, Miguel Alvarez
+
+Change history:
+- 2024-02-15: initial draft
+- 2024-08-03: added Buildkite job templates and canary thresholds
+- 2025-09-30: updated SLO numbers and warm-pool runway policy to 20% based on Q2 2025 capacity study
+
+Contact & escalation:
+- Primary oncall: infra-release-engineer rotation (pager group: infra-release)
+- Slack: #infra-node-lifecycle

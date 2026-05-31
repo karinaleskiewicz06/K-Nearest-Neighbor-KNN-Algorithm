@@ -1,0 +1,153 @@
+Shadow Sequencer and Fallback Orchestration Playbook
+
+Summary
+-----
+This playbook documents the Shadow Sequencer pattern and fallback orchestration used by the eval harness to safely validate new model variants (including quantized and trimmed kernels) across live workloads. It prescribes sequencing rules, sampling policies, telemetry contracts, and incident-runbook steps to keep production SLOs intact while maximizing signal for model onboarding and regression triage.
+
+Audience
+--------
+- Applied ML engineers running model onboarding and continuous evals
+- Serving runtime engineers integrating shadow pipelines
+- SRE and platform teams responsible for routing and fallbacks
+
+Goals
+-----
+1. Collect high-fidelity shadowed request/response pairs for evaluation without impacting user-perceived latency or correctness.
+2. Provide deterministic sequencing and prioritization so limited eval capacity focuses on the most informative traffic slices.
+3. Automate safe fallback to production variants on degradation (quality or latency).
+4. Integrate with quantization and KV-cache-aware on-device evaluation flows.
+
+Terminology
+-----------
+- Shadow request: a copy of a production request routed to an eval model for offline scoring and telemetry.
+- Sequencer: the service that decides which production requests to shadow and at what priority. (service: eval-sequencer)
+- Shadow bus: asynchronous pipeline that delivers shadow traffic to eval environments with metadata. (service: shadow-bus)
+- Fallback policy: policy that triggers automatic rollback or traffic diversion when a health gate fails.
+
+Architecture overview
+---------------------
+1. Production ingress -> routing layer (redwood-router).
+2. redwood-router emits a sampling key and forwards the request to production model variant.
+3. eval-sequencer subscribes to routing metadata and decides shadow eligibility using the Sequencing Policy DB (see configs).
+4. Eligible requests are serialized and posted to shadow-bus (Kafka topic: shadows.v1) with encryption and a metadata envelope.
+5. Shadow consumers (dedicated eval-pools, private shadow runners) pull and run model variants; results written to eval-store and linked back to the originating request id for later comparison.
+
+Sequencing policy (high level)
+-----------------------------
+- Priority classes (in descending order):
+  - P0: production slow-paths and SLA-critical endpoints (sample rate: 0.1% default)
+  - P1: high-business-value cohorts (paid customers, sample rate: 1%)
+  - P2: high-entropy prompts (identified by probe classifier, sample rate: 5%)
+  - P3: heavy compute or long-context examples (sample rate: 0.5%)
+- Global budget: max 3% of total QPS can be shadowed into any single eval-cluster to avoid resource interference.
+- Adaptive throttle: sample rates are dynamically lowered if the eval-cluster CPU/GPU utilization > 75% for 5m window.
+
+Sequencing config table (editable YAML snippet)
+------------------------------------------------
+| key | meaning | recommended value |
+|-----|---------|-------------------|
+| sequencer.default_rate | baseline sampling | 0.01 |
+| sequencer.priority_p1_rate | paid customers | 0.01 |
+| sequencer.max_cluster_shadow_pct | cap per cluster | 0.03 |
+| sequencer.cpu_util_throttle_pct | throttling threshold | 0.75 |
+
+(Example YAML for a sequence rule)
+```yaml
+- id: p1_paid_customers
+  match: request.customer_tier == \"paid\"
+  sample_rate: 0.01
+  priority: P1
+  destinations: [\"eval-dedicated-a\", \"eval-private-vpc\"]
+```
+
+Security and privacy controls
+-----------------------------
+- All shadow payloads are hashed at ingress and PII fields redacted according to the redaction ruleset (service: pii-filter).
+- Shadow bus messages are encrypted with customer-scoped keys; private deployment shadows can be configured to never persist in central eval-store.
+- For regulated customers, use DP-mode: add Laplace noise to numeric telemetry and strip verbatim user content before storage.
+
+Telemetry and SLOs
+------------------
+- Critical SLOs that must not be violated by shadowing:
+  - P99 production latency change: <= +1.5ms attributable to shadowing hooks.
+  - Error budget: shadow subsystem must not cause >0.1% increase in 5xx rate.
+- Observability outputs:
+  - metric: eval.shadowed_requests_count (tags: priority, destination, model_variant)
+  - metric: eval.shadow_processing_lag_seconds (95th)
+  - log: shadow-envelope-{request_id} includes: request_id, sampling_key, model_variant, seq_rule, cluster_id
+
+Quality gates and automated fallback triggers
+-------------------------------------------
+We evaluate shadow-run results weekly and in near real-time for the following gates. Any failure above thresholds triggers one of the fallback actions below.
+
+Quality gates (examples)
+- Token-level degradation: LM_delta_bleu > 0.12 vs baseline for customer-critical prompts
+- Latency regressions: 95th percentile increase > 15% for the model variant under test
+- Regression alerts per 10k shadowed requests > 3
+
+Fallback actions (ranked)
+1. Circuit-breaker: stop all new shadowing for the failing variant for 30 minutes.
+2. Auto-rollforward: if degradation persists and a compatible fallback exists (quantized->float or small->large), route canary traffic to fallback variant with gradual ramping.
+3. Live rollback: for Dedicated or Private deployments with observed customer impact, automatically switch traffic away from the failing variant at the routing layer and create incident.
+
+Operational runbook (incident scenario: spike in token degradation)
+--------------------------------------------------------------------
+1. Triage: PagerDuty -> oncall-eng (eval). Confirm spike via grafana: eval.quality.regression_rate (5m).
+2. Identify sequencer keys correlated with regressions via:
+   - CLI: rcli seq-query --from 2026-03-02T09:00Z --to 2026-03-02T09:30Z --filter=regression=1
+3. Stop shadowing for the implicated variant:
+   - curl -XPOST https://eval-sequencer/api/v1/rules/disable -d '{"rule_id":"<id>"}'
+4. If spike persists > 30m, enable fallback route to previous stable variant:
+   - rcli routes update --route-id prod-chat --fallback-variant redwood-gpt-3b-stable --weight 100
+5. Postmortem: capture root-cause, model diff, and submit to regression-triage workspace.
+
+Integration checklist for model onboarding
+----------------------------------------
+- Ensure the model is registered in model-catalog with the following metadata: variant_id, quant_profile, kv_cache_compatibility, expected_latency_ms.
+- Attach an eval-suite that includes: production prompt slices, adversarial probes, and a small human-labeled gold set for P1 customers.
+- Verify shadow-run: run 1k synthetic shadow requests using the shadow-runner utility:
+  - shadow-runner --variant <id> --sample-size 1000 --emulate-headers
+- Confirm telemetry: eval.shadowed_requests_count > 1000 and eval.quality.sentinal_pass == true
+
+Operational tips (best practices)
+--------------------------------
+- Prefer deterministic hashing for stable slice selection to enable reproducible comparisons.
+- Use higher sampling for rare high-value slices (e.g., B2B integrations) and lower sampling for generic low-value traffic.
+- For quantized variants, annotate messages with quant_profile to enable downstream analysts to compare like-for-like.
+
+Example CLI snippets
+--------------------
+- Create a new sequencing rule:
+  rcli sequencer create --name p2_high_entropy --match-file p2_match.json --sample-rate 0.05 --destinations eval-dedicated-a
+- Disable shadowing for a variant immediately:
+  rcli shadow disable --variant-id ql-6b-quant-v2
+
+Ownership and contacts
+----------------------
+- Owner: Maya Patel (Applied ML)
+- Runtime integration: Jin Park (serving-runtime)
+- SRE contact: Aisha Khan
+- Oncall escalation: eval-oncall@redwood.com
+
+Related pages
+-------------
+- /confluence/applied-ml-and-evals/model-onboarding/inference-readiness-eval-matrix-and-promotion-playbook-2026
+- /confluence/eng-serving-runtime/runbooks/shadow-bus-maintenance
+
+Appendix: example shadow-envelope format
+--------------------------------------
+{
+  \"request_id\": \"uuid-v4\",
+  \"sampling_key\": \"seq-2026-0001\",
+  \"seq_rule\": \"p1_paid_customers\",
+  \"metadata\": {
+    \"model_variant\": \"redwood-gpt-3b-quant-v2\",
+    \"customer_tier\": \"paid\"
+  },
+  \"payload\": \"<redacted-or-encrypted-bytes>\"
+}
+
+Change log
+----------
+- 2026-01-12: created initial playbook (M. Patel)
+- 2026-03-02: added adaptive throttle rules and DP-mode guidance (M. Patel)

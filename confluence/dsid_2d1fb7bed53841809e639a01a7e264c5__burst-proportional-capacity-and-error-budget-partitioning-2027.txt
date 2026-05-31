@@ -1,0 +1,142 @@
+Burst-Proportional Capacity Strategies and Error-Budget Partitioning
+
+Overview
+
+This playbook describes a practical, ops-focused approach for provisioning and operating capacity for bursty, multi-model inference workloads using two complementary levers: (1) burst-proportional capacity allocation and (2) deterministic error-budget partitioning. It is intended for SREs and platform owners responsible for model-tenant capacity, SLO enforcement, and incident response.
+
+Goals
+- Keep customer-facing latency SLOs stable during short-duration traffic spikes (bursts).
+- Ensure fair, predictable error-budget consumption across tenants and model classes.
+- Enable automatic recovery and deterministic manual escalation when capacity limits are reached.
+
+Scope and applicability
+- Applies to Redwood Dedicated and Private deployments where multiple tenants and model variants share GPU pools managed by our serving runtime.
+- Focuses on inference (text generation, chat, embeddings) workloads where traffic exhibits high short-term variance (minutes-to-hours).
+- Does not replace tenant-level business SLAs or billing controls; it augments SLO enforcement and capacity controls.
+
+Key definitions
+- Burst window: a configurable short period (recommended default: 5 minutes) used to compute transient demand and adaptive provisioning.
+- Reserved baseline: the committed steady-state capacity assigned to a tenant or model group.
+- Burst-proportional headroom: additional ephemeral capacity apportioned during burst windows based on tenant weight and global headroom budget.
+- Error-budget partition: fraction of global error budget allocated to a tenant/model for a rolling SLO window.
+
+Design principles
+1) Preserve tail latency SLOs (primary): prioritize p95/p99 latency budgets for production routes.
+2) Make burst handling deterministic: explicit math for headroom and graceful degradation order.
+3) Cost-aware fairness: prefer proportional throttling over hard eviction when possible.
+4) Observable and auditable: every autoscale/eviction decision must emit an event with reason, decision inputs, and resulting state.
+
+Capacity model overview
+- Capacity pools: GPU pools are partitioned into Baseline (steady commitments), Headroom (shared ephemeral pool), and Safety Reserve (manual/automated emergency buffer).
+- Allocation flow: Baseline meets normal demand. If short-term demand > Baseline, we consult Headroom entitlement (burst-proportional). When Headroom is exhausted, apply error-budget partition and throttling.
+
+Burst-proportional entitlement algorithm (summary)
+1) Observe demand_i = sum(active_tokens/sec_i) per tenant/model group over the burst window.
+2) Compute global_demand = sum(demand_i).
+3) Available_headroom = max(0, configured_headroom - reserved_safety_margin).
+4) Proportional_share_i = (demand_i / global_demand) * Available_headroom.
+5) Enforce per-tenant caps: share_i = min(Proportional_share_i, configured_max_burst_cap_i).
+6) Commit ephemeral slots and emit event: capacity.alloc.burst -> {tenant, committed_slots, window_start, window_end, reason}.
+
+Example numeric policy table
+| Parameter | Recommended default | Notes |
+|----------|---------------------|-------|
+| burst_window | 5m | Sliding window used for demand aggregation |
+| configured_headroom | 20% of pooled GPUs | Tuned per cluster |
+| reserved_safety_margin | 3% of pooled GPUs | Avoid zero headroom in face of supply flaps |
+| configured_max_burst_cap_i | 40% of tenant_baseline | Prevent single tenant from consuming all headroom |
+| safety_reserve | 2 GPUs | Manual/automatic emergency buffer |
+
+Error-budget partitioning model
+- Global SLO: defined for a service surface (e.g., generation-api.production). Example SLOs: availability target = 99.95% (30d rolling), latency target = p95 <= 220ms (5m rolling).
+- Partition approach: split global error budget across tenants and model classes using a two-level scheme: baseline partition (proportional to committed baseline capacity) and opportunistic partition (proportional to recent steady consumption).
+- Deterministic fallback order: when a tenant consumes > 80% of its partitioned error budget in the rolling window, it is placed into progressive throttling tiers (soft throttle -> controlled shed -> hard degrade) described below.
+
+Partition calculation (textual formula)
+- global_error_budget = (1 - SLO_target) * rolling_window_seconds
+- baseline_partition_tenant_i = global_error_budget * (baseline_capacity_i / sum(baseline_capacity_all))
+- opportunistic_partition_tenant_i = global_error_budget * w * (recent_token_share_i), where w is opportunistic weight (default 0.25).
+- tenant_total_partition = baseline_partition_tenant_i + opportunistic_partition_tenant_i
+
+Throttle & degradation tiers (operational rules)
+1) Soft throttle (>= 80% partition consumption): Reduce new request admission by throttling token rate by up to 15%. Continue to route, but mark metrics with "throttle.soft" tag.
+2) Controlled shed (>= 95% partition consumption OR headroom exhausted): Gradient-based shed of non-critical routes (batch/embeddings > low priority) up to 50%. Notify tenant via billing/telemetry webhook.
+3) Hard degrade (> 100% partition consumption AND safety_reserve empty): Fall back to a lightweight model family and return structured fallback reason to client. Emit incident annotated with tenants impacted.
+
+Operational runbook: burst-capacity shortage (on-call actions)
+1) Detect: Alert fires when cluster headroom_utilization > 85% for > burst_window and global error_budget consumption > 60%.
+2) Triage: Check telemetry dashboard: burst_alloc_events, headroom_committed_by_tenant, error_budget_consumption_by_tenant.
+3) Immediate mitigation (automated first then manual):
+   a) If headroom available but misallocated: trigger immediate rebalancer: /opt/redwood/bin/headroom-rebalance --force --reason "ops:rebalance-urgent"
+   b) If headroom exhausted and soft throttle not yet applied: escalate automated soft throttle policies for the top 3 consumers.
+   c) If controlled shed needed: follow the controlled-shed checklist (two-step approval: SRE oncall and platform owner).
+4) Communication: Post status update to #sre-incidents and include: affected_tenants, estimated_recovery, applied_actions.
+5) Post-incident: Run the headroom replay and root-cause analysis (RCA) using the tooling in observability: runbook-replay --start <window_start> --end <window_end> --reason headroom-shortfall.
+
+Runbook checklist for controlled shed approval
+1) Confirm we are exceeding tenant partition by > 15% and top consumer has > 40% of active tokens.
+2) Notify platform-owner and product-PM for the impacted tenant (send automated digest).
+3) Apply controlled shed policy in staging for 5 minutes to validate failover correctness.
+4) Roll out to production with a 2-minute stagger per zone and monitor p95 and error budget burn rate.
+
+Telemetry and alerting (sample queries)
+- Headroom utilization (PromQL-like):
+  sum(headroom_committed_slots) / sum(headroom_total_slots) by (cluster)
+- Tenant error-budget burn (5m rolling):
+  increase(tenant_error_budget_consumed[5m]) / tenant_total_partition
+- Burst allocation events (logs):
+  log_level:INFO service:capacity role:allocator message:"capacity.alloc.burst"
+
+Autoscaler and throttler config examples (YAML snippet)
+- autoscaler-policy.yaml
+  cluster: gpu-pool-east-1
+  burst_window: 300s
+  headroom_percent: 20
+  safety_margin_percent: 3
+  max_burst_per_tenant_percent: 40
+  opportunistic_weight: 0.25
+
+- throttler-policy.yaml
+  soft_throttle_threshold: 0.8
+  controlled_shed_threshold: 0.95
+  hard_degrade_threshold: 1.0
+  soft_throttle_rate_limit_pct: 15
+  controlled_shed_priority_order: ["batch", "low-priority-embed", "interactive-noncritical"]
+
+Ownership and responsibilities
+- SRE (oncall): Detect, perform triage, execute runbook mitigations, and escalate if thresholds breach controlled shed.
+- Platform (capacity team): Maintain autoscaler, adjust headroom sizing, approve controlled shed actions.
+- Product/Account owner: Coordinate customer communication and post-incident remediation.
+- Observability team: Ensure allocation events, partition burn metrics, and audit logs are flowing into the metrics pipeline.
+
+Testing and rollout plan
+1) Unit tests for allocation math (automated): validate proportional_share and cap behavior for synthetic demand profiles.
+2) Integration canary: deploy autoscaler changes to a single zone during low-traffic window and run synthetic bursts (3x normal) for 30 minutes.
+3) Chaos: run a planned exercise where headroom pool is artificially reduced by 50% for 10 minutes and validate controlled-shed path.
+4) Gradual global rollout: 10% -> 30% -> 100% with 24h observation windows between phases.
+
+Audit and postmortem requirements
+- Any time controlled shed or hard degrade occurs, a post-incident RCA must be opened within 48 hours and include: timeline, allocation events, decision rationale, mitigation steps, and action owner(s).
+- Automated export: headroom allocation logs + tenant partition burn must be archived for 90 days.
+
+Appendix: quick commands and examples
+- Force a headroom rebalance (CLI):
+  sudo /opt/redwood/bin/headroom-rebalance --cluster gpu-pool-east-1 --force --dry-run=false
+- Query top burst consumers (PromQL):
+  topk(10, sum(rate(tenant_tokens[1m])) by (tenant))
+- Example allocation event (log):
+  {timestamp: "2027-01-11T14:02:12Z", event: "capacity.alloc.burst", tenant: "acme-corp", committed_slots: 6, window: "2027-01-11T14:00:00Z/2027-01-11T14:05:00Z", reason: "spike:search-indexing"}
+
+Related docs and links
+- Capacity onboarding checklist for new model tenants (see related_pages).
+- SLO-driven autoscale and hybrid inference runbook (see related_pages).
+
+Contact and escalation list
+- SRE oncall rota: #sre-oncall (pager duty)
+- Platform capacity lead: miguel.ortega@redwood.ai
+- Observability lead: priya.desai@redwood.ai
+
+Revision history
+- 2026-11-03: Draft created by Aisha Kapoor.
+- 2026-12-15: Added controlled-shed checklist and YAML examples (reviewers: Miguel, Priya).
+- 2027-01-12: Published with tested canary guidance and CLI commands.

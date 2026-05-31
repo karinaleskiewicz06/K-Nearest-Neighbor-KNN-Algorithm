@@ -1,0 +1,195 @@
+Incremental Kernel Snapshot Profiling and Telemetry Deduplication Playbook
+
+Summary
+
+This playbook describes an incremental snapshot profiling method for Redwood's serving runtime that reduces observability cost and noise by deduplicating telemetry at ingestion and by shipping compact kernel snapshots instead of full traces for every request. It is intended for engineers operating the runtime (runtime-manager, kernel-dispatcher, trace-collector, telemetry-processor) and for SREs investigating regressions.
+
+Motivation
+
+- Full-trace capture at high QPS produces excessive storage and processing costs and buries signals under duplicate events.
+- Incremental snapshots preserve causal telemetry (kernel selection, queue wait, batch composition, KV-cache hits) while limiting volume.
+- Deterministic deduplication reduces alert noise and increases signal-to-noise in regression hunts.
+
+Scope and Audience
+
+- Applies to: production runtime fleets (hosted and dedicated), dev sandbox fleets when sampling=on.
+- Not for: air-gapped private deployments that have custom telemetry pipelines unless adapters are installed.
+- Audience: runtime engineers, perf SREs, observability engineers.
+
+Key Services & Components
+
+- runtime-manager: orchestrates shard topology and rollout flags.
+- kernel-dispatcher: assigns kernels and emits kernel-hint events.
+- trace-collector: local agent on each instance, emits incremental snapshots.
+- telemetry-processor: centralized aggregator that deduplicates, enriches, and stores compact records.
+
+Goals and SLOs
+
+- Profiling capture SLO: when sampling is enabled for a cohort, >=99% of sampled requests must produce an incremental snapshot within 1s of completion (99th percentile).
+- Deduplication latency: telemetry-processor must deduplicate and index new unique signatures within 30s.
+- Storage budget: sampled tracing must consume <= 1.5% of monthly observability spend for the fleet by default.
+
+Terminology
+
+- Snapshot: compact set of fields capturing request surfaces and kernel decisions (not a full span tree).
+- Signature: a canonicalized hash of stable snapshot fields used for deduplication.
+- Incremental diff: subset of fields that changed relative to the last seen signature for a tenant/cohort.
+
+Design Overview
+
+1) Local Collector Behavior (trace-collector)
+
+- Capture points: request start/end, kernel selection, batch boundaries, KV cache warmup, GPU dispatch, kernel completion.
+- Compose a baseline snapshot template per process at startup containing static metadata (instance_id, gpu_type, runtime_version).
+- For each sampled request: produce an incremental snapshot consisting of {request_id, timestamp, seq_len, kernel_hint, batch_size, kvcache_hit_ratio, latency_buckets, runtime_flags}.
+- Compute signature: SHA256(hex(pick_fields(kernel_hint,batch_shape,model_version,quant_profile,static_metadata))) truncated to 64 bits.
+
+Example incremental snapshot (JSON line):
+
+{
+  "proc_id": "p-7f21",
+  "req_id": "r-9b3e",
+  "ts": "2026-02-03T15:12:21Z",
+  "sig": "a3f4c1e2b8d9f6c7",
+  "kernel": "sharded-attn-v2",
+  "batch": 4,
+  "seq_len": 128,
+  "kv_hit": 0.78,
+  "lat_ms": 72
+}
+
+CLI: capture a one-off snapshot from running instance
+
+$ rctl instance snapshot capture --instance p-7f21 --tail 1 --out /tmp/snap.jsonl
+
+2) Signature & Deduplication Strategy (telemetry-processor)
+
+- Tiered signature keys:
+  - primary_key: (tenant_id, model_version, quant_profile, kernel_hint, batch_shape)
+  - secondary_key: (seq_len_bucket, kv_hit_bucket, runtime_flags_hash)
+- Deduplication window: 15 minutes per tenant by default (configurable per cohort).
+- Behavior: first occurrence of a signature produces a full record (indexed). Subsequent identical signatures emit only a counter increment event and a 1-line delta if a non-key field (e.g., tail latency) crossed a configured threshold.
+
+Deduplication pseudocode (simplified)
+
+store = TTLMap()  # TTLMap(signature->last_seen_ts, summary)
+
+function ingest(snapshot):
+  sig = snapshot.sig
+  if sig not in store or now - store[sig].last_seen > dedup_window:
+    index_full(snapshot)
+    store[sig] = {last_seen: now, summary: summarise(snapshot)}
+  else:
+    delta = compute_delta(store[sig].summary, snapshot)
+    if delta.significant:
+      index_delta(snapshot.req_id, delta)
+      store[sig].summary = merge_summaries(store[sig].summary, snapshot)
+    else:
+      increment_counter(sig)
+
+3) Sampling and Cohorts
+
+- Sampling policies are declared in runtime-manager as YAML cohort policies. Example:
+
+cohorts:
+  - name: production-critical
+    sampling_rate: 0.01  # 1%
+    dedup_window: 900   # seconds
+    retention_days: 30
+  - name: experimental-heavy
+    sampling_rate: 0.10  # 10%
+    dedup_window: 300
+    retention_days: 7
+
+- Default cohorts: baseline-sampled (0.1%), production-critical (0.01%), emergency-high (100% but short retention).
+
+4) Storage schema & retention table
+
+| Record type | Fields (primary) | Retention (default) | Size estimate | Owner |
+| Full snapshot | sig, req_id, ts, kernel, batch, seq_len, kv_hit, latency_hist, flags | 30 days | ~1.2 KB | observability-team |
+| Delta record | sig, req_id, ts, changed_fields | 90 days | ~200 B | observability-team |
+| Counter event | sig, ts, count_inc | 365 days | ~50 B | cost-analytics |
+
+5) Rollout checklist (how to enable on a fleet)
+
+1. Create cohort in runtime-manager and set sampling_rate/dedup_window/retention. Owner: runtime-engineering.
+2. Deploy trace-collector v2.4.1 to a 5% canary pool.
+3. Verify snapshots flow to telemetry-processor test namespace, confirm signatures are computed (CLI: tproc inspect --ns test --sig a3f4...).
+4. Confirm dedup counts vs full records ratio >= 20:1 for steady-state traffic.
+5. Expand to 25% then 100% with 2h observation windows between stages.
+6. Run the regression-hunt script (see Troubleshooting) against the new data.
+
+Safety checks and thresholds
+
+- If dedup ratio drops below 2:1 for 10m, rollback collector and open P0 incident.
+- If average snapshot latency > 1s for 5% of instances, reduce sampling_rate by 50% and investigate kernel-dispatcher backlog.
+
+6) Operational playbook: investigating a regression using incremental snapshots
+
+1. Query telemetry-processor: find new signatures with sudden latency change:
+
+$ tproc query --ns production --since 1h --filter "lat_ms>p95*1.5" --group-by sig --limit 50
+
+2. For top signals run: tproc fetch-full --sig <sig> --limit 20 --out /tmp/full-samples.jsonl
+3. Cross-reference with kernel-dispatcher logs:
+
+$ kdis logs --sig <sig> --since 2m --follow
+
+4. If root cause is a kernel change, trigger kernel-rollout-safety checks (see kernel-and-scheduling handbook).
+
+7) Troubleshooting and common scenarios
+
+- High cardinality due to noisy runtime_flags: canonicalize or map runtime_flags into coarse buckets in trace-collector config (example mapping in next section).
+- Missing signatures: check process-level static metadata; ensure model_version and quant_profile are present.
+- Signature collisions (rare): use extended signature (128-bit) temporarily and run forensic query to check variance.
+
+Example trace-collector YAML (partial)
+
+collector:
+  sampling_rules:
+    - cohort: production-critical
+      rule: "request_path =~ /api/v1/complete"
+      rate: 0.01
+  canonicalization_map:
+    runtime_flags:
+      "debug_enabled": low
+      "zero_copy": medium
+      "hardware_bfloat": high
+
+Performance experiments and benchmark plan
+
+- Microbenchmarks: measure per-snapshot CPU and memory cost on representative instances (p4d-like and a100-like). Target: < 2% CPU and < 64MB additional RSS per 1% sampling of traffic.
+- End-to-end: run load-synthesis with sampling on 1% baseline and measure dedup ratio, ingest latency, and storage delta.
+- Regression tests: include snapshot capture and signature computation in CI perf-suite (benchmarking-and-perf-suite) with synthetic traces.
+
+Security & Privacy considerations
+
+- Redact PII at trace-collector using the redaction module (config key: redaction.enabled=true).
+- For private deployments, provide an adapter that emits snapshots to customer-managed telemetry stores; deduplication runs can execute in a self-hosted mode.
+
+Runbook links and ownership
+
+- Runtime-engineering runbook: ../runbooks/runtime-hotpatch-and-quick-redeploy-playbook-2026.json
+- Kernel scheduling handbook: ../kernel-and-scheduling/scheduler-observability-contract-and-simulated-injector-2026.json
+- Observability-team owner: observability@redwood.ai
+
+Change log
+
+- 2025-11-12: Initial draft and design review.
+- 2025-12-08: Added deduplication pseudocode and cohort YAML examples.
+- 2026-02-03: Published with rollout checklist and CLI commands.
+
+Appendix: utility scripts
+
+- regression-hunt.sh (pseudo):
+
+#!/bin/bash
+# Query for sigs with p95 jump and fetch examples
+SIGS=$(tproc query --ns production --since 2h --group-by sig --filter "lat_ms>p95*2" --limit 20 --format ids)
+for s in $SIGS; do
+  tproc fetch-full --sig $s --limit 10 --out /var/tmp/snap-$s.jsonl
+  kdis logs --sig $s --limit 100 > /var/tmp/klog-$s.txt
+  echo "Saved $s"
+done
+
+End of playbook. For questions, contact the author or the observability team.

@@ -1,0 +1,175 @@
+GPU soft-reserve protocol and graceful fallback runbook
+
+Summary
+-------
+This runbook describes the GPU soft-reservation protocol (soft-reserve) used by the capacity-orchestrator and gpupool-manager services to reduce tail latency during short bursts while preserving eviction-friendly behavior for spot/preemptible capacity. It covers the operational model, SLOs, observability, troubleshooting steps, Terraform/IaC variables, and CI/CD gating required for safe rollout.
+
+Motivation
+----------
+- Short user bursts (1–30s) cause expensive cold-warm transitions and high tail latencies when a tenant must wait for a full GPU allocation.
+- Hard reservations (exclusive long-lived leases) waste capacity and increase costs.
+- We need a middle ground: a low-latency, short-duration soft reservation that can be revoked quickly and falls back gracefully to lower-cost pools or degraded inference modes.
+
+Scope and assumptions
+---------------------
+- Applies to hosted and Dedicated pools managed by gpupool-manager.
+- Not intended for Private (on-prem air-gapped) unless customer explicitly enables the feature.
+- Assumes kernel-level preemption on spot instances and support for fast container restart/warmup in runtime (warmup-agent).
+
+Definitions
+-----------
+- soft-reserve: ephemeral capacity allocation that pins a fraction of a GPU resource for up to 60s, with an expectation it can be revoked with <200ms notice.
+- warmup-agent: user-space helper that preloads model KV caches and tokenizers during soft-reserve.
+- fallback-policy: routing decision when soft-reserve cannot be satisfied (options include queue-hold, model-quantize, region-fallback, and degraded-mode).
+
+Operational SLOs and thresholds
+-------------------------------
+- soft_reserve_success_rate >= 99.0% (30d rolling) for requests tagged "interactive" and priority >= 50.
+- soft_reserve_alloc_latency_p95 < 150ms.
+- warmup_seed_time_p95 < 30s for large models (>20B).
+- fallback_activation_rate < 2% (percentage of soft-reserve requests hitting fallback).
+- eviction_revoke_latency < 200ms (time from reclaim decision to exclusive-affinity removed).
+
+Key services and owners
+-----------------------
+- gpupool-manager (owner: infra/gpu-fleet) — orchestrates soft reservations and pool assignments.
+- capacity-orchestrator (owner: infra/scheduling) — global policy and reconciliation.
+- warmup-agent (owner: eng-serving-runtime) — container-side preload helper.
+- spot-fallback-operator (owner: infra/cloud) — handles routing to spot/backfill pools and billing tags.
+
+High-level protocol
+-------------------
+1. Admission: api-gateway receives a request with metadata {priority, interactive=true, tenant_id}. If priority >= 50, api-gateway forwards an allocation request to capacity-orchestrator with soft=true and ttl=30s.
+2. Try soft: gpupool-manager evaluates warm pool and fractional slots; if available, it places a soft-reserve token and signals warmup-agent in the chosen node via agent API.
+3. Warmup: warmup-agent activates preload routines in parallel (KV cache, tokenizer) and reports readiness.
+4. Latency window: if the request is served within TTL and token remains valid, reservation converts to ephemeral session and is billed at interactive rate. If the token is revoked, fallback is triggered.
+5. Revoke: during high pressure, gpupool-manager revokes tokens with a prioritized revoke list; warmup-agent receives revoke and either checkpoints state or drops caches depending on reclaim class.
+
+Runbook: oncall troubleshooting steps
+-------------------------------------
+- Alert: soft_reserve_success_rate breach (PagerDuty: INFRA-GPU-P1)
+  1. Check dashboard: /dashboards/gpu/soft-reserve-health — note p95 alloc latency and region distribution.
+  2. Verify gpupool-manager pods status: kubectl -n infra get pods -l app=gpupool-manager
+  3. Inspect recent revoke events: kubectl logs deploy/gpupool-manager --since=15m | jq 'select(.event=="revoke")'
+  4. If revokes are frequent and eviction_revoke_latency < 200ms satisfied, escalate to capacity-orchestrator (oncall: scheduling) to inspect policy churn.
+  5. If pods are OOM/killed, open incident per standard SRE runbook and revert recent kernel/driver changes.
+
+- Alert: warmup_seed_time_p95 elevated
+  1. Query warmup-agent metrics: warmup_seed_time_seconds_bucket by model_name.
+  2. If a single model shows regression, check model artifact integrity and layer IO throughput to NVMe.
+  3. Temporarily reduce soft-reserve preference for that model via feature flag: ffctl set infra.soft_reserve.model_preference.${model_name}=false
+
+- Manual fallback debugging
+  1. Reproduce: send a synthetic interactive request with headers X-Test-SoftReserve:1 to staging.
+  2. Trace allocation path: curl -sS http://capacity-orchestrator.internal/api/trace?request_id=...
+  3. Inspect fallback-policy decision tree in logs (/var/log/capacity-orchestrator/decision.log).
+
+Terraform / IaC variables and pattern
+-----------------------------------
+- We manage the protocol via a small feature-module that can be toggled per-account. Key variables:
+
+| variable | type | description | default |
+|---------|------|-------------|---------|
+| soft_reserve_enabled | bool | Enable soft reservations for account | false |
+| soft_reserve_ttl_sec | number | Soft reservation TTL (seconds) | 30 |
+| soft_reserve_fraction_per_gpu | number | Fractional slots per GPU (0.0-1.0) | 0.25 |
+| warmup_timeout_sec | number | Max time warmup-agent may take | 60 |
+| fallback_policy | string | one of [queue-hold, quantize, region-fallback, degraded-mode] | region-fallback |
+
+Example terraform snippet
+
+```hcl
+module "soft_reserve_policy" {
+  source = "git::ssh://git@repo.redwood.ai/infra/terraform-modules.git//soft-reserve?ref=v1.2.0"
+
+  account_id = var.account_id
+  soft_reserve_enabled = true
+  soft_reserve_ttl_sec = 30
+  soft_reserve_fraction_per_gpu = 0.25
+  warmup_timeout_sec = 45
+  fallback_policy = "region-fallback"
+}
+```
+
+CI/CD and release gating
+------------------------
+- Feature flag first: enable behind infra.soft_reserve.enabled and per-account toggles.
+- Unit tests: scheduler policy unit tests and warmup-agent mock must cover revoke paths and race conditions.
+- Integration tests: lightweight e2e that simulates 1k synthetic short-burst requests to validate p95 latency.
+- Canary rollout: enable in test-account -> 3 customer accounts with low risk -> 20% of interactive traffic -> 100%. Observe soft_reserve_success_rate and fallback_activation_rate across steps.
+
+Observability and dashboards
+---------------------------
+- Metrics to emit (prometheus):
+  - gpupool_soft_reserve_requests_total{status=(granted|denied|revoked)}
+  - gpupool_soft_reserve_alloc_latency_seconds_bucket
+  - warmup_seed_time_seconds_bucket{model_name}
+  - gpupool_fallback_activation_total{policy} 
+  - eviction_revoke_latency_seconds
+- Dashboards:
+  - /dashboards/gpu/soft-reserve-health (region, model, tenant split)
+  - /dashboards/gpu/warmup-traces (top slow models, IO latency)
+- Alerts:
+  - P1: soft_reserve_success_rate < 98.0% over 5m for any region -> page infra-gpu-pager
+  - P2: fallback_activation_rate > 5% over 10m -> slack #infra-gpu-alerts
+
+Revoke & graceful fallback semantics
+-----------------------------------
+- Revoke classes:
+  - class=A (urgent reclaim) — immediate revoke, best-effort checkpoint.
+  - class=B (soft reclaim) — 200ms notice, allow orderly cache eviction.
+  - class=C (policy-level) — 1s notice for planned draining.
+- Fallback ordering when revoke occurs:
+  1. Try region-fallback if compatible pool exists within same region <150ms RTT.
+  2. If not, try degraded-mode (switch to 8-bit quantized model variant).
+  3. If not, queue-hold for up to 10s with exponential backoff.
+  4. Last resort: deny with reason=RESOURCE_PRESSURE.
+
+Cost and billing considerations
+-----------------------------
+- Soft-reserve is billed as interactive-rate tokens only once the reservation converts to an ephemeral session; aborted soft-reserves (denied or revoked before session start) incur a 0.1x overhead charge to cover warmup work (configurable).
+- Tenant tags must include billing_tag:soft_reserve=true so FinOps can track usage.
+
+Rollout checklist
+-----------------
+1. Merge feature module behind ff infra.soft_reserve.enabled=false.
+2. Deploy capacity-orchestrator changes to staging. Run integration test harness.
+3. Enable per-account TF var for internal test accounts.
+4. Run canary (10k synthetic short requests). Monitor for 48h.
+5. Flip canary to 3 low-risk customers (manual opt-in). Monitor 7 days.
+6. Gradual global ramp with automated monitors halting rollout on P1 alerts.
+
+Ownership and escalation paths
+-----------------------------
+- Primary owner: infra/gpu-fleet (pager oncall: infra-gpu)
+- Secondary owner: infra/scheduling (pager: infra-scheduling)
+- Security/legal: require approval for private customers enabling soft-reserve in air-gapped environments.
+
+Appendix: debug commands and snippets
+-------------------------------------
+- List soft-reserve tokens on node:
+  kubectl -n infra exec node-agent-XXX -- /usr/local/bin/nodectl list-soft-reserve --json | jq '.tokens | length'
+
+- Force-revoke token (dev only):
+  curl -X POST http://gpupool-manager.internal/api/v1/revoke -d '{"token_id":"<id>","class":"B"}'
+
+- Trace a synthetic request using test client:
+  python tests/clients/soft_reserve_tester.py --model redwood-7b --count 1000 --priority 60 --attach-trace
+
+Appendix B: sample incident postmortem template fields
+- Timeline of events
+- Metrics at start and end (soft_reserve_success_rate, fallback_activation_rate)
+- Root cause
+- Mitigation and permanent fix
+- Action items with owners and due dates
+
+Notes and future work
+---------------------
+- Evaluate machine-learning-backed soft_reserve acceptance policy (predict which requests will become full sessions) to reduce unnecessary warmups.
+- Investigate zero-copy KV warmup to reduce warmup_seed_time for large models.
+
+Revision history
+----------------
+- 2024-02-15: Draft created (Maya Chen)
+- 2024-10-08: Added detailed revoke classes and billing semantics (Diego Alvarez)
+- 2025-11-03: Finalized SLOs and CI/CD gating notes; promoted to published (Priya Sundaram)

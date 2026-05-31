@@ -1,0 +1,141 @@
+GPU namespace self-service provisioner: operator design, Terraform adapter, and SLO-aware traffic shaping
+
+Overview
+
+This document describes the design and operational playbook for the GPU Namespace Self-Service Provisioner — a Kubernetes operator + Terraform adapter that enables product and platform engineers to create isolated GPU namespaces (compute+egress) via a self-service Terraform module or API while enforcing SLO-aware egress shaping and quota policies. The goal is to reduce manual infra tickets, lower onboarding friction for teams that need isolated GPU environments, and maintain cost and network fairness across multi-tenant GPU pools.
+
+Why we built it
+- Current onboarding for tenant GPU namespaces requires manual Terraform changes + cross-account networking steps and typically takes multiple hours.
+- Teams frequently misconfigure egress limits leading to noisy neighbors and billing surprises.
+- We want a single declarative path (Terraform module) that drives both cloud infra (VPC subnets, NAT, IAM) and cluster objects (namespaces, resource quotas, egress-shaper).
+
+Scope and non-goals
+- Scope: tenant namespace lifecycle (create, update, delete), automated egress shaping, bounded network egress accounting, CSI-backed ephemeral checkpoint PVs, audit logging.
+- Non-goals: full multi-cloud orchestration (initial rollout is AWS-only), tenant billing reconciliation (billing will be exported to existing billing pipeline), per-tenant HSM/KMS rotation (handled by platform secrets).
+
+High-level architecture
+1) Terraform module (self-serve) — exposes a small surface for product teams to request a GPU namespace. The module calls our provisioning API via a small provider (redwood/gpu-namespace).
+2) Provisioner API (internal, single-tenant control plane) — validates requests, enqueues jobs into a durable job queue, applies cloud infra templates, and patches the Kubernetes cluster via the operator CRDs.
+3) Kubernetes Operator (gpu-namespace-operator) — watches GPUNamespace CRs, creates Namespace and associated Kubernetes objects, deploys per-namespace egress-shaper DaemonSet or sidecar, attaches CSI PVs, and annotates telemetry.
+4) OPA policy/admission webhook — enforces guardrails (max CPUs on pods in GPU namespace, allowed hostNetwork usage, approved container registries).
+5) Egress shaping layer — CNI egress-shaper built on top of tc/iptables + eBPF policy hooks to implement SLO-aware bandwidth caps and burst tokens.
+6) Observability stack — Prometheus metrics, Fluentd/OTel logs, and an internal dashboard in the Console with per-namespace SLO and billing signal.
+
+Required SLOs and SLIs (owner: infra capacity / oncall)
+- Namespace creation success rate >= 99.5% (window: 30d)
+- Mean namespace provision latency <= 120s (API request -> namespace ready)
+- Egress cap compliance <= 0.1% violation (measured as percent of 5m windows with > configured limit)
+- Warm pool assignment latency for GPU-backed pods <= 30s for 95th percentile
+
+Key metrics to instrument
+- gpu_namespace_provision_latency_seconds (histogram)
+- gpu_namespace_provision_failures_total (counter)
+- gpu_namespace_egress_bytes_total{namespace}
+- gpu_namespace_egress_violation_count{namespace}
+- gpu_namespace_gpu_allocation_latency_seconds
+- tf_provider_apply_duration_seconds (pipeline metric)
+
+Operator CRD schema (summary)
+- GPUNamespace (apiVersion: infra.redwood/v1alpha1)
+  - spec:
+    - tenant_id: string
+    - gpu_profile: [t4-small, a10-large, mixed]
+    - vpc_subnet_id: string (optional)
+    - egress_policy: { bandwidth_mbps, burst_seconds, priority_class }
+    - pvc_template: { size_gb, storage_class }
+  - status: 
+    - phase: Pending|Provisioning|Ready|Failed|Deleting
+    - infra_ref: cloud resource ids
+
+Terraform module usage (example)
+```
+provider "redwood" { }
+module "gpu_namespace" {
+  source = "redwood/modules/gpu-namespace"
+  name   = "search-team-staging"
+  tenant_id = "ten-1234"
+  gpu_profile = "t4-small"
+  egress_policy = {
+    bandwidth_mbps = 100
+    burst_seconds  = 10
+    priority_class = "standard"
+  }
+  pvc_size_gb = 200
+}
+```
+
+Implementation notes for Terraform provider/adapter
+- The provider performs a single POST to the provisioning API and then polls the job status. The provider should be idempotent and map the module lifecycle to the GPUNamespace CR lifecycle.
+- All cloud infra changes (subnet creation, NAT gateway placement, route table entries) are executed by a templated Terraform run in a short-lived worker (not by the module directly), to reduce IAM surface in users' CI.
+
+Admission policies enforced by OPA
+- Max GPU count per namespace = 4 unless tenant is whitelisted.
+- No hostPath mounts outside /var/lib/redwood-approved.
+- All images must be from approved registries (list managed in configmap).
+- Egress policy must specify bandwidth_mbps within [10,1000].
+
+Egress shaping design and behavior
+- Egress policy is implemented via an eBPF + tc shim injected as a per-namespace DaemonSet.
+- Bandwidth limit is enforced with a token-bucket where tokens are replenished at the configured bandwidth_mbps. Burst_seconds defines the initial token bucket size.
+- To satisfy SLOs for latency-sensitive inference, the operator can attach a ‘priority_class’ and tag flows with tenant priority so the network fabric can apply fairness at edge proxies.
+- Violations are logged to a dedicated index and produce a metric (gpu_namespace_egress_violation_count).
+
+Operational runbook: common incidents
+Incident: namespace creation fails (status Failed)
+1) Check the GPUNamespace CR status: kubectl get gpuns -n infra -o yaml <name>
+2) Inspect controller logs: kubectl logs -n infra deploy/gpu-namespace-operator --since=1h | grep <name>
+3) If failure is during cloud infra apply, inspect provisioning API job: curl -sS https://provisioner.internal/api/jobs/<jobid> | jq .
+4) Remediation: retry the TF worker job via the API: POST /api/jobs/<jobid>/retry. If IAM errors, run the local iam-debug script in the TF worker image.
+5) Escalation: if system rate limits are hit or persistent cloud API errors, page infra-cloud-oncall and include the job id and account id.
+
+Incident: egress shaping misbehavior (high violations)
+1) Check per-namespace egress metrics in Prometheus: gpu_namespace_egress_bytes_total and gpu_namespace_egress_violation_count
+2) Verify the DaemonSet pods: kubectl -n gpu-shapers get pods -l namespace=<tenant>
+3) Exec into the shaper pod and run tc qdisc show dev eth0 and bpftool prog list to confirm policies are loaded.
+4) If tc missing, restart the shaper pod: kubectl -n gpu-shapers rollout restart daemonset/gpu-egress-shaper && monitor for reattachment.
+5) If violations persist after shaper is healthy, check NAT gateway throughput and ALB target weights; escalate to infra-networking if egress spikes exceed account soft limits.
+
+CI/CD and testing strategy for changes
+- Unit tests: controller business logic and Terraform provider simulated responses.
+- Integration tests: ephemeral AWS account with a single cluster (run in ephemeral CI lane) – validate full flow (TF apply -> API -> operator -> namespace Ready). These are run nightly and gate merges for critical changes.
+- Canary: new operator canary is deployed to 10% of provisioner jobs for 48h; metrics are mirrored to canary dashboards.
+- Safety gates: any change that touches egress-shaper must include perf benchmarks showing <5% added p95 latency in synthetic inference traffic.
+
+Terraform module inputs and outputs (compact reference)
+Inputs: name, tenant_id, gpu_profile, egress_policy.bandwidth_mbps, egress_policy.burst_seconds, pvc_size_gb, approved_contact_email
+Outputs: namespace_name, gpu_namespace_cr_id, prov_job_id, cloud_resources (map of ids), dashboard_url
+
+Security and IAM considerations
+- The TF worker uses a short-lived role assumed via STS with tight scoping to create subnets/NATs and tag resources with tenant_id.
+- Secrets for privileged operations (e.g., API token to post to provisioner) are stored in the TF worker worker-kv in Vault and rotated every 30 days.
+- Audit: every change to a GPUNamespace generates an audit line (user, time, action, job_id) forwarded to our centralized audit index.
+
+Migration path for existing namespaces
+1) Export current tenant configuration and annotate with tenant_id.
+2) Run a dry-run migrate tool that creates GPUNamespace CRs in Pending state and validates cloud resource mapping.
+3) For namespaces where the dry-run matches existing infra, mark as Ready; otherwise open a migration ticket for manual reconciliation.
+
+Rollout plan
+- Phase 1 (internal alpha): expose module to Platform and Search teams only; deploy operator canary at 5% traffic. Verify metrics and fix OPA policy edge cases.
+- Phase 2 (beta): open to all internal teams with quota guardrails; integrate on-call playbooks and billing exports.
+- Phase 3 (GA): public module, docs in Console, formal SLA and runbook for 24x7 oncall.
+
+Ownership and contact
+- Service owner: Aisha Patel (infra capacity)
+- Primary oncall: infra-cloud-oncall rotation; use #infra-gpu namespace channel for async updates.
+
+Appendix: useful commands and debugging snippets
+- Get GPUNamespace CRs: kubectl get gpuns -A
+- Tail operator logs: kubectl -n infra logs -f deploy/gpu-namespace-operator
+- Check TF worker job status: curl -H "Authorization: Bearer $TOKEN" https://provisioner.internal/api/jobs/<id>
+- Restart shaper DaemonSet: kubectl -n gpu-shapers rollout restart daemonset/gpu-egress-shaper
+
+References and related reading
+- Egress shaping design notes (internal): /confluence/eng-infra/cloud-accounts-and-networking/egress-fairness-request-shaper-and-proxy-patterns.json
+- Terraform provider RFC (internal): /confluence/eng-infra/terraform-and-iac/tf-provider-design-rfc.json
+- OPA admission policy guide: /confluence/security-and-compliance/rbac-and-auth/opa-admission-integration-guide.json
+
+Changelog
+- 2025-09-12: Created initial design (Sana Li)
+- 2025-11-20: Added eBPF shaper implementation notes and SLO targets (Ravi Desai)
+- 2026-02-15: Clarified TF provider idempotency and CI canary gating (Elena Park)

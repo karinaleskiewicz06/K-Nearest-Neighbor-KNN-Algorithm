@@ -1,0 +1,135 @@
+Inference transaction boundaries and causal consistency playbook
+
+Summary
+-------
+This playbook defines a lightweight, implementable set of conventions (API headers, server-side semantics, observability hooks, and operational runbook steps) for bounding inference "transactions" and enforcing causal consistency across multi-request interactions with Redwood Inference services. The goal is to make multi-step or streamed generation, side‑effecting tool calls, and retry patterns predictable and debuggable without mandating heavyweight distributed transactions.
+
+Goals
+-----
+- Provide a consistent, low-friction transaction envelope for inference requests that span multiple network calls or model variants.
+- Ensure causal ordering and a reproducible lineage for outputs where application correctness depends on a sequence of prompts or stateful cache use.
+- Make retries and failover deterministic by defining idempotency and compensation semantics at the API level.
+- Surface telemetry and diagnostic signals that make post-facto reconstruction and debugging straightforward.
+
+Scope
+-----
+Applies to: hosted Redwood API endpoints (generation, chat, embeddings), Dedicated runtimes, and the runtime-sidecar used in Private deployments. Does NOT mandate cross-account distributed locking. This is a pragmatic set of rules to be implemented in: request gateways, runtime frontends, and SDK client libraries.
+
+Definitions
+-----------
+- Transaction: a bounded logical unit of work from a client perspective. It may be a single request or a sequence of requests that must be causally ordered (e.g., chat + tool invocation + follow-up prompt).
+- Causal Token: an opaque client-supplied or server-returned token that binds subsequent requests to prior outputs and cache entries.
+- Effective Model Variant: the actual model binary/quantization variant used to satisfy a request (visible in telemetry).
+- Deterministic Replay: the ability to reproduce the same output sequence when replaying the same transaction envelope, within model nondeterminism bounds.
+
+Design Principles
+-----------------
+1. Lightweight tokens over locks: prefer causal tokens and versioned caches instead of distributed locks to avoid blocking latency-sensitive inference paths.
+2. Explicit boundaries: clients opt-in to transactional semantics via headers/fields; default (stateless) behavior remains cheapest and simplest.
+3. Observable lineage: every transaction emits a compact lineage header and structured telemetry to make reconstruction possible.
+4. Bounded guarantees: document the precise guarantees (causal ordering, idempotency, replay fidelity) and the conditions under which they degrade (e.g., model fallback, quantization change).
+
+API contract (recommended headers / body fields)
+-----------------------------------------------
+Use these headers when starting or continuing a transaction:
+- X-RW-Txn-Id: client-generated UUID for the logical transaction. If omitted, the request is treated as a single-shot transaction.
+- X-RW-Txn-Mode: one of {single, causal-seq, best-effort-causal}. Defaults to single.
+- X-RW-Causal-Token: server-generated opaque token used to bind future requests to server-side KV/prefix cache. Present only after the first response.
+- X-RW-Expect-Replayable: boolean indicating that the client requires best-effort replayability.
+- X-RW-Model-Intent: optional hint (text generation / structured-fill / rerank) used to select consistent variant families.
+
+Request envelope (JSON example)
+- The client MAY include a compact transaction envelope in the request body for multi-part flows: 
+{
+  "txn_id": "<uuid>",
+  "step": 1,
+  "parent_event": "<opaque-event-id>",
+  "prompt": "Summarize the following...",
+  "metadata": {"trace_id":"..."}
+}
+
+Server response (key fields)
+- txn_id: echoed or assigned transaction id.
+- causal_token: opaque string for binding to caches.
+- effective_model: canonical name + semantic version of the variant used (e.g., rw-arch/transformer-v2@quant8r-2026-02-01).
+- lineage_event_id: unique event id for this step (used in tracing).
+
+Guarantees and tradeoffs
+------------------------
+- single mode: no server-side binding to KV cache; idempotency follows ETag-style request deduplication only. Lowest latency and cost.
+- causal-seq: server guarantees that requests with same X-RW-Txn-Id and sequential step numbers will be served with causal ordering with respect to prefix/KV caches and offline buffer state on a best-effort basis. If the runtime must route across variants that are non-compatible (e.g., different tokenizer/quantization that changes tokenization semantics), server returns 409 + incompatible-variant code and a suggested fallback.
+- best-effort-causal: softer guarantee. The server will try to keep ordering and reuse prefix/KV caches but may rehydrate from a checkpoint or offer an explicit ReplayHint to the client.
+
+Observability contract
+----------------------
+Every request/response pair participating in a transaction must include these telemetry fields in logs/metrics:
+- txn_id, lineage_event_id, parent_event_id, causal_token (hashed), effective_model, model_variant_hash, node_shard_id.
+- emit a compact "transaction-summary" structured log at transaction commit or after N steps; include cumulative token counts, latency percentiles, and fallback events.
+
+Table: Boundary types and guarantees (text table)
+- single | no inter-request causal guarantees | idempotent when request-id provided | lowest cost
+- causal-seq | ordered with prefix/KV reuse, stronger replay hints | requires txn_id and step | recommended for multi-step apps
+- best-effort-causal | best-effort ordering, ReplayHint on mismatch | useful for cross-variant failover | moderate cost
+
+Cache and KV semantics
+----------------------
+- Causal tokens bind to a visible cache namespace: caches are namespaced by (tenant, txn_id) and have TTL semantics configured by transaction lifecycle.
+- Replication: caches are replicated as usual for redundancy but causal tokens include a generation number so stale cache entries can be detected.
+- Invalidation: client may send X-RW-Invalidate-Key: <key> to force eager invalidation inside a transaction. This operation is non-atomic and will not block; clients must handle read-after-write semantics via step ordering.
+
+Idempotency and retry model
+---------------------------
+- Each step should be idempotent when a step_id is supplied: step_id + txn_id forms a deduplication key stored for a TTL.
+- Retries SHOULD be client-first: SDKs should use exponential backoff and attach the same txn_id+step_id so servers can deduplicate.
+- Compensation: For side-effects (tool calls, external writes), include a compensation URL/callback in the request metadata. The runtime will attempt delivery but makes no hard guarantee; applications must implement eventual reconciliation.
+
+Model variant and downgrade handling
+----------------------------------
+- The response must indicate effective_model. If the runtime substitutes a lower-capacity or quantized variant due to capacity, it must also include ReplayHint and QualityDelta estimates in the response metadata.
+- Replay fidelity is best-effort across variants in the same compatibility family; we record model_variant_hash to allow offline differential regression analysis.
+
+Operational runbook (short)
+--------------------------
+1. Detection: high rate of 409-incompatible-variant responses or ReplayHint incidents should trigger an investigation; alert threshold: >0.5% of transactions in a 5-minute window.
+2. Immediate mitigation: enable canary routing to pinned-variant pool for affected tenants or raise adaptive priority.
+3. Reconciliation: run the deterministic-replay harness (see related page) for affected txn_ids using recorded prompts and model_variant_hash.
+4. Postmortem: annotate the transaction-summary logs with resolution and update variant compatibility ledger if necessary.
+
+Rollout checklist (for SDKs and gateway)
+----------------------------------------
+- Gateway: accept and forward txn headers; propagate lineage_event_id to tracing.
+- SDK: expose transactional primitives: start_txn(), step(txn_id, step_id), commit(txn_id). Default to single-mode unless developer explicitly uses transaction APIs.
+- Runtime: implement dedup stores (TTL 24h by default), causal token issuance, and effective_model annotation.
+- Telemetry: add transaction-summary log and associated dashboards (SLOs below).
+
+SLOs and alerts (recommended)
+----------------------------
+- Transaction replay error rate: <0.1% per tenant per day. Alert at 0.5%.
+- Causal ordering latency impact (p95 extra latency due to causal enforcement): <10ms for in-region, alert if >50ms.
+- Incompatible-variant responses: <0.1% of transaction steps; alert if >0.5% in 5m window.
+
+Ownership and implementation plan
+--------------------------------
+- Owner: Serving Runtime team (primary) with SDKs work owned by Eng Developer Experience (secondary).
+- Phase 1 (Q4 2025): implement headers, dedup store, telemetry fields in hosted API.
+- Phase 2 (Q1 2026): SDK primitives and canary runtime pinned-variant routing.
+- Phase 3 (Q2 2026): extend to Dedicated and Private runtimes, document guarantees for on-prem packaging.
+
+Appendix: example failure codes and client actions
+--------------------------------------------------
+- 409 INCOMPATIBLE_VARIANT: client should either restart transaction with single-mode or surface a choice to user.
+- 423 TXN_LOCKED: transient; retry after backoff.
+- 412 REPLAY_NOT_POSSIBLE: client must surface to user and optionally restart as a new txn.
+
+Related documents and artifacts
+------------------------------
+- Deterministic replay harness (internal link in related_pages).
+- Variant compatibility ledger (team-owned spreadsheet tracked in product-docs).
+- SDK design doc with code examples (ENG-DEVEX).
+
+Notes and open questions
+------------------------
+- We do not attempt strong cross-tenant transactional guarantees; if a customer requires multi-resource atomicity, recommend an application-level orchestrator.
+- Future work: integrate an optional vector of random seeds to improve deterministic replay fidelity for models that accept explicit seeds.
+
+This playbook is intentionally pragmatic: it provides clear, implementable mechanics that balance latency and determinism across our deployment modes while giving application developers predictable semantics for multi‑step inference flows.

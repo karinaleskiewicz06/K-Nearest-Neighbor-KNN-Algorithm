@@ -1,0 +1,173 @@
+Paged KV: Compact Sweep + Granular Pin Coordinator Rollout Guide
+
+This page describes how to safely roll out (and roll back) the paged-KV compact sweep reclamation pass and the granular pin coordinator in production. These changes reduce fragmentation and pin-induced allocator stalls, improving 99p latency under mixed workloads. The guide includes recommended configs, feature gates, dashboards, canary procedure, and known failure modes.
+## Background
+Long-lived pins and coarse reclamation can cause tail-latency spikes and fragmentation in the paged KV backend. The compact sweep pass opportunistically coalesces sparse blocks; the granular pin coordinator tracks mini-span pins inside blocks to avoid head-of-line blocking during eviction/reuse contention.
+
+This guide is a production-facing update to the implementation that landed in redwood#91534. Since the PR merged, rollout controls, metric names, and default gating have been updated based on perf-canary and two real-world regressions (see “Known issues & mitigations”).
+
+## What changed (operator view)
+### Compact sweep
+- Runs opportunistically when the allocator reports sufficient slack.
+- Moves live mini-spans into denser blocks and releases empty blocks back to the global pool.
+- Adds bounded background CPU work to reduce fragmentation and improve reuse.
+
+### Granular pin coordinator
+- Exposes per-mini-span pin tokens.
+- Fast-path acquisition via atomic bitmap/refcount; fallback path uses a short wait strategy before parking.
+- Integrates with eviction scoring (frecency + pin density) to prefer reclaim candidates with fewer pinned spans.
+
+## Feature gates and current defaults
+The original PR introduced a scheduler gate named `kv.background_pin_lane`. During rollout hardening (Dec 2025–Jan 2026), we standardized flags and changed defaults.
+
+### Gates
+1) Scheduler background lane for long pins
+- Old key (deprecated): `kv.background_pin_lane`
+- New key: `kv.pin_coordinator.background_lane_enabled`
+- Current default: true in canary, false in general production unless explicitly enabled by service config (see “Rollout procedure”).
+
+2) Compact sweep enablement
+- Key: `kv.compact_sweep.enabled`
+- Current default: true for paged-KV enabled services.
+
+3) Compact sweep aggressiveness
+- Keys: `kv.compact_sweep.min_free_ratio`, `kv.compact_sweep.max_cpu_pct`, `kv.compact_sweep.max_move_bytes_per_run`
+- Notes: `max_move_bytes_per_run` was added after perf-canary feedback to cap worst-case relocation bursts.
+
+## Recommended configuration (2026-02)
+Use these as baseline values. Adjust per cluster based on workload mix and SLO sensitivity.
+
+### Baseline (safe)
+- `kv.compact_sweep.enabled=true`
+- `kv.compact_sweep.min_free_ratio=0.18`
+- `kv.compact_sweep.max_cpu_pct=1.0`
+- `kv.compact_sweep.max_move_bytes_per_run=268435456`  (256 MiB)
+- `kv.pin_coordinator.enabled=true`
+- `kv.pin_coordinator.background_lane_enabled=false`
+
+### Performance-optimized (after canary success)
+- `kv.compact_sweep.enabled=true`
+- `kv.compact_sweep.min_free_ratio=0.12`
+- `kv.compact_sweep.max_cpu_pct=2.0`
+- `kv.compact_sweep.max_move_bytes_per_run=536870912`  (512 MiB)
+- `kv.pin_coordinator.enabled=true`
+- `kv.pin_coordinator.background_lane_enabled=true`
+
+## Observability
+### Key metrics (current names)
+Metric names were normalized after the PR. If your dashboard uses older names, update it.
+
+Compact sweep:
+- `kv.compact_sweep.runs_total`
+- `kv.compact_sweep.coalesced_blocks_total`
+- `kv.compact_sweep.moved_bytes_total`
+- `kv.compact_sweep.run_duration_ms`
+- `kv.compact_sweep.throttled_total` (incremented when CPU budget or move cap prevents additional work)
+
+Pin coordinator:
+- `kv.pin_coordinator.active_tokens`
+- `kv.pin_coordinator.wait_latency_ms` (histogram)
+- `kv.pin_coordinator.waiters`
+- `kv.pin_coordinator.fallback_path_total`
+
+Allocator / fragmentation:
+- `kv.paged_allocator.fragmentation_index` (0..1)
+- `kv.paged_allocator.free_ratio`
+- `kv.paged_allocator.eviction_stalls_ms` (histogram)
+
+Scheduler lane (when enabled):
+- `scheduler.background_lane.queue_depth`
+- `scheduler.background_lane.run_latency_ms`
+
+### Traces / logs
+- Traces: `compactSweep()` spans include tags `moved_bytes`, `coalesced_blocks`, `throttled`.
+- Pin acquisition traces include tags `fast_path=true|false`, `wait_ms`.
+- Log sampling: keep at <= 0.1% for pin wait warnings; otherwise high-QPS services can flood.
+
+### SLO signals to watch during canary
+- Serving 99p/99.9p latency
+- OOM / RSS growth rate
+- Token cost or GPU utilization (service-dependent)
+- `kv.pin_coordinator.wait_latency_ms` p99
+- `kv.paged_allocator.eviction_stalls_ms` p99
+
+## Rollout procedure
+### 0) Preconditions
+- You are on a runtime build that includes the post-merge config normalization (>= runtime v1.19.3).
+- You have dashboards updated to the metric names above.
+- You can revert flags without redeploy (dynamic config or config-map reload).
+
+### 1) Canary: enable compact sweep only (recommended order)
+1. Set `kv.compact_sweep.enabled=true` (if not already).
+2. Start with baseline settings:
+   - `min_free_ratio=0.18`, `max_cpu_pct=1.0`, `max_move_bytes_per_run=256MiB`.
+3. Run for 24 hours.
+4. Success criteria:
+   - Fragmentation index drops by >= 20% relative to baseline over comparable traffic.
+   - No sustained increase in tail latency (> 2% at p99) and no elevated eviction stall p99.
+
+### 2) Canary: enable granular pin coordinator (if not already default)
+1. Set `kv.pin_coordinator.enabled=true`.
+2. Keep `kv.pin_coordinator.background_lane_enabled=false` initially.
+3. Run for 24 hours.
+4. Success criteria:
+   - Reduction in `kv.paged_allocator.eviction_stalls_ms` p99 (target: 10–25% depending on workload).
+   - `kv.pin_coordinator.fallback_path_total` stable or decreasing after warm-up.
+
+### 3) Canary: enable background lane for long pins (optional)
+1. Set `kv.pin_coordinator.background_lane_enabled=true`.
+2. Run for 24–72 hours.
+3. Success criteria:
+   - No throughput regression on continuous batching.
+   - Background lane queue depth remains bounded (no persistent growth).
+
+### 4) Ramp-up
+- Ramp 1% -> 5% -> 25% -> 50% -> 100% by cluster, holding at least 12 hours per step.
+- Use the same step schedule for enabling background lane.
+
+## Rollback procedure
+If any of the following occurs, rollback the most recent step first:
+- Sustained p99 latency increase > 5% for 30 minutes.
+- OOM events increase or RSS growth accelerates unexpectedly.
+- `kv.pin_coordinator.wait_latency_ms` p99 increases > 2x baseline.
+
+Rollback order:
+1) Disable background lane: `kv.pin_coordinator.background_lane_enabled=false`
+2) If still bad, disable pin coordinator: `kv.pin_coordinator.enabled=false`
+3) If still bad (rare), disable compact sweep: `kv.compact_sweep.enabled=false`
+
+Notes:
+- Disabling compact sweep may increase fragmentation over hours; plan for a follow-up defragmentation window if needed.
+
+## Expected performance impact (field data)
+The original microbench numbers in redwood#91534 remain directionally correct, but production outcomes vary by workload.
+
+Observed ranges in canary (Nov 2025–Feb 2026):
+- 99p latency: 12–25% improvement for short-sequence / mixed hot-cold traffic; minimal change for long-context dominated traffic.
+- Fragmentation index: 25–45% reduction after 6–24 hours of steady traffic.
+- Token cost: 3–7% improvement where eviction/reuse contention was a limiter.
+
+## Known issues & mitigations
+1) Burst relocation causing short CPU spikes
+- Symptom: `kv.compact_sweep.run_duration_ms` and host CPU jump, correlated with small latency blips.
+- Mitigation: lower `kv.compact_sweep.max_cpu_pct` or `kv.compact_sweep.max_move_bytes_per_run`.
+
+2) High contention pin waits under pathological micro-span churn
+- Symptom: `kv.pin_coordinator.wait_latency_ms` p99 increases and `fallback_path_total` climbs.
+- Mitigation: ensure background lane is disabled initially; if enabling, confirm background lane queue depth stays bounded. Consider raising allocator free ratio target (service-specific).
+
+3) Config key mismatch after standardization
+- Symptom: changes to `kv.background_pin_lane` have no effect.
+- Mitigation: migrate to `kv.pin_coordinator.background_lane_enabled`. The old key is ignored in runtime >= v1.19.3.
+
+## Ownership & support
+- Primary owner: Serving Runtime (Kernel & Scheduling)
+- Escalation: #eng-serving-runtime-oncall
+- Related work items: ENG-7342, ENG-7460
+
+## Appendix: quick validation checklist
+- [ ] Confirm `kv.paged_allocator.free_ratio` is stable after enabling compact sweep.
+- [ ] Confirm fragmentation index trends downward over a full diurnal cycle.
+- [ ] Confirm eviction stalls p99 is not worse than baseline.
+- [ ] Confirm pin coordinator wait latency p99 is stable.
+- [ ] If background lane enabled, confirm scheduler queue depth is bounded.

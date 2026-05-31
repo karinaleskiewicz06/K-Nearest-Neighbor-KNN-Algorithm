@@ -1,0 +1,147 @@
+Autonomic Error Budget Controller — Playbook and Runbook
+
+Summary:
+This document describes the design, operational runbook, and incident procedures for the Autonomic Error Budget Controller (AEBC): an automated control plane that enforces SLO-aware mitigations across model-serving and gateway layers. The AEBC reduces manual toil during SLO pressure events by performing tiered throttles, priority hedging, and temporary routing degradations while preserving core availability and providing audit trails for incident review.
+
+Scope and intended audience:
+- Audience: SREs, runtime platform engineers, oncall responders, and incident commanders.
+- Services in scope: model-gateway (gateway-rpc), inference-runtime (runtime-v2), batching-service, tenant-router, and the global traffic-orchestrator.
+- Not in scope: customer billing systems (handled by finance/team).
+
+Definitions and key concepts:
+- Error budget (EB): remaining allowable SLI failures for a rolling window (typically 7d).
+- Tiered EB windows: fast-window (1h) for immediate action, medium-window (24h) for corrective capacity changes, long-window (7d) for policy/contract actions.
+- Autonomic mitigation: automated actions taken by AEBC (soft-throttle, priority-gating, fallback-routing).
+- Predictive hedging: short-term capacity reservation triggered by leading indicators (queue growth, tail-latency slope).
+
+Design overview:
+- Controller inputs: aggregated SLIs (p95 latency, error-rate, availability), per-tenant request envelopes, capacity metrics (GPU util, queue depth), and predictive models (latency trend).
+- Decision layer: configurable policy engine that maps EB thresholds to mitigation primitives with confidence scoring. Policies are versioned and stored in config store (kv://sre/ae/bundle).
+- Action layer: writes intent to the traffic-orchestrator (ORCHESTRATOR API) and runtime-control plane (runtime-api) with 1-minute reconciliation. Actions are idempotent and tagged with incident_id and policy_version.
+- Observability: AEBC emits audit events to event-log (kafka://ae-audit) and exposes metrics: ae_actions_total, ae_policy_triggered, ae_confidence, ae_reconcile_lag.
+
+Operational policies (defaults):
+- Green: EB >= 50% (no autonomic actions).
+- Watch: EB 20%–50% or fast-window deterioration -> enable predictive hedging for 5–15 minutes.
+- Restrict: EB 10%–20% -> soft-throttle 20% of non-critical traffic, enable priority queueing for premium tenants.
+- Protect: EB < 10% -> escalate to oncall, hard-throttle to 50% of best-effort classes and route new sessions to regional fallbacks.
+
+Owner and escalation paths:
+- AEBC primary owner: eng-sre/traffic-ops (oncall rotation: traffic-ops@redwood.com).
+- Escalation: traffic-ops -> runtime-sre -> eng-platform -> incident-commander.
+
+Preconditions before enabling Autonomic Mode manually:
+1) Confirm SLO dashboards (p95 latency and error-rate) are healthy and alerting is wired to PagerDuty.
+2) Validate that the audit pipeline (kafka://ae-audit) is healthy and consumer lag < 5k messages.
+3) Ensure canary policy bundle is deployed and policy_version matches release tag in /ops/policy-manifest.
+
+Runbook: Immediate responder steps when AEBC triggers Protect/Restrict
+1. Triage: check AEBC UI + incident id. Record the following in incident timeline: trigger_time, policy_version, affected_services, tenant_impact_score.
+2. Verify telemetry: Confirm p95, error-rate, GPU util, and queue depth for runtime-v2 and gateway-rpc. Use the following queries: 
+   - PromQL p95 latency (gateway-rpc):
+     quantile_over_time(0.95, gateway_request_duration_seconds_sum[1h]) / quantile_over_time(0.95, gateway_request_duration_seconds_count[1h])
+   - PromQL queue depth (batching-service):
+     sum(batch_queue_depth) by (region)
+3. Confirm AEBC action via audit log: 
+   curl -s "https://ops-api.internal/ae/audit?incident_id=INC12345" | jq '.events[-5:]'
+4. Validate whether action is desired: If AEBC soft-throttle is reducing non-critical traffic and latency is dropping, monitor for 10 minutes. If latency continues to worsen, escalate.
+5. If action caused customer-visible regressions (e.g., high 5xx or aborted sessions for premium tenants), immediately run rollback: 
+   - Command to reverse AEBC action: 
+     POST https://ops-api.internal/ae/intent-reconcile 
+     Headers: Authorization: Bearer $SRE_TOKEN
+     Body: {"incident_id":"INC12345","action":"revoke","scope":"tenant:premium"}
+   - Monitor audit events for revocation confirmation.
+6. If controller is not reconciling (ae_reconcile_lag > 30s), run controller health check: systemctl status ae-controller; journalctl -u ae-controller -n 200.
+
+Automated mitigation primitives (examples):
+- soft-throttle: reduce concurrency tokens for a traffic class (graceful, per-connection).
+- weight-shift: move 30% of best-effort traffic to next-best compatible model (quantized variant).
+- cache-boost: increase KV prefix cache retention for hot prefixes.
+- canary-fallback: route new sessions to a region with lower utilization for a short TTL.
+
+Sample policy bundle (YAML):
+---
+policy_version: "2027.01.12-ae-v1"
+rules:
+  - id: hedging-rule-1
+    trigger: "fast_window_error_rate > 0.02 and p95_slope > 0.05"
+    actions:
+      - type: predictive_hedge
+        reserve_gpus: 2
+        duration: 10m
+  - id: protect-rule-high
+    trigger: "long_window_remaining < 0.10"
+    actions:
+      - type: hard_throttle
+        target: "class:best_effort"
+        percent: 50
+      - type: notify
+        channel: "#aebc-alerts"
+---
+
+Alerting and telemetry requirements:
+- Required AEBC alerts (examples):
+  - AEBC_Lagging_Reconcile (ae_reconcile_lag > 30s for 5m): PagerDuty severity P1 to traffic-ops.
+  - AEBC_Confidence_Drop (ae_confidence < 0.25 for 2m): PagerDuty P2.
+  - AEBC_Policy_Throttle_Initiated (ae_policy_triggered{severity=\"protect\"} >= 1): Slack alert to #aebc-alerts.
+
+SLI and SLO configuration guidelines (per-service):
+- gateway-rpc: availability SLO 99.95% (7d rolling), p95 latency SLO 200ms (1d rolling).
+- runtime-v2: availability SLO 99.9% (7d), p95 latency SLO 350ms (1d).
+- batching-service: throughput SLO 99% of expected throughput during business hours.
+
+Capacity planning integration:
+- AEBC writes predictive-hedge requests to capacity-planner service with tags: region, service, requested_gpus, priority. Capacity planner will:
+  1) Attempt to allocate from spare reserved pool (dedicated-reserve).
+  2) If not available, notify capacity-ops and create temporary burst ticket with 15-minute SLA.
+- For long-term trends (multiple hedges over 24h), schedule capacity review: capacity-planning@redwood.com will open a remediation ticket and assign to runtime-capacity squad.
+
+Incident review and post-incident requirements (when AEBC actions were involved):
+1. Add a dedicated AEBC section to the postmortem capturing: policy_version, trigger_expression, action_ids, reconcile_lag, audit_events slice (first/last 5).
+2. Run delta analysis: compare p95 and throughput 30 minutes before vs 60 minutes after AEBC action. Include charts in the postmortem.
+3. If AEBC took an incorrect action (false positive), file a policy bug and roll the policy bundle back to previous stable version. Label: aebc-false-positive.
+4. Document learnings as either a new rule refinement or a model improvement task (e.g., improve p95_slope predictor).
+
+Playbook for policy changes and releases:
+1. Author policy change in policy repo: /repos/ae-policies (branch: feature/<ticket>).
+2. Add unit tests and a canary manifest that targets a small internal tenant.
+3. Submit PR and include simulation results (load tests showing >= 5% improvement under constraint).
+4. Merge -> policy-bundler CI stages: lint -> unit tests -> integration-sim -> publish to kv://sre/ae/bundle as new version.
+5. Post-deploy: monitor ae_policy_triggered and ae_confidence for 30 minutes. If regressions, automatically roll to previous version within 30 minutes.
+
+Audit and compliance considerations:
+- All AEBC actions must carry: incident_id, operator (automated or user id), policy_version, and justification string.
+- Audit events are retained for 365 days in S3 (s3://aebc-audit-archive) and indexed in the event search service for forensics.
+
+Appendix A — Example Prometheus alert (YAML):
+ALERT AEBC_Reconcile_Lag
+  IF ae_reconcile_lag_seconds > 30
+  FOR 5m
+  LABELS { severity = "P1", team = "traffic-ops" }
+  ANNOTATIONS { summary = "AEBC controller not reconciling actions within expected window", runbook = "/confluence/eng-sre/operational-tooling/sre-autonomic-error-budget-controller-playbook-2027" }
+
+Appendix B — Common troubleshooting commands:
+- Check controller health and version:
+  curl -sS https://ops-api.internal/ae/health | jq
+  systemctl status ae-controller
+- Fetch recent audit events for an incident:
+  curl -s "https://ops-api.internal/ae/audit?incident_id=INC...&limit=100" | jq
+- Revoke an action (example):
+  curl -X POST https://ops-api.internal/ae/intent-reconcile -H "Authorization: Bearer $SRE_TOKEN" -d '{"incident_id":"INC...","action":"revoke","scope":"tenant:best_effort"}'
+
+Document ownership and maintenance:
+- Primary maintainer: Aisha Patel (eng-sre).
+- Review cadence: quarterly (labels: aebc, policy-review).
+- Major version bump required when changing trigger semantics or action primitives.
+
+Change log (high-level):
+- 2026-11-15: Initial draft and canary policy examples.
+- 2026-12-20: Added predictive hedging guidelines and capacity integration.
+- 2027-02-03: Added post-incident audit requirements and rollback procedure.
+
+Related reading and references:
+- /confluence/eng-sre/runbooks/slo-rollout-readiness-and-capacity-checklist-2026
+- /confluence/eng-sre/incident-review/model-serving-regression-incident-review-standards-2026
+- /repos/ae-policies/README.md
+
+End of document.

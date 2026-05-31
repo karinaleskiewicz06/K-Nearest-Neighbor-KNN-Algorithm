@@ -1,0 +1,346 @@
+Reliability Plan: Safe Apply + Rollback for Optimization Configs
+
+## Summary
+This document defines the reliability targets, observability requirements, alerting strategy, and operational KPIs for **Safe Apply + Rollback** of versioned **Optimization Configs** (batching, caching, and quantization profiles) across Hosted, Dedicated, and Private deployments.
+
+The intent is to make optimization/config changes:
+- **Predictable:** gated by health/quality signals before broad rollout.
+- **Reversible:** one-click rollback with clear semantics and bounded time-to-mitigate.
+- **Auditable:** end-to-end traceability (who/what/when/where) and correlation to SLO impact.
+
+Owner: **SRE (Eng-SRE)** in partnership with **Platform Control Plane** and **Serving Runtime**.
+
+---
+
+## Goals
+1. Define **SLOs** for config-change operations (validate/apply/promote/rollback) and the surrounding rollout controller.
+2. Specify **gating signal requirements** (latency, errors, saturation; plus eval/quality for quantization) and how we alert on failures.
+3. Establish operational **KPIs** (change failure rate, MTTR, rollback frequency) and required tagging for accurate attribution.
+4. Provide launch readiness criteria and gameday expectations.
+
+## Non-goals
+- Designing the config versioning model or Console UX (covered in Platform/Console docs).
+- Automatically rolling back for all customers by default (may be enabled for select internal/limited accounts).
+- Defining model-quality evaluation methodologies beyond the gating thresholds and required integrations.
+
+---
+
+## Definitions (terms used in metrics and alerts)
+- **Optimization Config Version**: immutable config object version stored in the control plane.
+- **Active version**: version currently targeted for traffic for a given scope (tenant/model/region).
+- **Safe Apply**: staged rollout (canary → progressive) with gates; supports pause/resume.
+- **Promote**: marking a version as the new stable/active version for scope.
+- **Rollback**: reverting active target version to a prior known-good version.
+- **Scope**: the blast radius boundary. At minimum includes `{tenant_id, model_id, region}`. Some rollouts additionally include `{deployment_id}` (Dedicated) or `{cluster_id}` (Private).
+- **Rollout job**: the control-plane job that coordinates staged apply + gating.
+- **Runtime apply**: worker-side application of the config version (idempotent), including cache invalidation behavior.
+
+---
+
+## SLOs
+We track SLOs as **internal SLOs** for the Safe Apply + Rollback system. These do not directly map to customer inference uptime SLOs, but are designed to prevent config changes from causing customer impact.
+
+### SLI sources
+- Control plane service logs/metrics (Optimization Config Service + rollout controller)
+- Serving runtime metrics for apply status and worker convergence
+- Standard inference SLO metrics (5xx, p95/p99) segmented by `config_version`
+- Evals harness metrics (quantization gates)
+
+### SLO 1: Rollout gate correctness (safety)
+**Intent:** When a rollout causes a regression beyond thresholds, the system should detect it and either pause or fail the rollout before broad impact.
+
+- **SLI:** % of rollouts where a regression breach is detected and the rollout is **paused/failed** before reaching the next stage.
+- **Target:** ≥ 99.0% per quarter (internal).
+- **Notes:** This is evaluated via gamedays + controlled failure injections (see “Validation & Gamedays”).
+
+### SLO 2: Rollout controller availability
+**Intent:** Operators should be able to initiate apply/pause/rollback actions during incidents.
+
+- **SLI:** Successful requests / total requests for rollout operations (apply/pause/resume/rollback endpoints), excluding 4xx due to authz.
+- **Target:** ≥ 99.9% monthly.
+- **Error budget policy:** If below target for 2 consecutive weeks, we freeze non-critical feature work and prioritize reliability fixes.
+
+### SLO 3: Rollback time to mitigate (TTM)
+**Intent:** Once an operator initiates rollback, we should restore steady-state inference performance quickly.
+
+- **SLI:** Time from `rollback.requested` to `rollback.converged` (worker convergence) OR to `inference.p95` returning within baseline band (whichever is later).
+- **Target:**
+  - Hosted/Dedicated: p95 TTM ≤ 10 minutes, p99 TTM ≤ 20 minutes (monthly).
+  - Private: p95 TTM ≤ 25 minutes, p99 TTM ≤ 45 minutes (monthly), assuming operator follows documented procedure.
+
+### SLO 4: Apply convergence
+**Intent:** Progressive applies should converge quickly without leaving mixed worker states.
+
+- **SLI:** For each stage, time from `stage.started` to `stage.converged` (≥ 99% of targeted workers report applied version).
+- **Target:** p95 ≤ 15 minutes, p99 ≤ 30 minutes.
+- **Special case:** Large fleets with intentional slow-roll windows must declare overrides (see “Overrides & Guardrails”).
+
+### SLO 5: Audit log completeness for change operations
+**Intent:** Every config lifecycle action must be logged for security and customer auditability.
+
+- **SLI:** % of change operations that emit the expected audit event(s) with required fields.
+- **Target:** ≥ 99.99% monthly.
+- **Implementation note:** measured by internal audit pipeline reconciliation (counts from service vs. SIEM export).
+
+---
+
+## Gating signals and default thresholds
+Gating rules are evaluated per rollout stage. Thresholds vary by environment; below are **default safe thresholds** used unless a scoped exception is approved.
+
+### Health gates (all optimization changes)
+**Windowing:**
+- Canary stage: evaluate over a 5–10 minute rolling window (configurable by stage).
+- Progressive stages: evaluate over a 10–15 minute rolling window.
+
+**Default gates:**
+1. **Error rate gate (5xx):**
+   - Condition: `5xx_rate` increases by > 0.10% absolute OR > 2× relative compared to baseline for same scope.
+   - Action: Pause rollout. Require operator decision to resume or rollback.
+2. **Latency gate (p95 and p99):**
+   - Condition: `p95` increases by > 10% relative OR > 25 ms absolute (whichever is larger) vs baseline.
+   - Condition: `p99` increases by > 15% relative OR > 50 ms absolute (whichever is larger) vs baseline.
+   - Action: Pause rollout.
+3. **Saturation gate:**
+   - Indicators: GPU utilization, queue depth, batch queue wait, KV cache evictions (runtime-specific), and request shedding.
+   - Condition: any saturation metric exceeds configured ceiling for > 5 minutes.
+   - Action: Pause rollout.
+
+### Quality gates (quantization profile changes only)
+Quantization can regress output quality without immediate infra symptoms. For quant profile changes:
+- **Required:** eval harness run for defined prompt sets by model family.
+- **Default gate:** fail if quality score drop > 1.0 point (absolute) OR > 2.0 standard deviations vs baseline.
+- **Noisy signals:** if eval variance is high, the rollout must remain paused until Applied ML approves an override.
+
+### Overrides & guardrails
+- Overrides must include:
+  - Scope (tenant/model/region)
+  - Justification (linked incident, customer request, or measured baseline)
+  - Expiration date (max 30 days) and owner
+- Overrides require approval from **SRE on-call** and **Applied ML on-call** (for quant) or **Runtime on-call** (for runtime-related gates).
+
+---
+
+## Operational KPIs
+We track the following KPIs monthly and review in the Eng-SRE reliability review.
+
+1. **Change Failure Rate (CFR)**
+   - Definition: (# of rollouts that required rollback or were aborted due to gate breach) / (total rollouts) per environment.
+   - Target: ≤ 5% overall; ≤ 2% for “low-risk” changes (metadata-only or minor tuning).
+
+2. **Rollback Rate**
+   - Definition: rollbacks per 100 applies.
+   - Target: no hard target; used as leading indicator. Spikes trigger investigation.
+
+3. **Mean Time To Mitigate (MTTM) for config regressions**
+   - Definition: time from first automated alert OR customer-impact detection to restored baseline (inference SLOs in-band).
+   - Target: p50 ≤ 20 minutes; p90 ≤ 45 minutes for Hosted/Dedicated.
+
+4. **Rollback Execution Time (operator action)**
+   - Definition: time from incident declared to rollback initiated.
+   - Target: p50 ≤ 10 minutes; p90 ≤ 20 minutes.
+
+5. **Mixed-Version Duration**
+   - Definition: time where > 5% of workers for a scope are on a non-target version.
+   - Target: p95 ≤ 10 minutes outside of active rollout windows.
+
+6. **Audit Event Coverage**
+   - Definition: % of config operations with complete audit events.
+   - Target: ≥ 99.99%.
+
+---
+
+## Observability: required metrics, logs, and tags
+### Required metric tags (must be present)
+All relevant time series MUST include:
+- `tenant_id`
+- `model_id`
+- `region`
+- `config_version`
+- `rollout_id`
+- `stage` (canary/progressive/complete)
+- `deployment_mode` (hosted/dedicated/private)
+
+Optional but recommended:
+- `cluster_id` (Private)
+- `deployment_id` (Dedicated)
+- `worker_pool` or `node_pool`
+
+### Control plane metrics (rollout controller)
+Minimum set:
+- `optcfg_rollout_started_total{...}`
+- `optcfg_rollout_completed_total{status=success|failed|aborted, ...}`
+- `optcfg_rollout_paused_total{reason, ...}`
+- `optcfg_rollout_gate_eval_total{gate, result=pass|fail|error, ...}`
+- `optcfg_rollout_gate_eval_latency_ms{gate, ...}`
+- `optcfg_rollout_stage_duration_ms{stage, ...}`
+- `optcfg_rollback_requested_total{...}`
+- `optcfg_rollback_converged_total{...}`
+- `optcfg_rollout_operation_errors_total{operation, error_class, ...}`
+
+### Runtime metrics (apply and convergence)
+Minimum set:
+- `runtime_optcfg_applied_total{worker_id, config_version, ...}`
+- `runtime_optcfg_apply_errors_total{error_class, ...}`
+- `runtime_optcfg_target_version{...}` (gauge)
+- `runtime_optcfg_worker_version{...}` (gauge or sampled)
+- `runtime_optcfg_convergence_ratio{...}`
+- `runtime_cache_invalidation_events_total{reason, ...}`
+
+### Inference health metrics (gating)
+Existing SLO metrics must be segmented by `config_version` at a minimum:
+- `inference_requests_total{status_code, ...}`
+- `inference_latency_ms{quantile, ...}`
+- `queue_depth{...}` / `batch_queue_wait_ms{...}`
+- `gpu_utilization{...}`
+- `shed_requests_total{reason, ...}`
+
+### Logs and correlation
+- Rollout controller logs must include `rollout_id`, `config_version`, `scope`, and `actor`.
+- Runtime apply logs must include `config_version`, `worker_id`, and `checkpoint` markers for idempotency tracing.
+- All operator-initiated actions should include `request_id` propagated end-to-end.
+
+---
+
+## Dashboards
+Primary dashboard: **Optimization Rollout Health** (see related page).
+
+Required panels:
+1. Rollout timeline annotations (apply/pause/resume/promote/rollback)
+2. 5xx rate and error budget burn (by tenant/model/region/config_version)
+3. p95 and p99 latency vs baseline band
+4. Throughput (RPS) and token rate
+5. GPU utilization and queue depth
+6. Convergence ratio and mixed-version percentage
+7. Gate evaluations (pass/fail/error) over time
+8. Audit event emission counters and mismatch checks
+
+Operational views:
+- “Active rollouts” table: rollout_id, scope, stage, canary %, last gate result, on-call owner
+- “Recent rollbacks” table: scope, from_version → to_version, trigger (manual/gate/customer), TTM
+
+---
+
+## Alerting strategy
+Alerts are designed to (a) catch unsafe rollouts early, (b) prevent prolonged mixed-version states, and (c) guarantee rollback availability during incidents.
+
+### P0 / Pager alerts (on-call)
+1. **Gate evaluation error**
+   - Trigger: `optcfg_rollout_gate_eval_total{result=error}` rate > 0 for 5 minutes for any active rollout.
+   - Impact: gates can’t evaluate; rollout safety compromised.
+   - Action: pause rollout; investigate metrics pipeline or gate rule service.
+
+2. **Mixed-version drift outside rollout window**
+   - Trigger: `mixed_version_ratio > 0.05` for > 10 minutes AND no rollout in progress.
+   - Action: check runtime apply pipeline; consider forcing converge or rollback.
+
+3. **Rollback API availability degradation**
+   - Trigger: rollback endpoint success rate < 99.0% over 10 minutes OR elevated 5xx.
+   - Action: treat as incident if active customer-impacting regression exists.
+
+4. **Inference regression during rollout**
+   - Trigger: p95 latency or 5xx breach thresholds for a scope with an active rollout.
+   - Action: rollout should auto-pause; if not paused, manually pause and consider rollback.
+
+### P1 / Ticket alerts
+- Repeated rollouts aborted for same config field (likely semantic validation gap)
+- Convergence p99 exceeding targets
+- Audit event mismatch between source and SIEM export
+
+### Notification routing
+- Eng-SRE on-call owns initial response.
+- Escalate to:
+  - Platform Control Plane on-call for rollout/controller failures
+  - Serving Runtime on-call for convergence/apply pipeline issues
+  - Applied ML on-call for quant quality gate issues
+  - Security on-call for audit logging gaps (especially enterprise tenants)
+
+---
+
+## Incident response: standard playbook integration
+During a suspected optimization-config regression:
+1. Confirm active rollouts and current `config_version` for impacted scope.
+2. If a rollout is in progress: ensure it is **paused**.
+3. Compare latency/errors by `config_version` and by stage cohort.
+4. Initiate rollback if thresholds breached and impact is customer-visible or trending.
+5. Verify:
+   - convergence to rollback target
+   - p95/p99 return to baseline band
+   - 5xx returns to baseline
+6. Capture metadata for post-incident review:
+   - rollout_id, from_version, to_version
+   - gate results
+   - time-to-detect, time-to-rollback, time-to-recover
+
+Canonical runbook: **Rollback Optimization Config** (linked above).
+
+---
+
+## Validation & gamedays
+We treat reliability of rollback as a feature requiring continuous validation.
+
+### Pre-GA checks (must pass)
+- Controlled failure injection: introduce a known-bad config for canary scope and validate auto-pause.
+- Race test: concurrent apply + rollback requests converge to expected target (no mixed steady state).
+- Observability: all dashboards show rollout annotations; gate evaluations visible within 60 seconds.
+- Audit logging: create/apply/pause/promote/rollback events present in SIEM export with required fields.
+
+### Gameday cadence
+- Internal beta: weekly gamedays for 4 weeks.
+- Post-Limited GA: monthly gameday.
+
+Success criteria (gameday):
+- Detect regression within 5 minutes (alert or operator observation)
+- Rollback initiated within 10 minutes
+- Recovery within 20 minutes (Hosted/Dedicated)
+
+---
+
+## Launch readiness checklist (SRE sign-off)
+SRE sign-off requires:
+- All P0 alerts defined and tested in staging
+- Dashboard complete with required panels and tags
+- Runbook reviewed and validated end-to-end
+- Error budget policy agreed with Platform/Runtime
+- Quant quality gating integrated for applicable models
+- Audit event coverage ≥ 99.99% in staging soak for 7 days
+
+---
+
+## Ownership and escalation
+- Primary owner: **Eng-SRE** (Sean Gallagher)
+- Control plane owner: **Platform Control Plane** (Ethan Park)
+- Console workflow owner: **Console & Tooling** (Chloe Martin)
+- Runtime owner: **Serving Runtime** (Noah Patel)
+- Quant gate owner: **Applied ML / Evals** (Jonas Weber)
+- Audit/RBAC owner: **Security & Compliance** (Marcus Lin / Dr. Aisha Rahman)
+
+Escalation guideline:
+- If rollback does not converge within 15 minutes (Hosted/Dedicated), page Runtime on-call.
+- If gate evaluation is failing or stale, page Platform on-call.
+- If audit events are missing for an enterprise tenant, page Security on-call.
+
+---
+
+## Appendix A: Example alert thresholds (starting defaults)
+These are initial defaults; tune per region/model once we have 30+ days of production data.
+
+- `GateEvalError`: > 0 errors for 5m (P0)
+- `MixedVersionOutsideRollout`: > 5% for 10m (P0)
+- `RollbackEndpoint5xx`: > 1% for 10m (P0)
+- `RolloutLatencyRegression`: p95 +10% or +25ms for 5m during active rollout (P0)
+- `Rollout5xxRegression`: +0.10% absolute for 5m during active rollout (P0)
+- `ConvergenceSlow`: stage duration p99 > 30m (P1)
+
+---
+
+## Appendix B: Audit event expectations (high level)
+For each action, an audit event must be emitted with `actor`, `tenant_id`, `scope`, `config_version`, `rollout_id`, and `request_id`:
+- `optimization_config.version_created`
+- `optimization_config.validated`
+- `optimization_config.rollout_started`
+- `optimization_config.rollout_paused`
+- `optimization_config.promoted`
+- `optimization_config.rollback_requested`
+- `optimization_config.rollback_completed`
+
+See Security page for full field requirements and retention.

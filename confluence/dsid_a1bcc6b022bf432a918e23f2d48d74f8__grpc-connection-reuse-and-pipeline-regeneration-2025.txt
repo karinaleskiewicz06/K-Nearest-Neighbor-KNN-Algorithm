@@ -1,0 +1,133 @@
+gRPC connection reuse and pipeline regeneration: root causes, triage, and mitigations
+
+Summary
+
+This page documents a recurring class of production issues we tag as \"gRPC connection reuse / pipeline regeneration events\" that affect the serving runtime's frontproxy -> worker (dispatcher/gpu-proxy) communication path. The problem manifests as sudden latency spikes, increased CPU on frontproxy, and a transient drop in request throughput for a subset of tenants. These incidents have been observed across heterogeneous pools (A100 and H100) and correlate with high client churn, long tail responses, or server-initiated stream resets.
+
+Goals
+
+- Provide a clear symptom checklist and deterministic triage workflow.
+- Identify short-term mitigations and longer-term remediation patterns.
+- Standardize monitoring, tests, and release guidance to prevent regressions.
+
+Scope and assumptions
+
+- Applies to gRPC multiplexed HTTP/2 connections used by frontproxy and internal GPU-side proxies.
+- Does not cover public API client SDKs (separate doc).
+- Assumes HTTP/2 flow control, stream reset (RST_STREAM), and GOAWAY semantics are in play.
+
+Observed symptoms (production signature)
+
+1) Sudden P50->P99 latency divergence for affected route(s). P99 increases by 3x+ while median increases modestly.
+2) Frontproxy CPU climbs to >75% in the cluster pool while worker GPU utilization remains stable.
+3) Error burst of grpc.StatusCode.UNAVAILABLE and INTERNAL with message fragments like \"RST_STREAM\" or \"REFUSED_STREAM\".
+4) Connection-level metrics show spike in active connection churn (connections/sec) and TCP retransmits.
+5) Streaks of reorders in request ids in the trace logs due to stream reassignments.
+
+Root cause taxonomy (how this happens)
+
+- A: Client churn + stream reuse exhaustion: large number of short-lived clients exhausts MAX_CONCURRENT_STREAMS and triggers RST_STREAM or REFUSED_STREAM; frontproxy retries rebuild pipelines to other worker connections causing in-flight reorder and temporary head-of-line blocking.
+- B: Server-side keepalive and GOAWAY miscoordination: worker-side GOAWAY to drain leads frontproxy to open new connections while in-flight streams are aborted due to aggressive RST semantics.
+- C: Middlebox path MTU or TLS renegotiation causing short disconnects: connection rekeying or PMTU events cause transport resets and pipeline re-creation.
+- D: Backpressure-induced stall: GPU-side request processing stalls (long decode/attention spike) causing HTTP/2 flow-control window exhaustion; frontproxy treats stall as connection failure and rebuilds session.
+
+Immediate triage checklist (ordered)
+
+1) Identify affected routes and tenants. Query the request log aggregator for spikes in grpc UNAVAILABLE/INTERNAL for last 15m.
+   - Kibana query: service:frontproxy AND grpc.code:(UNAVAILABLE OR INTERNAL) AND @timestamp:[now-15m TO now] AND route:<ROUTE>
+2) Check frontproxy connection churn: connections_opened_per_min and connections_closed_per_min for frontproxy pool.
+   - Grafana panel: frontproxy.connections_opened_rate / frontproxy.connections_closed_rate
+3) Inspect trace spans for RST_STREAM, REFUSED_STREAM, and GOAWAY markers. Correlate trace ids across frontproxy -> worker hops.
+4) Validate server keepalive and window sizes in worker logs. Look for GOAWAY frames with last_stream_id < current_stream_id.
+5) CPU vs GPU utilization: if frontproxy CPU high but GPU healthy, likely pipeline rebuild churn.
+6) Confirm whether error pattern follows a config change or deploy within the last 30 min.
+
+Short-term mitigations (operational playbook)
+
+- Apply an emergency rate limit per-source IP for the affected route to reduce churn. Example: edge-bind limit 150 rps per ephemeral client for the route.
+- Temporarily increase MAX_CONCURRENT_STREAMS and flow-control window on frontproxy-worker connection endpoints (config knobs below). Note: increasing streams increases memory and per-connection CPU.
+- Disable aggressive keepalive or delayed GOAWAY on the worker to allow graceful stream completion.
+- If the issue correlates with a recent kernel or runtime patch, rollback using the runtime rollback matrix.
+
+Permanent fixes and engineering changes
+
+- Connection leasing: implement short-lived connection leases that reduce per-client connection churn while enforcing per-lease stream accounting. This avoids opening new TCP/TLS connections for every client burst.
+- Adaptive MAX_CONCURRENT_STREAMS: runtime-side controller that increases allowed streams when measured per-connection CPU overhead is low and decreases during overloads.
+- Improved GOAWAY semantics: coordinate GOAWAY issuance with stream-level graceful window to avoid aborting in-flight streams.
+- Flow-control heuristic: detect in-flight compute stalls (GPU-side stalls > threshold) and advertise smaller initial windows so frontproxy spreads streams across more connections rather than piling onto a blocked connection.
+- Health-aware routing: extend the smart routing policy to avoid using worker connections with elevated stall signals; prefer routing new streams to underutilized connections.
+
+Config knobs and recommended safe ranges
+
+| config_key | default | recommended emergency | tradeoffs |
+|------------|---------|------------------------|-----------|
+| grpc.max_concurrent_streams | 100 | 200 | higher concurrency reduces connection churn but increases memory/CPU per-connection |
+| grpc.initial_window_size | 65535 | 65535 | very large windows can worsen head-of-line blocking when stalls occur |
+| grpc.stream_idle_timeout_ms | 60000 | 120000 | longer idle avoids premature RST from transient spikes but delays resource reclamation |
+| worker.goaway_grace_ms | 500 | 2000 | larger grace means fewer aborted streams during drain at the cost of slower rollouts |
+
+Note: the table above is presented as text in this page; apply changes during low risk windows or use canary first.
+
+Monitoring and alerting recipes
+
+- New composite alert: GRPC_PIPELINE_REGEN_HIGH
+  - Trigger: frontproxy.connections_opened_rate > 5x baseline AND frontproxy.grpc_unavailable_rate > 3x baseline in 3m window.
+  - Severity: P2 when affecting <5% tenants, P1 when >5% tenants or SLO breaches.
+  - Runbook link: this page.
+
+- Dashboards to add:
+  - Connection churn per route (heatmap)
+  - Stream reset reason breakdown (REFUSED_STREAM / RST_STREAM / GOAWAY) by worker pool
+  - Average outstanding streams per connection and avg stream lifetime
+
+Reproduction procedure (dev sandbox)
+
+1) Test harness: grpc-client-spammer (internal tool). Start with N=500 concurrent short-lived clients sending 1-2 requests and terminating.
+2) Vary MAX_CONCURRENT_STREAMS to 20, 50, 100 and observe when REFUSED_STREAM increases.
+3) Introduce artificial GPU-side stalls by injecting a sleep in the decoder path for a subset of requests and observe frontproxy behavior.
+4) Capture tcpdump and http2 frame logs to confirm GOAWAY and RST frames.
+
+Fix rollout guidance and canary strategy
+
+- Any change to grpc.max_concurrent_streams or worker.goaway_grace_ms must be canaried: apply to 5% of worker nodes for 2 hours under production-like synthetic traffic.
+- For code changes (connection leasing, adaptive controller): feature-flag and side-by-side deployment with telemetry gates. Telemetry gates must include stream-reset rate, per-connection CPU, and P99 latency for canary tenants.
+
+Testing checklist for PRs and releases
+
+- Unit tests for new state machines (lease lifecycle, goaway-coordination).
+- Integration test: simulated churn harness with deterministic verification of no stream loss above threshold.
+- Load test: scaled to 300k streams/min with mixed short/long sessions showing <=3% REFUSED/RST under steady state.
+- Chaos test: inject GOAWAY and RST under load and assert graceful completion percent >= 95%.
+
+Ownership and contacts
+
+- Primary owner: runtime-networking (oncall: @runtime-networking-oncall).
+- Secondary owner: frontproxy-team.
+- SLT escalation: runtime-eng-manager@example.redwood.com
+
+Post-incident analysis template
+
+1) Incident timeline: collect timestamps for first error spike, detection, mitigation, and recovery.
+2) Affected tenants: list tenant ids and approximate request volume during window.
+3) Root cause evidence: trace screenshots, tcpdump snippets, worker logs with GOAWAY/RST frame dumps.
+4) Remediation actions taken and time to implement.
+5) Follow-ups and code patches assigned with owners and ETA.
+
+Appendix: example diagnostic commands and snippets
+
+- grpc tranlogs: curl -s \"https://logs.internal/api/search?q=grpc.code:REFUSED_STREAM%20AND%20service:frontproxy&from=now-15m\"
+- tcpdump: sudo tcpdump -i eth0 -w /tmp/conn-regen.pcap host <worker_ip> and port 443
+- http2 frame log extract (dev tool): ./http2-frame-dump --file /tmp/conn-regen.pcap --filter 'GOAWAY|RST_STREAM'
+- quick config bump (kubectl patch): kubectl -n runtime patch configmap frontproxy-config --type merge -p '{\"data\":{\"grpc.max_concurrent_streams\":\"200\"}}'
+
+Revision history
+
+- 2025-04-10: Created by Sofia Martinez.
+- 2025-05-02: Expanded mitigation list and added monitoring alert recipe (Ravi Menon).
+
+References
+
+- HTTP/2 GOAWAY semantics: RFC 7540 section 6.8
+- Internal: frontproxy connection metrics schema: /confluence/eng-serving-runtime/team-wiki/runtime-telemetry-data-model-and-tracebook-2026
+
+If you see an ongoing incident matching the symptom checklist, follow the triage checklist first and notify runtime-networking. For long-term work, file a tracking ticket in the runtime backlog with label \"grpc-pipeline-regen\" and link to this doc.

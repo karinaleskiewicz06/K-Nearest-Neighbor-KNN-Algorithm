@@ -1,0 +1,172 @@
+Cohort-driven Eval Scheduling and Priority Protocol
+
+Overview
+
+This playbook defines the cohort-driven evaluation scheduling and priority protocol used by Redwood's eval-orch service to allocate evaluator resources, reduce noisy variance across workloads, and ensure high-value experiments get stable, timely runs. It describes how cohorts are defined, how priority scores are computed, resource windows and backfill rules, integration with caching/quantization-aware profiles, and operational runbooks for common scenarios.
+
+Why this exists
+
+- Reduce cross-workload interference that causes unstable eval signals (especially for latency-sensitive and quantized workloads).
+- Make scheduling decisions reproducible and auditable so regressions can be traced to scheduling artifacts rather than model changes.
+- Balance cost, timeliness, and statistical fidelity when allocating constrained evaluator capacity.
+
+Scope and applicability
+
+- Applies to eval runs managed by eval-orch (interactive and batch evaluators) across Hosted, Dedicated, and Private eval fleets.
+- Covers cohort construction, priority computation, preemption/backfill policies, telemetry signals used for autoscaling, and required annotations on eval requests.
+- Does NOT cover model acceptance criteria (see production-model-certification-checklist) or user-facing rollout policies.
+
+Definitions
+
+- Cohort: A grouping of eval jobs that share workload characteristics (latency sensitivity, sequence-length distribution, quant profile, dataset type, and customer tier).
+- Priority Score: A computed numeric score used to order job execution. Higher means run earlier.
+- Evaluator Pool: Logical group of workers with similar hardware and kernel profiles (e.g., a100-40g-int8-pool).
+- Fidelity Band: Statistical group that indicates required sample size and stability budget (low/medium/high).
+
+Cohort construction rules
+
+1) Mandatory tags on every eval request (API/SDK):
+   - workload_type: {chat, completion, embedding, rerank}
+   - seq_len_bucket: {short:<128, medium:128-1024, long:>1024}
+   - quant_profile: {fp16, int8, q4_0, q4_1}
+   - latency_sensitivity: {low, medium, high}
+   - customer_tier: {self_serve, commercial, enterprise}
+
+2) Cohort assignment algorithm (pseudo):
+   - Step A: Bucket by evaluators_supported_hardware and quant_profile.
+   - Step B: Sub-bucket by latency_sensitivity + seq_len_bucket.
+   - Step C: Tag with fidelity_band using heuristics: high fidelity for enterprise & regression triage jobs; medium for feature-tracking; low for exploratory.
+
+Priority score calculation
+
+Priority score (PS) is a weighted linear combination:
+
+PS = W_tier * TierScore + W_latency * LatencyScore + W_fidelity * FidelityScore + W_staleness * StalenessScore - W_cost * EstimatedCostRank
+
+Where:
+- TierScore: self_serve=10, commercial=30, enterprise=60.
+- LatencyScore: low=5, medium=20, high=50.
+- FidelityScore: low=5, medium=25, high=45.
+- StalenessScore: monotonic hours since request submission normalized to [0,10].
+- EstimatedCostRank: cost rank of the run on normalized scale [0,10].
+- Default weights: W_tier=1.0, W_latency=1.2, W_fidelity=1.4, W_staleness=0.6, W_cost=0.8.
+
+Notes: weights are tunable via eval-orch config; score is clipped to [0,100]. Priority ties are broken by request id timestamp.
+
+Resource windows and capacity allocation
+
+- Each Evaluator Pool exposes N concurrent slots (configured per-pool).
+- Pools are partitioned into: baseline_capacity (70%), burst_capacity (20%), preemptible_backfill (10%).
+- Baseline capacity honors enterprise SLAs and scheduled high-priority cohorts. Burst capacity serves transient spikes for commercial workloads. Backfill runs lower-priority & exploratory evals and may be preempted.
+
+Preemption and backfill rules
+
+1) Preemption is allowed only for backfill jobs. Baseline and burst slots cannot be preempted without explicit approval.
+2) When a higher-priority job (PS delta >= 15) is queued and there is no free baseline slot, eval-orch will attempt to reclaim a backfill slot.
+3) Preempted jobs receive an attempt to checkpoint partial results to the artifact store; if checkpointing fails, they are marked for fast-resume (see runbook).
+
+Cache & quantization-awareness
+
+- Cohorts maintain a small KV cache affinity window (default 15 minutes) per pool to preserve KV-cache hotness and reduce cold-start noise.
+- Quantization profile mismatches between requested eval and pool hardware lower the effective PriorityScore by 10 points to avoid noisy mismatch runs.
+
+Fidelity bands and statistical budgets
+
+Table: Fidelity band definitions
+
+| Fidelity | Min samples | Max variance budget (std) | Run window (hours) | Typical use-cases |
+|----------|-------------|---------------------------|---------------------|-------------------|
+| Low      | 250         | 0.15                      | 72                  | exploratory dev, feature probes |
+| Medium   | 1,000       | 0.07                      | 48                  | performance tracking |
+| High     | 5,000       | 0.02                      | 24                  | regression triage, release gating |
+
+Example YAML eval-orch job config
+
+```yaml
+job_id: "eval-2026-0009"
+workload_type: "chat"
+seq_len_bucket: "medium"
+quant_profile: "int8"
+latency_sensitivity: "high"
+customer_tier: "commercial"
+fidelity_band: "medium"
+priority_overrides: null
+requested_pool: "a100-40g-int8-pool"
+expected_sample_count: 1200
+max_run_time_hours: 12
+annotations:
+  team: "search-ranking"
+  experiment: "rerank-quant-int8-v2"
+```
+
+Telemetry signals and SLOs (what eval-orch tracks)
+
+- Queue latency P95 <= 2 hours for baseline capacity cohorts.
+- Job start P95 <= 1 hour after dequeuing.
+- Checkpoint success rate >= 99% for runs > 30 minutes.
+- Preemption noise rate (jobs preempted more than once) < 0.5%.
+- Fidelity convergence: median variance/day reduction >= 30% for medium/high bands.
+
+Operational procedures and runbooks
+
+1) Fast resume for preempted runs
+   - Trigger: job preempted and checkpoint saved to artifact store.
+   - Steps:
+     1. Verify checkpoint exists in s3://eval-artifacts/<job_id>/checkpoint/ .
+     2. Requeue job with resume=true and original priority.
+     3. Monitor memory and kv-cache warming metrics for first 5 minutes.
+     4. If failure to resume, mark job as resume_failed and notify owner (Slack group: #eval-ops).
+
+2) Handling runaway variance in a cohort
+   - Trigger: variance > band threshold for 3 consecutive runs.
+   - Steps:
+     1. Quarantine cohort (stop scheduling new medium/high runs to the same pool).
+     2. Spawn diagnostic shadow runs on isolated pool (a100-debug-pool) with identical seeds.
+     3. Collect kernel-level traces and KV-cache hit rates.
+     4. Open an incident in Incidents Jira (component: eval-orch) and assign to Applied ML on-call.
+
+3) Emergency rebalancing (SLA breach imminent)
+   - Trigger: enterprise SLA breach predicted within 15 minutes due to capacity loss.
+   - Steps:
+     1. Pause all backfill jobs immediately.
+     2. Drain burst capacity and move eligible jobs to preemptible nodes.
+     3. If still insufficient, execute cross-region fallback policy (route to compatible pools in another region).
+
+Integration points and hooks
+
+- eval-orch -> telemetry-pipeline: emits job lifecycle events (queued, started, checkpointed, preempted, completed).
+- eval-orch -> optimizer-service: requests cost estimates and suggested batching parameters.
+- eval-orch -> evaluator-agent: gRPC control plane for running and checkpointing jobs.
+- eval-orch -> kv-cache-service: affinity hints for cache warmup.
+
+Metrics and dashboards to create
+
+- Evaluator Pool: concurrent usage, slot occupancy by cohort, burst/backfill ratio.
+- Job lifecycle: queue latency distribution, preemption counts, resume success rate.
+- Cohort health: variance over time, sample completion rate, checkpoint success.
+
+Ownership and contacts
+
+- Primary owner: Applied ML Platform (team alias: applied-ml-eval-platform@redwood.com).
+- On-call for eval-orch: eng-sre rotation (see eng-sre/oncall-rotations).
+- Incident escalation: Applied ML lead (Marco Hernandez) -> Eng Platform manager (Lena Ortiz).
+
+Change history
+
+- 2026-01-18: Initial published version (Aisha Patel).
+- 2026-02-02: Adjusted default weights and added cache affinity window (reviewers: Marco Hernandez, Rina Sato).
+
+Appendix: common troubleshooting commands
+
+- List queued jobs: `curl -sS https://eval-orch.internal/api/v1/jobs?state=queued | jq .`
+- Drain backfill on pool: `eval-orch ctl drain --pool a100-40g-int8-pool --mode backfill`
+- Force resume job: `eval-orch ctl resume --job eval-2026-0009`
+- Inspect checkpoint: `aws s3 ls s3://eval-artifacts/eval-2026-0009/checkpoint/`
+
+References
+
+- production-model-certification-checklist-2026 (model acceptance)
+- quantization-profiles/kv-cache-quant-stability-audit-playbook-2025
+- eval-harness/latency-sensitivity-eval-routing-fallback-protocol-2026
+
+For questions or suggested changes, add a comment on this page or ping #eval-ops on Slack.

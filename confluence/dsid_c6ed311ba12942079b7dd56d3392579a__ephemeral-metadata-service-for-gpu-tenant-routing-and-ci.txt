@@ -1,0 +1,181 @@
+Ephemeral metadata service for GPU tenant routing and CI
+
+Summary
+-------
+This document describes the design, Terraform contract, CI/CD integration, and operational runbook for the Ephemeral Metadata Service (EMS): a small, highly-available service that provides per-request tenant metadata for GPU inference routing, cost attribution, and warm-pool hints. EMS is meant to be a low-latency sidecar/edge service that integrates with request routing in the inference mesh and the infra CI pipelines that manage pool allocation.
+
+Motivation
+----------
+- We need a single, authoritative place to look up tenant routing configuration (priority class, burst credits, preferred egress region, cached KV token hints) without touching long-lived DBs on the hot path.
+- Current approaches embed tenant metadata in long-lived in-memory caches that drift from authoritative billing/state and complicate CI-driven pool changes.
+- EMS reduces coupling between infra state changes (Terraform promos, quota updates) and the live serving runtime by exposing a lightweight ephemeral layer that is updated atomically during CI promotions.
+
+Goals
+-----
+1. Provide sub-5ms p99 lookup for tenant metadata for interactive inference requests.
+2. Atomic updates via CI: Terraform/CD pipelines can promote a new metadata snapshot (JSON blob) that becomes immediately available to routing agents.
+3. Minimal operational surface: horizontally scalable stateless frontends + replicated snapshot store (S3-backed + small Dynamo/Spanner index).
+4. Strong consistency guarantees for promotions used in capacity rebalancing and billing-critical flows.
+
+Non-goals
+---------
+- EMS is not a replacement for long-term billing or audit storage. The authoritative billing exports remain in the billing pipeline.
+- EMS does not store checkpoint data or model artifacts.
+
+High-level design
+-----------------
+- Components:
+  - ems-frontend: autoscaled K8s deployment that serves HTTP/GRPC lookup endpoints.
+  - ems-publisher: ephemeral job run by CI that validates and publishes new metadata snapshots.
+  - ems-snapshot-store: S3 prefix (encrypted) + index maintained in Dynamo DB.
+  - ems-cache-populator: lightweight Lambda/k8s job that warms regional proxies.
+  - inference-router: existing routing layer calls EMS before policy evaluation for tenant-specific overrides.
+
+- Promises:
+  - Lookups are favorite-keyed by tenant-id and request-hash; missing keys return "fallback-policy" with explicit TTL.
+  - Snapshot publish is atomic: a single manifest.json points to a data blob and an incrementing version.
+
+Data model (manifest example)
+----------------------------
+- manifest.json (stored at s3://redwood-ems/snapshots/<version>/manifest.json)
+  - version: integer (monotonic)
+  - created_at: ISO8601
+  - checksum: sha256 of the blob.tar.gz
+  - blob_path: s3://.../blob.tar.gz
+  - release_notes: short string
+
+- tenant metadata entry (per tenant) example (JSON lines inside blob):
+  - tenant_id: string
+  - priority_class: low | normal | interactive | enterprise
+  - burst_credits: integer (decays via billing pipeline; EMS holds last known value)
+  - preferred_regions: [string]
+  - cost_center: string
+  - kv_cache_hint: {prefix_ttl_seconds: int, prefetch_tokens: int}
+  - enforcement_flags: [string]
+
+Terraform module contract (ems_snapshot module)
+-----------------------------------------------
+- Module outputs and inputs must be intentionally narrow so CI can run it without cluster admin rights. Key inputs:
+  - name (string)
+  - version_tag (string)
+  - manifest_s3_bucket (string)
+  - manifest_s3_prefix (string)
+  - snapshot_checksum (string)
+  - allowed_publishers (list of iam principal ARNs)
+
+- Expected outputs:
+  - manifest_path -> s3 URI
+  - manifest_version -> integer
+
+Example usage (Terraform snippet)
+--------------------------------
+module "ems_snapshot" {
+  source = "git::ssh://git@github.com/redwood/infra-modules.git//ems_snapshot?ref=v0.3.0"
+  name = "tenant-meta-prod"
+  version_tag = "2025-11-12-ashapublish"
+  manifest_s3_bucket = "redwood-ems-snapshots"
+  manifest_s3_prefix = "prod"
+  snapshot_checksum = "sha256:abcdef..."
+  allowed_publishers = ["arn:aws:iam::123456789012:role/ci-runner"]
+}
+
+CI/CD integration (publisher pipeline)
+-------------------------------------
+- Preconditions (CI job):
+  1. Run metadata validation suite (local schema + cross-check against billing export snapshot).
+  2. Run static policy linter (ensure enforcement_flags are allowed).
+  3. Stage blob to s3 under a temp prefix.
+  4. Call terraform apply for ems_snapshot module with prepared checksum and version_tag.
+  5. Run integration smoke test against ems-frontend in canary namespace.
+  6. On success, promote route in k8s or update DNS to point to new canary -> prod routing slice.
+
+- CLI flow (example)
+  - publish: ./ci/publish-ems --manifest ./manifests/2025-11-12.json --env prod
+  - smoke: curl -H "x-tenant-id: example-tenant" https://ems-canary.internal/v1/lookup
+
+Operational SLOs and metrics
+----------------------------
+- Availability: 99.95% (global) for the /v1/lookup path (measured p95 across regional frontends).
+- Latency: p50 < 1ms, p95 < 5ms, p99 < 15ms (end-to-end from router to lookup).
+- Consistency: snapshot promotion must be visible to 100% of frontends within 30s after successful promote event from CI job.
+- Costs: target $0.0000004 per lookup (target for billing/forecasting).
+
+Instrumentation (required telemetry)
+-----------------------------------
+- Metrics to emit from ems-frontend: lookup_latency_ms (histogram), lookup_cache_hit (counter), lookup_miss_reason (tagged counter), manifest_version_served (gauge).
+- Tracing: request span should include manifest_version and tenant_id.
+- Alerts:
+  - P95 latency > 10ms for 5m -> page oncall infra-owner.
+  - 5xx rate > 0.1% for 10m -> trigger degraded-route playbook.
+  - Snapshot promotion fails CI step -> notify infra-publishers Slack channel and create ticket.
+
+Warm-population strategy
+------------------------
+- After a successful publish the ems-cache-populator will:
+  1. Read manifest and fan out warm requests to regional proxies in parallel (rate-limited).
+  2. Validate a small sample of tenant lookups against the new version.
+  3. Publish a per-region readiness signal to the orchestration service (k8s configmap or service mesh tag).
+- Rollback: if readiness signals are not collected in 5 minutes, the CI pipeline automatically rolls back to previous manifest_version and issues an incident.
+
+Runbook: lookup failure (triage)
+--------------------------------
+1. Detect: Alert fires for P95 latency or 5xx rate.
+2. Initial checks (1–5 minutes):
+   - Check ems-frontend pod status in the affected region (kubectl -n ems get pods -l app=ems-frontend).
+   - Query manifest_version_served gauge in telemetry to see if frontends have the expected version.
+   - Check S3 for latest manifest and checksum: aws s3 ls s3://redwood-ems-snapshots/prod/
+   - Run a manual lookup: curl -H "x-tenant-id: test-tenant" http://<frontend-pod-ip>:8080/v1/lookup
+3. Mitigation (5–15 minutes):
+   - If frontends are failing to fetch the manifest, restart the ems-frontend pods to force rehydrate.
+   - If manifest checksum mismatch, revert to last-known-good manifest using the terraform module: terraform apply -var manifest_version=<prev>
+   - If latency spike and cache miss flood is suspected, temporarily set router config to cache fallbacks for 60s and scale up ems-frontend replicas (kubectl scale deployment/em-frontend --replicas=10).
+4. Escalation (15+ minutes):
+   - If CI promotion caused the issue, notify CI publisher and open a P1 incident.
+   - Page infra-sre and the owner_team (engineering). Provide manifest_version, CI run id, and telemetry links.
+
+Security and compliance
+-----------------------
+- All snapshots are encrypted-at-rest in S3 using the company-managed KMS key (alias/redwood/ems).
+- Publish permissions are limited to CI roles and a small set of ops principals.
+- Access to read manifest S3 paths is allowed to the ems-frontend role and the cache-populator principal.
+- Audit: every publish event writes an audit line to the audit-log stream (kinesis) with publisher identity, checksum, and version.
+
+Cost attribution and billing integration
+--------------------------------------
+- Each lookup returns a lightweight cost_center string which the router stamps on downstream telemetry and billing exports.
+- The snapshot includes a coarse-grained burst_credits value; billing exports run decay math and emit final charge entries.
+- Monthly billing reconciliation job compares EMS cost_center tags with billing pipeline exports and surfaces mismatches to finance.
+
+Ownership and contacts
+----------------------
+- Service owner: infra-routing-team (primary contact: Asha Patel, oncall rotation).
+- SRE escalation: infra-sre@redwood.com.
+- CI publisher owners: infra-ci-team.
+
+Rollout plan
+------------
+- Phase 0 (lab): internal dev namespace, limited tenants. Validate latency and CI flow.
+- Phase 1 (canary): route 5% of interactive traffic through EMS-backed routing for a shadow manifest.
+- Phase 2 (gradual): increase to 50% with TTL-based fallback.
+- Phase 3 (global): 100% with autoscale and warmed caches; decommission legacy in-memory metadata stores.
+
+Appendix: example validation checks (unit test list)
+--------------------------------------------------
+1. Schema validation against jsonschema draft-07.
+2. Cost center present and matches known list.
+3. No duplicate tenant_id entries.
+4. Enforcements are in allowed-enforcement registry.
+5. Checksum matches blob.tar.gz contents.
+6. Smoke lookup against ems-canary return 200 and expected fields.
+
+Related pages and references
+---------------------------
+- See: /confluence/eng-infra/cloud-accounts-and-networking/gpu-egress-proxy-shim-and-soft-failover-spec.json for how regional proxies interact.
+- See: /confluence/eng-infra/runbooks/kv-cache-consensus-and-warmup-coordination-runbook.json for warmup coordination patterns.
+
+Change log
+----------
+- 2024-02-15: Document created (Asha Patel).
+- 2024-09-03: Added CI failure rollback semantics and readiness signal (Rina Kapoor).
+- 2025-11-12: Updated Terraform module contract and SLO targets after performance run (Daniel Kim).
+

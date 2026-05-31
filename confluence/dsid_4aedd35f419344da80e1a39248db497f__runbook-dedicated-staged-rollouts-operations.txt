@@ -1,0 +1,356 @@
+Runbook: Dedicated staged rollouts (reserved pools) — operations
+
+## Purpose
+This runbook describes how to operate **Dedicated staged rollouts** for **reserved-capacity pools** ("Dedicated pools"). It covers:
+- Creating and validating a DedicatedPoolRolloutPlan
+- Running and promoting stages
+- Interpreting gate failures (including missing/lagging telemetry)
+- Manual override procedures (hold / force-promote / abort)
+- Emergency rollback steps and what to do during incidents
+
+Staged rollouts are used to safely deploy changes to a Dedicated pool, including:
+- Model version upgrades (weights/tokenizer)
+- Serving runtime build changes
+- Routing policy changes (e.g., fallback behavior)
+- Performance/caching/batching configuration changes
+
+## Scope and non-goals
+**In scope:** operational procedures and safety controls for rollouts that partition a Dedicated pool into stage segments (traffic or replica partitions) with measurable gates.
+
+**Not a general experimentation platform:** A/B is supported only as a safety mechanism for staged rollout promotion.
+
+## Definitions
+- **Pool:** A customer’s reserved GPU capacity group; may be single-region or multi-region.
+- **Rollout plan (DedicatedPoolRolloutPlan):** Control-plane object describing stages, target change set, gates, and state.
+- **Stage:** A discrete step (e.g., 1% / 10% / 50% / 100% or replica partitions) with gates that must pass before promotion.
+- **Gate:** A deterministic evaluation of metrics over a time window (latency, error rate, saturation, GPU health, OOM rate, drop/429, and optional quality regression where enabled).
+- **States:** `draft` → `running` → (`held` | `aborted` | `completed`).
+- **Abort vs rollback:** In v1 operations, **Abort** returns traffic routing to the **baseline** (pre-rollout) configuration/model. The data plane may keep pre-warmed resources, but routing must prefer baseline.
+
+## Ownership and escalation
+Primary owners:
+- Control plane: **Ethan Park** (lead), oncall via `#eng-platform-oncall`
+- Routing/data plane: **Mina Haddad** / **Vikram Singh**, oncall via `#eng-infra-oncall`
+- Telemetry/gates: **Logan Wright**, oncall via `#observability-oncall`
+
+Escalate immediately if:
+- Any Dedicated customer SLO is threatened (error spikes, elevated 429s, saturation) during a rollout
+- Gate evaluation is stuck due to missing telemetry for >15 minutes
+- Multi-region pool has regional impairment during promotion
+
+## Preconditions (before creating a plan)
+1. **RBAC / permissions**
+   - `dedicated.rollouts.write`: create/update rollout plans
+   - `dedicated.rollouts.promote`: promote stage
+   - `dedicated.rollouts.abort`: abort rollout
+   - `dedicated.rollouts.override`: force-promote / hold (admin-only; requires justification)
+
+2. **Feature flag enablement (beta/limited availability)**
+   - Confirm rollout staging is enabled for the account and pool (see “Feature flags” below).
+
+3. **Pool sizing and headroom sanity checks**
+   - Ensure the pool is large enough to safely partition.
+   - Confirm **minimum headroom** (see table below) to avoid starvation and elevated 429s.
+
+4. **Telemetry readiness**
+   - Stage-tagged metrics must be present for the pool (latency/error/saturation/429/OOM).
+   - If this is the first time the pool uses staged rollouts, validate dashboards can break down by stage.
+
+### Minimum capacity / headroom guidelines (operational)
+| Pool size (GPUs or replicas) | Smallest allowed canary stage | Required headroom (recommended) | Notes |
+|---|---:|---:|---|
+| <= 4 | Avoid replica partitioning; prefer 0%/100% with manual validation | >= 25% | Risk of starvation is high; consider maintenance window |
+| 5–8 | >= 1 replica or >= 10% traffic | >= 20% | Watch 429 and queue depth closely |
+| 9–32 | 1%–10% traffic or 1–2 replicas | >= 15% | Standard staged rollout fits |
+| > 32 | 1% traffic or 1 replica | >= 10–15% | Can use finer stages if needed |
+
+Refer to: dedicated-pool-partitioning-guidelines-for-staged-rollouts.
+
+## Feature flags (control plane and routing)
+Common flags (names may vary by environment):
+- `dedicated_staged_rollouts_enabled` (account-level)
+- `dedicated_staged_rollouts_pool_allowlist` (pool-level)
+- `dedicated_stage_metrics_enabled` (telemetry tagging)
+
+If a customer requests enablement:
+- File or reference internal support request (see pattern in INT-1933) and ensure approvals from Product (Lauren Bishop) + SRE (Sean Gallagher) for beta accounts.
+
+## Creating a rollout plan
+Rollout plans can be created via **Console** (preferred) or **API**.
+
+### Option A: Console (preferred)
+1. Navigate to: **Console → Dedicated → Pools → <pool> → Rollouts → Create rollout**
+2. Select target change set:
+   - Model version (e.g., `llama-3.1-70b-instruct@2025-03-01`)
+   - Runtime build (e.g., `runtime-2025.03.12`)
+   - Routing policy bundle (e.g., `policy/dedicated-default@v17`)
+   - Config overrides (batching/caching/quantization profile)
+3. Choose stage template:
+   - Default: **1% → 10% → 50% → 100%**
+   - For small pools: **10% → 50% → 100%** or replica-based
+4. Review gate set and confirm evaluation window.
+5. Save as `draft`, then click **Start rollout**.
+
+### Option B: API (control plane)
+Use this when automating or when Console is degraded.
+
+1. Create plan (draft)
+- `POST /v1/dedicated/pools/{pool_id}/rollout-plans`
+
+Example (illustrative):
+- Idempotency header: `Idempotency-Key: <uuid>`
+
+Body fields to include (names may differ by client SDK):
+- `change_set`: model/runtime/policy/config identifiers
+- `stage_definitions`: list of stages (traffic % or replica partitions)
+- `gate_policy`: gate list + thresholds + windows
+- `promotion_mode`: `manual` or `auto` (v1 typically manual promotion with automated gate checks)
+
+2. Start rollout
+- `POST /v1/dedicated/rollout-plans/{plan_id}:start`
+
+3. Confirm plan is running
+- `GET /v1/dedicated/rollout-plans/{plan_id}`
+
+### Validation checks performed by the service
+Creation/update is rejected if:
+- Stages are not monotonic (e.g., 10% then 1%)
+- Stages exceed 100% total traffic, or invalid replica partitioning
+- Minimum canary size/headroom constraints are violated
+- Multi-region pool constraints cannot be satisfied (e.g., region has insufficient capacity to create the stage partition)
+
+If validation fails, check the response `validation_errors` and consult Infra (Vanessa Ortiz) if you believe capacity signals are stale.
+
+## Running a staged rollout (promotion procedure)
+### Standard promotion cadence
+A typical cadence per stage:
+1. Promote into stage
+2. Wait for warm-up stabilization (2–5 minutes)
+3. Evaluate gates for at least one full window (see “Default gates”)
+4. If gates pass and no active incident/high burn, promote to next stage
+
+### Promote a stage
+Console:
+- On the rollout timeline, click **Promote to next stage**.
+- Provide a short reason (required).
+
+API:
+- `POST /v1/dedicated/rollout-plans/{plan_id}:promote`
+- Include:
+  - `expected_version` (optimistic concurrency)
+  - `idempotency_key`
+  - `reason`
+
+Expected behavior:
+- Routing layer begins sending the stage’s partition of traffic/replicas to the new change set.
+- Telemetry should emit stage-tagged signals within a few minutes.
+
+### Hold (pause) a rollout
+Use **Hold** when you need to pause promotion without aborting (e.g., waiting on telemetry lag, awaiting customer approval, investigating mild regression).
+
+Console: **Hold** on timeline
+API: `POST /v1/dedicated/rollout-plans/{plan_id}:hold`
+
+Hold semantics:
+- No further promotions occur.
+- Routing remains at the current stage.
+- Holds are audited. Some environments enforce an auto-timeout (typically 24h) requiring explicit resume.
+
+### Resume from hold
+Console: **Resume**
+API: `POST /v1/dedicated/rollout-plans/{plan_id}:resume`
+
+## Default gates (v1) and interpretation
+Gate evaluation is **deterministic** and uses standardized signals. If telemetry is missing/stale, the system defaults to **fail-closed** (gate status “unknown/fail”) and requires operator action (hold/abort/override).
+
+### Default gate set (typical)
+| Gate | Signal | Default window | Typical threshold (guideline) | Notes |
+|---|---|---:|---|---|
+| Error rate | 5xx / total | 15m | <= 0.5% and not >1.2× baseline | Compare against prior stage/baseline |
+| p95 latency | request p95 | 15m | <= 1.25× baseline OR within tier SLO | Use region breakdown |
+| p99 latency | request p99 | 15m | <= 1.35× baseline | Sensitive to tail issues |
+| Saturation/headroom | GPU util + queue depth | 15m | util < 85% AND queue depth stable | See “429/queue depth” |
+| OOM rate | OOM events / req | 15m | 0 (or near-zero) | Any sustained OOM is a stop signal |
+| 429/drop | 429s / total | 5m + 15m | <= 0.1% and not spiking | Canary starvation is a known failure mode |
+| GPU health | ECC/taints/throttling | 15m | no new critical health events | Region-specific |
+
+Important:
+- Gates use **minimum sample sizes** (to avoid noisy promotion): if request volume is low, the gate may be “insufficient data”. Treat as **hold** unless you have alternative evidence.
+- Promotion should be blocked during **active incidents** or **high error budget burn** for the pool.
+
+### Where to view gate evidence
+Console:
+- Rollout timeline → Stage → **Gate evidence**.
+- Evidence includes: query name, time window, observed value(s), thresholds, and pass/fail reasoning.
+
+Dashboards:
+- “Dedicated Rollout Stage Overview” (per pool, per region, per stage)
+- Validate metrics include `pool_id` and `stage_id` tags.
+
+## Common failure scenarios and what to do
+### 1) Elevated 429s / queue depth spike after promoting canary
+Symptoms:
+- 429 rate rises quickly in canary stage
+- Queue depth increases and latency tails worsen
+
+Likely cause:
+- Canary partition is too small or lacks headroom, causing starvation (see SUP-28522 / incident thread on beta).
+
+Actions:
+1. **Hold** immediately if impact is limited and stabilizing; otherwise **Abort**.
+2. Check partition sizing vs guidelines; ensure canary has enough replicas/traffic share.
+3. If multi-region, check whether one region is impaired and routing is concentrating traffic.
+4. If safe to continue, adjust plan (increase canary size) and restart at earlier stage.
+
+### 2) Gate status “unknown” / missing telemetry
+Symptoms:
+- Gate evidence panel empty or stale
+- Evaluation says “insufficient data” or “stale metrics”
+
+Actions:
+1. **Hold** rollout.
+2. Validate telemetry pipeline:
+   - Confirm stage tag is present and correct (stage_id allowlist / cardinality protections).
+   - Check for known mismatches (see SUP-28605 pattern).
+3. If telemetry outage is ongoing and customer impact is low:
+   - Keep on hold until signals recover.
+4. If signals will not recover quickly and you must proceed (rare):
+   - Use **force-promote** only with explicit approval and audit justification.
+
+### 3) Latency regression without error spikes
+Actions:
+1. Compare by region and by request shape (context length, streaming vs non-streaming).
+2. Check GPU saturation; latency regressions often correlate with saturation.
+3. If p99 is regressing materially, treat as a stop signal (hold/abort) even if p95 looks fine.
+4. Engage routing/data plane owner if regression correlates with routing policy changes.
+
+### 4) GPU health gate failure in one region of a multi-region pool
+Actions:
+1. **Hold** rollout.
+2. Confirm whether routing is configured to fail over away from the region.
+3. If regional impairment persists, consider aborting and re-running rollout region-by-region (if supported) or during a maintenance window.
+4. Coordinate with Fleet (Irene Choi / Vanessa Ortiz) for remediation.
+
+## Manual overrides (use sparingly)
+Overrides are intentionally hard to use. They are audited and may be visible to customer admins depending on account configuration.
+
+### Force-promote
+Use only when:
+- Business-critical deployment must proceed
+- Gate failure is understood and accepted (e.g., known false positive, telemetry lag) OR customer explicitly requests proceeding
+
+Required steps:
+1. Confirm customer impact is acceptable and SRE is informed.
+2. Gather evidence (screenshots/links to dashboards, incident context).
+3. Force-promote with a clear reason.
+
+Console: Promote → choose **Force promote** (admin-only)
+API: `POST /v1/dedicated/rollout-plans/{plan_id}:promote?mode=force`
+
+### Force-hold
+Use to freeze changes while investigating without losing state.
+Console: **Hold**
+API: `POST /v1/dedicated/rollout-plans/{plan_id}:hold`
+
+### Abort (recommended “stop” mechanism)
+Abort returns routing to the baseline (pre-rollout) target.
+Console: **Abort rollout**
+API: `POST /v1/dedicated/rollout-plans/{plan_id}:abort`
+
+When to abort:
+- Any material SLO impact (error spike, sustained 429s, severe latency regression)
+- OOM gate failures
+- Inability to evaluate gates due to telemetry issues combined with elevated risk
+
+## Emergency rollback (incident response)
+### Immediate objective
+Stop customer impact quickly by restoring baseline routing and reducing overload.
+
+### Step-by-step
+1. **Declare and coordinate**
+   - If customer-facing impact: open/attach to incident channel and notify `#eng-oncall`.
+   - Assign an incident lead and scribe if severity warrants.
+
+2. **Abort the rollout plan**
+   - Console: Abort rollout
+   - API: `:abort`
+
+3. **Validate routing has reverted**
+   - Confirm traffic is no longer routed to the new stage partition.
+   - In multi-region: confirm region failover policy is behaving as expected.
+
+4. **Stabilize the pool**
+   - If saturation persists, consider temporary rate limiting or capacity adjustments (coordinate with Fleet).
+   - Watch: 429 rate, queue depth, p99 latency.
+
+5. **Streaming request considerations**
+   - In-flight streaming requests may remain pinned to the selected backend for the duration of the stream.
+   - Expect rollback effects to be non-instant for long-lived streams. Monitor until steady state.
+
+6. **Capture required evidence for postmortem**
+   - Timeline: stage promotions, gate statuses, when impact started
+   - Dashboards snapshots (per region/stage)
+   - Audit event IDs for promote/abort/override actions
+
+7. **Escalate to owners**
+   - Routing/data plane regressions: Mina Haddad / Vikram Singh
+   - Gate query bugs/telemetry: Logan Wright / Allison Grant
+   - Control plane issues: Ethan Park
+
+## Audit logging requirements (operational)
+All of the following actions must produce audit events:
+- Plan create/update/start
+- Promote (normal and forced)
+- Hold/resume
+- Abort
+
+Operators must include a reason for:
+- promotions
+- holds > 30 minutes (recommended)
+- any forced override
+
+If audit exports are missing events (see INT-1951 pattern), treat as a compliance risk and notify Security (Kaitlyn Nguyen) and the audit export owner (Kevin Osei).
+
+## Post-rollout completion and cleanup
+After reaching 100% and passing gates:
+1. Confirm plan state is `completed`.
+2. Confirm baseline pointers are updated (if applicable) and fallback targets remain valid.
+3. Ensure any temporary guardrails (rate limits, alerts silences) are removed.
+4. Add a short entry to the rollout record:
+   - What changed
+   - Any mitigations used
+   - Any follow-ups filed (bugs, threshold tuning)
+
+## Troubleshooting quick reference
+- Gate fails with high 429s: abort; re-evaluate stage sizing and headroom
+- Gate unknown due to missing metrics: hold; validate stage tags + telemetry freshness
+- p99 regression only: treat as serious; check saturation and region imbalance
+- Multi-region impairment: hold; avoid promoting until region health is green
+
+## Appendix A: Checklist (operator)
+Pre-start:
+- [ ] Feature flag enabled for account/pool
+- [ ] Pool capacity/headroom meets guidelines
+- [ ] Dashboards show stage-tagged metrics
+- [ ] Customer comms/maintenance window confirmed (if needed)
+
+Per stage:
+- [ ] Warm-up (2–5m)
+- [ ] Gates evaluated for full window
+- [ ] No active incident/high burn
+- [ ] Promote with reason recorded
+
+On failure:
+- [ ] Hold or abort based on impact
+- [ ] Capture evidence links
+- [ ] Notify correct owning oncall
+
+## Appendix B: Example operator message templates
+**Hold due to telemetry lag**
+“Held rollout at stage 10% due to stale stage-tagged latency metrics (no updates for 12m). Waiting for telemetry recovery; no customer impact observed.”
+
+**Abort due to capacity starvation**
+“Aborted rollout at stage 1% due to elevated 429s and queue depth spike indicating canary partition starvation. Reverting to baseline; will re-run with larger canary stage after capacity review.”
+
+**Force-promote (requires approval)**
+“Force-promoted from stage 50% to 100% with SRE approval due to known false-positive GPU health gate (fleet signal flapping). Customer requested immediate completion; monitoring p99 + 429s closely.”

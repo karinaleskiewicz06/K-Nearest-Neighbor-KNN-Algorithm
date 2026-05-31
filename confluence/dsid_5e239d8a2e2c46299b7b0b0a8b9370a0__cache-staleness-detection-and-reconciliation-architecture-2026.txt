@@ -1,0 +1,180 @@
+Cache staleness detection and reconciliation architecture
+
+Overview
+
+This document defines the architecture, detection heuristics, observability surface, and operator procedures for detecting staleness in distributed prefix/KV caches used by the runtime and for safely reconciling stale entries without undue traffic impact. It targets platform operators, runtime engineers, and SREs who maintain the multi-tenant cache layer.
+
+Goals
+
+- Detect cache staleness quickly with high precision and configurable sensitivity.
+- Provide automated and operator-driven reconciliation paths that avoid global traffic storms.
+- Maintain SLOs for foreground latency and tail latency during reconciliation.
+- Provide dashboards and alerts that give clear operator actions.
+
+Scope and non-goals
+
+- Scope: runtime prefix/KV caches (region-local), cache coordination services (shard leaders), platform operator tooling, dashboards and runbooks.
+- Non-goal: single-tenant application-level cache semantics and data-model reconciliation outside of prefix/KV semantics.
+
+Background and problem statement
+
+Redwood’s multi-tenant inference runtime relies on prefix/KV caches to reduce per-token compute. Cache entries can become stale when model checkpoints are rotated, requantized, or when cache index metadata is repaired. Staleness manifests as:
+
+- High decode error/parse failures (structured outputs)
+- Sudden regressions in model quality metrics for a tenant cohort
+- Elevated cache miss rate followed by high downstream cost
+- Operator-observed token-retries and client timeouts
+
+Challenges: detection is noisy (workload variance), reconciliation can create cache stampedes, and multi-tenant isolation must be preserved.
+
+Detection architecture
+
+1) Signal sources (collected per-shard, per-region, per-model):
+   - cache_hit_rate (1s/1m/5m windows)
+   - avg_prefix_k (average prefix length observed)
+   - decode_errors_per_1k_tokens
+   - downstream_model_quality_delta (from evals/quickchecks)
+   - eviction_rate and unexpected_invalidations
+   - uid-scoped tail-latency percentiles (p95/p99)
+
+2) Aggregation and enrichment
+   - Signals are emitted from shard agents to the telemetry pipeline with the following tags: region, shard_id, model_id, tenant_id, node_pool.
+   - Enrichment adds recent rollout metadata (model version, quantization_profile), last-write timestamp, and last-cache-populate job id.
+
+3) Heuristics engine (realtime and batch):
+   - Short-window anomaly detector (1m): flags > 10% absolute drop in hit rate vs trailing 30m median.
+   - Quality delta guard: if decode_errors_per_1k_tokens increases by > 5x in 10 minutes AND correlated to a tenant cohort, mark HIGH-confidence staleness.
+   - Eviction-surge rule: if eviction_rate spikes > 3x baseline AND concurrent drop in hit_rate, mark MEDIUM-confidence staleness.
+   - Warmset-drift rule (model switch): when rollout metadata shows model_id changed for shard and hit_rate falls below 50% of previous median within 5 minutes, mark MEDIUM-confidence.
+
+Alerting and triage levels
+
+- P0 (actionable immediate): HIGH-confidence staleness affecting >= 5% of total global traffic for a model_id or affecting an enterprise tenant with reserved capacity. Triggers paging.
+- P1 (urgency): MEDIUM-confidence affecting >= 0.5% traffic or any drop pushing p99 latency > 2x SLO for > 3m. Triggers on-call notification.
+- P2 (investigate): LOW-confidence or localized anomalies; creates dashboard tickets for operator follow-up.
+
+Thresholds and example metric table
+
+| Metric | Window | Threshold (default) | Confidence impact |
+|---|---:|---:|---|
+| cache_hit_rate drop | 1m vs 30m median | > 10 percentage points drop | increases confidence |
+| decode_errors_per_1k_tokens | 5m | > 5x baseline | high |
+| eviction_rate | 5m | > 3x baseline | medium |
+| p99 latency | 5m | > 2x SLO | escalates |
+| downstream-quality-delta | 10m | >= 3% absolute drop | high |
+
+Operator dashboards and widgets
+
+Required dashboard panels (per region/model shard):
+
+- Key summary row: current confidence, affected tenants list, quick-links to shard logs and recent rollouts.
+- Time-series: cache_hit_rate (1m/5m/1h), eviction_rate, decode_errors_per_1k_tokens.
+- Heatmap: shard-level confidence over last 24h.
+- Scatter: model_version vs hit_rate change with rollout markers.
+- Impact projection: estimated token-cost delta if reconciliation done naively.
+
+Example panel spec (text table):
+
+| Panel | Metrics | Viz | Notes |
+|---|---|---|---|
+| Summary | confidence, affected_tenants_count | single-value | click to open runbook |
+| Hit rate | cache_hit_rate{shard,model} | line | 1m/5m series overlays |
+| Eviction vs Latency | eviction_rate, p99_latency | dual-axis | annotate rollouts |
+
+Automated reconciliation strategies (safe by default)
+
+- Passive repair: background rehydration where operator-specified low-traffic refeed jobs run at a capped QPS per shard. Default: 5% of shard sustained QPS.
+- Staggered vacuum: coordinator issues reconcile windows per shard with jittered start times to avoid simultaneous load.
+- Tenant-aware backfills: reconcile tenant prefixes with per-tenant rate-limits and lease tokens. For enterprise tenants with reserved capacity, allow faster backfills under quota.
+- Canary repopulation: pick 5% of queries (by hash sampling) to be used to repopulate cache; monitor p99 latency and quality before widening.
+- Fallback routing: if reconciliation threatens latency SLOs, temporarily route new requests to a lighter-weight model-variant (quantized or CPU-safe variant) for affected tenant shards.
+
+Reconciliation operators and safety checks (automatic guardrails)
+
+- Global throttle: reconciliation jobs share a global credit pool (default 0.2 of aggregate QPS). Jobs can borrow credits only if p99 latency across region remains within 1.25x SLO.
+- Eviction protection: if a shard’s eviction_rate is above configured threshold, pause new rehydration to avoid chase-cycle.
+- Progressive ramping: start at 0.1x target flow, monitor impact for 2 minutes, then increase exponentially with 2x steps up to the operator-specified cap.
+
+Operator runbook (quick steps)
+
+1) Notification received (P0/P1). Open shard dashboard and confirm: check confidence panel, decode_errors, hit_rate delta.
+2) Identify recent rollouts: click rollout metadata; if a model change happened in last 30m, mark rollout_cause and contact rollout owner.
+3) If HIGH-confidence and affecting customers: escalate to model-ops and initiate canary repopulation.
+4) Start canary repopulation: launch tenant-aware backfill for one low-impact tenant with sampling=5% and ramp plan: 0.1x -> 0.2x -> 0.4x over 8 minutes. Monitor p99 and decode_errors.
+5) If p99 > 1.5x SLO or decode_errors rise, immediately abort and fall back to routing policy. Document in incident ticket.
+6) If canary is stable for 20 minutes, widen to other tenants in staggered waves (per-shard jitter 30s).
+7) After full reconcile, run validation job (quick-checks) that compares downstream-quality-delta and token-cost impact, then set shard as healthy.
+
+Playbook snippet: CLI examples
+
+# Start canary backfill on shard (example)
+redwoodctl cache backfill --shard s-23 --model rtx-15b-q4 --tenants t-low-1 --sample 0.05 --max-qps 200
+
+# Pause automatic reconciliation for a shard
+redwoodctl cache reconcile pause --shard s-23
+
+Testing, verification and post-action checks
+
+- Validation check suite (automated):
+  1) structural-check (ensures keys deserialize)
+  2) quality-check (small sampled eval set)
+  3) latency-check (p95/p99 against baseline)
+
+- Run these checks after every full reconcile and store results in the shard audit log.
+
+Rollout plan for architecture changes
+
+1) Deploy heuristics engine as feature-flagged service in staging.
+2) Run shadow detection for 48h; collect false-positive/negative rates.
+3) Enable automated P2 notifications for one region.
+4) After 1 week of stable signals, enable MEDIUM-confidence P1 notifications (no auto-paging).
+5) After refining throttles, enable canary repopulation automation behind a kill-switch.
+
+Ownership and contacts
+
+- Primary owners: eng-platform (cache team) — Marisol Vega (owner), eng-sre on-call for region.
+- Secondary: eng-serving-runtime (model rollouts), model-ops (for verified quality deltas).
+- Pager: cache-team@redwood.internal, oncall: +1-555-0102 (see oncall roster).
+
+Metrics to report quarterly
+
+- Mean time to detect (MTTD) staleness (target < 5m for HIGH confidence).
+- Mean time to reconcile (MTTR) for article-sized incidents (target < 60m end-to-end for P0 after manual start).
+- False-positive rate of staleness detection (target < 8%).
+- Token-cost delta during reconciliation (target < 15% uplift).
+
+Postmortem and retrospective guidance
+
+- Always include: timeline, signals used, false positives/negatives, operator actions, rollback timeline, and suggested heuristic tuning.
+- If reconciliation triggered significant SLO impact, add a technical task to add a new global throttle or improve sampling strategy.
+
+Appendix: sample config snippet (YAML)
+
+heuristics:
+  short_window_median_minutes: 30
+  hit_rate_drop_pct_threshold: 10
+  decode_error_multiplier: 5
+  eviction_spike_multiplier: 3
+  canary_sample_fraction: 0.05
+  global_reconcile_credit_fraction: 0.2
+  initial_ramp_seconds: 120
+  ramp_step_multiplier: 2
+
+FAQ
+
+Q: What if fast rollouts intentionally change model behavior and cause hit-rate drops?
+A: Release teams must annotate rollout metadata with 'expected-cache-impact: true' and a safe-window. The heuristics engine will lower confidence for such rollouts unless decode_errors spike.
+
+Q: Can tenants opt out of automated reconcile?
+A: Yes — enterprise tenants can set a policy to opt out of automated background backfills; reconciliation will be operator-driven for those tenants.
+
+References
+
+- /eng-platform/runbooks/kv-cache-consistency-and-degraded-read-backoff-guide-2027.json
+- /eng-platform/systems-and-services/operator-heuristics-for-adaptive-warmset-consolidation-2026.json
+
+Document history
+
+- 2026-02-14 — initial draft by Marisol Vega
+- 2026-04-20 — added canary repopulation pattern and CLI snippets (review: Ravi Menon)
+- 2026-10-03 — tuned thresholds and added global credit pool design (review: Claire Hsu)

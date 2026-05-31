@@ -1,0 +1,194 @@
+Capacity Signal Denoising and SLO Guardrail Runbook
+
+Overview
+
+Purpose: provide a repeatable, tool-agnostic runbook for converting noisy capacity and SLO telemetry into reliable decision signals used by autoscaling, error-budget orchestration, and incident detection. This document codifies: denoising algorithms, sampling and aggregation policies, thresholds for automated actions, verification checks, ownership, and a staged rollout plan.
+
+Why this exists
+
+- Model inference workloads generate high-cardinality, bursty telemetry (token-level latencies, KV cache/hit rates, GPU utilization by batch size). Raw telemetry often produces false positives for SLO regressions and leads to unnecessary capacity changes.
+- This runbook reduces operational churn by: (1) converting raw telemetry into robust signals, (2) providing action matrices tied to error-budget burn, and (3) validating those signals before automated remediation.
+
+Scope
+
+- Applies to all inference-facing services managed by eng-sre (hosted API, dedicated pools, private deployments).
+- Focus metrics: request latency quantiles (p50/p95/p99), request success rate (HTTP 2xx-%), per-tenant request rate, GPU utilization (device), model hot-pool hit rate, KV cache hit ratio.
+- Out-of-scope: per-development environment experiments (use telemetry-sandbox for that).
+
+Key concepts and definitions
+
+- Denoised signal: metric after smoothing, outlier filtering, and seasonal decomposition.
+- Burst: short-lived spike where request rate > 3x local moving median for the same hour-of-week.
+- Stable window: rolling 30-minute window used for operational decisions unless otherwise noted.
+- Actionable event: denoised signal crossing a configured threshold for >= two consecutive stable windows.
+
+Signal processing pipeline (recommended implementation)
+
+1) Collection and raw retention
+
+- Collect raw events at full fidelity (token-level traces) but primarily route to hot storage for 72 hours and cold storage for 90 days.
+- Sampling guideline: store 100% of aggregate request/latency metrics; sample token-level traces at 2% baseline, up to 20% during anomalous periods triggered by a preliminary detector.
+
+2) Preprocessing
+
+- Tag normalization: ensure every telemetry row includes service, cluster, region, model-version, tenant-id, route, and request-type. Missing tags -> forward to telemetry-quality channel for remediation.
+- Clock alignment: metrics must be aligned to the cluster-local minute; apply server-time skew correction if >250ms.
+
+3) Denoising steps (applied in order)
+
+A. Outlier trimming (short tail suppression)
+- Remove top 0.1% sample values per minute per metric to limit measurement noise from instrumentation spikes.
+- Rationale: instrumentation or transient host scheduling can produce extreme latencies that should not immediately drive autoscale.
+
+B. Median absolute deviation (MAD) filter
+- Compute median M and MAD over the last 30 minutes. Mark samples outside M ± 6*MAD as transient; downweight them by 90% in the aggregation.
+
+C. Seasonal-trend decomposition (STL)
+- If the metric exhibits clear periodicity (hour-of-day or day-of-week), decompose using STL with seasonal period = 60 (minutes) or 1440 (minutes) depending on dataset. Use the trend component for autoscale decisions and the seasonal residual to avoid reacting to predictable load cycles.
+
+D. Robust exponential smoothing for trend (RTS)
+- Apply an alpha tuned to the metric class: latency quantiles: alpha=0.12; request rate: alpha=0.25; GPU util: alpha=0.08. Maintain both smoothed and raw percentiles for drift detection.
+
+E. Burst-aware gating
+- When an increase in request rate qualifies as a burst (see definition), require at least two conditions to be true before autoscale: smoothed request rate > 1.3x baseline AND p95 latency smoothed > threshold. This prevents scale-up on short spiky traffic that current model-serving pool can absorb.
+
+Telemetry queries (examples)
+
+- Baseline p95 (ClickHouse-style):
+
+SELECT toStartOfMinute(timestamp) AS minute, quantileExact(0.95)(latency_ms) AS p95
+FROM inference_requests
+WHERE service = 'redwood-api' AND model_version = 'rwd-v2' AND region = 'us-west-2'
+  AND timestamp BETWEEN now() - INTERVAL 2 HOUR AND now()
+GROUP BY minute
+ORDER BY minute DESC
+
+- Denosing pipeline (pseudocode):
+
+# pseudocode
+raw = query(metric, window=60min)
+trimmed = trim_top_percent(raw, 0.1)
+median, mad = stats(trimmed)
+filtered = downweight_outliers(trimmed, median, mad, threshold=6)
+seasonal, trend = stl_decompose(filtered, period=60)
+smoothed = rts(trend, alpha=0.12)
+return smoothed
+
+Action matrix (automated vs. human-in-loop)
+
+- Inputs: denoised p95 latency, denoised request rate, GPU util, error budget burn rate (24h and 1h).
+
+| Condition | 1h burn | 24h burn | Action | Owner |
+|---|---:|---:|---|---|
+| Minor latency rise: p95 > SLO*1.05 for 30m | <2x | <1.5x | Annotate signal, create async ticket to platform, no autoscale | Platform Oncall |
+| Sustained latency regression: p95 > SLO*1.1 for 2 windows | >2x | <3x | Open incident, human approval for scale-up, runbook: manual pool add | Oncall + Platform Eng |
+| Rapid high burn: 1h burn > 4x and p95 > SLO*1.15 | >4x | >6x | Automated pre-approved scale-up of +20% capacity, notify SRE, begin throttling policies if capacity not provisioned in 10m | SRE Autopilot |
+| Resource saturation: GPU util > 92% for 15m + queue growth | - | - | Immediate scale up limited by quota; trigger priority routing & error-budget admission control | Oncall + Capacity team |
+Note: SLO multipliers are tied to product tier (free-tier tenants use stricter admission control). See governance section for per-tenant policy.
+
+SLO and error-budget integration
+
+- Canonical SLOs to drive the pipeline: availability (successful requests >= 99.95% monthly), latency p95 <= 120ms for 'short' requests, p95 <= 500ms for 'long' requests. These are the baseline; product teams may define stricter SLOs per feature.
+- Error budget burn detection: compute burn rate as (observed bad / expected bad) over a lookback. Trigger levels defined at 1h, 6h, 24h.
+- Linkage: denoised signals feed the error-budget dashboard. Only actionable events as defined above should decrement automated budget allowances (to avoid punishing teams for instrumentation noise).
+
+Operational verification checklist (pre-automation)
+
+1) Synthetic canary: deploy synthetic generator at 1% of traffic with configured steady patterns. Verify denoised trend matches canary within +/- 3% over 6 hours.
+2) Replay test: run pipeline on archived 48-hour trace with known incidents; confirm detection precision >= 0.92 and false positive rate <= 0.06.
+3) Shadow autoscaling: run the autoscale decisions in shadow mode for 48 hours and compare to baseline operator decisions.
+4) Safety net: automated scale-up rate-limited to 20% per 10 minutes; require manual approval for >50% changes.
+
+Incident review and evidence requirements
+
+- For any incident where the denoised signal triggered an automated action, incident owners must provide: link to raw telemetry bucket, the denoising assertion (median/MAD summary), the STL decomposition visuals, and the synthetic canary comparison. Use template: IncidentEvidenceID-<YYYYMMDD>-<service>.
+- Post-incident questions to answer: Did denoising mask a real regression? Were thresholds misconfigured? Was sampling rate adequate? Each answer must be documented in the postmortem.
+
+Ownership and governance
+
+- Owner: SRE Telemetry Squad (primary), Capacity team (secondary).
+- Review cadence: monthly review of thresholds and denoising parameters; quarterly run replay tests across representative model families.
+
+Operational runbook (step-by-step)
+
+1) Detection: Alert fires on "denoised-p95-crossing" with tags {service, cluster, tenant}.
+2) Triage (first 10 minutes):
+   a) Verify the denoised signal dashboard.
+   b) Cross-check raw minute-level p95 and sampled token traces.
+   c) Check for correlated signals: GPU util, queue length, cache hit rate.
+3) If actionable event (see Action Matrix):
+   a) For automated actions, confirm change in ticketing system and observe for 10 minutes.
+   b) For manual actions, escalate to platform oncall and follow manual pool add/runbook steps.
+4) Post-action (within 1 hour):
+   a) Verify SLO status and error-budget burn.
+   b) If automated action did not reduce latency, begin rollback sequence and open incident.
+5) Postmortem and parameter tuning: run replay and update denoising parameters if necessary.
+
+Rollback safety and throttles
+
+- Every automated scale operation includes an automatic rollback hook if:
+  - latency p95 does not improve by at least 7% within 15 minutes, OR
+  - queue growth continues for 20 minutes after scale-up.
+- Throttle policy: when error budget < 20% remaining and 24h burn > 2x, admit new low-priority tokens at 70% rate and redirect bulk-batch jobs to deferred queue.
+
+Example configs (YAML)
+
+---
+denoising:
+  outlier_trim_percent: 0.1
+  mad_threshold: 6
+  smoothing:
+    latency_alpha: 0.12
+    rate_alpha: 0.25
+    gpu_alpha: 0.08
+  seasonal_period_minutes: 60
+actions:
+  max_auto_scale_pct_per_10m: 20
+  auto_scale_notify: true
+  require_manual_over_pct: 50
+thresholds:
+  p95_short_request_ms: 120
+  p95_long_request_ms: 500
+  gpu_saturation_pct: 92
+  burst_multiplier: 3.0
+---
+
+Rollout plan
+
+1) Pilot (2 weeks): enable denoising in shadow for a single service (recommendation: embeddings route) with sampling increased to 5%.
+2) Evaluate: run replay tests and shadow autoscale. Review metrics with Platform Eng.
+3) Gradual enable: enable for 25% of clusters for 1 week, then 50% for 1 week, then full for non-critical regions.
+4) Hardening: after 30 days of full traffic with autopilot, remove shadow-mode rate limits for autoscaling and incorporate into SRE runbook triggers.
+
+Related pages and templates
+
+- SLO contract template: /confluence/eng-sre/slo-contract-template
+- Incident evidence template: /confluence/eng-sre/incident-review/evidence-template
+- Telemetry-sandbox guide: /confluence/eng-sre/operational-tooling/telemetry-sandbox
+
+Appendix A: Troubleshooting snippets
+
+- Quick query to compare raw vs denoised p95 (ClickHouse):
+SELECT minute, quantileExact(0.95)(latency_ms) AS raw_p95, smoothed_p95
+FROM (
+  SELECT toStartOfMinute(timestamp) AS minute, latency_ms, -- smoothed_p95 computed offline by pipeline
+  FROM inference_requests
+  WHERE service = 'redwood-api' AND timestamp > now() - INTERVAL 2 HOUR
+)
+GROUP BY minute
+ORDER BY minute DESC
+
+- If denoised signal suppressed a true regression: check sampling rate (increase to 20%), verify raw-top-0.1% values, and re-run replay with lower MAD threshold.
+
+Revision history
+
+- 2025-03-12 (Priya Nambiar): initial draft and pilot config.
+- 2025-05-04 (Maya Chen): added burst gating logic and YAML defaults.
+- 2026-11-02 (Ethan Ruiz): tuned alpha parameters after model-family replay testing; publish.
+
+Contact and escalation
+
+- Primary: SRE Telemetry Squad (pager: #sre-telemetry)
+- Secondary: Capacity Team (pager: #capacity-ops)
+
+End of runbook.

@@ -1,0 +1,184 @@
+gpu-mesh-egress-iac-and-cicd-gatekeeping
+
+Overview
+
+This page documents the design, Terraform module contract, CI/CD gating patterns, and operational runbook for the GPU mesh egress enforcement pattern. The goal of the pattern is to ensure GPU workloads (training, inference, evals, and CI jobs) only egress to approved destinations, and that changes to egress/IaC are validated automatically before being applied. This protects sensitive model weights and evaluation telemetry from accidental exfiltration while enabling fast iterations for infra and ML teams.
+
+Background
+
+Historically we have seen two classes of egress failures: misconfigured security group rules and hidden outbound NAT permissions in shared VPCs. GPU workloads are particularly high risk because they: (a) run customer or model artifacts; (b) often live in high-throughput ephemeral pools; and (c) can trigger large bursts of outbound traffic (S3, registries, metrics). The mesh-egress pattern provides a single IaC-backed enforcement surface plus an automated pipeline and smoke tests that run on every change.
+
+Goals
+
+- Enforce allowlist-only egress for GPU compute subnets by default.
+- Provide a reusable Terraform module that codifies egress policies for multi-account/multi-region deployments.
+- Gate Terraform changes with CI:Pipelines that run network policy unit tests and a fast e2e smoke test in a minimized ephemeral GPU pool.
+- Provide clear rollout and rollback steps and alerting for policy violations.
+
+Non-Goals
+
+- Replacing VPC-level host-based firewalls (where required) — this is complementary.
+- Solving every non-GPU egress case; the module is tuned for high-throughput GPU workloads but is usable for other compute types.
+
+Scope
+
+Applies to: Dedicated GPU clusters (hosted and dedicated), ephemeral CI GPU pools, and evaluation clusters used by applied ML teams.
+
+Exclusions: on-prem air-gapped deployments — those use the Private deployment checklist located in eng-private-deployments.
+
+Architecture overview
+
+1) Control plane: Terraform modules stored in the infra modules repo (git::ssh://git.company/internal/infra-modules) with input validation and policy checks via Open Policy Agent (OPA) pre-apply step.
+2) Enforcement plane: Network resources that implement egress allowlists. For cloud providers this includes: managed NAT Gateways + proxy endpoints, VPC egress gateway appliances (where used), and provider-native network-policy for pods (K8s).
+3) Validation plane: CI pipeline with three stages — lint/test, plan-and-opa-validate, ephemeral-deploy-and-smoke.
+
+ASCII Diagram
+
+  +----------------------+      +----------------------+      +---------------------+
+  |  Git (infra-modules) |----->|  CI (pipeline)       |----->|  Control plane (TF) |
+  +----------------------+      +----------------------+      +----------+----------+
+                                                                        |
+                                    +-----------------------------------+------------------------------------+
+                                    |                                                                        |
+                         +----------v---------+                                                  +-----------v---------+
+                         | GPU Compute Subnet |                                                  | Allowed Destination  |
+                         | (private)          |<===== Allowed outbound via ====|  (S3, Artifact Registry |
+                         +--------------------+           NAT + Proxy/GW            |  model-storage)        |
+                                                                                          +---------------------+
+
+Terraform module contract (summary)
+
+Module path: modules/network/gpu-egress-gateway
+Versioning: follow semver; breaking changes must be documented in CHANGELOG and have an ADR.
+
+Inputs (selected):
+- name_prefix (string) — prefix for all resources.
+- vpc_id (string) — target VPC.
+- subnet_ids (list of string) — GPU private subnets to attach rules to.
+- allowed_cidrs (list of string) — global CIDR allowlist for destinations.
+- allowed_fqdns (list of string) — FQDNs allowed through proxy.
+- nat_type (string) — one of [managed, egress_gateway, proxy] (default: managed).
+- logging_bucket (string) — S3/GCS bucket for flow logs.
+- enable_k8s_network_policy (bool) — whether to inject NetworkPolicy CRs for K8s clusters.
+
+Outputs (selected):
+- egress_gateway_id (string)
+- proxy_config_url (string)
+- applied_allowlist_hash (string) — hash of the allowlist used for drift detection.
+
+Example Terraform usage
+
+module "gpu_egress" {
+  source = "git::ssh://git.company/internal/infra-modules//modules/network/gpu-egress-gateway?ref=v1.6.2"
+  name_prefix = "gpu-prod-usw2"
+  vpc_id = "vpc-0abc1234"
+  subnet_ids = ["subnet-0aa111","subnet-0aa112"]
+  allowed_cidrs = ["10.0.0.0/8","54.239.0.0/16"]
+  allowed_fqdns = ["models.internal.redwood.ai","artifacts.redwood.ai"]
+  nat_type = "egress_gateway"
+  logging_bucket = "redwood-gpu-flowlogs"
+  enable_k8s_network_policy = true
+}
+
+CI/CD pipeline pattern
+
+We use the centralized infra-pipelines project (git::ssh://git.company/internal/infra-pipelines) with the following stages for any PR that touches the gpu-egress module or its call-sites:
+
+Stage A — lint + unit tests (static checks)
+- terraform fmt + tflint + checkov.
+- unit tests for helper scripts (python/bash).
+
+Stage B — terraform plan + opa policy check (pre-approval)
+- run terraform init && terraform plan in a fork workspace.
+- run opa test/rego policies to ensure no broad allow_all rules and that nat_type cannot be set to "managed" for prod workspaces without annotation.
+- upload plan and OPA results to PR.
+
+Stage C — ephemeral-deploy-and-smoke
+- If change touches resources that alter egress, the pipeline performs a fast ephemeral deploy into a per-PR test account (sandbox).
+- The pipeline provisions a minimized GPU nodepool (1 cheap GPU instance), applies the module, and runs a small list of smoke tests:
+  1) curl to allowed endpoint (models.internal.redwood.ai) — expect 200 within 3s.
+  2) curl to disallowed IP (23.23.23.23) — expect blocked (no TCP connect or HTTP 403) within 5s.
+  3) check egress logs forwarded to logging_bucket within 60s.
+- Tests are automated and must pass for the PR to be auto-merge eligible; failures require owner_team approval.
+
+Policy and OPA snippets
+
+- Deny if any resource of type aws_security_group_rule or aws_network_acl_rule allows 0.0.0.0/0 outbound to ports > 1024.
+- Deny if nat_type == "managed" and workspace == "prod" and annotation_missing("business-justification").
+
+Operational runbook (high level)
+
+When a blocking alert fires (egress anomalies or smoke test failures):
+1) Pager — oncall infra primary is paged via PagerDuty (policy: S1 if >3 clusters impacted).
+2) Triage dashboard — open the GPU egress dashboard (Grafana board: infra/gpu-egress-overview).
+3) Confirm scope — identify which VPC/subnets (use outputs.applied_allowlist_hash) show unexpected destinations.
+4) Rollback plan — if recent terraform apply in last 30 minutes changed allowlist, run terraform rollback to previous version using the known-good ref.
+5) Fallback mitigation — apply an emergency block rule at the cloud provider NAT gateway (managed) or detach NAT and attach isolated NAT (egress_gateway) to cut outbound traffic while preserving internal connectivity.
+6) Postmortem — open incident doc under oncall-and-incident-response/postmortems with links to plan files and pipeline run IDs.
+
+SLOs and alerting
+
+- Egress-policy drift detection: 99.9% detection coverage for changes in applied_allowlist_hash (metric: infra.egress.hash_mismatch).
+- Smoke-test pipeline success rate: 99% for non-failing PRs (infra.ci.smoke.success).
+- Alert thresholds: fire S1 if >3 clusters see outbound connections to `unapproved_destinations` in 5 minutes.
+
+Monitoring and logs
+
+- Flow logs: enabled for all GPU subnets and delivered to logging_bucket with 24h hot retention and 30 days cold.
+- Proxy logs: forwarded to central Loki index `network-proxy-gpu`.
+- Metrics: per-subnet egress_bytes, denied_connections, allowed_connections framed by destination tag.
+
+Change management and rollout
+
+1) Create a feature branch in infra-modules and include: variable changes, module bump, and a CHANGELOG entry.
+2) Open PR and assign reviewers from reviewers list above.
+3) Pipeline will run stages A–C. If stage C passes on sandbox, request an ops-run for production rollout.
+4) Production rollout should be canaried to a single non-critical cluster for 1 hour, then to 10% of clusters, monitor denied/allowed ratio.
+
+Testing catalogue (quick list)
+
+- unit: rego tests for OPA, terraform unit tests for helper scripts.
+- integ: ephemeral GPU node smoke tests (curl allowed/disallowed endpoints).
+- perf: measure cold-start latency on attaching proxy/gateway for 1k connections.
+
+Ownership and contacts
+
+- Module owner: infra-networking team (primary: @aisha.patel).
+- Escalation: infra-sre oncall -> network-governance -> head of infra.
+- Docs owner: Marco Reyes (eng-infra team wiki).
+
+Related pages
+
+- infra-modules/modules/network/README (internal module docs)
+- eng-infra/cloud-accounts-and-networking/gpu-network-topology-and-tenant-isolation-patterns (related topology guide)
+- oncall-and-incident-response/preflight-gpu-deployment-validation-and-rollback-playbook (preflight checklist)
+
+Appendix: example CI YAML snippet
+
+pipeline:
+  name: gpu-egress-validate
+  steps:
+    - name: lint-and-unit
+      image: hashicorp/terraform:light
+      commands:
+        - terraform fmt -check
+        - tflint
+        - pytest tests/unit
+    - name: plan-and-opa
+      image: hashicorp/terraform:light
+      commands:
+        - terraform init -backend-config=...
+        - terraform plan -out=plan.tfplan
+        - opa test policies/ || exit 1
+    - name: ephemeral-deploy-smoke
+      image: alpine:3.18
+      commands:
+        - ./bin/create-ephemeral-gpu-pool.sh --pr ${PR_ID}
+        - ./bin/run-egress-smoke.sh --allowed models.internal.redwood.ai --disallowed 23.23.23.23
+
+Notes and future work
+
+- Add ML-driven eviction/pattern detection to reduce false positives when evaluation clusters legitimately connect to new registry endpoints.
+- Explore eBPF-based in-cluster enforcement for lower-latency allowlist decisions for pod-level egress.
+
+If you are implementing or modifying this module, please follow the review and canary rollout steps above and add a CHANGELOG entry. For questions, ping infra-networking or file an RFC in the team wiki.

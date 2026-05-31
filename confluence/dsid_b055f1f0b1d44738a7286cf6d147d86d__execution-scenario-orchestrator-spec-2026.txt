@@ -1,0 +1,178 @@
+Execution Scenario Orchestrator: Spec and Playbook
+
+Overview
+
+Purpose: This document specifies the Execution Scenario Orchestrator (ESO), a cross-cutting component that composes, schedules, and replays representative end-to-end inference scenarios against the runtime. ESO is intended to:
+
+- Provide a reproducible, versioned way to define complex multi-tenant workloads (prefixes, kv-cache warmup, mixed sequence lengths, burst patterns).
+- Integrate with kernel scheduler hooks so scenario fidelity is preserved when testing scheduler changes.
+- Produce traceable profiling artifacts consumable by the benchmarking suite and the profiling playbook.
+
+Scope and audience: engineers owning runtime architecture, kernel-and-scheduling, profiling, and SREs running performance experiments or incident triage.
+
+Design goals
+
+1) Determinism and provenance: every scenario is a small, self-contained script with a hashable manifest and metadata (model version, quantization profile, hardware fingerprint).
+2) Scheduler-aware playback: the orchestrator can attach scheduler context (priority, tenant-id, kernel-hint) to each request so the runtime executes the scenario as intended.
+3) Observability-first: scenario runs automatically capture structured traces, kernel attributions, and per-token cost deltas and upload to the central perf store.
+4) Lightweight chaos vectors: the orchestrator supports controlled perturbations (evictions, forced preemption, simulated NVLink degradation) to surface degradation modes.
+
+Component overview
+
+- Scenario DSL (YAML): declarative description of request series, injected events, and expected assertions.
+- Runner: controller that materializes requests and submits them to a chosen endpoint (local sandbox, canary cluster, full production mirror).
+- Scheduler Adapter: library that translates DSL affinity/priority fields into scheduler annotations and kernel hints.
+- Collector: post-run artifact collector (traces, kernel telemetry, raw responses, golden diffs) with upload to perf-bucket.
+
+Scenario DSL (conceptual example)
+
+# A minimal scenario manifest in YAML. Fields must remain flat (no nested objects with unknown keys) for deterministic hashing.
+
+manifest_version: "1.0"
+name: "multi-tenant-burst-warmup"
+model: "llama-13b-q4f16"
+hardware_fingerprint: "g4dn-8nvlink-2026-03"
+sequence_profile: "mix-small-medium-long"
+timeline:
+  - t: 0
+    action: "warmup"
+    params: "prefix_file=warmup-prompts.txt,concurrency=4"
+  - t: 30
+    action: "burst"
+    params: "clients=120,shape=50%short-30%med-20%long,priority=production"
+  - t: 90
+    action: "evict"
+    params: "tenant=tenant-42,reason=memory-pressure"
+assertions:
+  - type: "median-latency-below"
+    value_ms: "200"
+  - type: "tail-99-latency-below"
+    value_ms: "800"
+
+Scheduler integration
+
+The Scheduler Adapter exposes three annotations consumed by the kernel mapper: kernel_hint (preferred kernel variant), priority_class (production/canary/batch), and affinity_token (NUMA/slot placement hint). When the runner submits requests it attaches these fields as HTTP headers (X-ESO-Kernel-Hint, X-ESO-Priority, X-ESO-Affinity) to preserve signal across transport layers.
+
+Example headers (curl):
+
+curl -X POST https://runtime-canary.internal/api/v1/generate 
+ -H 'Authorization: Bearer $TOKEN' 
+ -H 'X-ESO-Kernel-Hint: grouped-attn-v2' 
+ -H 'X-ESO-Priority: production' 
+ -H 'X-ESO-Affinity: numa-0:slot-3' 
+ -d '{"prompt":"Summarize ..."}'
+
+Profiling playbook integration
+
+When an ESO run completes the Collector creates a run package and triggers the profiling playbook pipelines:
+
+1) Minimal trace upload: we include per-request trace IDs and compact kernel-attribution CSVs.
+2) Sampling policy: for runs > 10k requests, we apply stratified sampling by sequence length and priority class.
+3) Correlation loop: perf store populates the run record with scheduler decision traces so the profiler can compute causal latency deltas associated with kernel selection.
+
+Benchmarks and synthetic load harness
+
+ESO can emit two modes of workload: synthetic (generated tokens for microbenchmarks) and recorded-replay (playback of production request surface with anonymization). The benchmarking suite consumes scenario manifests to run SLO-driven experiments.
+
+SLO-driven experiment matrix (example)
+
+| parameter | example values | notes |
+|-----------|----------------|-------|
+| concurrency | 1, 8, 64, 256 | cluster-dependent cap |
+| sequence mix | 60/30/10 (s/m/l) | affects kernel crossing points |
+| kv-cache state | cold, warm, hot | warmimplies prefix-caching |
+| priority distribution | 90/10 prod/batch | scheduler stress test |
+
+Runtime runbook: Replaying a production slowdown
+
+Purpose: step-by-step guide to reproduce a reported production slowdown using ESO.
+
+1) Triage and capture: collect the incident ID and the example request IDs from the status page.
+2) Assemble a scenario: create a manifest that replays the failing requests (redacting PII), include the observed client headers and priority classes.
+3) Select target: use a canary cluster that mirrors the production scheduler version and kernel set.
+4) Run with tracing enabled: set environment variable ESO_TRACE_LEVEL=debug and run the runner with --collect-kernel-csv.
+4a) If the slowdown reproduces, immediately tag the run with incident:<id> and notify SRE channel.
+5) If the slowdown does not reproduce, run a higher-fidelity replay using recorded-replay mode with full affinity and session cookies (use only in secure sandbox).
+
+Investigation checklist (what to look for)
+
+- Kernel attribution spikes: sudden shift from grouped-attn-v2 to scalar-attn-fallback during medium sequences.
+- Preemption events: scheduler logs containing "evict" + matching trace IDs.
+- GPU metrics: duty-cycle drop, NVLink error counters, and sudden memory compaction events.
+- KV-cache miss rate increase after eviction window.
+
+Known issues and mitigations
+
+- Issue: affinity headers not propagated by edge proxy in old canaries.
+  Mitigation: upgrade proxy config to preserve X-ESO-* headers; work-around: include scheduler hints in body metadata.
+- Issue: reproducibility variance when running on different NVLink topologies.
+  Mitigation: include hardware_fingerprint in the manifest and pin to identical pool for replay.
+- Issue: large recorded-replay runs can saturate perf-store ingest.
+  Mitigation: use bucketed uploads and the incremental-collector option.
+
+Release notes (summary of changes that introduced ESO)
+
+- 2026-01-12: initial beta of ESO runner and DSL, supports warmup/burst/evict actions.
+- 2026-06-03: Scheduler Adapter v1 added kernel_hint mapping and header propagation.
+- 2026-09-22: Collector incremental upload and stratified-sampling policies added to reduce perf-store load.
+
+Operational requirements and configs
+
+Config keys (example table):
+
+| key | type | default | description |
+|-----|------|---------|-------------|
+| eso.runner.target | string | "canary" | target cluster: sandbox|canary|prod |
+| eso.collector.sample_rate | float | "0.1" | fraction of requests to keep in full trace (0.0-1.0) |
+| eso.scheduler.propagate_headers | bool | "true" | ensure X-ESO-* headers are forwarded by gateways |
+| eso.archive.bucket | string | "gs://perf-bucket/eso-runs" | destination for run artifacts |
+
+Security and privacy notes
+
+- Recorded payloads must be redacted. The runner supports an anonymizer plugin that hashes or drops PII fields before uploading.
+- Access controls: only members of runtime QA or SRE may run recorded-replay against production-mirrors. ESO enforces RBAC via OAuth groups.
+
+Ownership and rollout plan
+
+- Owner: runtime-infra team (primary), profiling team (secondary). Contacts: Marta Alvarez (runtime-infra), Kofi Mensah (profiling).
+- Rollout stages: alpha (sandbox-only) -> beta (canary clusters, opt-in) -> GA (policy: default available to oncall).
+- Acceptance criteria for GA: deterministic replay of previously recorded incidents in 90% of cases (same kernel selection and equivalent per-token latency within 15%).
+
+Appendix: Example full scenario manifest and runner commands
+
+# scenario.yaml
+manifest_version: "1.0"
+name: "incident-2026-299-replay"
+model: "vicuna-7b-q2"
+hardware_fingerprint: "a100-mig-4g-2026-05"
+sequence_profile: "60%short-30%med-10%long"
+timeline:
+  - t: 0
+    action: "replay-requests"
+    params: "file=incident-2026-299-requests.ndjson,concurrency=32,priority=production"
+  - t: 45
+    action: "chaos"
+    params: "type=evict,tenant=default,duration=5s"
+
+# run in sandbox
+eso-runner --manifest scenario.yaml --target canary --trace-level debug --collect-kernel-csv --upload-bucket gs://perf-bucket/eso-runs/incident-2026-299
+
+Support matrix and troubleshooting quick tips
+
+- If kernel CSVs are empty: confirm X-ESO-Kernel-Hint header propagation and ESO_TRACE_LEVEL.
+- If reproductions differ by >20% latency: pin hardware_fingerprint and verify NVLink topology.
+- If perf-store upload fails: retry with --incremental-collector and check bucket ACLs.
+
+Document change log
+
+- 2026-02-14 (Marta Alvarez): created initial draft.
+- 2026-06-10 (Kofi Mensah): added scheduler adapter header spec.
+- 2026-09-22 (Jade Patel): updated sampling policy and release notes.
+
+Related artifacts and references
+
+- Kernel mapper annotation contract: /confluence/eng-serving-runtime/kernel-and-scheduling/scheduler-policy-language-declarative-profiles-2026
+- Profiling integration guide: /confluence/eng-serving-runtime/profiling-playbook/causal-latency-attribution-and-signal-enrichment-playbook-2027
+- Perf store upload API: internal PRD #4571
+
+End of document.

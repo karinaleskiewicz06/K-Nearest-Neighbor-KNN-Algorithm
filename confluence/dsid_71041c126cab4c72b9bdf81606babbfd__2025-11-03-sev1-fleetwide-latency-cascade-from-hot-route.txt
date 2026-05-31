@@ -1,0 +1,186 @@
+Postmortem: 2025-11-03 Sev1 — Fleet-wide latency cascade triggered by hot /v1/chat/completions route
+
+## Summary
+On 2025-11-03, the Hosted API experienced a Sev1 incident where a bursty, high-token-length workload on the `/v1/chat/completions` route caused a fleet-wide latency cascade across shared GPU pools. The event began as localized p99 latency elevation in `us-east` and progressed to elevated tail latency and increased 5xx rates across multiple routes (chat, embeddings, rerank) due to shared capacity and lack of effective tier-aware admission control.
+
+The primary trigger was a single enterprise tenant workload (large prompts + high concurrency + streaming) that behaved like a noisy neighbor. Our control plane and routing stack at the time did not:
+- enforce tier-aware budgets per route,
+- gate best-effort traffic early when capacity is constrained,
+- export/consume reliable queue depth signals to drive admission decisions,
+- provide consistent overload semantics (429s) to shed load predictably.
+
+We restored stability by applying manual throttles and re-routing traffic, but the incident highlighted systemic gaps that directly motivated the **Hot-route capacity protection** initiative.
+
+## Impact
+**Customer impact (external):**
+- Hosted API: intermittent elevated latency and increased errors.
+- Dedicated tier: minimal direct error impact, but some elevated tail latency observed in shared services (control plane / policy evaluation) due to knock-on effects.
+
+**What customers experienced:**
+- Increased response latency on `/v1/chat/completions` (notably for streaming clients where time-to-first-token degraded).
+- Increased 5xx rates (primarily 503/504) for a subset of requests when upstream queues exceeded timeouts.
+- Retries amplified load due to lack of consistent backpressure guidance and inconsistent 429 behavior.
+
+**SLO/SLA impact (Hosted API):**
+- A subset of enterprise accounts breached their route-level p99 latency objective for `/v1/chat/completions` during the peak window.
+- Best-effort traffic experienced the largest latency variance and error spikes.
+
+**Blast radius:**
+- Primary: `us-east` hosted GPU pools (`hosted-gpu-a100-us-east-*`).
+- Secondary: global impact via cross-region spillover as clients retried and traffic shifted.
+
+## Detection
+**How we detected:**
+- First alert was the standard Hosted API p99 latency alert (regional) and elevated 5xx rate alert.
+- On-call noticed concurrent increases in GPU saturation and request queueing, but we lacked a single “overload protection active” signal.
+
+**Detection gaps:**
+- No tier/route-specific overload dashboards existed; we only had aggregate route latency and overall 5xx.
+- Queue depth and scheduler lag signals were either unavailable or not normalized enough to be actionable.
+
+## Timeline (UTC)
+> Note: Times are approximate; see incident channel transcript for raw timestamps.
+
+| Time (UTC) | Event |
+|---:|---|
+| 14:07 | First elevation in `/v1/chat/completions` p99 latency in `us-east` detected (latency alert fired). |
+| 14:10 | 5xx begins rising on chat route; embeddings begins showing elevated p95 due to shared pools. |
+| 14:13 | On-call (SRE) joins; initial hypothesis: regional capacity shortfall / GPU pool saturation. |
+| 14:18 | GPU saturation at/near 100% for `us-east` shared pool; request queue depth increases rapidly. |
+| 14:23 | Router continues admitting best-effort traffic; tail latency increases fleet-wide (clients retry and shift load). |
+| 14:29 | Manual action: increase existing global throttle on Hosted API for best-effort tier (coarse limit). |
+| 14:33 | Partial stabilization; chat route still elevated; 5xx plateaus but remains above baseline. |
+| 14:41 | Identified dominant tenant/workload shape: long prompts + high concurrency + streaming on `/v1/chat/completions`. |
+| 14:45 | Manual mitigation: apply temporary tenant-level rate limit at gateway (custom rule) and reduce burst. |
+| 14:52 | Latency begins to recover; queue depth decreases; 5xx drops. |
+| 15:06 | Traffic normalized; monitoring returns to near-baseline; incident downgraded from active mitigation to monitoring. |
+| 15:35 | Incident resolved; begin drafting postmortem and follow-up items. |
+
+## Root cause
+### Immediate cause
+A single high-traffic, high-token-length chat workload saturated the shared GPU pool serving `/v1/chat/completions` in `us-east`. Continuous batching and KV cache pressure amplified the effect: long sequences reduced effective throughput, increased queueing, and caused timeouts.
+
+### Systemic causes
+1) **No tier-aware admission control tied to route budgets**
+- We did not have explicit per-route/per-tier budgets aligned to enterprise vs best-effort SLOs.
+- Under pressure, the router treated traffic more uniformly than intended, allowing best-effort to compete with enterprise traffic for the same constrained resources.
+
+2) **Lack of reliable capacity signals in routing decisions**
+- Routing did not consume normalized queue depth / scheduler lag signals to gate new requests.
+- The system reacted only after latency and error rates rose, which is too late for overload management.
+
+3) **Inconsistent overload shedding semantics**
+- Many clients saw 5xx/timeout behavior rather than consistent 429s with actionable retry guidance.
+- This increased retry storms and elevated load during recovery.
+
+4) **Shared pool coupling across “hot routes”**
+- Chat traffic saturation degraded other routes in the same shared pools (embeddings/rerank) via resource contention and control plane hot paths.
+
+## Contributing factors
+- **Workload shape:** long prompts, high output token targets, and streaming increased GPU occupancy time per request.
+- **Burst behavior:** rapid ramp-up exceeded what autoscaling could absorb in minutes.
+- **Noisy neighbor isolation:** the tenant was in a shared hosted pool without strict per-tenant burst controls.
+- **Observability gaps:** limited visibility into “why” requests were slow (queue depth, scheduler lag, shed reasons).
+
+## What went well
+- On-call triage was fast; we identified the dominant workload within ~35 minutes.
+- Manual gateway throttles reduced load and helped restore stability without needing a full regional shutdown.
+- Cross-team coordination (SRE + Routing + Gateway + Infra) was effective during mitigation.
+
+## What went poorly
+- We relied on coarse throttles and manual tenant-specific rules; decisions were not deterministic or easily auditable.
+- Lack of tier-aware protections meant enterprise and best-effort behaviors were not predictably separated under load.
+- Customer-visible errors skewed toward 5xx/timeouts rather than 429 with clear retry semantics.
+- Limited runbook coverage for overload: no standardized “overload mode” actions or dashboards existed.
+
+## Where we got lucky
+- The trigger tenant’s burst tapered rather than sustaining for hours.
+- `eu-west` had spare capacity, which reduced the duration of global spillover effects.
+
+## Customer communications
+- Support sent targeted updates to affected enterprise accounts during/after the incident, but messaging was reactive.
+- We did not have a pre-approved explanation for overload behavior or recommended client-side backoff.
+
+Follow-up: create standardized customer-facing guidance for 429s/reason codes and predictable overload handling (see Action Items).
+
+## Action items
+### P0 (committed / already in flight)
+1) **Implement tier-aware rate limiting at the API gateway**
+- Owner: Amara Diallo (API Gateway)
+- Tracking: Linear `ENG-4922`
+- Due: 2025-12-05
+- Notes: Standardize 429 payload + headers; differentiate quota vs overload.
+
+2) **Add priority classes + deterministic evaluation in policy engine**
+- Owner: Jordan Lee (Policy Engine)
+- Tracking: Linear `ENG-4923`
+- Due: 2025-12-12
+- Notes: Decisions must be explainable for enterprise escalations.
+
+3) **Integrate capacity signals into routing for admission control**
+- Owner: Elena Popov (Routing)
+- Tracking: Linear `ENG-4924`
+- Due: 2025-12-19
+- Notes: Gate best-effort earlier; preserve enterprise route budgets.
+
+4) **Export runtime queue depth and scheduler lag metrics (low cardinality)**
+- Owner: Julian Moore (Runtime) / Logan Wright (Telemetry)
+- Tracking: Linear `ENG-4925`
+- Due: 2025-12-02
+- Notes: Must be cheap on data plane; usable for dashboards and automated triggers.
+
+### P1 (operational readiness)
+5) **Create SRE dashboards + paging rules for protected routes**
+- Owner: Sergio Costa (Observability)
+- Tracking: Linear `ENG-4926`
+- Due: 2025-12-20
+
+6) **Incident-bot notifications for overload protection triggers**
+- Owner: Peter Holtz (Embedded SRE)
+- Tracking: Linear `ENG-4927`
+- Due: 2026-01-10
+
+7) **Runbook: overload protection + admission control**
+- Owner: Aisha Bello (SRE)
+- Tracking: Confluence page `runbook-overload-protection-and-admission-control`
+- Due: 2025-12-23
+
+8) **Support playbook + customer docs for new 429 semantics**
+- Owner: Dev Patel (Support) / Wei Chen (Docs)
+- Tracking: Linear `ENG-4930`
+- Due: 2026-01-15
+
+### P2 (hardening / longer-term)
+9) **Fallback policy guardrails for enterprise routes**
+- Owner: Ravi Menon (Architecture) / Mina Haddad (Routing)
+- Tracking: GitHub `pr-27460` + follow-ups
+- Due: 2026-01-30
+- Notes: Avoid silent quality changes; only allow fallback where explicitly permitted.
+
+10) **Game day: simulate hot-route overload + validate enterprise SLO stability**
+- Owner: Rafael Mendes (SRE)
+- Tracking: Linear `ENG-4929`
+- Due: 2026-02-07
+
+## Prevention / design changes (high level)
+This incident directly motivated the **Hot-route capacity protection** program with the following principles:
+- **Protect the fleet:** overload in one hot route must not cause fleet-wide degradation.
+- **Guarantee enterprise behavior:** explicit priority classes and per-route/per-tier budgets tied to SLOs.
+- **Make overload behavior predictable:** consistent 429 semantics + reason codes; deterministic and auditable decisions.
+- **Keep data-plane overhead low:** avoid high-cardinality checks and expensive policy evaluation on critical paths.
+
+## Appendix
+### Key metrics observed (peak window)
+- `/v1/chat/completions` p99 latency (us-east): elevated multiple times above baseline during 14:10–14:50 UTC.
+- GPU saturation: effectively pinned at 95–100% for the affected shared pool.
+- Queue depth: increased rapidly and remained elevated until tenant throttling was applied.
+- Error profile: mix of 503/504 and client timeouts; 429 usage was inconsistent and not a reliable load-shed mechanism.
+
+### Notes on incident classification
+- Severity: Sev1 due to broad customer impact and fleet-wide degradation risk.
+- Duration: ~1h 30m from first alert to stable recovery.
+
+### References
+- Linear epic: `ENG-4921 Hot-route capacity protection`
+- Design/ADR: see related pages above
+- Support follow-ups: see Known Issues page `enterprise-priority-429-and-quota-behavior` (created later as part of program)

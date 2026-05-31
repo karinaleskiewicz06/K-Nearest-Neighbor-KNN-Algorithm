@@ -1,0 +1,171 @@
+kv-cache-consensus-and-warmup-coordination-runbook
+
+Overview
+
+This runbook describes the KV cache consensus pattern and warmup coordination protocol for Redwood inference nodes. It is intended for SREs and infra engineers responsible for node lifecycle, cache health, and incident mitigation. The goal is to avoid cold-start thundering herds, minimize per-token cost during warmup, and preserve correctness of cached KV state across rolling upgrades, preemptions, and pool resizing.
+
+Problem statement
+
+- Inference nodes maintain per-session and per-prefix KV caches to accelerate autoregressive decoding.
+- On pool scale-ups, preemptions, or mass restarts (e.g., driver/kernel upgrades), many nodes can issue identical prefix priming requests simultaneously causing: higher latency spikes, increased cost, and pressure on model backends.
+- A naive warmup strategy leads to inconsistent cache population, unnecessary duplicate compute, and degraded SLOs.
+
+Goals
+
+1. Define a lightweight consensus protocol for electing a warmup leader per-tenant and per-shard.
+2. Provide step-by-step incident remediation for corrupted or unsynchronized KV state.
+3. Specify monitoring, Terraform module knobs, and rollout steps for safe adoption.
+
+Glossary
+
+- KV cache: key-value cache holding past attention keys/values used to avoid recomputing prefixes.
+- Shard: scheduling domain (GPU or logical partition) where a set of sessions are packed.
+- Warmup leader: ephemeral leader that performs prefix priming and shares the seed with peers.
+
+Design summary
+
+- Leader election: lease-based lightweight election using the existing tenancy allocator (redis-store: redwood-tenant-coordinator). Lease TTL default = 30s, renew interval = 10s.
+- Seed exchange: when a leader is elected it performs deterministic prefix priming for tenant routing keys and publishes a signed seed manifest into the shared metadata store.
+- Peer join: new peers consult manifest and pull the seed via the secure sidecar proxy (seed service). If no manifest exists, peers attempt leader election.
+- Fallbacks: if the seed is unavailable or manifest stale, nodes fallback to controlled parallel warmup with jitter and rate limits to avoid thundering herd.
+
+Consensus protocol (high level)
+
+1. Candidate nodes try to obtain a per-tenant lease key: tenant/{tenant_id}/warmup/lease.
+2. Lease owner becomes warmup leader for TTL. Leader sets manifest at: tenant/{tenant_id}/warmup/manifest -> {seed_version, sha256, created_at, signature}.
+3. Peers detect manifest change via watch stream and call seed-service: /v1/seed/{manifest.seed_version} to retrieve seed snapshot.
+4. Seed-service validates manifest signature and returns encrypted seed blob.
+
+Failure modes and mitigations
+
+- Manifest write failure: retry with exponential backoff; if > 3 consecutive failures, leader relinquishes lease.
+- Stale manifest: peers compare manifest.created_at with node_boot_time; if manifest older than 10m and no leader refresh, peers attempt new election.
+- Inconsistent state (mismatched seed hashes): detect via sha256 mismatch -> trigger reconcile job: kv-reconcile --tenant $T --shard $S.
+
+Operational knobs (config table)
+
+| Setting | Default | Effect | Recommended change during incident |
+|---------|---------|--------|---------------------------------|
+| lease_ttl_seconds | 30 | Leader lease duration | Increase to 60s for noisy networks |
+| lease_renew_interval_seconds | 10 | Frequency leader renews lease | Reduce to 5s if leader flaps |
+| seed_manifest_ttl_minutes | 60 | How long manifests remain authoritative | Reduce to 15m to force fresh priming after infra changes |
+| parallel_warmup_limit | 5 | Max concurrent warmup peers per tenant per shard | Lower to 1 during high-cost incidents |
+| seed_pull_rate_per_min | 20 | Rate limit of seed pulls from seed-service | Increase for onboarding waves if seed-service scaled |
+
+Telemetry and alerts
+
+Primary signals to monitor (Prometheus metric names provided):
+
+- kv_seed_manifest_age_seconds (gauge) — alert if > 600 (10m)
+- kv_seed_pull_errors_total (counter) — alert on P95 increase > 100/min
+- kv_parallel_warmups_active (gauge) — alert if > configured parallel_warmup_limit * tenants_scaled
+- inference_p95_latency_tokens (histogram) — correlate spikes with warmup events
+- kv_reconcile_runs_total (counter) — alert if reconciliation runs increase 5x over baseline
+
+Suggested alerts and thresholds:
+
+1. Alert: KV-Manifest-Stale
+   - Condition: kv_seed_manifest_age_seconds > 600 for > 5m
+   - Severity: paged (P1) if correlated with inference_p95 > SLA baseline
+
+2. Alert: Warmup-Herding
+   - Condition: kv_parallel_warmups_active > 50% of max pool size for > 2m
+   - Severity: paged (P1)
+
+3. Alert: Seed-Service-Errors
+   - Condition: kv_seed_pull_errors_total rate > 200/min over 3m
+   - Severity: pager (P0 if cross-region failures)
+
+Runbook: Incident remediation (ordered)
+
+1. Triage (5m):
+   - Check recent deploys and infra events (oncall notes, cloud-provider preemptions).
+   - Query manifest age: curl -s "https://seed-store.internal/api/v1/manifest?tenant=$T" | jq .created_at
+
+2. If manifest missing or stale: (10–20m)
+   a. Attempt safe leader election: run "seedctl elect --tenant $T --force" as service account redwood-ops.
+   b. If election succeeds, verify manifest signature and sha256 before marking manifest authoritative.
+   c. Scale seed-service horizontally if seed_pull_errors are the cause: terraform module seed_service.autoscale.desired_count++ (see Terraform snippet).
+
+3. If sha256 mismatches across peers: (20–40m)
+   a. Pause new scheduling for affected shard: "schedulerctl pause --shard $S --reason kv-reconcile"
+   b. Run reconciliation: "kv-reconcile --tenant $T --shard $S --mode=conservative --max-concurrency=2"
+   c. Validate reconcile via metric: kv_reconcile_success_total increases and kv_parallel_warmups_active reduces.
+
+4. If warmup herding persists: (30–60m)
+   a. Reduce parallel_warmup_limit with a safe config rollout (see rollout steps).
+   b. Introduce temporary client-side jitter to Accept header: X-Redwood-Warmup-Jitter=rand(0-5000ms).
+
+Terraform / IaC guidance
+
+- Module names: modules/kv-seed-service, modules/tenant-lease (cross-account), modules/warmup-throttle.
+- Variables to expose for product teams: parallel_warmup_limit, lease_ttl_seconds, seed_manifest_ttl_minutes.
+
+Sample Terraform snippet (consumer-level change):
+
+resource "redwood_service_config" "tenant_warmup" {
+  tenant_id = var.tenant_id
+  settings = {
+    parallel_warmup_limit = 3
+    lease_ttl_seconds = 45
+    lease_renew_interval_seconds = 8
+  }
+}
+
+Rollout steps (safe path)
+
+1. Create feature flag: ff/warmup-consensus-enabled=false (target internal dev tenants).
+2. Deploy modules to staging: apply modules/kv-seed-service with increased autoscaling and logging.
+3. Toggle feature flag to true for 5 dev tenants. Monitor kv_seed_pull_errors_total, kv_parallel_warmups_active for 15m.
+4. If stable, expand to 10% traffic, then 50%, then 100% over 24h with rollback gates at each stage.
+
+Verification checklist (post-rollout)
+
+- kv_manifest_age 95th percentile <= 120s.
+- no P1 warmup-herding alerts for 48h.
+- inference_p95 latency unchanged or improved <= 3% from baseline.
+
+Playbook: Quick commands (for oncall)
+
+- Query manifest: curl -s "https://seed-store.internal/api/v1/manifest?tenant=$T" | jq .
+- Force elect leader: seedctl elect --tenant $T --force --ttl 60
+- Pause shard scheduling: schedulerctl pause --shard $S --reason "kv-reconcile"
+- Trigger reconcile: kv-reconcile --tenant $T --shard $S --mode=conservative
+- Temporarily lower warmup limit via API: curl -X POST -H 'Authorization: Bearer $TOKEN' -d '{"parallel_warmup_limit":1}' https://config-api.internal/v1/tenants/$T/warmup
+
+Ownership and escalation
+
+- Primary oncall: infra-gpu oncall rotation (pager).
+- Secondary: serving-runtime oncall (pager).
+- Escalation to engineering reliability: escalate after 30m of degraded inference_p95 or if reconcile runs > 10 in 1h.
+
+Post-incident actions
+
+- Run a root cause analysis document including: what manifest changed, which nodes elected leader, and which reconcile sessions modified state.
+- Add lessons learned to this doc and adjust default knobs.
+
+Appendix A — Implementation notes
+
+- Seed manifests are signed using service account key stored in KMS; manifest signature verification libraries are provided in seed-service and runtime sidecar (golang, python).
+- Storage backends supported: Redis (default), Consul (on-prem), S3 (manifest archive).
+- Security: manifests and seed blobs are encrypted with tenant-specific KMS keys; access checks performed by seed-service.
+
+Appendix B — Example manifest JSON (stored as value in key-value store)
+
+{
+  "seed_version": "v2025-02-12-09:14:03",
+  "sha256": "b1946ac92492d2347c6235b4d2611184",
+  "created_at": "2025-02-12T09:14:03Z",
+  "ttl_seconds": 3600,
+  "signature": "BASE64_SIG..."
+}
+
+Appendix C — Related docs and links
+
+- /confluence/eng-infra/runbooks/kv-cache-reconstruction-and-eviction-resilience-runbook
+- /confluence/eng-infra/team-wiki/gpu-runtime-debugging-and-tenant-triage-checklist-2026
+- Seed-service repo: git@github.com:redwood/seed-service.git
+
+Contact
+
+For questions or improvements to this runbook, contact Asha Kapoor (asha@redwood.ai) or open an RFC in the infra-team backlog.

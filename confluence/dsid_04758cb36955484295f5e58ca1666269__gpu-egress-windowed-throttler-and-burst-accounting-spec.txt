@@ -1,0 +1,163 @@
+GPU Egress Windowed Throttler and Burst Accounting - Implementation Spec
+
+Summary
+-------
+This document defines the design, Terraform/IaC contract, and runbook for the GPU Egress Windowed Throttler (GEWT): a multi-tenant, cloud-native rate limiter that enforces windowed egress quotas and credits for GPU tenants while enabling controlled short bursts with accurate accounting for chargeback and SLO enforcement. This spec balances predictable egress billing, operational simplicity, and low-latency inference routing for tenant workloads.
+
+Motivation
+----------
+- We have observed large transient egress spikes from multi-tenant GPU deployments that cause network overage charges and downstream saturation.
+- Existing long-lived token-bucket approaches do not map cleanly to hourly/day windows needed for billing reconciliation and tenant credits.
+- Some tenants need short, high-throughput bursts for batch evals; we must support these while preventing noisy neighbors from degrading other tenants.
+
+Goals
+-----
+1. Enforce per-tenant egress quotas scoped to rolling windows (1m, 1h, 24h) with configurable soft/hard limits.
+2. Allow controlled short bursts up to a configurable multiple of steady rate (burst multiplier) with fast reconciliation to credits.
+3. Produce deterministic, auditable accounting records that feed billing exports (CSV/Parquet) and live dashboards.
+4. Integrate with existing gateway/proxy (egress-proxy sidecar) and routing policies so throttling is transparent to inference callers.
+5. Provide IaC modules for self-serve tenant opt-in and safe defaults for new accounts.
+
+Architecture Overview
+---------------------
+Components:
+- Egress Gatekeeper Service (stateless API + Redis-compatible store)
+- Windowed Accounting Store (time-series chunks in Redis Streams or DynamoDB TTL shards)
+- Credit Ledger (append-only S3/Parquet export and PostgreSQL for live queries)
+- Tenant Admission Controller (maps tenant -> policy and burst multiplier)
+- Proxy hook (envoy/l7 sidecar) that calls Gatekeeper per connection or per-token depending on flow
+
+Flow (high level):
+1. Request egress from runtime -> envoy sidecar.
+2. Sidecar queries Gatekeeper (GRPC) with tenant id, flow size (bytes), and policy key.
+3. Gatekeeper uses a rolling-window algorithm to decide allow/queue/reject and returns a lease token when allowing a burst.
+4. If allowed, sidecar proceeds; if queued, sidecar returns 429 with Retry-After or performs backoff.
+5. Accounting events are appended to both the in-memory window store and the Credit Ledger for reconciliation.
+
+Policies and Defaults
+---------------------
+- Default policy for self-serve tenants: 100 Mbps steady, 5x burst multiplier for up to 2 minutes, 1 GB hourly cap, 50 GB daily cap.
+- Enterprise customers may opt into dedicated egress pools with relaxed policing and different billing.
+- Soft limit: triggers telemetry and a warning but allows short bursts. Hard limit: enforces pause/reject until tokens are available.
+
+SLOs and Metrics
+----------------
+Primary SLOs:
+- Throttling correctness: >99.9% of requests are either allowed or rejected in < 50ms by Gatekeeper under normal load.
+- Accounting durability: 100% of accounting events are persisted to the Credit Ledger within 30s.
+
+Operational metrics to export:
+- gatekeeper.request_latency_ms (p50/p90/p99)
+- gatekeeper.decisions{allow,queue,reject} per tenant
+- ledger.flush_latency_s and ledger.pending_events_count
+- tenant.egress_bytes_window_{1m,1h,24h}
+- sidecar.retries and sidecar.429_rate
+
+Alerts (examples)
+----------------
+1) gatekeeper.error_rate > 1% for 5m -> Pager to infra-sre (P1).
+2) ledger.pending_events_count > 10k for 10m -> Pager to infra-data (P1).
+3) top-5 tenants consuming > 70% of pooled egress for 10m -> Pager to infra-sre (P2) and message to tenant-ops channel.
+
+Terraform / IaC Contract (examples)
+----------------------------------
+Module: redwood/gpu-egress-windowed-throttler (versioned)
+Inputs:
+- tenant_id (string) - required
+- steady_bandwidth_mbps (number) - optional, default 100
+- burst_multiplier (number) - optional, default 5
+- window_caps: map {"1m":"bytes", "1h":"bytes", "24h":"bytes"} - optional defaults provided
+- policy_tier (string) - [self-serve|enterprise|restricted]
+Outputs:
+- gatekeeper_endpoint (string)
+- policy_id (string)
+
+Example usage (HCL):
+```
+module "gpu_egress_tenant_a" {
+  source = "redwood/gpu-egress-windowed-throttler/aws"
+  tenant_id = "tenant-a"
+  steady_bandwidth_mbps = 250
+  burst_multiplier = 4
+  window_caps = {"1m" = 31457280, "1h" = 1073741824, "24h" = 53687091200}
+  policy_tier = "self-serve"
+}
+```
+
+Terraform notes:
+- The module creates: IAM role for Gatekeeper access, KMS key for ledger encryption, SQS topic for async ledger batching, and a DNS record in the shared internal zone.
+- State: remote state must live in the tenant account with a prefix (eg. redwood/egress/tenant-id).
+- A policy review CI job will validate window_caps anomalies (e.g., 1m cap > 24h cap) and fail PRs.
+
+Implementation Algorithms (brief)
+--------------------------------
+- Rolling window is implemented with fixed-size sub-window bins (e.g., 6s bins for 1m window) stored in a Redis stream. For each request we compute the sum over the last N bins and compare to cap.
+- Burst leases are granted as ephemeral tokens tied to a timer key that decays; lease grants decrement both steady allowance and burst pool.
+- For durability, accounting events are first appended to an append-only Redis Stream and then batched to S3/Parquet by a ledger-flush worker. The worker writes a checkpoint to Postgres after successful write.
+
+Runbook: Common Operational Procedures
+-------------------------------------
+1) Gatekeeper high latency (p50 > 200ms):
+   - Check gatekeeper pods cpu/memory and Redis-client connection counts.
+   - Run: kubectl describe pod <gatekeeper-pod> and kubectl logs <pod> | tail -n 200.
+   - If Redis error: failover to read-replica via the internal service. Follow Redis failover playbook.
+
+2) Ledger backlog > 10k:
+   - Identify slow flush worker via prometheus: ledger_flush_workers{job="ledger"} and restart unhealthy worker(s).
+   - Increase worker parallelism temporarily: run terraform apply to scale deployment replicas to +2.
+   - If S3 target failing, run the backup flush to the alternate bucket (see section 'Disaster failover').
+
+3) Tenant reports unexpected 429s:
+   - Query tenant window usage: POST /gatekeeper/admin/usage?tenant_id=<id>&window=1h (admin API).
+   - If soft limit warnings are frequent, consider increasing burst_multiplier for that tenant or adding a short one-off credit via the Tenant Credit API.
+
+Operational Play: Burst Mitigation for Holidays/Events
+-----------------------------------------------------
+- Preflight steps (72h prior):
+  1. Estimate expected traffic using historical multipliers.
+  2. Temporarily increase pool allocation in metrics wrapper: set envvar MAX_POOL_MULTIPLIER=1.5 and notify billing.
+  3. Schedule ledger-flush workers capacity test run during low-traffic hours.
+
+- Post-event reconciliation:
+  1. Export ledger events to Parquet and run chargeback job.
+  2. Rehydrate Postgres checkpoint if partial writes occurred.
+
+Security and Compliance Notes
+-----------------------------
+- All ledger exports are encrypted with customer KMS keys.
+- Gatekeeper admin APIs are RBAC guarded; keys rotated quarterly.
+- Audit trail: every allow/reject decision stores request_id, tenant_id, bytes, timestamp, gatekeeper_node_id for 90 days in the audit index.
+
+Testing and Validation
+----------------------
+- Unit tests for rolling-window algorithm with corner cases (bin boundaries, clock skew).
+- Integration tests in CI: run synthetic multi-tenant workloads to validate fairness and that no tenant > 80% pool usage for > 5m by default.
+- Chaos test: inject Redis latency 250ms and assert Gatekeeper still serves p50 < 200ms for 95% requests.
+
+Migration Plan (existing token-bucket to GEWT)
+--------------------------------------------
+1) Run Gatekeeper in pass-through mode for 2 weeks to gather real usage metrics.
+2) Deploy Gatekeeper in audit-only mode: decisions are recorded but not enforced. Compare expected rejects with historical logs.
+3) Rollout enforcement for 10% tenants (canary), monitor 24/7 SRE line for 48h.
+4) Incrementally open to 100% with staged policy rebalancing.
+
+Developer and SRE ownership
+---------------------------
+- Service owner: infra-networking team (oncall alias: infra-net-sre@redwood.com)
+- Billing exports and ledger: infra-data (alias infra-data@redwood.com)
+- Terraform module maintenance: infra-iac (alias infra-iac@redwood.com)
+- Oncall rotation: infra-sre takes primary for Gatekeeper, infra-data takes secondary for ledger issues.
+
+Appendix: Useful CLI snippets
+----------------------------
+- Check gatekeeper decision counts for tenant:
+  curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
+    "https://internal-gatekeeper.redwood/v1/admin/decisions?tenant=tenant-a&window=1h" | jq .
+
+- Export pending ledger events (temporary):
+  python tools/ledger_dump.py --since 2025-09-01T00:00:00Z --out /tmp/ledger_dump.parquet
+
+- Terraform validate policy caps: (run in module root)
+  terraform init && terraform validate && terraform plan -var-file=policy_override.hcl
+
+The document also includes an attached reference patch for the module (see inline examples) and a link to the feature RFC (internal link) for long-term design alternatives.

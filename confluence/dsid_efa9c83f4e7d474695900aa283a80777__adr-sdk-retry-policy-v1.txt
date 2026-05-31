@@ -1,0 +1,195 @@
+ADR: SDK Retry Policy v1 (Defaults, Configurability, and Streaming Guidance)
+
+## Summary
+This ADR defines the v1 retry policy for Redwood Inference SDKs (Python, TypeScript, Go). The goal is to make retry behavior consistent, predictable, and safe across languages while protecting the platform from retry storms.
+
+Key outcomes:
+- Standardized retryable conditions (HTTP status codes + network failures).
+- Standardized exponential backoff with jitter and `Retry-After` handling.
+- Standardized default maximum attempts and a small set of configuration knobs.
+- Conservative streaming retry behavior with explicit idempotency guidance.
+
+## Status
+**Published** (v1). SDKs should implement this policy by default in the next coordinated major/minor releases per the parity rollout plan.
+
+## Context / Problem
+Customers have reported cross-language inconsistencies such as:
+- Different retryable status code sets (including incorrect retries on 4xx).
+- Ignoring `Retry-After` on 429 in some SDKs.
+- Divergent backoff timing and jitter (leading to thundering herd risk).
+- Confusing behavior for streaming disconnects (partial output handling, whether to retry, and duplicate billing concerns).
+
+We need a single policy that:
+1) Works well for production workloads under transient platform errors and rate limiting.
+2) Avoids retrying requests that are unlikely to succeed (and may duplicate side effects).
+3) Is implementable with similar semantics across Python/TS/Go HTTP stacks.
+
+## Decision
+All Redwood SDKs MUST implement the retry policy below as the default behavior.
+
+### 1) Retryable conditions (non-streaming)
+SDKs retry a request only when **all** are true:
+- Request is eligible for retry (see “Non-retryable conditions”).
+- The error is classified as retryable per the table below.
+- The request has remaining attempts.
+
+**Retryable HTTP status codes**
+- `408 Request Timeout`
+- `429 Too Many Requests` (rate limited)
+- `500 Internal Server Error`
+- `502 Bad Gateway`
+- `503 Service Unavailable`
+- `504 Gateway Timeout`
+
+**Retryable network / transport failures** (language-specific error classes map to these categories)
+- DNS resolution failure (temporary)
+- TCP connect timeout / connection refused / connection reset
+- TLS handshake failure (transient)
+- EOF / connection closed **before** response headers are received
+
+Notes:
+- Read timeouts and disconnects **after** response headers are received are not automatically retryable for streaming (see “Streaming”). For non-streaming they MAY be considered retryable only if the SDK can prove no response body bytes were delivered to the application.
+
+### 2) Non-retryable conditions (default)
+SDKs MUST NOT retry on:
+- Any `4xx` other than `408` and `429`.
+- Validation errors, auth errors, and permission errors (e.g., `400`, `401`, `403`, `404`, `409`, `422`).
+- Any error where the SDK has already delivered response content to the caller (including partial streaming tokens/events).
+
+Rationale: Retrying non-retryable 4xx wastes time, increases load, and can create duplicate billing concerns for POST-style generation requests.
+
+### 3) Default attempt budget
+The default attempt budget is measured as **total attempts**, including the initial request.
+
+**Defaults (v1):**
+- `max_attempts = 4` (1 initial attempt + up to 3 retries)
+
+Rationale:
+- Empirically, most transient failures clear within 1–2 retries; 4 attempts provides resilience without excessive tail latency or platform amplification.
+- SRE review identified higher attempt budgets as a meaningful risk during widespread 429/5xx events.
+
+### 4) Backoff and jitter
+SDKs MUST use exponential backoff with jitter and MUST cap wait times.
+
+**Backoff algorithm (v1): Full jitter**
+For retry number `n` (where the first retry is `n=1`):
+- `base_delay_ms = 250`
+- `cap_delay_ms = 8000`
+- `computed = min(cap_delay_ms, base_delay_ms * 2^(n-1))`
+- `sleep_ms = random(0, computed)`
+
+Rationale:
+- Full jitter reduces synchronization across clients and is a standard mitigation for thundering herd behavior.
+- Cap prevents extreme user-visible delays and reduces overlap with overall timeouts.
+
+### 5) `Retry-After` handling
+When the server includes a `Retry-After` header on a retryable response, the SDK MUST respect it, subject to a maximum.
+
+**Rules:**
+- Parse both forms:
+  - Delta-seconds (e.g., `Retry-After: 3`)
+  - HTTP date (e.g., `Retry-After: Wed, 21 Oct 2015 07:28:00 GMT`)
+- If parsing succeeds and the value is in the future, set:
+  - `sleep_ms = min(retry_after_ms, retry_after_cap_ms)`
+- Otherwise fall back to the exponential backoff algorithm.
+
+**Defaults (v1):**
+- `retry_after_cap_ms = 30000` (30 seconds)
+
+Rationale:
+- `Retry-After` is the platform’s strongest signal for safe retry timing under rate limiting.
+- A cap prevents user requests from hanging too long unexpectedly and helps bound tail latency.
+
+### 6) Configuration surface (supported knobs)
+SDKs MUST expose a consistent configuration model (names may be idiomatic per language, but semantics must match).
+
+Required configurable knobs:
+- `max_attempts` (integer, >= 1)
+- `base_delay_ms` (integer, >= 0)
+- `cap_delay_ms` (integer, >= base)
+- `respect_retry_after` (boolean, default true)
+- `retry_after_cap_ms` (integer, default 30000)
+
+Optional knobs (allowed, but MUST NOT change defaults silently):
+- Custom predicate or allowlist for retryable status codes (advanced use only)
+- Hook/callback invoked before each retry attempt (for logging/telemetry)
+
+Non-goals for v1 configurability:
+- Per-route retry policies in the SDK (handled by higher-level application code).
+- Automatic idempotency key generation by default (see “Idempotency guidance”).
+
+### 7) Streaming behavior (chat/completions with streaming)
+Streaming has additional safety constraints because partial output may have already been delivered and the server may have already begun work.
+
+**Streaming retry policy (v1):**
+- The SDK MAY retry the request only if the failure occurs **before** any streaming event/token is yielded to the caller (i.e., before the application observes content).
+- Once any streaming content is yielded, the SDK MUST NOT automatically retry.
+- On disconnect after partial output:
+  - The SDK MUST surface a typed streaming exception that includes the `request_id` (when available), attempt count, and whether the error is potentially retryable.
+  - The SDK SHOULD provide access to the partial output accumulated so far (language-idiomatic; e.g., last partial text or emitted events).
+
+Rationale:
+- Automatically retrying after partial streaming output can produce duplicated text, inconsistent tool calls, and duplicate billing/side effects.
+- Customers often have domain-specific safe retry logic (e.g., only retry if no tool call was invoked), which the SDK cannot reliably infer.
+
+### 8) Idempotency guidance (what SDKs recommend)
+Because Redwood generation endpoints are typically POST requests, retries can create duplicate work unless the application uses idempotency.
+
+**Guidance to developers (docs + examples):**
+- For non-streaming requests that are safe to deduplicate, set an idempotency key header (e.g., `Idempotency-Key`) that is stable across retries of the same logical operation.
+- For streaming requests:
+  - Only retry if your application can guarantee no side effects were triggered and you can tolerate duplicated partial content.
+  - Prefer retrying from a higher level with explicit idempotency and request correlation.
+
+**SDK behavior (v1):**
+- SDKs MUST NOT generate an idempotency key automatically by default.
+- SDKs SHOULD provide a simple way for the user to set `Idempotency-Key` (request option, client default header, or middleware).
+
+Rationale:
+- Automatic key generation can unintentionally deduplicate distinct user actions and create confusing semantics.
+- The application, not the transport layer, is best positioned to define the idempotency scope.
+
+## Implementation requirements (cross-language)
+SDK owners MUST ensure:
+1) Retry classification is based on the standardized error taxonomy (request_id, status_code, retryable, retry_after_ms when present).
+2) The retry loop logs/exports (where permitted) standardized fields:
+   - `request_id` (if available)
+   - `attempt` / `max_attempts`
+   - `retry_count`
+   - `retryable` (boolean)
+   - `retry_after_ms` (if present)
+   - `backoff_ms` actually slept
+   - For streaming: `streaming_disconnect_reason` (best-effort)
+3) `Retry-After` parsing behaves identically across languages (seconds and HTTP date).
+4) Defaults match exactly (attempts, base/cap, retry-after cap).
+
+## Rollout / Migration notes
+- If an SDK previously retried non-retryable 4xx (e.g., `400`), this is a behavior change and MUST be called out in release notes and migration docs.
+- Changes to retry defaults should be staged (beta channel where available) and monitored with SRE dashboards for:
+  - Retry rate and distribution by status code
+  - 429 retry delay adherence (Retry-After compliance)
+  - Tail latency impact
+  - Evidence of retry amplification during incidents
+
+## Alternatives considered
+1) **Retry more status codes (e.g., most 5xx + more 4xx)**
+   - Rejected: increases load and can mask application errors; also caused real support incidents (incorrect 4xx retries).
+2) **Automatically retry streaming disconnects**
+   - Rejected: high risk of duplicated partial output and unintended side effects.
+3) **Always auto-generate idempotency keys**
+   - Rejected: unclear scope; can deduplicate distinct operations and surprise users.
+
+## Consequences
+Positive:
+- Predictable cross-language behavior and easier support/debugging.
+- Reduced rate-limiting thrash due to `Retry-After` compliance.
+- Lower risk of retry storms via jitter + capped attempt budget.
+
+Trade-offs:
+- Some applications will need to implement higher-level retry and idempotency for streaming use cases.
+- Conservative defaults may not be optimal for every workload; advanced users can tune via supported knobs.
+
+## Open items (tracked separately)
+- Conformance tests for retry classification and `Retry-After` parsing across SDKs (see ENG-5127).
+- Documentation updates to ensure identical examples and option names across languages (see ENG-5128).
+- Ensure gateway consistently provides `Retry-After` on 429 and stable `request_id` on all error paths, including streaming (platform tickets linked above).

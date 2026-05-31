@@ -1,0 +1,285 @@
+Data deletion and TTL enforcement standards
+
+## Purpose
+This standard defines the minimum engineering requirements for implementing **data retention (TTL) and deletion** across Redwood Inference systems.
+
+It exists to ensure:
+- Retention controls are **enforceable** (not just configurable).
+- Purge mechanisms are **safe, idempotent, and observable**.
+- We can provide credible **evidence** for internal audits and customer security reviews (SOC 2/ISO-style).
+
+This is a *must-follow* standard for any store or service that holds customer-affecting data classes subject to retention.
+
+## Scope
+Applies to:
+- Control-plane and data-plane stores that persist any of the following (examples):
+  - Request/response logs (where enabled)
+  - Prompts/completions stored at rest (where enabled)
+  - Audit logs
+  - Traces/metrics/log aggregates
+  - Artifacts (eval datasets, report packages, exported evidence bundles)
+
+Does not replace:
+- Data classification and logging standards (redaction, PII controls).
+- Legal hold / exceptions policy (see Security & Compliance pages).
+
+## Definitions
+- **TTL (time-to-live):** Maximum time data is allowed to exist after its relevant timestamp (usually `created_at` / `ingested_at`).
+- **Retention policy:** Tenant + data-class specific configuration describing TTL, residency constraints, and exception behavior.
+- **Purge job:** Automated deletion process that enforces TTL by deleting records/objects past their expiry.
+- **Idempotent deletion:** A purge job can run multiple times (retries, replays) and yields the same end state without causing incorrect deletions or operational harm.
+- **Deletion verification:** A set of metrics and checks proving that expired data is actually removed within an allowed lag window.
+- **TTL lag:** `now - max(deleted_cutoff_applied)` for a given store/tenant/data class. In other words, how far behind deletion is from the intended TTL boundary.
+
+## Design principles
+1. **Policy is evaluated centrally; enforcement is local.**
+   - Policy evaluation source of truth is the control plane (see ADR-017).
+   - Each store/feature must implement enforcement in the component that owns the data.
+
+2. **Delete is a production operation.**
+   - Purge paths must be designed for predictable load, backpressure, and safe retries.
+
+3. **Verification is mandatory.**
+   - If you can’t measure deletion, we treat it as not implemented.
+
+4. **Prefer deterministic, incremental deletion over “big sweeps.”**
+   - Use primary-key ordered pagination and bounded batch sizes.
+
+5. **Respect legal hold and documented exceptions.**
+   - Holds must be enforced consistently and be auditable.
+
+## Required implementation checklist (all stores)
+The following are minimum requirements for any TTL enforcement implementation.
+
+### 1) Data model requirements
+**Required fields (or equivalent):**
+- `tenant_id` (or org/project/workspace id)
+- `data_class` (explicit or implied by table/bucket)
+- `created_at` or `ingested_at` timestamp (source-of-truth clock described below)
+- Optional but strongly recommended:
+  - `region` (if multi-region)
+  - `policy_version_applied` (or last-evaluated policy reference)
+  - `hold_status` / `hold_reason` (if holds apply at record/object granularity)
+
+**Time source standard:**
+- Use database/server-side timestamps for expiry decisions when possible (e.g., `NOW()` in SQL) to avoid clock skew.
+
+### 2) Deletion semantics
+You must document (in the owning system doc):
+- Whether deletion is **hard delete** (required for retention enforcement unless explicitly approved otherwise).
+- If soft-delete/tombstones exist for product needs, define:
+  - When tombstones are permanently removed
+  - Whether tombstones are themselves subject to TTL
+  - How exports/reporting treat tombstoned records
+
+**Not allowed as the only enforcement mechanism:**
+- “We filter expired rows at read time.” (This is not deletion.)
+
+### 3) Purge job requirements
+All purge jobs must be:
+- **Idempotent** (safe to re-run; deletes are repeatable).
+- **Bounded** (limits per run to prevent DB/storage pressure).
+- **Retryable** with exponential backoff.
+- **Observable** (metrics + structured logs + run identifiers).
+- **Multi-tenant safe** (no cross-tenant deletion).
+- **Hold-aware** (legal hold / incident hold must prevent deletion when applicable).
+
+### 4) Verification requirements
+You must implement:
+- TTL lag metric(s)
+- Deletion success/failure metrics
+- Backlog size estimates (where meaningful)
+- Alerts (see below)
+- A dashboard panel set (see “Dashboards”)
+
+### 5) Runbook and ownership
+Before GA:
+- Create/extend a runbook describing how to monitor, throttle, re-run, and validate the purge.
+- Explicitly assign an owning team and on-call escalation.
+
+## Standard purge job pattern
+### Recommended algorithm (SQL-backed stores)
+**Key idea:** delete in small, ordered batches using an index that supports the filter.
+
+**Required indexes (example):**
+- `(tenant_id, created_at, id)` or equivalent.
+
+**Batch delete pattern:**
+1. Compute cutoff: `cutoff_ts = NOW() - ttl_duration` (from policy).
+2. Select candidate ids using deterministic ordering and a strict upper bound.
+3. Delete by id list (or range) with safeguards.
+4. Emit metrics for deleted rows, runtime, and errors.
+
+**Example (illustrative):**
+- SELECT: `SELECT id FROM request_logs WHERE tenant_id = $1 AND created_at < $2 AND hold_status != 'HOLD' ORDER BY created_at, id LIMIT $3;`
+- DELETE: `DELETE FROM request_logs WHERE tenant_id = $1 AND id = ANY($ids);`
+
+**Safety requirements:**
+- Enforce `LIMIT` and an absolute cap like `max_rows_per_minute`.
+- Use statement timeouts and circuit breakers.
+- If a batch repeatedly fails, the job must degrade safely (stop and alert) rather than spin.
+
+### Object storage / blob stores
+Prefer native lifecycle rules when compatible with policy semantics, but still implement **verification metrics**.
+
+If lifecycle rules cannot express holds/exceptions, implement an explicit sweeper that:
+- Lists objects by prefix including tenant and data class
+- Compares object metadata timestamp to cutoff
+- Deletes in bounded batches
+- Tracks deletion results (including 404/not found as a successful idempotent outcome)
+
+### Streaming/telemetry pipelines
+For stores with compaction windows (e.g., metrics backends):
+- Document the compaction/retention behavior and how it maps to customer TTL.
+- Provide TTL lag as: `now - last_compaction_cutoff` or backend-specific equivalent.
+
+## Idempotency requirements (what we test for)
+A purge job must tolerate:
+- Retry after partial success (some rows deleted, then crash)
+- Concurrency (two workers overlap on the same range)
+- Reordering (delayed scheduling, catch-up runs)
+- Duplicate work (same batch processed twice)
+
+Allowed outcomes:
+- Attempted deletions of already-deleted data are treated as success.
+
+Not allowed:
+- Deleting outside the target tenant, region, or data class.
+- “Cursor corruption” where later runs skip ranges permanently.
+
+## Required metrics (minimum set)
+All metrics must be emitted with **low-cardinality labels**. Do not label by request_id, user_id, or free-form strings.
+
+### Metric names (standardized)
+Use these canonical metrics for retention enforcement. If you must deviate, document it and provide mapping.
+
+1) `ttl_lag_seconds` (gauge)
+- Definition: How far behind TTL enforcement is for a given store.
+- Required labels:
+  - `store` (e.g., `request_logs_pg`, `audit_logs_pg`, `traces_clickhouse`)
+  - `data_class` (e.g., `request_logs`, `audit_logs`, `traces`)
+  - `region`
+- Optional label:
+  - `tier` (`hosted`, `dedicated`, `private`)
+
+2) `purge_rows_deleted_total` (counter)
+- Increment by number of records deleted.
+- Required labels: `store`, `data_class`, `region`
+
+3) `purge_failures_total` (counter)
+- Increment on purge operation failure.
+- Required labels: `store`, `data_class`, `region`, `failure_type`
+- `failure_type` must be one of a bounded enum (examples): `db_timeout`, `rate_limited`, `permission_denied`, `serialization_failure`, `unknown`.
+
+4) `purge_job_duration_seconds` (histogram)
+- Required labels: `store`, `data_class`, `region`
+
+5) `purge_backlog_estimate` (gauge) (when meaningful)
+- Examples:
+  - estimated rows older than cutoff
+  - estimated bytes older than cutoff
+- Required labels: `store`, `data_class`, `region`
+
+### Structured logs
+Each run must emit a single structured “summary log” event containing:
+- `job_name`, `run_id`, `store`, `data_class`, `region`
+- `cutoff_ts`, `batch_size`, `rows_deleted`, `rows_scanned` (if available)
+- `duration_ms`, `status` (`success|partial|failed`)
+- `error_code` (bounded enum) if failed
+
+## Required alerts (baseline)
+Alerts must be routed to the owning on-call with an escalation policy.
+
+### Paging alerts (P1)
+1. **TTL enforcement stalled**
+- Condition: `ttl_lag_seconds` exceeds the maximum allowed lag for the store/tier.
+- Default thresholds (unless documented otherwise):
+  - Hosted: page at > 24h lag
+  - Dedicated: page at > 12h lag
+  - Private: page at > 24h lag (or as contractually required)
+
+2. **Purge job error burst**
+- Condition: `purge_failures_total` rate above threshold for 15 minutes AND `purge_rows_deleted_total` not increasing.
+- Guidance: threshold depends on schedule; for hourly jobs, any consistent failure across 2 consecutive runs should page.
+
+### Ticket alerts (P2)
+3. **Backlog growing**
+- Condition: `purge_backlog_estimate` increasing for > 6 hours.
+
+4. **Job not running**
+- Condition: missing `purge_job_duration_seconds` and `purge_rows_deleted_total` activity for > 2x expected schedule interval.
+
+## Dashboards (required panels)
+Create a dashboard (or extend the standard retention dashboard) with:
+- TTL lag over time (`ttl_lag_seconds`) by region/store
+- Rows deleted per run / per hour (`purge_rows_deleted_total` rate)
+- Failure rate (`purge_failures_total` rate) with top `failure_type`
+- Job duration (`purge_job_duration_seconds` p50/p95)
+- Backlog estimate (if available)
+- Overlay of deploy markers for the purge component (when supported)
+
+## Performance and safety guardrails
+### Database pressure controls
+- Hard limit deletes per batch (e.g., 1k–10k rows) and per minute (environment dependent).
+- Prefer primary-key pagination; avoid large OFFSET scans.
+- Use read replicas for candidate selection only if correctness is preserved.
+- Use statement timeouts and cancellation; do not allow long-running delete transactions.
+
+### Scheduling
+- Jobs should be scheduled at a cadence that matches TTL granularity and expected write volume.
+- Stagger schedules by region to reduce peak load.
+
+### Backfills and migrations
+If adding TTL to an existing store:
+- Provide a backfill plan for legacy rows without timestamps or without tenant attribution.
+- Plan for initial backlog deletion (ramp slowly).
+- Define success criteria (e.g., “ttl_lag_seconds < 6h for 7 consecutive days”).
+
+## Legal hold and exceptions (integration requirements)
+Retention enforcement must honor holds and exceptions as defined by Security & Compliance.
+
+Minimum integration requirements:
+- Purge evaluation must check for active hold at the correct scope:
+  - **Tenant-wide hold:** all relevant data classes blocked.
+  - **Case/incident hold:** specific data classes and time windows may be blocked.
+- Hold decisions must be auditable (link to the policy version or hold record id).
+- “Break-glass” exceptions must require:
+  - explicit approval (per policy)
+  - audit log entry indicating who/when/why
+
+## Evidence and auditability requirements
+For compliance reporting packs and internal audit readiness:
+- The system must be able to export (or reconstruct) the effective retention configuration for a time window.
+- Purge job runs must be traceable via run_id and summary logs.
+- Demonstrate that metrics exist and alerts are configured.
+
+## Testing requirements
+Before enabling a retention control in production:
+- Unit tests:
+  - cutoff calculation, policy parsing, hold behavior
+  - idempotency behavior (rerun same batch)
+- Integration tests:
+  - create expired records, verify deletion, verify non-expired not deleted
+  - multi-tenant isolation
+- Load tests:
+  - ensure deletes do not exceed DB/storage SLO budgets
+- Failure-mode tests:
+  - injected timeouts, partial deletes, retry behavior
+
+## Exceptions to this standard
+Any exception (e.g., inability to hard delete due to third-party backend constraints) requires:
+- Security review sign-off (Security & Compliance)
+- SRE review for operational risk
+- Documented compensating controls (e.g., crypto-shredding, lifecycle rules + verification)
+- A clear timeline for remediation if the exception is temporary
+
+## Reference implementation notes
+- Prefer the shared purge job framework (see platform docs) to get:
+  - run_id generation
+  - retry/backoff defaults
+  - metrics hooks
+  - rate limiting
+
+## Change log
+- 2025-03-05: Standardized canonical metric names and default paging thresholds by tier; clarified hold integration requirements.
+- 2025-02-03: Initial publication aligned with Retention Controls + Compliance Reporting Pack project requirements.

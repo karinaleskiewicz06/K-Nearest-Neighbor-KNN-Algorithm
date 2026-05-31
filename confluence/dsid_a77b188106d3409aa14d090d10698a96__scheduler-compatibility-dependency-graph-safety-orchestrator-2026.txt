@@ -1,0 +1,159 @@
+Scheduler Compatibility Dependency Graph and Safety Orchestrator
+
+Summary
+
+This document defines the Scheduler Compatibility Dependency Graph (SCDG) and describes the Safety Orchestrator that enforces compatibility, graceful degradation, and safe rollouts between kernel variants, scheduler plugins, and runtime subsystems. It combines a static dependency model with dynamic runtime checks and an automation layer that performs remediation and controlled fallback.
+
+Why this exists
+
+- Kernels and scheduler plugins are evolving rapidly (new quantization paths, sparse-attention kernels, fractional residency modes). We need a machine-readable compatibility model to avoid accidental unsafe pairings.
+- Incidents historically involve combinations of kernel variants + admission-controller policies that produce deadlocks, soft OOMs, or priority inversion. The SCDG lets automation surface risky pairings before they reach production.
+
+Scope and assumptions
+
+- Space: eng-serving-runtime/kernel-and-scheduling and runtime-architecture operational surface.
+- Assumes per-cluster kernel metadata is available via kernel-manifest service (artifact: /artifacts/kernels).
+- Not a replacement for unit/interop tests; it augments CI and runtime safety checks.
+
+Key concepts
+
+1) Node: a component (kernel, plugin, admission-controller, cache-manager). Each node has attributes: name, semantic-version, capabilities, resource-profile, affinity-tags.
+2) Edge: a directional compatibility relation between nodes. Edge metadata includes: compatibility-level (compatible | advisory | incompatible), min-version, known-issues-ref.
+3) Cohort: a small set of nodes commonly updated together (e.g., {tensor-core-kernel-v2, prefetch-plugin-1.4}). Cohorts are used for canaries and rollback groups.
+4) Safety Orchestrator: runtime daemon that consumes the SCDG and enforces policy: rejects incompatible combos, synthesizes safe fallbacks, and coordinates rolling remediations.
+
+Design overview
+
+- Authoring: kernel owners publish node descriptors as YAML under kernel-manifest; CI validates descriptor JSON schema.
+- Graph materialization: a scheduled job (scdg-builder) consolidates manifests from clusters, runs compatibility heuristics, and persists a canonical SCDG snapshot to the metadata DB.
+- Runtime enforcement: Safety Orchestrator subscribes to snapshots. On each model-serving slot allocation, it verifies requested kernel + plugin pair against SCDG. If advisory or incompatible, orchestrator applies configured policy (block | warn-and-audit | auto-fallback).
+- Telemetry: every verification emits a verification event (verif_id) with context: request_id, node-pair, compatibility-level, decision, and matched-cohort. These events feed the scheduler-telemetry pipeline.
+
+Compatibility matrix (example table)
+
+| Component A | Component B | Min A ver | Min B ver | Compatibility | Action on incompatible |
+|-------------|-------------|----------:|----------:|--------------:|-----------------------:|
+| tensor-core-kernel | prefetch-plugin | 2.1.0 | 1.4.0 | compatible | none |
+| tensor-core-kernel | sparse-attn-plugin | 2.0.0 | 0.9.0 | advisory | warn-and-audit |
+| fp8-quant-kernel | nvlink-allocator | 1.0.0 | 2.3.1 | incompatible | block-and-fallback |
+
+Authoring schema (YAML snippet)
+
+```yaml
+# kernel-manifest/<kernel>/descriptor.yaml
+name: tensor-core-kernel
+version: 2.1.0
+capabilities:
+  - attention:sparse
+  - quantization:fp16
+resource_profile:
+  vram_min_mb: 12288
+affinity_tags:
+  - high-throughput
+compatibility:
+  - with: prefetch-plugin
+    min_version: 1.4.0
+    level: compatible
+  - with: sparse-attn-plugin
+    min_version: 0.9.0
+    level: advisory
+```
+
+Safety Orchestrator policies (examples)
+
+- block-on-incompatible: refuse to schedule and return HTTP 409 with a diagnostic payload to the dispatcher.
+- warn-and-audit: allow scheduling but attach a high-severity audit event and tag the request for shadow replay.
+- auto-fallback: transparently substitute the nearest compatible kernel variant from the same cohort and attach a warning in response metadata.
+
+Operational runbook: incompatible-pair-detected
+
+1. Trigger: Safety Orchestrator emits event type SCDG.VERIF.INCOMPATIBLE with decision=block-and-fallback.
+2. Immediate actions (0-5m):
+   a. Orchestrator will reject new allocations for the offending cohort.
+   b. Paging is sent to oncall-scheduler (channel: #oncall-scheduler).
+   c. Short-circuit: route new requests for impacted model routes to fallback pool (if configured).
+3. Triage (5-30m):
+   a. Oncall inspects SCDG snapshot id and the verif_id, then runs scdg-debug --verif <verif_id> to get contextual pair traces.\   b. If a recent change is implicated, use canary-rollback playbook (section: Canary rollback matrix).
+4. Remediation (30m-4h):
+   a. If safe fallback exists, perform automated cohort-rollback or kernel-substitute using orchestrator's action plan.\   b. If no fallback, escalate to kernel owner and schedule expedited patch.
+5. Post-incident (4h+):
+   a. Add an advisory edge entry describing observed behavior and mitigation steps.
+   b. Schedule a focused interop run in the CI lab with the failing pair (see test matrix below).
+
+Canary and rollout matrix
+
+- Canary cohort size: 1–3 nodes (1% traffic from a control tenant, randomized across zones).
+- Canary pass criteria (automated): 99.95% success rate for 10k requests, median latency delta < 5% vs baseline, no new SLO error budget burn > 2%.
+- Rollout steps (recommended):
+  1. Publish kernel descriptor and update SCDG snapshot in staging.
+  2. Run interop suite: scdg-interop --staging --cohort <name>. Expect green.
+  3. Canary deploy to production cohort (1% traffic) with orchestrator policy=warn-and-audit.
+  4. Monitor for 6 hours. If green, advance to 10% with auto-fallback enabled.
+  5. Full rollout after 72-hour quiet window.
+
+Test matrix (short)
+
+| Test | Target | Expected outcome |
+|------|--------|-----------------|
+| admission-safety | kernel + admission-controller | pass (no rejection) |
+| memory-pressure | kernel + allocator | no soft-ooms under baseline burst profile |
+| latency-cohort | kernel + plugin | p99 < configured p99 SLO |
+
+Observability and alerts
+
+- Verification events feed: scheduler.verify.events -> kafka/topic:scheduler-verify.
+- Alert: SCDG.IncompatibleRate > 5/min for 5m -> PagerDuty to scheduler oncall.
+- Dashboard: "Scheduler Compatibility" with heatmap of advisory/incompatible edges by cohort and 24h trend.
+
+Developer workflows and CLI tools
+
+- scdg-author validate <descriptor.yaml>  # local schema validation
+- scdg-builder --snapshot-id auto         # produces canonical SCDG
+- scdg-debug --verif <verif_id>          # human-readable decision trace
+- scdg-simulate --pair A:B --load-file burst-profile.json  # run lab interop
+
+Configuration table (defaults)
+
+| Key | Default | Notes |
+|-----|--------:|-------|
+| scdg.snapshot.interval | "1h" | Frequency scdg-builder runs; lower intervals increase churn |
+| orchestrator.policy.default | "warn-and-audit" | Default enforcement policy for advisory edges |
+| canary.cohort.size | "1-3" | Number of nodes in a canary cohort |
+| canary.traffic.percent | "1" | Starting canary traffic percent |
+
+Safety trade-offs and notes
+
+- Conservative defaults avoid silently shipping incompatible combos; teams that opt into faster innovation should register cohorts and accept increased advisory warnings.
+- The SCDG is only as good as manifests and telemetry. Encourage owners to include comprehensive capability tags and reproduction steps in manifests.
+- Known blind spot: cross-cluster NVLink topology constraints are not inferred automatically; add explicit edges when topology matters.
+
+Ownership and contact points
+
+- Scheduler Compatibility steward: Ava Martinez (author).
+- Kernel manifest service owner: Priya Natarajan.
+- Oncall escalation: eng-serving-runtime/scheduler rotation.
+
+Related pages and artifacts
+
+- Kernel manifests: artifact store /artifacts/kernels (read-only for non-owners).
+- CI interop harness: repo infra/ci/scdg-interop.
+- Telemetry schema: /confluence/eng-serving-runtime/team-wiki/runtime-telemetry-data-model-and-tracebook-2026.
+
+Appendix A: example incident query (KQL)
+
+```
+// sample query: find incompatible failures in last 6h
+service=="safety-orchestrator" and event_type=="SCDG.VERIF.INCOMPATIBLE" | where timestamp > now() - 6h | top 50 by count()
+```
+
+Appendix B: minimal manifest checklist (owner must verify before publish)
+
+1. version and checksum present
+2. resource_profile.vram_min_mb accurate
+3. affinity_tags reflect intended scheduling
+4. compatibility edges include at least: allocator, admission-controller, common-plugin-cohort
+
+Document change log
+
+- 2026-01-15: Draft created by Ava Martinez.
+- 2026-02-03: Added runbook steps and CLI examples after reviewer feedback.

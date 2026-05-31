@@ -1,0 +1,141 @@
+Accelerator ABI and Driver Graceful Degradation ADR
+
+Summary
+
+This ADR defines the Accelerator ABI (application binary interface) and the runtime-side driver graceful-degradation policy for heterogeneous accelerator fleets (GPU, TPU-like ASICs, and vendor-provided inference accelerators). The goal is a small, well-specified handshake and capability set that: 1) allows the runtime to negotiate performance/precision tradeoffs with device drivers; 2) exposes a deterministic degradation path when an accelerator cannot satisfy requested guarantees; and 3) provides operational signals for capacity, thermal, and error states so higher layers (routing, fallback) can make policy decisions.
+
+Context and motivation
+
+Redwood's serving runtime runs across mixed hardware: cloud GPUs with different memory/compute, vendor inference chips with quantization-aware runtimes, and experimental on-prem ASICs for Private deployments. Historically each driver exposed a different surface (promises about sequence-length limits, supported quantization, KV cache semantics), which led to fragile fallbacks and silent quality regressions. Operations has observed incidents where a node reported "healthy" but silently served half-precision tensors, creating subtle hallucination regressions in downstream evals. We need a minimal ABI and a deterministic downgrade model so the orchestration and routing layers can react before customer-visible quality drops.
+
+Decision (what we are adopting)
+
+We adopt a two-part contract:
+
+1) Accelerator ABI (driver runtime surface)
+- A JSON capability manifest returned during driver handshake with these required fields: vendor, model, memory_bytes, peak_fp32_throughput, supported_precisions (list), max_sequence_length, kv_cache_model (none|keyseg|segmented), supported_quant_modes (list), fail_modes (list of canonical failure codes).
+- A gRPC control channel for health + telemetry that emits structured events: THERMAL_WARNING, MEMORY_PRESSURE, DRIVER_DEGRADATION(start/end), ARTIFACT_ERRORS. Events include numeric fields (temp_celsius, available_bytes, eviction_count).
+- Deterministic downgrade functions exposed by drivers: get_degradation_path(requested_precision) -> ordered list of fallback precisions and a max-acceptable-seq-length for each step.
+
+2) Graceful-degradation policy (runtime orchestration expectations)
+- If a driver indicates DRIVER_DEGRADATION or memory pressure that will affect >P% of requests in next T seconds, the runtime must:
+  a) Mark node as "degrading" and emit a metric (accelerator.node.degradation{reason}).
+  b) For new requests, consult degradation path and either re-route to compatible node, fall back to a quantized variant, or invoke a lower-fidelity model per client policy.
+  c) For in-flight requests, attempt best-effort KV-preserving re-execution (see runbook) but avoid silent precision demotion unless explicitly allowed by the tenant's model policy.
+
+Rationale
+
+- Small manifest + events provide actionable signals without locking in per-vendor RPCs.
+- Centralizing downgrade logic in drivers avoids guessing behavior and ensures the runtime can reason about end-to-end effects (e.g., seq length vs precision tradeoff).
+- Separating "allowed by tenant policy" from automatic demotion prevents silent regressions for customers with strict fidelity requirements.
+
+Alternatives considered
+
+1) Do nothing / keep vendor-specific surfaces
+   - Pros: no immediate engineering cost
+   - Cons: repeated incidents, unpredictable fallbacks, poor observability for quality regressions (rejected).
+
+2) Full feature-rich driver RPC (rich schema for every kernel)
+   - Pros: maximum expressivity
+   - Cons: long vendor integration time, brittle across versions (rejected).
+
+3) Runtime-only heuristic demotion (runtime interprets raw metrics and decides)
+   - Pros: driver-agnostic
+   - Cons: wrong assumptions across devices; drivers have the ground truth (rejected).
+
+Implementation specification
+
+1) Manifest schema (JSON example)
+{
+  "vendor": "string",
+  "device_model": "string",
+  "memory_bytes": 68719476736,
+  "peak_fp32_throughput": 12000.0,
+  "supported_precisions": ["fp32","fp16","int8*"],
+  "max_sequence_length": 4096,
+  "kv_cache_model": "segmented",
+  "supported_quant_modes": ["static8","dynamic8","awq"],
+  "fail_modes": ["OOM","THERMAL","DRIVER_FAULT"]
+}
+
+2) Control channel: gRPC proto (summary)
+- Service: AcceleratorControl
+- RPCs: GetManifest(), StreamEvents(stream Event) -> ack, SetThrottle(level) -> ack
+- Event structure: {timestamp_ms, node_id, code, numeric_map, text}
+
+3) Degradation API (driver-side function)
+- get_degradation_path(requested_precision: string, requested_sequence: int) -> list of {precision, max_sequence_length, estimated_throughput_ratio}
+
+Operational runbook (short)
+
+Triggers and immediate actions:
+1) Event THERMAL_WARNING with temp_celsius > 85 for 30s -> put node into read-only drain and notify SRE.
+2) DRIVER_DEGRADATION with predicted_available_bytes < requested_memory -> mark degrading, reduce offerable concurrency by 50% and trigger rescheduling.
+
+Manual recovery steps:
+1) For transient thermal events: verify cooling system, evict long-running ephemeral jobs, restart driver process if required.
+2) For persistent artifact errors: collect driver logs / dmesg, escalate to vendor with manifest and event stream.
+
+Routing & API implications
+
+- API layer must include these fields in the request envelope: preferred_fidelity (strict|best-effort|cost-optimized) and allow_demote boolean.
+- Default tenant policy: preferred_fidelity=best-effort, allow_demote=false. Allowing demote requires explicit opt-in by the customer and is surfaced in Console settings.
+
+Testing and acceptance criteria
+
+- Unit: manifest parsing, event handling, degradation-path evaluation.
+- Integration: simulate driver events (thermal, OOM) in testbed and assert runtime re-routes or rejects per tenant policy.
+- Quality regression: run prompt-suite CI (refer to prompt-suite-ci-contract-testing-guidelines) before and after simulated demotion; metrics: BLEU/ROUGE analogs and hallucination rate must not regress beyond tenant thresholds.
+
+Metrics to monitor
+
+- accelerator.node.degradation.count by code
+- accelerator.request.demoted.count by tenant and model
+- end_to_end_quality_regressions.per_model (linked to evals)
+- routing_fallbacks.per_minute
+
+Rollout plan
+
+1) Stage 0: Spec review and vendor alignment (2 weeks).
+2) Stage 1: Driver shim implementation for two vendor drivers and testbed integration (6 weeks).
+3) Stage 2: Runtime support (handshake, event processing, routing changes) in canary (4 weeks).
+4) Stage 3: Tenant opt-in on Dedicated and Private (2 weeks).
+5) Stage 4: Full launch for Hosted (after 8 weeks of canary stability).
+
+Owners and contacts
+
+- Design author: Michael Chen (runtime team)
+- Driver integration lead: Nadia Alvarez (kernel & drivers)
+- SRE contact: Priya Singh
+- Product liaison: Daniel Romero
+
+Open questions and future work
+
+- How to represent approximate numeric fidelity (e.g., AWQ variants with mixed blocks)? We propose a small extension to the manifest to include per-layer fidelity profiles in a later ADR.
+- Should the runtime be allowed to force demotion for system safety (e.g., to avoid cascading OOMs)? Current decision: only when "system_safety" flag present in tenant policy (requires legal/product sign-off).
+
+Appendix A: Example degradation path table
+
+| requested_precision | step | fallback_precision | max_seq | throughput_ratio | notes |
+|---------------------|------|--------------------|---------|------------------|-------|
+| fp32                | 0    | fp32               | 4096    | 1.0              | native |
+| fp32                | 1    | fp16               | 4096    | 0.65             | reduced numerical headroom |
+| fp32                | 2    | int8               | 2048    | 0.35             | quantized; requires calibration |
+
+Appendix B: Example tenant request headers (JSON)
+{
+  "tenant_id": "t-12345",
+  "model": "redwood-base-13b",
+  "preferred_fidelity": "best-effort",
+  "allow_demote": false
+}
+
+Related documents
+
+- eng-serving-runtime/runtime-architecture/sequence-length-aware-kernel-selection-guidelines-2026.json
+- architecture-and-standards/infra-standards/graceful-gpu-preemption-and-prewarming-guidelines-2026.json
+
+Revision history
+
+- 2026-02-18: Drafted by Michael Chen.
+- 2026-03-05: Reviewed with drivers team; updated event schema and rollout plan.

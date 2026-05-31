@@ -1,0 +1,174 @@
+Runtime Cache Invalidation and Staleness Mitigation Playbook
+
+Summary:
+This playbook defines recommended patterns, configuration defaults, observability, and runbooks for prefix/KV and result caches used by the inference runtime. It focuses on preventing stale outputs in downstream applications while preserving batching and cache-efficiency benefits. The guidance applies to: Redwood-hosted runtime, Dedicated pools, and Private runtime sidecars.
+
+Why this matters:
+- Cached KV/prefix state and generated outputs reduce cost and latency but can cause incorrect responses when model weights, prompt templates, control tokens, or user-scoped data change.
+- We need predictable, auditable invalidation behavior to maintain SLOs, preserve user trust, and support safe rollouts of models, quantization, and prompt engineering changes.
+
+Scope:
+- Invalidation for: prefix cache, KV cache (key-value attention/cache), structured response caches, and API-level result caches.
+- Not in scope: client-side browser caches, CDN edge caches (see edge cache playbook).
+
+Core concepts and terminology:
+- Cache key: deterministic identifier used for lookup. Keys must include model variant id, model-artifact-version, prompt-template-hash, and tenant-id when applicable.
+- Staleness window: configured maximum acceptable age (seconds) for cached entries before forcing revalidation.
+- Tombstone: a short-lived marker indicating an entry was invalidated while ensuring race conditions between writers/readers are handled.
+- Invalidation signal: any event that triggers removal or marking of cache entries as stale (model rollout, artifact re-signing, prompt template edit, tenant-specific KV updates).
+
+Design principles (high level):
+1) Make cache keys semantically rich: include model_variant, artifact_version, and prompt_template_hash to allow coarse-grained automatic isolation.
+2) Prefer explicit invalidation events over infinite TTLs.
+3) Use tombstones to avoid reintroducing stale entries during concurrent writes.
+4) Offer both soft-stale (serve but mark) and hard-expire (do not serve) behaviors to balance availability vs correctness.
+5) Surface staleness signals in telemetry and error budgets; do not hide them behind silent, silent-miss behavior.
+
+Invalidation signals and sources:
+- Model rollout: control plane emits model.artifact.updated with fields {model_id, variant_id, artifact_version, rollout_id}.
+- Prompt/template change: prompt-service emits prompt.template.changed with template_hash and affected-route patterns.
+- Tenant KV update: tenant-kv-service emits tenant.kv.updated with keys and tenant_id.
+- Manual administrative action: console / CLI invalidate-cache {scope, reason}.
+- Time-based TTL: configured at cache-class level.
+
+Signal delivery patterns (recommended):
+- Primary: event bus (pub/sub) topic `cache-invalidation` with JSON payload (see appendix). All runtimes subscribe and apply events asynchronously.
+- Secondary (fallback): HTTP webhook for private deployments where pub/sub is not available. Webhook must be idempotent and authenticate via mutual TLS.
+- Emergency: admin API that accepts a signed invalidate request for immediate hard-expire.
+
+Consistency models and recommended defaults:
+- Tenant-isolated read-after-write (strong for tenant-scoped writes): for KV updates originating from the same tenant, reads must reflect writes within 200ms in Dedicated/Hosted; for Private deployments document local constraints.
+- Cross-tenant and global model rollouts: eventual consistency with observability. Recommendation: soft-stale window 60s, hard-expire 300s by default for model rollouts.
+- Prefix/KV cache policy: soft-stale 5s, hard-expire 60s for streaming/batched inference to minimize user-facing regressions.
+- Config override: teams can tighten windows for critical routes (e.g., financial or compliance flows).
+
+Runtime patterns (implementation guidance):
+1) Cache key composition: `tenant:<tenant_id>|model:<model_variant>@<artifact_v>|prompt:<template_hash>|route:<route_id>|seq:<seq_pos>`
+2) Tombstone flow: on invalidation, write tombstone with TTL = tombstone_ttl (default 30s). Readers that encounter tombstone must treat the entry as missing and trigger recompute.
+3) Soft-stale flow: on model-artifact update, mark cached entries as soft-stale. Serve soft-stale but include response metadata header `X-Cache-Stale: true` and `X-Served-From: cache`. Increment staleness metric. Optionally trigger background refresh.
+4) Hard-expire flow: admin or urgent invalidation marks entry hard-expire -> delete immediately.
+5) Background revalidation: implement opportunistic revalidation where a background worker prefetches and repopulates caches after rollouts. Throttle prefetch to avoid stampeding.
+
+API contract changes (client-facing guidance):
+- New response headers: `X-Cache-Hit`, `X-Cache-Stale`, `X-Model-Version`, `X-Prompt-Template-Hash` (values: strings). Documented in client SDKs.
+- Clients should not rely on long-lived cached outputs for transactional semantics. For idempotent or authoritative responses, clients must pass `force_fresh=true` on the request.
+- Admin invalidate endpoints: `POST /internal/v1/cache/invalidate` with payload {"scope": ["tenant","model","prompt"], "identifiers": [...], "severity": ["soft","hard"], "reason": "..."}. Requests authenticated via service token and audited.
+
+Configuration table (recommended defaults):
+- cache_class=prefix.kv
+  - default_soft_stale_seconds=5
+  - default_hard_expire_seconds=60
+  - tombstone_ttl_seconds=30
+- cache_class=result.http
+  - default_soft_stale_seconds=60
+  - default_hard_expire_seconds=300
+  - tombstone_ttl_seconds=60
+- prefetch_worker_parallelism=4
+- revalidation_backoff_ms=200
+
+Observability and SLOs:
+- Required metrics (per-route, per-model-variant):
+  - cache_hits_total
+  - cache_misses_total
+  - cache_stale_served_total
+  - cache_invalidation_events_received_total
+  - cache_tombstones_written_total
+  - prefetch_repopulated_total
+- Traces: include cache lookup span with attributes {cache_key, hit:boolean, stale:boolean, tombstone:boolean, model_variant, artifact_version}.
+- Dashboards: per-tenant dashboard showing stale rate and mean-time-to-invalidate (MTTI) after model rollout.
+- SLOs: for critical routes, stale_served_rate must be <0.1% over 30d rolling window. For standard routes target <1%.
+- Alerting thresholds (examples):
+  - P1: cache_stale_served_rate > 5% for 15m for any production route -> page oncall.
+  - P2: invalidation_event_processing_lag > 5s across >90% of nodes -> slack alert.
+
+Testing, validation and CI checks:
+- Unit tests: composition of cache keys must be deterministic and covered for all route permutations.
+- Integration tests: simulate model rollout by emitting event and assert no stale responses beyond hard-expire window.
+- Chaos test: add latency and message reordering to invalidation bus and assert tombstone semantics prevent re-introducing stale items.
+- Load test: measure prefetching throughput and ensure it does not exceed prefetch_worker_parallelism budget.
+- Contract test: admin invalidation API must be audited; CI generates synthetic audit events and validates write-to-metadata-store.
+
+Rollout plan for changes to cache behavior:
+1) Design review and ADR -> publish change with migration guide.
+2) Stage in canary runtime with metric-level sampling; enable `X-Cache-Stale` header and collect baseline for 72h.
+3) Gradual ramp across regions 10% -> 50% -> 100% with automated rollback on P1 alerts.
+4) After 100% rollout, enable background prefetchers for model rollout events.
+
+Ownership and responsibility matrix:
+- Runtime core team: implementation and observability (owner: eng-serving-runtime).
+- Control plane: emits model and prompt change events, API surface for admin invalidation (owner: product-infra).
+- SDK/Docs: surface client headers and guidance (owner: eng-developer-experience).
+- SRE: define alerts and oncall-runbooks (owner: eng-sre).
+
+Runbook: Staleness incident (serving stale responses unexpectedly)
+1) Triage: check `cache_stale_served_total` rate and identify affected routes/tenants.
+2) Check invalidation event bus lag and webhook delivery logs.
+3) If messages are queued: restart subscriber, increase parallelism temporarily, and trigger prefetch for affected model variants.
+4) If tombstone races suspected: increase tombstone_ttl from default to 120s for affected class, run controlled purge.
+5) If control plane mis-sent artifact_version (wrong hash): initiate emergency hard-expire for the model variant, and roll back the rollout.
+6) Post-incident: create short RCA, include timeline of invalidation events and lead time to MTTI.
+
+Appendix: Example invalidation event payload (pub/sub)
+```json
+{
+  "type": "model.artifact.updated",
+  "timestamp": "2026-02-03T12:21:00Z",
+  "payload": {
+    "model_id": "redwood-7b-o2",
+    "variant_id": "v2-quant-a",
+    "artifact_version": "2026-02-03-1123",
+    "rollout_id": "roll-2026-02-03-01",
+    "scope": "global",
+    "severity": "soft"
+  }
+}
+```
+
+Webhook example for private deployments (YAML):
+```yaml
+- url: https://private-sidecar.example.com/_internal/invalidate
+  method: POST
+  mTLS: true
+  payload: |-
+    type: prompt.template.changed
+    timestamp: 2026-02-03T12:22:00Z
+    payload:
+      template_hash: f1a2b3c4d5
+      affected_routes: ["/v1/chat","/v1/generate"]
+      severity: hard
+```
+
+Implementation pseudocode (reader logic):
+```python
+def get_response(cache_key):
+    entry = cache.read(cache_key)
+    if entry is None:
+        return compute_and_populate(cache_key)
+    if entry.is_tombstone():
+        return compute_and_replace(cache_key)
+    if entry.is_soft_stale():
+        emit_metric('cache_stale_served')
+        background_prefetch(cache_key)
+        return entry.payload_with_header({'X-Cache-Stale': 'true'})
+    return entry.payload
+```
+
+Appendix: Checklist for changes to cache behavior:
+- [ ] ADR drafted and approved by architecture board.
+- [ ] Observability metrics instrumented and dashboarded.
+- [ ] Integration tests and chaos tests added to CI.
+- [ ] Documentation updated for SDKs/clients about headers and `force_fresh` flag.
+- [ ] Canary/rollout plan scheduled with rollback criteria.
+
+Related reading and references:
+- Decision records on cache-affinity and KV prefetching (see related_pages).
+- Observability sampling playbook for tracing async consumers.
+
+Contact and escalation:
+- Primary owner: eng-serving-runtime (pager: @eng-serving-runtime-oncall)
+- Secondary: eng-platform
+
+Document history:
+- 2025-11-12: Draft created by Iris Patel
+- 2025-12-10: Reviewed by Kai Nakamura and Ravi Shah; added tombstone semantics
+- 2026-02-03: Published; added webhook guidance for private deployments

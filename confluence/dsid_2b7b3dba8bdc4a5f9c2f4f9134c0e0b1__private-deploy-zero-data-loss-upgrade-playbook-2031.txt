@@ -1,0 +1,170 @@
+Zero-Data-Loss Private Deploy Upgrade Playbook (SRE Runbook)
+
+Summary:
+This runbook describes a tested, operator-focused process to perform upgrades to Private (VPC / on-prem) deployments with an explicit goal: zero data loss for runtime state (KV caches, tenant snapshots, model artifacts) and minimal customer-visible disruption. It combines atomic state checkpointing, staged model activation, transactional KMS-friendly key rotation, and automated verification gates.
+
+This 2031 revision reflects changes in tooling (snapshot v4.x), updated latency gates, and a stricter definition of “wave success” after several 2030 incident learnings.
+
+Scope and audience:
+- Scope: Tenant-facing runtime components in private deployments (inference runtime, KV cache, model store, control-plane agents, local telemetry collectors).
+- Not in scope: physical firmware upgrades for HW (see onprem-packaging docs) and customer-managed load balancer changes.
+- Audience: SREs, field operators, deployment engineers, and delivery leads executing upgrades in customer environments.
+
+Prerequisites and assumptions:
+- Operator access to customer control plane and operator-run SSH bastion or management VPN.
+- Backups of model artifacts and KV state accessible in immutable object store (S3 compatible).
+- Snapshot tooling version >= 4.1.0 installed on operator workstation (replaces 3.x).
+- KMS integration supports offline wrapping/unwrapping, key versions, and dual-primary “grace” windows (see KMS rotation appendix).
+- Pre-approved maintenance window in calendar and customer acceptance of canary flow.
+- NOTE: Starting 2031-01, “strong” KV snapshots are mandatory for tenant-critical namespaces (see KV notes).
+
+High-level strategy (phases):
+1) Validate and baseline: collect telemetry and pre-upgrade evidence.
+2) Cold checkpoints: produce consistent, point-in-time snapshots of tenant runtime state.
+3) Canary upgrade: upgrade control plane + 1–3 tenants with staged runtime activation and smoke tests.
+4) Gradual roll: expand tenant upgrades in bounded waves with automated validation gates.
+5) Switch-over: final atomic activation for remaining tenants with KV rehydrate and verification.
+6) Fortify and evidence: preserve upgrade artifacts and run post-upgrade acceptance tests.
+
+Success criteria (per wave):
+- No loss of KV keys between pre-checkpoint and post-activation (0 missing keys; 0 unexpected new keys in protected namespaces).
+- Latency and tail-p99 meet SLOs for canary tenants (< 140ms p50, < 450ms p99) OR match pre-upgrade baseline within configured delta (default: +10% p50, +15% p99).
+- Error budget change < 3% during the wave (tightened from 5%).
+- All smoke evaluation prompt-sets show no regressions beyond configured threshold.
+- Snapshot restore drill remains viable: restore test of at least one tenant snapshot to a staging runtime must succeed during T-24h baseline window.
+
+Detailed checklist and operator steps:
+A. Baseline collection (T-24h to T-1h)
+  1. Run auto-benchmark agent:
+     `rwoodctl telemetry baseline --tenants all --duration 1h --out baseline.json`
+  2. Export list of active tenants and outstanding long-lived KV sessions:
+     `rwoodctl tenants list --format csv`
+  3. Verify object-store snapshot health and retention window >= 96h (updated from 72h).
+  4. Create pre-upgrade evidence bundle (sha256) and upload to evidence bucket.
+  5. Validate KMS health and key-version visibility from the customer environment:
+     `rwoodctl kms status --out kms-status.json`
+
+B. Cold checkpoint (T-2h)
+  1. Quiesce write-heavy routes: add temporary rate-limit rule for tenant hotpaths.
+  2. Trigger KV checkpoint:
+     `rwoodctl kv snapshot create --consistency strong --label pre-upgrade-2031-01-10`
+  3. Verify snapshot completion and checksum.
+  4. Export a short read-only witness token for customers that require audit proof.
+  5. (New) Record snapshot manifest ID returned by snapshot v4.x (required for restore concurrency control).
+
+C. Canary wave (T)
+  1. Select 1–3 low-risk tenants (non-critical, representative workload).
+  2. Upgrade control plane components (control-plane agents, operator-tools): follow package manifest install and smoke test commands in order.
+  3. For each canary tenant: perform in-place runtime upgrade with staged model activation:
+     - Upload new model variant to model-store with staging label `staged-<version>`
+     - Start runtime in `dual-binary` mode: accept both old/new model loads but route 95% traffic to old version for 20m (reduced from 30m if gates are clean).
+     - Run synthetic workload and compare outputs to golden prompt-set (automation command):
+       `rwoodctl eval run --tenant TENANT_ID --prompt-set ./canary-prompts.json`
+  4. If checks pass (no regressions, latency within gate), increase traffic to new model 50% for 10m, then 100%.
+  5. Monitor telemetry for 60 minutes after 100% cutover before proceeding.
+
+D. Wave expansion and throttling rules
+  - Waves are timeboxed to 90 minutes each (updated from 2 hours) to reduce blast radius and improve operator focus.
+  - A wave fails if any of:
+    - KV drift > 0 keys in protected namespaces (auth/session/rate-limit)
+    - Error rate spike > 35% over baseline for > 10 minutes (tightened)
+    - P99 latency exceeds gate for > 15 minutes
+    - Any KMS unwrap failure affecting model-store or snapshot envelope (now an automatic stop)
+  - On failure: execute rollback for that wave (see Rollback procedures).
+
+Rollback procedures (per-wave and final):
+1. Immediate rollback trigger conditions: KV inconsistency detected, persistent tail latency degradation, KMS unwrap/rewrap failures, or customer emergency request.
+2. Per-wave rollback steps:
+   - Reapply older model label and switch runtime routing:
+     `rwoodctl runtime route set --tenant TENANT_ID --model-label previous --force`
+   - If model routing cannot be reverted within 5 minutes, trigger KV snapshot restore from `pre-upgrade` snapshot and restart runtime processes (see KV restore command below).
+   - (New) If KMS rotation Phase 2 has started, pause rotation and keep old key version active; do not delete or disable any key versions.
+3. Full rollback (global):
+   - Pause all waves and open incident bridge (see related runbook).
+   - Restore object-store model artifacts from `pre-upgrade` evidence bundle.
+   - Restore KV for affected tenants:
+     `rwoodctl kv snapshot restore --snapshot pre-upgrade-2031-01-10 --tenants TENANT_LIST`
+   - Run full smoke regression and hold traffic behind circuit-breaker until verified.
+
+Commands and examples:
+- Create snapshot:
+  `rwoodctl kv snapshot create --consistency strong --label pre-upgrade-2031-01-10 --out /tmp/snap.json`
+- Restore snapshot (v4.x supports adaptive concurrency; start conservative):
+  `rwoodctl kv snapshot restore --snapshot /tmp/snap.json --concurrency 2 --confirm`
+- Start dual-binary runtime:
+  `rwood-runtime --mode dual --old-bin /opt/runtime/v1 --new-bin /opt/runtime/v2 --health-probe /health`
+- Model staging upload:
+  `rwoodctl model upload --file model-1.q8 --label staged-2031-01-10`
+
+KV and cache consistency notes:
+- Always use strong-consistency checkpoints for tenant-critical KV namespaces (session tokens, auth grants, rate-limiter counters).
+- Snapshot v4.x: strong-consistency snapshots may take longer but provide deterministic manifest + checksum. Plan wave timing accordingly.
+- Ephemeral caches (in-memory LRU) are allowed to be warm-started; do not rely on them for correctness.
+- Use the kvcmp tool to assert key-level equality for a small sample:
+  `kvcmp --from snapA --to runtime --sample 1000`
+
+KMS rotation and key versioning during upgrade:
+- When upgrading components that touch key-wrapping (model-store encryption, snapshot envelopes), perform a two-phase key rotation:
+  Phase 1: Add new key version as a secondary wrapping key and re-encrypt non-critical artifacts asynchronously.
+  Phase 2: After successful canary and wave 1, promote new key version to primary and rewrap remaining artifacts.
+- 2031 update: maintain a 14-day grace window where both old and new key versions remain enabled for unwrap operations in customer environments that may lag configuration propagation.
+- Do not delete old key versions until full forensic evidence is archived and customer confirms successful acceptance.
+
+Verification matrix (minimum checks per tenant):
+| Step | Check | Command / Tool |
+|------|-------|----------------|
+| Pre-snapshot | Active worker count and mem pressure | `rwoodctl metrics get --worker-count` |
+| Post-snapshot | Snapshot checksum matches runtime expected | `rwoodctl kv snapshot verify --snapshot /tmp/snap.json` |
+| Canary outputs | Prompt-set semantic similarity >= 0.93 vs baseline (tightened) | `rwoodctl eval similarity --a baseline.json --b canary.json` |
+| Post-activation | No increase in 5xx errors for 30m | `rwoodctl alerts query --metric 5xx --window 30m` |
+| Post-activation | KMS unwrap error count == 0 for 30m | `rwoodctl alerts query --metric kms_unwrap_errors --window 30m` |
+
+Roll-forward gates and sign-off:
+- Waves continue only after automated gate + human sign-off from SRE on-call for restricted/private deployments.
+- For large tenants (> $X revenue) also require delivery lead and customer success sign-off.
+- For small tenants, automated gates suffice unless customer opted into manual approval.
+
+Troubleshooting quick hits:
+- If snapshot fails due to network timeouts: increase object-store multipart timeout and retry with concurrency 1–2.
+- If model load fails with OOM: reduce max_concurrent_requests on runtime and throttle traffic; escalate to runtime team with `#runtime-ops` bridge.
+- If KMS unwrap fails for a tenant: fetch secondary wrapping key and attempt offline unwrap; if unsuccessful, open high-priority support SR with KMS vendor and stop rollout.
+- If post-upgrade P99 regresses but correctness is intact: hold at current wave, roll back only affected tenants, and collect heap/CPU profiles before proceeding.
+
+Post-upgrade monitoring and evidence preservation:
+- Retain evidence bundle (snapshots, checksums, logs, eval outputs) for minimum 180 days for restricted upgrades (updated from 90 days).
+- Run full evaluation harness across representative prompt-sets at 1h, 6h, 24h post-upgrade.
+- Update deployment manifest and chronic record in upgrade ledger:
+  `rwoodctl ledger append --entry upgrade-2031-01-10 --artifact evidence-bucket/pre-upgrade-2031-01-10`
+
+Owner and escalation matrix:
+- Upgrade owner (primary): SRE On-Call (per rota)
+- Runbook owner: Arjun Patel (eng-sre)
+- Private deploy engineering liaison: Sofia Martinez
+- Runtime/Kernel escalation: Li Wei
+- Customer Success liaison: Maya Thompson
+
+Appendix A — Sample manifest diff (text):
+- runtime_image: v3.1.2 -> v3.2.0
+- model_store_schema: 2030-08 -> 2031-01 (staged label defaults + stricter checksum enforcement)
+- kv_snapshot_tool: 4.0.2 -> 4.1.0 (manifest IDs + improved verify)
+
+Appendix B — Forensic checklist (mandatory for restricted upgrades):
+- SHA256 of all snapshots and model artifacts
+- Snapshot manifest IDs and restore logs (including concurrency settings)
+- System logs from control-plane agents (window T-1h to T+2h)
+- Eval outputs and similarity scores for canary tenants
+- KMS key versions and rotation event log (including grace-window config)
+
+Change history:
+- 2029-02-15: Created by Sofia Martinez (initial draft)
+- 2029-03-02: Added KMS rotation guidance and hardened rollback gates (reviewers: Arjun Patel, Li Wei)
+- 2031-01-10: Migrated into eng-sre runbooks; tightened wave gates, retention policy, and updated snapshot tooling requirements (owner: Arjun Patel)
+- 2031-02-05: Updated latency/error gates and added mandatory KMS unwrap checks; clarified v4.x snapshot manifest handling (reviewers: Priya Nair, Maya Thompson)
+
+Related reading and references:
+- See `kv-cache-migrations-and-runtime-state-migration-playbook-2025` for deep dive on snapshot internals.
+- See `private-deploy-evidence-preservation-and-forensic-playbook-2026` for compliance evidence retention guidelines.
+- See `private-deploy-upgrade-incident-bridge-guide-2030` for incident coordination.
+
+Contact and support:
+- For immediate assistance during an upgrade, open the `#private-deploy-upgrades` channel and tag `@ops-oncall` and `@sre-oncall`.

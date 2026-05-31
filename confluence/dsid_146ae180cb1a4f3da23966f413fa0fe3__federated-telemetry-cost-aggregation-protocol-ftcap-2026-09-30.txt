@@ -1,0 +1,203 @@
+Federated Telemetry and Cost Aggregation Protocol (FTCAP) — Design Spec
+
+Overview
+
+This design spec describes the Federated Telemetry and Cost Aggregation Protocol (FTCAP). FTCAP standardizes how telemetry-producing components across Redwood Inference (hosted, dedicated, private edge, and partner proxies) emit usage and fidelity signals, and how downstream aggregators compute cost-attribution, SLO alignment, and billing-ready metrics. The protocol is intended to be lightweight, extensible, and resilient to partial failure.
+
+Goals
+
+- Provide a single wire format and interaction pattern for usage telemetry and fidelity signals across deployment surfaces (hosted API, Redwood Dedicated, Private VPC agents, and edge proxies).
+- Enable deterministic cost aggregation per-tenant, per-route, and per-model-variant with stable semantics for billing and SLA reconciliations.
+- Preserve low-latency path for production inference; telemetry must not add >1% p95 request latency overhead.
+- Support batched and streaming modes for different runtime constraints.
+- Be auditable and verifiable by both Redwood and enterprise customers (where applicable) to support disputes and compliance.
+
+Non-goals
+
+- FTCAP does not prescribe billing rates or pricing tiers. It provides accounting primitives only.
+- FTCAP does not replace full trace/span systems for distributed tracing; it complements them with cost-centric, compact usage payloads.
+
+Background and motivation
+
+Current state: multiple services (runtime workers, local prefetch proxies, hybrid-cache coordinators, and Dedicated control-plane agents) emit telemetry in heterogeneous formats. This makes cross-surface cost aggregation error-prone and costly to reconcile. Discrepancies cause customer confusion and slow incident resolution.
+
+FTCAP addresses:
+- Canonicalizing fields for token accounting, embedding units, KV cache reuse credits, batching amortization, and fidelity adjustments.
+- Providing signatures and sequence numbers for tamper-evidence and replay protections.
+- Defining a reconciliation plan for asynchronous delivery and partial visibility.
+
+High-level architecture
+
+- Producers: inference runtime workers, local prefetch proxies, edge SDKs. They emit FTCAP messages at request end or periodically for batch/stream windows.
+- Ingest gateway: lightweight collector that validates schema, enforces landlord quotas, and forwards to Aggregators. Implemented as an autoscaling k8s service in Hosted and as a dockerized collector in Private.
+- Aggregators: stateful services that compute per-tenant aggregated metrics and expose queryables and export sinks (billing pipeline, observability pipeline, SLO dashboard).
+- Storage: time-series store for near-term SLO/observability (Prometheus/TSDB), and an append-only ledger store for audit and billing (S3-backed Parquet partitions + ledger index).
+
+FTCAP message model (wire format)
+
+- Transport: HTTP/2 POST /ftcap/v1/ingest (primary), gRPC proxy option for low-latency environments, and a batched file upload S3 path for air-gapped on-prem sites.
+- Content type: application/json; charset=utf-8
+
+Example message (single-request mode):
+
+{
+  "version": "1.0",
+  "producer_id": "runtime-worker-42",
+  "producer_region": "us-west-2",
+  "seq": 45231,
+  "timestamp": "2026-09-30T14:22:03.123Z",
+  "tenant_id": "acct_12345",
+  "route_id": "chat-completion:v2",
+  "model_variant": "llama-3-13b-quantized-q4f16",
+  "request_id": "req_9a7f3b",
+  "tokens": {
+    "prompt_tokens": 64,
+    "generated_tokens": 128,
+    "cached_kv_hits": 12
+  },
+  "fidelity": {
+    "quant_profile": "q4f16",
+    "response_fidelity_score": 0.98
+  },
+  "batching": {
+    "batch_size": 4,
+    "batch_amortized_credits": 0.25
+  },
+  "cost_adjustments": {
+    "discount_type": "preemptible-credit",
+    "units": 0.5
+  },
+  "signature": "base64sig..."
+}
+
+Notes on fields:
+- seq: monotonic for a producer instance, used to detect missed/replayed payloads.
+- cached_kv_hits: used to reduce billed prompt tokens; aggregator applies the configured cache-credit policy.
+- batch_amortized_credits: fraction of baseline per-request token cost charged to this request due to batching.
+
+Batched window mode (when per-request is infeasible):
+
+{
+  "version":"1.0",
+  "producer_id":"proxy-nyc-08",
+  "window_start":"2026-09-30T14:20:00Z",
+  "window_end":"2026-09-30T14:20:05Z",
+  "tenant_id":"acct_23456",
+  "aggregates":{
+    "requests": 280,
+    "total_prompt_tokens": 10240,
+    "total_generated_tokens": 20480,
+    "kv_hit_tokens": 5120
+  },
+  "batching_profile":"adaptive-low-latency",
+  "signature":"base64sig..."
+}
+
+Cost aggregation rules (summary table)
+
+| Component                | Primary metric                    | Aggregation rule (default)                                  |
+|-------------------------|-----------------------------------|-------------------------------------------------------------|
+| Prompt billing          | prompt_tokens - kv_credit         | sum over time windows, apply tenant kv_credit policy        |
+| Generation billing      | generated_tokens                  | sum, minus batch amortization credits                       |
+| Embedding units         | embedding_units                   | sum, round up to embedding_unit_granularity                 |
+| Cache reuse credits     | cached_kv_hits                    | convert to token-equivalent using configured kv_to_token    |
+| Batching amortization   | batch_amortized_credits           | distributed evenly across requests in batch                |
+| Fidelity adjustments    | response_fidelity_score/flags     | apply fidelity_multiplier table per route/model            |
+
+SLO and billing alignment mapping
+
+- The Aggregator maintains per-route SLO windows and maps observed telemetry to SLO burn and billing credits using deterministic rules.
+- Example mapping: if response_fidelity_score < 0.85, mark request as "degraded" and apply fidelity_discount 0.5 to generated token billing until further review.
+
+Deterministic reconciliation
+
+- Each aggregator computes both a nearline and offline view. Nearline view is used for SLO alerts and rough billing; offline ledger view is authoritative for invoicing.
+- Producers and collectors keep sequence windows to allow replays. A three-phase reconcile is defined:
+  1) Nearline aggregation (minutes latency)
+  2) End-of-day ledger rollup (1–3 hours)
+  3) Audit pass with producer-signed manifests (up to 24 hours)
+
+Security, signing and tamper evidence
+
+- Every FTCAP message must include a signature header or field. Hosted producers use mTLS + service key signing. Private deployments use customer-provided HSM keys or Redwood-managed delegation keys.
+- Sequence numbers and producer monotonic IDs are used to detect gaps. Aggregators record any gaps and mark affected windows for audit.
+
+API contract and validation rules
+
+- Required fields: version, producer_id, tenant_id, timestamp, request_id OR window_start/window_end, tokens or aggregates, signature. Missing required fields -> 400.
+- Size cap: single-request message <= 8KB. Batched windows <= 2MB.
+- Schema evolution: version field must be present; older versions are accepted with mapping rules in the ingest gateway.
+
+Operational and rollout plan
+
+1. Phase 0 — Pilot (2 weeks): implement ingest gateway in staging; onboard internal runtime workers and Redwood Console; validate parity with current billing pipeline for a narrow set of tenants.
+2. Phase 1 — Partner pilot (4 weeks): enable Dedicated collectors in 2 enterprise clients with read-only audit exports; measure divergence vs current instrumentation.
+3. Phase 2 — Controlled ramp (6–8 weeks): flip ingestion for 25% of hosted traffic; compare nearline aggregator metrics with legacy sums; adjust kv_to_token and batching profiles.
+4. Phase 3 — Full rollout (2–4 weeks): deprecate legacy emitters once reconciliation error < 0.1% for 7 consecutive days.
+
+Migration considerations
+
+- Backwards compatibility: ingest gateway will accept legacy envelopes and translate them to FTCAP.
+- Reconciliation window: maintain legacy pipeline in parallel for 90 days after rollout to catch edge cases.
+
+Observability and dashboards
+
+- Aggregators expose these dashboards: per-tenant billing delta, producer gap events, sequence-health heatmap, fidelity-score distributions, and cost-per-model-variant trending.
+- Alerts:
+  - gap-events.rate > 0.1% sustained -> PagerDuty SEV2 (ownership: infra-observability)
+  - daily billing divergence > 0.5% for top 50 tenants -> Billing ops review (ownership: finance-legal + product)
+
+Security and compliance notes
+
+- Sensitive fields (tenant_id, request_id) must be redacted in public exports. Audit exports to customers may include signed manifests and obfuscated request_ids.
+- Private deployments must document key rotation procedures and provide HSM integration steps in the onprem packaging docs.
+
+Testing and validation matrix
+
+1) Unit tests: schema validation, signature verification, sequence gap detection.
+2) Integration tests: producer -> gateway -> aggregator against reference aggregator in CI.
+3) Reconciliation tests: synthetic traffic with known distributions to ensure offline ledger matches expected costs within 0.05%.
+4) Chaos tests: simulate dropped messages and replay; verify idempotency and dedupe behavior.
+
+Sample CLI and curl examples
+
+- HTTP ingest (single request):
+curl -X POST \"https://ingest.redwood.ai/ftcap/v1/ingest\" \\
+  -H 'Content-Type: application/json' \\
+  -H 'X-FTCAP-Signature: base64sig...' \\
+  -d '@sample_ftcap_request.json'
+
+- Local batched upload (air-gapped):
+aws s3 cp ftcap-window-20260930-1420.json s3://customer-onprem-ftcap/uploads/ --profile onprem-upload
+
+Ownership and next steps
+
+- Spec owner: Priya Menon (eng-product, serving-runtime)
+- Implementing teams: eng-serving-runtime (producers), eng-platform (ingest gateway & aggregators), eng-infra (storage & ledger pipeline), finance-legal (billing contract mapping), product (SLO/billing mappings).
+- Next steps: formalize fidelity_multiplier table; produce reference SDK for producers (Go + Python); implement ingest gateway rate-limits and schema registry.
+
+Appendix A — Fidelity multiplier example table
+
+| Fidelity band          | response_fidelity_score range | multiplier |
+|------------------------|-------------------------------|------------|
+| High                   | 0.95 - 1.00                   | 1.00       |
+| Standard               | 0.85 - 0.94                   | 0.90       |
+| Degraded               | 0.60 - 0.84                   | 0.50       |
+| Failed                 | 0.00 - 0.59                   | 0.00       |
+
+Appendix B — Reconciliation SLA expectations
+
+- Nearline accuracy: aggregators should match producer-signed manifests with >= 99.5% token parity within 30 minutes.
+- Ledger finalization: end-of-day rollups complete within 3 hours and be ready for billing pipeline ingestion.
+
+Contact and review cadence
+
+- Weekly spec sync: Tuesdays 11:00 PT (owners and reviewers).
+- Change control: all breaking schema changes require an ADR and two approvers from eng-platform and finance-legal.
+
+References
+
+- Related spec: Consumption telemetry provenance and crediting spec (link above).
+- Billing ledger format v2 (internal repo: git@internal.redwood:billing/ledger-v2).
+- Onprem packaging and HSM integration guide (confluence link in eng-private-deployments).
+

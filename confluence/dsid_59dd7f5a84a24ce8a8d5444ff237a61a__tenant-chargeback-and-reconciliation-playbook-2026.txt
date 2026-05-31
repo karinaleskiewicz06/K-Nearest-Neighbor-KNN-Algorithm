@@ -1,0 +1,128 @@
+Tenant chargeback and internal billing reconciliation playbook
+
+Summary:
+This playbook describes the operational process, dashboards, and verification checks used by Platform to produce reliable tenant-level chargeback numbers and to reconcile internal billing for Reserved/Dedicated capacity. It covers daily and weekly workflows, the telemetry sources and transforms used to compute costs, automated reconciliation checks, common failure modes and remediation steps, and a short QA/test matrix for changes to cost pipelines.
+
+Scope and audience:
+- Audience: platform operators, platform finance liaisons, SREs implementing telemetry, and team leads owning tenant economics.
+- Scope: chargeback for hosted API usage (per-token generation, embeddings), Dedicated reserved capacity chargeback, ad-hoc credits and manual adjustments. Does NOT cover external customer invoicing (handled by Finance Billing team).
+
+Owner and stakeholders:
+- Playbook owner: Platform Finance Integrations (team: eng-platform)
+- Primary stakeholders: Finance (billing), Customer Success, Dedicated Ops, Account Execs for large tenants
+- Pager: platform-costs@redwood-internal (for degraded reconciliation pipelines)
+
+Telemetry sources and canonical transforms:
+1) token-meter (service)
+   - Source of truth for per-request token counts. Emits: tenant_id, model_id, request_id, tokens_prompt, tokens_completion, timestamp, route.
+   - Location: kafka topic telemetry-ingest.token-meter.v1
+2) reserved-usage-collector
+   - Tracks reserved capacity utilization by GPU-pool and tenant allocation. Emits: tenant_id, pool_id, vgpu_hours, timestamp.
+3) infra-cost-mapper
+   - Maps GPU pool hours and infra costs to per-GPU-hour dollar rates (depends on instance types, region).
+4) credits-ledger
+   - Authoritative for manual credits and refunds. Writes to postgres table billing.credits.
+
+Canonical cost transform (executed in batch + streaming):
+- Step A (streaming): join token-meter with rate-labeller to produce per-request dollar estimate for near-real-time dashboards. Used by Tenant Cost Explorer.
+- Step B (batch nightly): materialize daily tenant cost by aggregating tokens, reserved hours, and subtracting credits. Produce table billing.daily_tenant_costs(date, tenant_id, tokens_cost, reserved_cost, credits, total_cost).
+- Owner of transforms: telemetry-pipeline team (eng-infra).
+
+Dashboards to maintain (minimum viable set):
+- Tenant Cost Explorer (Grafana)
+  - Panels: 7d rolling cost, per-route cost breakdown, top-k callers, anomaly score (Z-score on daily spend), reserved vs on-demand split.
+  - Filters: tenant_id, date range, model_id, region.
+- Reconciliation Summary (Grafana)
+  - Panels: daily materialized costs vs invoice-proxy totals, count of unclassified events, credits applied, reconciliation delta (abs and percent).
+- Reconciliation Drill (Explore/SQL)
+  - Panels linking to ad-hoc SQL queries for mismatched keys and last-touch telemetry.
+
+SLOs and thresholds for automated alerts:
+- Pipeline freshness SLO: billing.daily_tenant_costs available by 04:00 UTC (target 99% of days). Alert if missing for >1 day.
+- Delta threshold: if |materialized_total - invoice_proxy_total| > max(1000 USD, 2% of invoice_total) for any tenant, create P1 reconciliation investigation ticket.
+- Unclassified event threshold: if >0.5% of token events in the day fail mapping to tenant_id, paging to platform-costs oncall.
+
+Daily reconciliation runbook (operator checklist):
+1) At 04:10 UTC, verify nightly job status:
+   - CLI: kubectl -n telemetry get jobs billing-transform-daily -o json | jq '.status'
+   - If job failed, go to Failure modes -> remediation.
+2) Validate counts: run summary SQL (example):
+   - SQL snippet:
+     SELECT date, count(*) as events, SUM(tokens_prompt + tokens_completion) as tokens FROM telemetry.token_meter WHERE date = CURRENT_DATE - INTERVAL '1 day' GROUP BY date;
+3) Compare materialized totals to invoice proxy (example query):
+   - SQL snippet:
+     SELECT a.tenant_id, a.total_cost as materialized, b.total_cost as proxy, (a.total_cost - b.total_cost) as delta FROM billing.daily_tenant_costs a JOIN invoice_proxy.daily_costs b ON a.tenant_id = b.tenant_id AND a.date = b.date WHERE a.date = CURRENT_DATE - INTERVAL '1 day' AND ABS(a.total_cost - b.total_cost) > 1000;
+4) If small delta (<= thresholds), mark reconciliation OK and close ticket. If large delta, escalate to dedicated-ops and finance-team.
+
+Weekly audit and allocation exercise (Friday 09:00 UTC):
+1) Run 'unclassified events' drill: inspect top 20 request_ids that lack tenant mapping.
+2) Audit credits ledger for manual entries in the week: ensure each credit has a ticket id and approval.
+3) Recalculate reserved cost allocation for tenants on shared pools; compare weekly allocation drift >5% and raise to Dedicated Ops.
+4) Produce a short reconciliation summary note (1 paragraph) and publish to #platform-costs Slack channel with link to dashboards.
+
+Failure modes and remediation:
+- Failure: billing.daily_tenant_costs missing
+  - Action: restart batch job, inspect job logs (kubectl logs). If persistent, run fallback SQL to reconstruct from telemetry.token_meter and infra-cost-mapper and apply to a staging table billing.daily_tenant_costs_repair. Notify finance.
+- Failure: high unclassified events
+  - Likely cause: token-meter not receiving tenant header from upstream (API gateway change).
+  - Action: open an incident on the API gateway change set, enable request header enrichment for tenant_id, reprocess missed events if retention allows.
+- Failure: delta > threshold
+  - Triage steps: compare by component (tokens_cost vs reserved_cost vs credits). If credits mismatch, cross-check credits-ledger. If reserved allocation spike, inspect reserved-usage-collector.
+
+Reprocessing and recalculation guidance:
+- Reprocessing window: telemetry events retained in kafka for 7 days; archived logs kept for 90 days. Reprocess using the batch reindex job:
+  - CLI: airflow trigger_dag reconciliation_reindex --conf '{"date":"2026-02-09"}'
+- Use staging table and run parity checks before swapping into production:
+  - Validation SQL examples: compare counts, sample request_ids, and cost_correlation (Pearson) > 0.98 expected for identical logic.
+
+Automated reconciliation smoke tests (CI):
+- Add PR checks for telemetry-pipeline changes that include:
+  1) synthetic test data generator that outputs a 24-hour window with known costs.
+  2) end-to-end pipeline run in CI that produces billing.daily_tenant_costs and compares to golden values.
+  3) threshold tolerance set to 0.2% for token math, 0.5% for reserved allocation.
+- Example pseudo-command for local verification:
+  - python infra/tests/billing_smoke.py --seed 42 --days 1 --expected-golden tests/golden/billing-20260209.json
+
+Alerting playbook (what to include in alerts):
+- Alert title: "Billing pipeline delta: tenant_id=<tenant> date=<date> delta=<amount>"
+- Include: link to daily_tenant_costs row, link to Tenant Cost Explorer, recent commit of telemetry-pipeline, last successful job run log link.
+- Default assignees: platform-costs oncall -> finance-liaison -> dedicated-ops.
+
+Post-incident retrospective checklist for chargeback incidents:
+1) Who: list owners for telemetry-pipeline, token-meter, reserved-usage-collector.
+2) What: root cause summary and timeline (minutes resolution).
+3) Impact: tenants affected, dollar impact, customers notified.
+4) Action items: triaged to owners with ETA.
+5) Follow-up test: schedule a re-run of automated smoke tests + manual verification before next billing cycle.
+
+Change governance for cost calculation logic:
+- Any change to rate tables, reserved allocation logic, or credits application MUST:
+  1) Have a design doc linked in PR (template: /confluence/eng-platform/systems-and-services/change-design-template).
+  2) Include updated unit and integration tests for billing_smoke.
+  3) Be run in a canary against a 5% sample of synthetic tenant traffic for 48 hours.
+  4) Be reviewed by at least one Finance reviewer and one Platform SRE reviewer.
+
+Appendix: common SQL snippets and diagnostics
+- Top tenants by day:
+  - SELECT tenant_id, SUM(tokens_prompt + tokens_completion) as tokens, SUM(tokens_cost) as tokens_cost FROM telemetry.token_meter WHERE date = CURRENT_DATE - INTERVAL '1 day' GROUP BY tenant_id ORDER BY tokens_cost DESC LIMIT 50;
+- Find requests without tenant mapping:
+  - SELECT request_id, raw_headers, created_at FROM telemetry.token_meter WHERE tenant_id IS NULL AND date = CURRENT_DATE - INTERVAL '1 day' LIMIT 100;
+
+Glossary:
+- materialized_total: sum in billing.daily_tenant_costs
+- invoice_proxy_total: aggregate pulled from invoice-proxy service used by finance for near-final invoices
+- unclassified event: telemetry event that lacks tenant_id or cannot be mapped
+
+Maintenance notes:
+- Review this playbook quarterly and after any billing incident.
+- Owner to schedule an annual injection exercise: simulate a missing header event and verify reprocessing and alerting.
+
+Contact matrix:
+- telemetry-pipeline (owner): telemetry-pipeline@redwood-internal
+- platform-costs oncall: platform-costs-oncall@redwood-internal
+- finance-liaison: finance-ops@redwood-internal
+
+Document history:
+- 2025-09-15: created by Ava Martinez
+- 2025-12-01: added reprocessing notes and retention limits (Marcus Li)
+- 2026-02-10: tightened delta alert thresholds; added CI smoke-test requirements (Priya Raman)

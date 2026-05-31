@@ -1,0 +1,202 @@
+Eviction–Kernel Coordination Protocol and Signal Handbook
+
+A practical handbook describing the protocol and operational guidance for coordinating memory eviction (KV cache, model weights/shards) with kernel scheduling signals to prevent tail-latency spirals and preserve throughput SLOs.
+Overview
+========
+This document defines the Eviction–Kernel Coordination Protocol (EKCP), a lightweight control plane and operational playbook that synchronizes cache/shard eviction decisions with kernel scheduling hints and backpressure signals emitted by the serving runtime. The goal is to avoid reactive thrashing (concurrent eviction + heavy kernel activation) and reduce tail latency regressions when the system rehydrates caches or migrates shards under load.
+
+Scope
+-----
+- Applies to: KV cache eviction, session/sequence eviction, model shard migration, and kernel activation scheduling in the serving runtime.
+- Excludes: higher-level routing policies (tiered fallback routing) and customer-side session management.
+
+Why this matters
+----------------
+During mixed workloads we observed sequences of events that amplify tail latency:
+1) Memory pressure triggers mass eviction of KV cache and/or lightweight session state.
+2) Immediately after eviction, the scheduler admits high-priority requests that require cache rehydration and heavy kernel execution.
+3) Kernel queue saturation and memory reallocation cause long-tail latencies and increased error rates.
+
+EKCP provides a modest coordination layer of signals and policies to:
+- Stagger and rate-limit rehydration work.
+- Prefer low-fidelity fallbacks until caches are warmed.
+- Prioritize small, cheap inference requests during warmup windows.
+
+Design principles
+-----------------
+- Backwards-compatible: Defaults are conservative; behavior toggled via config flags per cluster/pool.
+- Signal minimal: Only a few semantic signals to avoid high cardinality.
+- Observability-first: Emit clear metrics and traces for every decision.
+- Experiment-friendly: Feature flags + canary ramp plan included.
+
+Protocol summary (high level)
+----------------------------
+EKCP uses three coordinated signal channels between eviction manager and kernel scheduler:
+- EvictionIntent: emitted when a tenant/pool plans mass eviction (soft signal).
+- WarmupWindow: a timeboxed period after eviction where rehydration is rate-limited and scheduler favors cheap kernels.
+- RehydrationProgress: incremental reports of cache warm percentage (0-100) and shard residency counts.
+
+State machine (per-pool)
+------------------------
+States: IDLE -> EVICTING -> WARMUP -> NORMAL
+Transitions:
+1) IDLE -> EVICTING: EvictionIntent(true) issued when free_memory < threshold_low and reclaim_plan applies.
+2) EVICTING -> WARMUP: Once eviction completes, WarmupWindow opens for N seconds (configurable).
+3) WARMUP -> NORMAL: When RehydrationProgress >= warmup_target OR warmup timeout expires.
+4) Any state -> IDLE: Manual override or pool drain event.
+
+Message formats (examples)
+-------------------------
+All messages are lightweight JSON blobs carried over the internal control plane (gRPC or internal pub/sub). Example payloads: 
+
+EvictionIntent example:
+{
+  "pool_id": "gpu-pool-23",
+  "initiator": "eviction-manager:v2",
+  "reason": "memory-pressure",
+  "estimated_evicted_mb": 15360,
+  "timestamp": "2026-06-11T13:22:08Z"
+}
+
+WarmupWindow example:
+{
+  "pool_id": "gpu-pool-23",
+  "warmup_seconds": 45,
+  "priority_policy": "favor-l2-small-requests",
+  "rehydration_target_percent": 30,
+  "timestamp": "2026-06-11T13:22:18Z"
+}
+
+RehydrationProgress example:
+{
+  "pool_id": "gpu-pool-23",
+  "cache_percent": 22,
+  "shard_residency": {"model-A": 3, "model-B": 7},
+  "timestamp": "2026-06-11T13:22:42Z"
+}
+
+Operational policy parameters (recommended defaults)
+--------------------------------------------------
+| Parameter | Default | Description |
+|---|---:|---|
+| memory_threshold_low | 0.15 | Fraction free memory that triggers soft eviction |
+| warmup_seconds_default | 30 | Default warmup window length |
+| warmup_rehydrate_target | 25 | Percent of important cache that should be present to exit warmup |
+| rehydrate_slowdown_factor | 0.6 | Rate limiter: reduce parallel rehydration tasks by this factor during warmup |
+| allow_high_fidelity_during_warmup | false | Whether to allow heavy kernels during warmup |
+
+Scheduler integration points
+----------------------------
+The kernel scheduler consumes EKCP signals and implements the following behaviors while warmup is active: 
+- Admission shaping: lower concurrency for kernels requiring > X MB scratch or > Y streams. 
+- Kernel hinting: prefer quantized or small-batch kernels for a configured percent of early requests. 
+- Soft-fallback: route to cheaper model variant (if available) for non-critical requests until warmup passes.
+
+Observability contract
+----------------------
+Every EKCP event must produce:
+- trace/span with event tags: pool_id, state, initiator, reason, warmup_seconds
+- metrics (per-pool): ekcp_evictions_total (counter), ekcp_warmup_seconds (histogram), ekcp_rehydrate_percent (gauge), ekcp_warmup_blocked_requests_total (counter)
+- logs: structured JSON logs with correlation_id for cross-service debugging
+
+Suggested dashboard widgets
+---------------------------
+- Warmup windows active (count) by pool (heatmap)
+- 95p/99p latency vs EKCP state time series (line)
+- Rehydration percent vs throughput (scatter)
+- Eviction triggers trend (bar)
+
+Runbook: triage when tail latencies spike after evictions
+---------------------------------------------------------
+1) Verify recent EKCP events: query ekcp_evictions_total and ekcp_warmup_seconds for pool in question.
+2) Check RehydrationProgress: if cache_percent < warmup_rehydrate_target, warmup is ongoing. Decide if you should extend warmup.
+3) Examine kernel queue depth and GPU occupancy. If occupancy > 90% and warmup is active: reduce admission for heavy kernels.
+4) Apply quick mitigations (ordered):
+   a) Increase warmup_seconds for the pool by +30s.
+   b) Enable allow_high_fidelity_during_warmup=false (if toggled).
+   c) Temporarily divert non-critical traffic to cheaper variant or fallback region.
+   d) If kernel queue remains saturated, scale up ephemeral burst capacity (if available).
+5) Post-incident: run a targeted replay of representative requests to validate recovery and update the eviction threshold if repeated.
+
+Benchmarking and validation protocol
+-----------------------------------
+Goal: ensure EKCP reduces 99p latency regressions without materially reducing 50p latency or throughput.
+Procedure:
+1) Baseline capture: capture normal steady-state for 30m, record latency distribution and cache hit ratio.
+2) Controlled eviction injection: simulate 2x the memory pressure to trigger eviction and observe behavior with EKCP OFF.
+3) EKCP ON: repeat the eviction injection with EKCP enabled.
+4) Compare: 99p latency, throughput, cache rehydration time, and error rates.
+5) Run stress matrix across tenant mixes (pure chat, embeddings-heavy, mixed short-long sequence).
+
+Sample synthetic driver commands
+-------------------------------
+# Start a warmup-aware eviction test
+redwood-testctl simulate-eviction --pool gpu-pool-23 --pressure 1.5 --duration 90
+# Observe samples and metrics
+redwood-metrics query "ekcp_rehydrate_percent{pool_id=\"gpu-pool-23\"}" --since 5m
+
+Rollout plan (canary -> regional -> global)
+------------------------------------------
+1) Feature flagged, default disabled. Enable EKCP in 1 canary pool (non-critical workloads). Run for 48 hours.
+2) If canary is stable, enable for backup pools for 7 days.
+3) Enable in 20% of production pools for 72 hours.
+4) Gradually roll to 100% with continuous monitoring of 95/99p latency and throughput.
+
+Testing checklist before global rollout
+--------------------------------------
+- Unit tests for state transitions and message validation.
+- Integration tests with a stubbed scheduler and eviction manager.
+- End-to-end replay testbench with synthetic traffic.
+- Observability verification (metrics, traces, logs).
+
+Ownership and contacts
+----------------------
+- Primary owner: Runtime Scheduling team (oncall: #runtime-scheduling).
+- Secondary: Kernel Performance team (oncall: #kernel-perf).
+- Escalation: Eng SRE lead (pager).
+
+Troubleshooting examples (short)
+-------------------------------
+Symptom: Warmup window never completes and cache_percent stalls at 1-5%
+Likely cause: Rehydration tasks are being rate-limited too aggressively or blocked by admission shaping.
+Remediation steps:
+- Inspect rehydrate_slowdown_factor and temporarily set to 1.0
+- Temporarily increase warmup_seconds to allow background rehydration workers to catch up
+- Check for kernel hot-path saturation and enable additional background worker slots
+
+Appendix A: Example cluster config snippet
+-----------------------------------------
+# ekcp config for a GPU pool (YAML)
+ekcp_config:
+  enabled: true
+  memory_threshold_low: 0.12
+  warmup_seconds_default: 45
+  warmup_rehydrate_target: 30
+  rehydrate_slowdown_factor: 0.7
+  priority_policy: "favor-l2-small-requests"
+  allow_high_fidelity_during_warmup: false
+
+Appendix B: Telemetry queries (promql examples)
+----------------------------------------------
+# warmup windows currently active
+sum(ekcp_warmup_seconds_count) by (pool_id)
+# 99p latency correlated with warmup state
+histogram_quantile(0.99, sum(rate(request_duration_seconds_bucket[5m])) by (le, pool_id, ekcp_state))
+
+Change log
+----------
+- 2026-01-15: Initial draft.
+- 2026-04-02: Added RehydrationProgress payload and warmup_rehydrate_target param.
+- 2026-07-02: Published after canary; updated default parameters and troubleshooting steps.
+
+Related reading
+---------------
+- NUMA-aware shard placement and eviction playbook (see related_pages).
+- Scheduler admission shaping guidelines (internal kernel scheduling doc).
+
+Notes and future work
+---------------------
+- Explore probabilistic warmup targets based on request shape prediction.
+- Add cross-pool coordination to avoid simultaneous warmups in colocated pools.
+
+End of document

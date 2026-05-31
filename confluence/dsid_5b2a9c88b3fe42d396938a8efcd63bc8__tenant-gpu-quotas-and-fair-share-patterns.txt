@@ -1,0 +1,178 @@
+Tenant GPU Quotas and Fair-Share Terraform Patterns
+
+Summary:
+This document defines a reproducible Terraform-based pattern for enforcing per-tenant GPU quotas and a fair-share scheduler policy across Redwood Inference reserved clusters and shared GPU pools. It combines IaC best practices, runtime enforcement mechanisms, CI/CD gating, and oncall runbook steps so teams can request capacity safely without destabilizing production.
+
+Goals:
+- Provide a standard Terraform module layout for tenant quota definitions that is auditable and testable.
+- Enforce soft and hard GPU limits per tenant with automated reclamation and notifications.
+- Ensure fair-share scheduling across interactive (dev/test) and production workloads.
+- Integrate quota changes into pipelines with policy checks and canary rollout.
+- Minimize blast radius for capacity requests and simplify chargeback labeling.
+
+Scope:
+- Applies to all AWS deployments using NVIDIA GPU instance families (G4/G5/A100-equivalent) and our on-prem clusters managed by the same orchestration layer.
+- Covers Terraform modules, cloud IAM roles, controller automation, CI/CD gating, and SRE runbook for quota incidents.
+- Does NOT cover low-level GPU driver installation or image build pipelines (see ci-cd/gpu-images).
+
+Architecture overview (textual diagram):
+- Terraform registry modules: tenant-gpu-quota (records desired quotas), shared-gpu-pool (defines pool metadata), fairshare-policy (scheduling weights).
+- Central Quota Controller (k8s controller or managed service) watches a namespaced CRD mirrors Terraform-state outputs and enforces runtime limits via Kubernetes ResourceQuota / device-plugin annotations or cloud autoscaling group tagging for non-k8s clusters.
+- Alerting and billing: Controller emits metrics to DataDog (metric names below) and writes quota events to audit-log S3 and to the Console entitlement API.
+
+Key Concepts and Definitions:
+- tenant_id: canonical identifier for an internal product/team.
+- requested_gpus: desired max GPUs for a tenant (soft limit).
+- hard_limit_gpus: strict ceiling enforced by the controller (must be <= pool_capacity).
+- fair_share_weight: integer weight used by the fair-share scheduler to proportionally allocate burst capacity.
+
+Recommended Terraform module layout (convention):
+- modules/tenant-gpu-quota/
+  - main.tf (resource schema, state outputs, example CRD export)
+  - variables.tf (tenant_id, requested_gpus, hard_limit_gpus, labels)
+  - outputs.tf (quota_id, policy_arn)
+  - examples/tenant-basic/
+
+Example usage (snippet - terraform):
+```hcl
+module "tenant_acme_quota" {
+  source         = "git::ssh://git@github.com/redwood/modules.git//tenant-gpu-quota?ref=v1.3.0"
+  tenant_id      = "acme-marketing"
+  requested_gpus = 8
+  hard_limit_gpus = 12
+  fair_share_weight = 20
+  labels = { team = "marketing", cost_center = "cc-1234" }
+}
+```
+
+Module outputs (example):
+- quota_id: "quota-acme-marketing"
+- controller_cr_manifest: serialized YAML to apply (for non-managed clusters)
+
+Policy enforcement and automation:
+1) Terraform writes desired state to a central state bucket and triggers the Quota Controller via a gitops push (we prefer push to the controller's CRD API).
+2) Controller compares requested_gpus to pool_capacity. If requested_gpus + sum(other_hard_limits) > pool_capacity: controller marks quota request as PENDING and emits a metric `infra.gpu.quota.request_denied`.
+3) For allowed requests, controller creates/updates a runtime representation: k8s ResourceQuota, nodeselector labels, or cloud autoscaling tag depending on environment.
+4) Soft-limit behavior: when tenant usage exceeds requested_gpus but is under hard_limit_gpus, controller triggers throttling annotations and sends warning notifications to tenant owners.
+5) Hard-limit behavior: usage above hard_limit_gpus results in immediate pod eviction ordering based on QoS and eviction policy. Evicted jobs are requeued per tenant retry policy.
+
+CI/CD and testing patterns for quota modules:
+- All changes to modules/* require: terraform fmt, terraform validate, unit tests (terratest), and a policy check step that enforces max hard_limit per module (policy as code using Sentinel or Open Policy Agent).
+- PR workflow:
+  1. Developer opens PR to modules repo.
+  2. Pipeline runs lint/test/policy.
+  3. If module changes affect outputs consumed by controller, CI triggers a staging apply (to a dedicated staging workspace) and runs end-to-end smoke tests that validate controller reconciliation.
+  4. After 24h in staging with green health checks, a manual approver can promote to production via the module registry UI.
+
+Testing checklist (automated where possible):
+- terraform plan shows only intended changes.
+- terratest asserts that CRD manifest contains expected hard_limit and labels.
+- Controller metrics in staging: infra.gpu.quota.reconcile_success == 1 after apply.
+
+Runbook: quota exhaustion (pageable flow for SRE/Oncall)
+- Symptoms: high infra.gpu.quota.denied rate, pending scheduling backlog, tenants hitting hard limit eviction.
+- Immediate steps (TL;DR):
+  1. Pager receives alert (alert name: GPU_QUOTA_EXHAUSTION_HIGH).
+  2. Open the quota controller dashboard and filter by `pool_id` in incident.
+  3. Identify offending tenants: query DataDog metric `infra.gpu.usage_by_tenant` and sort desc.
+  4. If a tenant is misbehaving (runaway jobs), pause their job queue via Console API: POST /internal/admin/tenant/{tenant_id}/pause (requires admin role).
+  5. If total hard_limits exceed pool_capacity, follow emergency mitigation: temporarily increase pool_capacity via autoscaling group override OR reduce per-tenant soft limits for non-critical tenants.
+  6. Notify stakeholders (Slack channel #infra-gpu-capacity) with template: incident id, pool, top 5 tenants, mitigation action.
+
+Detailed rollback mitigation (if autoscaler misbehaves):
+- Use CLI: `infractl pool update-capacity --pool-id <pool> --capacity <n>` (requires infra-admin).
+- If infractl is unavailable, patch the controller CRD to set poolOverride=true and manualCapacity integer.
+
+Governance and approval matrix:
+- Requests <= 4 GPUs: auto-approve for teams with dev tag.
+- Requests 5-16 GPUs: require approval from pool-owner and finance for chargeback assignment.
+- Requests >16 GPUs or cumulative team commit >32 GPUs: require infra capacity planning review and lead sign-off.
+
+Naming, labels and tagging conventions (enforced by module):
+- tenant_id: lower-case hyphenated, e.g., acme-marketing
+- labels: team, cost_center, environment (dev|staging|prod), business_unit
+- Terraform tags map to cloud tags: Owner=team, CostCenter=cost_center, InfraProject=redwood-gpu
+
+Metrics and alert thresholds (recommended):
+- infra.gpu.quota.request_denied > 5/min => Pager (P1) if sustained > 5m
+- infra.gpu.usage_by_tenant{env=\"prod\"} > 95% of hard_limit for 3m => Alert to tenant owner + SRE channel (P2)
+- infra.gpu.pool_utilization > 85% for 10m => Ops warning (P3)
+
+Module versioning and migration guidance:
+- Use semantic versioning for modules. Major bumps require migration notes and an automated migration plan that maps old outputs to new names.
+- Backwards compatibility: keep old outputs for 2 releases before removal.
+- Migration steps:
+  1. Publish module vX.Y with compatibility shim outputs.
+  2. Update consumer workspaces to reference new module version and run `terraform plan` in staging workspace.
+  3. Validate controller metrics and reconnect hookpoints.
+  4. After 1 week of green, remove legacy outputs in next major release.
+
+Security and IAM considerations:
+- Tenant quota modules must set a principal that maps to a team-specific IAM role (arn:aws:iam::redwood:role/tenant-{tenant_id}-quota-admin).
+- Controller service account requires a narrow policy that can only patch the controller CRD and update tags/labels on node pools, not full EC2 or IAM privileges.
+- Audit logs: every quota change must be written to S3 with server-side encryption and a retention policy of 2 years for auditability.
+
+Ownership and contacts:
+- Module owner: infra/iac-team (primary: Maya Patel).
+- Controller owner: eng-platform/scheduling (primary: Jon Rivera).
+- Oncall rotation: see eng-infra/oncall rota page (linked in related pages).
+
+Rollout plan (30/60/90):
+- 0-30 days: deploy module and controller in staging, migrate two pilot teams (internal platform & search).
+- 30-60 days: enable auto-approval rules for <=4GPU requests and collect telemetry.
+- 60-90 days: open self-serve request path for all teams, run a full capacity planning drill.
+
+Appendix A — Example controller CRD (YAML excerpt):
+```yaml
+apiVersion: infra.redwood.ai/v1alpha1
+kind: TenantGPUQuota
+metadata:
+  name: quota-acme-marketing
+spec:
+  tenantId: acme-marketing
+  hardLimitGpus: 12
+  requestedGpus: 8
+  fairShareWeight: 20
+  labels:
+    team: marketing
+    cost_center: cc-1234
+```
+
+Appendix B — Example IAM policy (abbreviated):
+```json
+{
+  \"Version\": \"2012-10-17\",
+  \"Statement\": [
+    {
+      \"Effect\": \"Allow\",
+      \"Action\": [\"autoscaling:UpdateAutoScalingGroup\", \"ec2:DescribeInstances\"],
+      \"Resource\": \"*\"
+    },
+    {
+      \"Effect\": \"Allow\",
+      \"Action\": [\"s3:PutObject\"],
+      \"Resource\": [\"arn:aws:s3:::infra-audit-logs/*\"]
+    }
+  ]
+}
+```
+
+Appendix C — Quick QA checklist for approvers:
+- Does requested_gpus fit within pool capacity projections for the quarter?
+- Are cost center and business case provided?
+- Is tenant using fair-share weight appropriately (not >100)?
+- Has the team provided a deprovision plan for idle GPUs?
+
+Notes and future work:
+- Next iteration will add a simulated capacity planning tool (what-if) into the Console using the modules' state outputs.
+- Investigate integration with the billing pipeline to show predicted monthly spend by tenant for requested_gpus.
+
+Related links:
+- Module registry: https://registry.redwood.internal/modules/tenant-gpu-quota
+- Quota controller dashboard: https://ops.redwood.internal/quota-controller
+- Slack channel: #infra-gpu-capacity
+
+Document history:
+- 2024-08-15: created by Maya Patel
+- 2024-09-10: added CI/CD gating steps (reviewer: Jon Rivera)
+- 2025-02-10: clarified hard-limit eviction behavior and added metrics thresholds (reviewer: Priya Nair)

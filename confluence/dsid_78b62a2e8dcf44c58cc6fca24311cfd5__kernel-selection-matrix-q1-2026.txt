@@ -1,0 +1,242 @@
+Kernel selection matrix (Q1 2026 baseline)
+
+## Purpose
+This page defines the **kernel auto-selection rules** used for the **Q1 2026 performance baseline runs**. It is the canonical reference for:
+- Which attention/GEMM kernels are expected for each **model family**
+- Which fallbacks are acceptable (and when they are considered “unexpected”)
+- Known performance cliffs and required **driver/CUDA/Triton** constraints for reproducibility
+
+The goal is to make baseline results **attributable**. If a perf delta is observed, the first question should be: *did kernel selection change?*
+
+---
+
+## Scope
+**In scope**
+- Attention kernel selection (prefill + decode)
+- KV-cache layout implications (paged vs contiguous) as they affect kernel eligibility
+- Common model families: **Llama-family**, **Qwen-family**, **Mistral-family** variants used in baseline sweeps
+- Hardware: **H100 (SXM/PCIe)**, **A100 80GB**, **L40S**
+
+**Out of scope**
+- Detailed scheduler knobs (see scheduler baseline)
+- Compiler passes beyond kernel eligibility (tracked separately)
+- Customer-facing or marketing benchmark guidance
+
+---
+
+## Definitions and measurement boundaries
+- **Prefill length (P):** number of input tokens processed before first generated token.
+- **Decode length (D):** number of output tokens generated.
+- **TTFT (time-to-first-token):** server-side time from request admitted to scheduler → first token available to stream (see ADR-0172 for canonical boundary).
+- **TPOT (time-per-output-token):** server-side per-token latency for decode tokens after TTFT.
+
+---
+
+## Baseline environment constraints (must match for “golden” runs)
+Baseline kernel behavior is only considered comparable when the following constraints are met.
+
+### Required versions (Q1 2026 baseline)
+| Component | Baseline requirement | Notes |
+|---|---|---|
+| NVIDIA Driver | >= 550.54 | Must be consistent across the benchmark fleet per SKU. Do not mix minor driver versions in the same baseline sweep. |
+| CUDA Runtime | CUDA 12.3 | CUDA 12.2 is allowed only if noted in the run manifest; kernel eligibility differs for some fused paths. |
+| cuBLASLt | bundled with CUDA 12.3 | Used for GEMM/autotune; ensure deterministic mode as described below. |
+| Triton | 2.1.x (pinned) | Triton minor bumps can change codegen and autotune decisions. |
+| Redwood runtime build | baseline tag as per baseline plan | Must be recorded in run manifest (git SHA + build ID). |
+
+### Runtime flags (baseline defaults)
+These flags affect kernel selection and must be captured in the run manifest:
+- `RWD_KERNEL_AUTOTUNE=baseline` (disables cross-run autotune drift; uses pinned profiles)
+- `RWD_ATTENTION_BACKEND=auto` (selection rules in this document)
+- `RWD_KV_LAYOUT=paged` for baseline runs unless explicitly running the contiguous variant
+- `RWD_ENABLE_FP8=off` for baseline (FP8 work is tracked separately; not part of Q1 2026 golden)
+
+### Determinism and noise control (minimum)
+- GPU clocks should be locked or constrained (see SRE benchmark fleet guidance); otherwise kernel timing-based heuristics can “flip” on borderline cases.
+- Warmup is mandatory (see perf suite profiling playbook).
+
+---
+
+## Kernel families (names used in logs and debug dumps)
+These are the kernel identifiers we expect to see in the **kernel selection debug dump** and perf run metadata.
+
+### Attention kernels
+- **FA3_PREFILL / FA3_DECODE**: FlashAttention v3 variants (H100-optimized). Lowest TPOT when eligible.
+- **FA2_PREFILL / FA2_DECODE**: FlashAttention v2 variants (A100/L40S primary path).
+- **PAGED_ATTENTION_DECODE**: Paged KV cache decode attention (robust under fragmentation / long-running serving).
+- **TRITON_ATTENTION_FALLBACK**: Triton attention fallback (functional, but usually slower; allowed only in specific edge cases).
+
+### GEMM / fused MLP kernels
+- **CUBLASLT_GEMM**: cuBLASLt-selected GEMM.
+- **TRITON_FUSED_MLP**: Triton fused MLP for certain shapes.
+- **FUSED_ROPE**: fused RoPE application when supported.
+
+---
+
+## Selection principles (high-level)
+Kernel selection is based on a combination of:
+1) **Hardware capability** (SM version, shared memory, BF16 support)
+2) **Data type** (BF16/FP16; quantization modes)
+3) **Attention shape regime** (P and D; head dim; GQA/MQA)
+4) **KV layout** (paged vs contiguous)
+5) **Sequence length regime** (context window boundaries)
+
+The baseline target is to maximize **TPOT** for decode-heavy workloads while protecting **p99 TTFT** for long-prefill workloads.
+
+---
+
+## Kernel selection matrix (Q1 2026)
+The tables below represent **expected** kernel choices when the baseline environment constraints are satisfied.
+
+### A) Llama-family (e.g., Llama 3.x class; GQA variants common)
+Assumptions:
+- DType BF16 preferred
+- GQA supported by FA2/FA3 paths only when head configuration matches supported patterns
+
+| Hardware | Regime | Expected attention kernel | Expected KV layout | Allowed fallback | Notes |
+|---|---|---|---|---|---|
+| H100 | P <= 4k, D any | FA3_PREFILL + FA3_DECODE | paged | FA2_* only if FA3 disabled | FA3 is baseline on H100. If FA3 not selected, treat as investigation unless run manifest indicates override. |
+| H100 | 4k < P <= 16k | FA3_PREFILL (may switch to FA2_PREFILL for some head dims) + FA3_DECODE | paged | TRITON_ATTENTION_FALLBACK for unsupported head dim | Known cliff if head dim unsupported: prefill can drop to Triton; TTFT p99 increases sharply. |
+| H100 | P > 16k | FA2_PREFILL + PAGED_ATTENTION_DECODE | paged | TRITON_ATTENTION_FALLBACK | FA3 prefill not guaranteed beyond 16k in baseline; decode remains FA3 if eligible, otherwise paged decode. |
+| A100 | P <= 8k | FA2_PREFILL + FA2_DECODE | paged | PAGED_ATTENTION_DECODE | If KV fragmentation high, decode can prefer paged kernel for stability. |
+| A100 | P > 8k | FA2_PREFILL + PAGED_ATTENTION_DECODE | paged | TRITON_ATTENTION_FALLBACK | Long-prefill TTFT is sensitive; ensure scheduler backpressure settings align with baseline. |
+| L40S | P <= 4k | FA2_PREFILL + FA2_DECODE | paged | PAGED_ATTENTION_DECODE | L40S is more likely to flip to paged decode under high concurrency due to memory pressure. |
+| L40S | P > 4k | FA2_PREFILL + PAGED_ATTENTION_DECODE | paged | TRITON_ATTENTION_FALLBACK | Treat Triton fallback as “allowed but undesirable”; file an issue if common. |
+
+### B) Qwen-family (often long-context; attention shapes vary)
+Assumptions:
+- Long-context workloads are common; P in 8k–32k appears in representative suite
+
+| Hardware | Regime | Expected attention kernel | Allowed fallback | Notes |
+|---|---|---|---|
+| H100 | P <= 8k | FA3_* | FA2_* | Baseline target is FA3 end-to-end. |
+| H100 | 8k < P <= 32k | FA2_PREFILL + FA3_DECODE (if eligible) OR PAGED_ATTENTION_DECODE | TRITON_ATTENTION_FALLBACK | Some variants prefer FA2 prefill due to shared-memory constraints; this is considered “expected” for baseline. |
+| A100 | P <= 16k | FA2_* (prefill+decode) | PAGED_ATTENTION_DECODE | Decode may switch to paged at high P to avoid OOM / fragmentation. |
+| A100 | P > 16k | FA2_PREFILL + PAGED_ATTENTION_DECODE | TRITON_ATTENTION_FALLBACK | If Triton is used for decode at scale, investigate eligibility regression. |
+| L40S | P <= 8k | FA2_* | PAGED_ATTENTION_DECODE | L40S is sensitive to batch size; ensure workload concurrency targets match suite definitions. |
+
+### C) Mistral-family (mix of standard + MoE variants)
+Assumptions:
+- Standard dense models behave similarly to Llama-family
+- MoE variants introduce additional GEMM/dispatch pressure; attention selection still follows rules below
+
+| Hardware | Regime | Expected attention kernel | Expected GEMM/MLP | Allowed fallback | Notes |
+|---|---|---|---|---|---|
+| H100 | P <= 8k | FA3_* | CUBLASLT_GEMM + TRITON_FUSED_MLP (if eligible) | FA2_* | MoE routing can increase variance; ensure warmup includes expert paths. |
+| A100 | P <= 8k | FA2_* | CUBLASLT_GEMM | PAGED_ATTENTION_DECODE | If fused MLP not selected, treat as neutral unless perf delta is large. |
+| L40S | P <= 4k | FA2_* | CUBLASLT_GEMM | PAGED_ATTENTION_DECODE | L40S memory bandwidth can make paged decode preferable under load. |
+
+---
+
+## Sequence length regimes and “cliff” boundaries
+These are the boundaries where we most commonly observe kernel selection flips that affect TTFT/TPOT.
+
+### Common boundaries (baseline guidance)
+- **P ~ 4k:** Some models switch from FA decode to paged decode under concurrency due to KV growth.
+- **P ~ 8k:** A100 and L40S often show increased fallback rates if batch size is high.
+- **P ~ 16k:** Eligibility constraints become more pronounced; prefill kernels may change; TTFT p99 becomes sensitive.
+- **P > 32k:** Not part of the Q1 2026 representative suite v1 “must-pass” set. If included in ad-hoc runs, expect non-golden behavior.
+
+### Known performance cliffs (tracked issues)
+1) **Unexpected Triton fallback on H100 for supported head dims**
+   - Symptom: FA3 expected, but TRITON_ATTENTION_FALLBACK appears in dump.
+   - Impact: TPOT degradation (often 15–40%), higher p99.
+   - Usual cause: Triton version drift or a disabled capability flag.
+
+2) **Paged decode overuse at moderate P (<= 4k)**
+   - Symptom: PAGED_ATTENTION_DECODE selected despite low KV pressure.
+   - Impact: TPOT drop; throughput regression in chat streaming.
+   - Usual cause: KV allocator fragmentation from prior runs (fix by isolation + warmup; confirm via run manifest and allocator stats).
+
+3) **cuBLASLt autotune instability across runs**
+   - Symptom: GEMM algo changes without code change.
+   - Impact: Throughput noise; can look like a regression.
+   - Mitigation: Use baseline autotune mode and ensure consistent GPU clocks.
+
+4) **GQA/MQA edge-case eligibility**
+   - Symptom: FA2/FA3 not selected for certain head configs; fall back to Triton.
+   - Impact: TTFT and TPOT regression concentrated in specific models.
+   - Action: Treat as “expected only if documented in model profile”; otherwise investigate.
+
+---
+
+## Expected fallback hierarchy (by component)
+When `RWD_ATTENTION_BACKEND=auto`, the runtime should follow this hierarchy:
+
+### H100
+1) FA3
+2) FA2
+3) PAGED_ATTENTION_DECODE (decode only)
+4) TRITON_ATTENTION_FALLBACK
+
+### A100 / L40S
+1) FA2
+2) PAGED_ATTENTION_DECODE (decode only)
+3) TRITON_ATTENTION_FALLBACK
+
+**Policy for baseline runs:**
+- Falling below (2) requires a note in the run manifest and is **not eligible** for baseline “golden” publishing unless explicitly waived.
+
+---
+
+## Operational requirements for baseline publishing
+A run is eligible to be included in the Q1 2026 baseline report only if:
+- Kernel debug dump is present (or kernel telemetry sample rate is >= baseline requirement)
+- No unexpected fallback below the expected tier for the model/hardware/regime table above
+- Environment versions match baseline constraints (or deviations are clearly annotated and approved)
+
+**Artifacts to attach/link**
+- Run manifest (schema per ADR-0172)
+- Kernel selection dump (per-run or sampled)
+- Summary metrics (p50/p95/p99 TTFT, TPOT, throughput) and variance panels
+
+---
+
+## How to validate kernel selection (quick procedure)
+1) Confirm the run manifest records:
+   - Driver/CUDA/Triton versions
+   - `RWD_*` kernel/autotune/KV flags
+   - Model identifier + dtype/quantization mode
+2) Open the kernel selection dump and verify:
+   - Attention kernels match the matrix for the given P regime
+   - Any fallback includes a reason code (unsupported head dim, KV layout constraint, disabled capability, etc.)
+3) If mismatch:
+   - Re-run once on the same node (after warmup) to rule out transient noise
+   - If persistent, file a perf triage issue and attach dump + manifest
+
+---
+
+## Notes on quantization and “non-golden” modes
+For Q1 2026 baseline runs, the default publishing set is **BF16**.
+
+Quantized runs (INT8/INT4) are allowed for exploratory tracking, but:
+- Kernel eligibility differs substantially (especially for fused GEMMs)
+- Results are not comparable unless the same quant profile is pinned and declared
+
+If you must run quantized baselines, create a separate baseline cohort and document:
+- Quantization format and calibration/pinning
+- Any altered attention backend selection
+
+---
+
+## Ownership and change control
+- **Owner:** Hiro Tanaka (kernels)
+- **Co-owner:** Yuki Sato (kernel auto-selection stability)
+
+Changes to this page must be paired with:
+- A corresponding change to the kernel debug dump reason codes (if new rule introduced)
+- An update to the baseline plan if the expected kernel for a published cohort changes
+- A note in the perf-canary threshold config if the change is expected to shift metrics
+
+---
+
+## Appendix: Reason codes (expected in kernel selection dump)
+- `ELIGIBLE_FASTPATH`: selected highest-tier kernel
+- `FALLBACK_UNSUPPORTED_HEAD_DIM`
+- `FALLBACK_KV_LAYOUT_INCOMPATIBLE`
+- `FALLBACK_SEQ_LEN_OUT_OF_RANGE`
+- `FALLBACK_DISABLED_BY_FLAG`
+- `FALLBACK_TRITON_VERSION_MISMATCH`
+- `FALLBACK_AUTOTUNE_PROFILE_MISSING`
+
+If a dump contains `UNKNOWN_REASON`, treat as a tooling bug and file against kernel telemetry.

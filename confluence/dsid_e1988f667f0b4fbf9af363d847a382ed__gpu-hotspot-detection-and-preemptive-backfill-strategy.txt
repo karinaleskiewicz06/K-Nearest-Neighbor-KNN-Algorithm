@@ -1,0 +1,162 @@
+GPU hotspot detection and preemptive backfill strategy
+
+Summary
+-------
+This document describes a pragmatic pipeline for detecting GPU hotspots (localized high-utilization or KV-cache pressure), generating preemptive backfill plans, and tuning autoscaler/eviction parameters to prevent noisy-neighbor and QoS degradation across multi-tenant GPU pools. It covers telemetry, scoring, alert thresholds, the prioritization algorithm for backfill placement, Terraform/IaC flags to control behavior, CI/CD gating for config changes, and a concise operator runbook.
+
+Why this exists
+----------------
+- Even with global autoscaling, small groups of hosts or racks can present transient hotspots that increase p99 latency and token cost.
+- Reactive eviction alone creates customer impact; combining detection + preemptive backfill reduces service interruptions and offers more predictable cost and latency.
+- This doc standardizes detection signals, thresholds, and safe rollout steps for teams touching GPU placement and autoscaler configs.
+
+Ownership
+---------
+- Primary: GPU Fleet & Capacity (eng-infra/gpu-fleet)
+- Secondary: Serving Runtime (eng-serving-runtime)
+- Pager: gpu-fleet-oncall (page escalation to infra-sre as needed)
+
+When to apply
+-------------
+- Persistent host-level GPU utilization imbalance (> 85% avg on subset of hosts for > 10m)
+- Elevated KV cache misses with high remote memory churn for a model family
+- Repeated tenant-facing p99+ tail latency spikes tied to specific racks or AZs
+
+Detection pipeline (high level)
+-------------------------------
+1) Metrics ingestion
+   - Source signals: DCGM per-GPU util, NVSMI memory pressure, runtime per-request token latencies, KV-cache hit/miss counters, host-level GPU temperature, PCIe retry counters.
+   - Exporters: dcgm-exporter -> prometheus remote_write -> metrics-lake (retention: 30d for aggregated histograms)
+2) Aggregation & feature extraction
+   - Group by: rack_id, host_pool_tag, model_variant, tenant_id (where permitted)
+   - Windowing: 1m, 5m, 10m aggregates
+3) Scoring
+   - Compute three independent scores (0-100): UtilizationHot, KVChurnHot, LatencySpikeHot
+   - Final HotspotScore = max(UtilizationHot, KVChurnHot * 0.8 + LatencySpikeHot * 0.2)
+4) Rule engine
+   - If HotspotScore >= 70 for 10m -> fire detection alert to GPU-HOTSPOT-DET
+   - If HotspotScore >= 85 for 2m -> fire HIGH-GPU-HOTSPOT and auto-create suggested backfill plan
+
+Alerting and alert semantics
+----------------------------
+- Alert names and targets:
+  - GPU-HOTSPOT-DET (SEV3): informs owners with context & suggested plan
+  - GPU-HOTSPOT-HIGH (SEV2): triggers automated plan creation and optional preemption window
+  - GPU-HOTSPOT-CRIT (SEV1): only after human-assessed failed mitigation; paged to oncall
+- Each alert includes: affected host list, aggregated metrics, top-3 tenants by token consumption in window (if permitted), suggested backfill commands and Terraform module diff (if applicable)
+
+Preemptive backfill prioritization policy
+----------------------------------------
+Goals: reduce local load while minimizing customer disruption and respecting reserved capacity.
+
+Algorithm (simplified):
+1) CandidateHosts = hosts in same rack/pool with HotspotScore < 30 and free memory >= required_request.sla_memory * 1.1
+2) For each candidate compute ScoreCandidate = (proximity_weight * network_latency_score) + (cost_weight * fractional_gpu_cost_score) + (stability_weight * historical_preemptions_score)
+   - weights: proximity_weight=0.5, cost_weight=0.3, stability_weight=0.2 (configurable)
+3) Sort candidates by ScoreCandidate asc. Choose top-N such that total_free_slots >= required_slots_for_backfill
+4) Respect tenancy rules: do not spill reserved-dedicated pools or hosts tagged with tenant_isolation=true
+
+Safety checks before applying backfill
+-------------------------------------
+- IAM & tenancy: verify that the operator/service account performing backfill holds role: infra:gpu:reassign (Terraform-managed)
+- SLA guard: if any affected tenant has active enterprise SLA and is in reserved pool, abort and escalate
+- Quota enforcement: ensure that preempted jobs can be rescheduled within 10 minutes under current autoscaler forecasts
+
+Autoscaler and eviction tuning knobs (Terraform variables & defaults)
+-------------------------------------------------------------------
+NOTE: Each flag is exposed in the gpu-autoscaler module. Update PRs must include simulation results.
+
+| variable_name | type | default | description |
+|---------------|------|---------|-------------|
+| backfill.enabled | bool | "true" | Allow automated backfill plan generation |
+| backfill.proximity_weight | number | "0.5" | Importance of network proximity when selecting target hosts |
+| backfill.max_preemptions_per_min | number | "2" | Max number of preemptions cluster-wide per minute from automated plans |
+| eviction.grace_seconds | number | "180" | Eviction grace period for preemptive moves (seconds) |
+| eviction.max_concurrent_per_host | number | "1" | Max concurrent evictions on a single host |
+| monitoring.hotspot_threshold | number | "70" | HotspotScore threshold to trigger detection alert |
+| monitoring.high_hotspot_threshold | number | "85" | Threshold for automated plan creation |
+| autoscaler.warm_pool_target | number | "0.08" | Fraction of fleet kept warm for immediate backfill |
+
+CI/CD & config change gating
+-----------------------------
+- All changes to gpu-autoscaler module must go through: feature branch -> unit tests -> simulator harness -> canary on staging GPU pool -> 72h observation window -> promote to prod.
+- Simulator harness (repo: infra/sim/gpu-hotspot-simulator): PR must include a 30-day synthetic-run report and a regression test against the 95th percentile preemption rate.
+- Config feature flags: any backfill parameter changes default to safe values behind a feature flag: feature.gpu.backfill.toggle
+
+Operator runbook (short)
+------------------------
+1) Detection fired: review alert dashboard (link included in alert)
+2) Validate context: check implicated hosts, top models, and dependent autoscaler logs
+3) If system-suggested backfill exists -> apply in dry-run mode first: cli: 
+   - rwi backfill plan apply --plan <id> --dry-run
+4) If dry-run looks safe and satisfies constraints -> apply with eviction grace 180s: 
+   - rwi backfill plan apply --plan <id> --confirm --grace 180
+5) Monitor: token latency dashboards, per-tenant 1m and 5m errors, and host GPU metrics for 20m
+6) If regressions observed -> revert with backfill rollback: 
+   - rwi backfill plan rollback --plan <id> --immediate
+7) Post-incident: open a PTR in the GPU-FLEET project, add snapshot of metrics and backfill plan id
+
+Playbook: emergency manual fallback
+----------------------------------
+1) If auto-backfill fails and p99 tokens remain > 2x baseline -> trigger forced-migration mode after approval from oncall lead
+2) Forced migration: increase eviction.max_concurrent_per_host to 4 and eviction.grace_seconds to 60 (temporary window)
+3) Revert parameters after stabilization and file an incident
+
+Testing and simulation guidance
+-------------------------------
+- Synthetic scenarios to run in the simulator:
+  1) Rack-hotspot: sudden spike of 10 tenants on 1 rack for 5–20 minutes
+  2) KV-churn storm: a model change causing 40% increased KV misses across 30% of hosts
+  3) Warm-pool exhaustion: simulate 2x warm_pool_target under scheduled maintenance
+- Success criteria per simulation run (must be in PR): p99 token latency delta <= +10% and total preemptions <= configured max_preemptions_per_min * window
+
+Telemetry and dashboards (links)
+-------------------------------
+- Dashboards to include in alert and postmortem: 
+  - GPU Hotspot Overview (rack-level HotspotScore heatmap)
+  - Backfill Planner Queue (plans in flight, success/fail rates)
+  - Eviction Impact (per-tenant error rate and latency deltas)
+  - Autoscaler Warm Pool Utilization
+
+Appendix: useful CLI snippets and Terraform variables example
+------------------------------------------------------------
+- Terraform variable example to enable safe backfill (examples/enable_backfill.tf):
+
+variable "backfill_enabled" { default = true }
+module "gpu-autoscaler" {
+  source = "git::ssh://git@github.com/redwood-inference/terraform-modules.git//gpu-autoscaler"
+  backfill = { enabled = var.backfill_enabled }
+  eviction = { grace_seconds = 180, max_concurrent_per_host = 1 }
+}
+
+- Run local simulator (developer machine with docker):
+  ./scripts/run_simulator.sh --scenario rack-hotspot --duration 1800 --output /tmp/sim-report.json
+
+- Example API to generate a suggested backfill plan (internal API):
+  POST /api/v1/internal/backfill/suggest
+  payload: {"affected_hosts": ["host-1","host-2"], "required_slots": 4}
+
+Post-incident checklist for RCA
+--------------------------------
+1) Capture timeline from metrics-lake and control-plane audit logs (ids: backfill_plan_id, autoscaler_event_id)
+2) Verify IAM checks and service-account actions
+3) Replay simulator scenario and compare preemptions
+4) Produce mitigations: adjust warm_pool_target, change weights, or ban specific host types from automated backfill
+
+Rollout notes
+-------------
+- Start with backfill.enabled=false in prod. Enable for a single non-critical pool and observe for 2 weeks.
+- Stage 2: enable for 5% of total fleet (tagged pools) with backfill.max_preemptions_per_min=1 and warm_pool_target at 0.12
+- Stage 3: global enable with strict monitoring and a 30-day rollback window
+
+Related work and links
+----------------------
+- See also: gpu-demand-forecasting-and-ml-backed-scaling-playbook for warm-pool sizing heuristics
+- Simulator repo: infra/sim/gpu-hotspot-simulator
+- Module: terraform-modules/gpu-autoscaler (maintainers: @infra-iac)
+
+Document change log
+-------------------
+- 2025-11-06 (Aisha Patel): Initial draft
+- 2025-11-27 (Marcus Li): Added safety check IAM section and Terraform variable table
+- 2026-02-12 (Aisha Patel): Expanded operator runbook and CI/CD gating steps

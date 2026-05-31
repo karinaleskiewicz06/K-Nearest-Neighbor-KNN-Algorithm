@@ -1,0 +1,150 @@
+Variant hot-swap: zero-downtime model variant hot-swap design spec
+
+Overview
+======
+This design spec describes the Variant Hot-Swap system: a runtime capability that allows swapping a serving model variant with zero client-visible downtime and bounded impact to SLOs. Hot-swap covers both in-place binary/weights replacement on a host and coordinated cross-host handoff for multi-replica services. The goal is to support fast rollbacks, emergency variant patches, and model upgrades without dropping connections or causing request errors.
+
+Context and motivation
+----------------------
+- Customers require predictable service levels during model rollouts. Traditional rolling restarts or drain-and-replace strategies cause request queueing, increased latency, or transient errors.
+- We already support progressive rollouts (canaries, staged traffic shifting). Hot-swap is a complementary capability targeted at: emergency rollbacks, tiny-critical fixes to a model in prod, and metadata-driven in-server variant swaps for affinity-sensitive sessions.
+
+Goals
+-----
+1. Zero client-connection interruption for active sessions during a variant swap.
+2. Maintain per-tenant latency 95th percentile within a configurable delta (default +200ms) during swaps.
+3. Guarantee token-consistency for streaming sessions: no duplicated or missing tokens delivered to the client.
+4. Support seamless rollback to the previous variant within 30s under normal conditions.
+5. Provide observability hooks and automated runbook triggers on SLO deviations.
+
+Non-goals
+---------
+- Solving stateful model weight warmup for very large models (>1TB) in sub-minute timelines. For very large variants, hot-swap will default to a staged cross-host approach rather than in-memory replace.
+- Replacing major architecture changes that require incompatible runtime kernels; those will use progressive rolling upgrade paths.
+
+Stakeholders and ownership
+--------------------------
+- Product: Model delivery and runtime experience (primary contact: Elena Moreno).
+- Engineering: Serving runtime (owner), rollout orchestration, and SRE (SLO/alerting).
+- Applied ML: Variant packaging constraints and validation tests.
+- Customer Success: Communication templates for emergency changes.
+
+High-level design
+-----------------
+The hot-swap capability is a multi-layer system composed of:
+- HotSwap Controller (stateless service): accepts swap requests, validates policy, coordinates with orchestrator.
+- Local Swap Agent (per-host): performs in-memory swap when safe, handles KV-cache migration, and sequences drain flags for local threads.
+- Session Coordinator (distributed): ensures streaming sessions' token state is checkpointed and resumed without duplication across variant boundaries.
+- Fallback Manager: enforces automatic rollback policies if SLO/health signals cross thresholds.
+
+Sequence flows (in-place hot-swap)
+---------------------------------
+1. Operator or automated job creates a HotSwap request with target variant id, prewarm hints, and rollout policy.
+2. HotSwap Controller verifies compatibility matrix and quota checks.
+3. Controller instructs candidate hosts' Local Swap Agent to prewarm weights into an isolated address space (worker pool).
+4. Local Swap Agent loads weights into standby workers, runs validation prompt set (configurable), and warms KV caches for prefix patterns if provided.
+5. When 90% of standby workers pass validation, Controller issues a coordinated handoff: 
+   a. Mark new workers as READY and old workers as TRANSITIONING.
+   b. Session Coordinator freezes streaming token emission checkpoint per-session.
+   c. Router starts routing new requests to READY workers.
+   d. For active streaming sessions, last-token markers are emitted, session state copied to new worker, and emission resumes.
+6. Local Swap Agent retires old workers post-grace period and releases memory.
+
+Cross-host staged hot-swap (for large variants)
+-----------------------------------------------
+- If in-place memory constraints prevent instant replacement, the Controller performs a staggered handoff: bring up READY workers on different hosts, start routing a subset of new sessions, migrate long-lived sessions in small batches, and finally decommission old capacity.
+
+Configuration table: key knobs
+----------------------------
+| config_name | default | description |
+|-------------|---------|-------------|
+| swap.max_downtime_ms | 200 | Soft upper bound for allowed p95 delta during swap |
+| swap.prewarm_timeout_s | 60 | Time to wait for prewarm/validation before abort |
+| swap.stream_checkpoint_mode | full | \"full\" or \"light\" checkpointing for streaming sessions |
+| swap.rollback_on_slo | true | Whether to trigger automatic rollback on SLO breach |
+| swap.max_parallel_sessions_migrate | 50 | Max concurrent session migrations per host |
+
+Example HotSwap request (YAML)
+------------------------------
+```yaml
+variant_id: v3.2.1-patch
+prewarm_hints:
+  - prompt_set: safety-smoke-10
+  - warm_prefixes: ["/chat/", "/assist/"]
+rollout_policy:
+  strategy: in_place
+  max_concurrent_migrations: 40
+  p95_latency_delta_ms: 200
+  abort_on_error: true
+```
+
+Failure modes and mitigations
+-----------------------------
+- Prewarm failure (OOM or validation fail): abort swap, mark variant as failed; send automatic rollback and create incident if >3 hosts failed.
+- Partial migration stalls: backoff and reduce batch size; route new sessions away from affected hosts.
+- Token duplication on streams: Session Coordinator enforces idempotent markers; API layer verifies last_token_id before resuming.
+- Sudden SLO regressions: Fallback Manager initiates rollback and throttles new requests for affected tenant(s).
+
+Observability and telemetry
+-------------------------
+Mandatory metrics (exported by Local Swap Agent and Controller):
+- hot_swap.start_count, hot_swap.success_count, hot_swap.abort_count
+- hot_swap.prewarm_latency_seconds (histogram)
+- host.swap_memory_peak_bytes
+- session.migrated_count, session.migration_latency_seconds
+- per-tenant.p95_latency_delta_during_swap_ms (derived)
+Alerts and runbook triggers:
+- hot_swap.abort_rate > 5% in 10m -> Pager to serving-runtime-oncall
+- per-tenant.p95_latency_delta_during_swap_ms > config.swap.max_downtime_ms -> Auto-rollback and SRE runbook
+
+API contract and admin UX
+------------------------
+HotSwap API endpoints (REST):
+- POST /hot-swap -> submit request; returns job id
+- GET /hot-swap/{id}/status -> progress, per-host status
+- POST /hot-swap/{id}/abort -> abort and rollback
+Admin UX elements: validation results, per-host prewarm logs, and a safe-preview mode that runs validation without committing swap.
+
+Runtime compatibility matrix (summary)
+-------------------------------------
+- In-place hot-swap supported: small->medium variants (<120GB resident) on kernels v2.1+.
+- Cross-host staged hot-swap required for >120GB or incompatible kernel combos.
+- Quantized variants: hot-swap allowed if kernel supports identical inference path; otherwise staged path.
+
+Testing strategy and acceptance criteria
+--------------------------------------
+1. Unit tests for Local Swap Agent state transitions.
+2. Integration: synthetic traffic runner with streaming sessions verifies no token duplication and p95 within configured delta across 1000 simulated long-lived sessions.
+3. Chaos tests: randomly kill workers during handoff; system must rollback cleanly and record artifacts.
+4. Performance: cold prewarm + swap on standard host must complete within prewarm_timeout_s for 95% of runs.
+Acceptance: in 10 controlled rollouts, 0 client-visible disconnects and p95 within configured delta for 9/10 runs.
+
+Rollout plan
+-----------
+- Phase 1 (canary): internal tenants only; runbook and monitoring enabled; 2-week window.
+- Phase 2 (beta): selected customers opt-in for emergency hot-swap; gather telemetry and refine config knobs.
+- Phase 3 (GA): enabled for all dedicated and hosted clusters with safe defaults and opt-out for tenants that request scheduled rolling upgrades.
+
+Operational runbook (high-level)
+-------------------------------
+1. Check job status in Controller UI.
+2. If prewarm failing: examine host logs, memory, and validation harness results.
+3. On SLO breach: trigger abort -> Controller posts abort -> Fallback Manager starts rollback.
+4. Postmortem: collect hot_swap.* metrics, agent logs, session checkpoint traces, and create incident summary.
+
+Open design issues and follow-ups
+--------------------------------
+- Edge-case: long-running streaming sessions with external side effects (webhooks). Need a policy for tie-breaker: prefer session affinity vs. external-side-effect consistency.
+- Validation set coverage: how to identify a minimal smoke set that covers critical safety/fidelity regressions for hot-swap. Responsible: Applied ML to own and curate.
+
+References
+----------
+- Progressive variant rollouts (compat matrix) — see related page.
+- Canary scheduler economics and rollback spec — see related page.
+
+Appendix: small glossary
+-----------------------
+- READY worker: process/worker that has loaded a new variant and passed validation but not yet serving live traffic.
+- TRANSITIONING worker: worker in the process of handing off state and draining outstanding requests.
+- Session Coordinator: distributed component that manages streaming token checkpoints to coordinate migration.
+

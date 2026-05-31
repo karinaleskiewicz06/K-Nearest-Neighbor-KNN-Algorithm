@@ -1,0 +1,184 @@
+Queue Smoothing and Throttling Safeguards
+
+Summary
+-------
+This document defines a cross-cutting standard for queue smoothing and throttling safeguards across Redwood’s public and internal services. It codifies a conservative set of behaviour guarantees, configuration templates, observability requirements, and runbook steps so that services avoid catastrophic cascading failures during load spikes while preserving predictable latency and clear cost accounting.
+
+Motivation
+----------
+Incidents and SLO violations in the last 18 months have shown two recurring failure modes: (1) unbounded request queues that cause OOMs and long tail latency, and (2) aggressive drop policies that produce silent functional degradation for customers. We need a single, opinionated pattern that balances availability, fairness, and cost across the stack (edge proxies, service ingress, worker pools, and the runtime).
+
+Scope
+-----
+- Applies to all Redwood public-facing services (redwood-api, routing-proxy, inference-gateway) and internal services where client-perceived latency matters (billing, telemetry-ingest).
+- Includes both synchronous request entry points and async worker queues driving GPU inference.
+- Does NOT prescribe model-specific batching logic or kernel-level eviction; those remain in eng-serving-runtime.
+
+Definitions
+-----------
+- Admission queue: in-memory or broker queue where incoming requests wait before being served. Examples: local ring buffer in routing-proxy, Redis list for background tasks.
+- Smoothing window: short time window used to convert bursty arrival to a steady feed to downstream workers (e.g., 50–200ms).
+- Backpressure signal: explicit upstream indication to slow or pause senders (HTTP 429, gRPC RESOURCE_EXHAUSTED or connection-level windowing).
+- Priority tier: numeric label (0=critical, 1=interactive, 2=batch) used for scheduling and admission.
+
+Principles
+----------
+1. Fail predictably and loudly: prefer fast rejection (429) over indefinite queuing when backlog threatens SLOs or resource saturation.
+2. Smooth short bursts locally: introduce bounded smoothing at ingress to avoid creating load spikes on GPU pools.
+3. Preserve SLAs for high-priority traffic using strict caps and preemptible lower-priority work.
+4. Measure end-to-end queue time and surface it as a first-class SLI.
+5. Provide a single configuration overlay and a deployable template for services to inherit.
+
+Design and Patterns
+-------------------
+1) Admission policy model (default):
+   - Max in-flight (per instance): integer cap on concurrently processed requests. Default: 200 for small instances, 800 for inference-gpu-1.
+   - Soft queue depth: per-instance queue buffer for smoothing. Default: 32 requests.
+   - Hard queue depth: absolute cap after which requests are rejected. Default: 128 requests.
+   - Priority partitioning: allocate queue slices per priority tier, e.g. 20% reserved for tier 0, 50% for tier 1, remainder for tier 2.
+
+2) Smoothing component:
+   - Implement a tokenized leaky-bucket that drains at a configured take_rate tuned to downstream throughput. Small smoothing windows (50–150ms) reduce transient contention and batching jitter.
+
+3) Backpressure and retry semantics:
+   - Upstream receives HTTP 429 with header Retry-After (seconds) for synchronous clients. 429 is our canonical backpressure signal across gateways.
+   - gRPC clients should map RESOURCE_EXHAUSTED and include Retry-After in trailers.
+   - Client SDK guidance: exponential backoff with jitter, max attempts = 6, and a total retry budget per top-level request = 20s by default (shorter for low-latency paths).
+
+4) Preemption and graceful eviction:
+   - Long-running or batch requests may be preempted when higher-priority traffic arrives. Preemption is signalled with a structured error (code PREEMPTED, body includes resume token when supported).
+
+Config templates (example YAML)
+-------------------------------
+This is the canonical config block used by routing-proxy and services that embed the admission controller. Services should include this block in their infra repo and allow overrides for instance class.
+
+admission:
+  enabled: true
+  instance_class: inference-gpu-1
+  max_in_flight: 800
+  soft_queue_depth: 32
+  hard_queue_depth: 128
+  smoothing_window_ms: 100
+  priority_slices:
+    - tier: 0
+      reserved_pct: 20
+    - tier: 1
+      reserved_pct: 50
+    - tier: 2
+      reserved_pct: 30
+  backpressure_response:
+    code: 429
+    retry_after_seconds: 1
+
+Note: defaults tuned for inference-gpu-1. Smaller instance_class should set max_in_flight <= 200 and hard_queue_depth <= 64.
+
+Observability requirements
+-------------------------
+Every service implementing this standard must emit the following metrics (Prometheus style) with the specified labels:
+- admission_queue_depth{instance,service,priority}: gauge (current queue depth per instance and priority).
+- admission_queue_wait_seconds_bucket{le,instance,service,priority}: histogram (time spent waiting before admission).
+- admission_rejects_total{reason,service,instance}: counter (reason=hard_cap|timeout|circuit_open).
+- smoothing_tokens_drain_rate{service,instance}: gauge (tokens/sec).
+- backpressure_signals_total{service,instance,type}: counter (type=429|grpc_resource_exhausted).
+
+SLIs and Alerts
+---------------
+SLIs (measured per service, 1m and 5m windows):
+- e2e_p95_latency: 95th percentile end-to-end request latency < service SLO (see service profile).
+- queue_wait_p99: 99th percentile admission_queue_wait_seconds < 250ms for interactive tiers.
+- reject_rate: rate(admission_rejects_total{reason=hard_cap}) < 0.1% over 5m.
+
+Alerting rules (suggestions):
+1. Alert P1 - Queue saturation: queue_wait_p99 > 500ms OR admission_queue_depth > hard_queue_depth * 0.9 for > 3m. (Pager to oncall, severity P1).
+2. Alert P2 - Reject surge: increase in reject_rate by >10x baseline for 5m. (Notify slack #ops and owner team).
+3. Alert P3 - Smoothing starvation: smoothing_tokens_drain_rate < configured_min for > 2m (indicates misconfiguration).
+
+Runbook: responding to queue saturation
+--------------------------------------
+1) Identify scope: query metrics admission_queue_depth and admission_rejects_total; determine instances affected.
+2) Short term mitigation (3–15 minutes):
+   - Increase replica count of the service by +25% if autoscaling is constrained (run autoscaler override).
+   - Reduce batch sizes on inference workers (if safe) to increase throughput per request.
+   - If overload is caused by tier 2 (batch), temporarily set priority_slices.tier2.reserved_pct=0 and restart admission controller.
+3) Medium term (15–120 minutes):
+   - Route new traffic to a warmer fleet (fallback model variant or different region) via smart routing.
+   - Throttle low-priority clients using rate-limiter policy by client_id.
+4) Post-incident: run a traffic replay with the incident trace to tune smoothing_window_ms and soft_queue_depth.
+
+Telemetry and tracing
+--------------------
+- Every admission event must add tracing spans named admission.enqueue and admission.dequeue with tags: service, instance, priority, queue_depth_at_enqueue.
+- Preserve a unique request id header X-Request-Id across retries; include it in logs and metrics.
+
+Compatibility guidelines for SDKs and clients
+--------------------------------------------
+- SDKs should expose: retry_budget(TimeSpan), max_attempts, and a helper for handling PREEMPTED responses.
+- Client libraries must treat 429 as a signal to back off immediately; they must not automatically escalate to more retries than configured by service-level retry budget.
+
+Testing and validation
+----------------------
+- Local integration test: use the admission test harness (scripts/ingress-loadtest) to validate that a service honors soft/hard caps and priority slices. The harness will: produce a mixed-priority workload, measure queue_wait_p99, and verify correct headers returned on rejects.
+- Canary: when enabling changes to admission config, run a canary rollout on 5% traffic for 30 minutes and verify queue_wait_p99 and reject_rate do not regress beyond +10%.
+
+Rollout procedure (safe path)
+----------------------------
+1) Add the canonical admission block to the service repo and create a feature branch.
+2) Unit tests and harness tests must pass locally.
+3) Deploy to staging and run the integration loadtest with mixed-priority traffic.
+4) Create a canary release: route 5% production traffic to new config for 30m. Monitor SLIs.
+5) If stable, progressive rollout to 25% then 100% with 30m observation windows.
+
+Ownership and contacts
+----------------------
+- Policy owner: eng-infra admission team (owner alias: eng-infra-admission@redwood.ai).
+- Primary stakeholders: eng-sre, eng-serving-runtime, eng-platform.
+- Oncall escalation: paging policy follows standard SRE rota; see eng-sre/runbooks.
+
+Security and privacy notes
+--------------------------
+- Admission queues may carry tenant identifiers and prompt text. Ensure PII is not persisted to disk in unencryped form. Long-lived broker queues must be encrypted at rest and role-restricted.
+
+Open questions and future work
+-----------------------------
+- Per-tenant adaptive smoothing that learns optimal smoothing_window_ms per traffic fingerprint.
+- Integration with Redwood Optimize to automatically propose instance_class changes when queue_wait_p99 shows persistent growth.
+
+Appendix: example Prometheus rules
+----------------------------------
+# Queue saturation alert
+ALERT QueueSaturation
+  IF max_over_time(admission_queue_depth[5m]) > (hard_queue_depth * 0.9)
+  FOR 3m
+  LABELS {severity=\"page\"}
+  ANNOTATIONS {
+    summary = \"Admission queue near hard cap for {{ $labels.service }}\",
+    runbook = \"https://confluence.internal/redwood/eng-sre/runbooks/admission-queue-saturation\"
+  }
+
+# Reject surge alert
+ALERT RejectSurge
+  IF increase(admission_rejects_total{reason=\"hard_cap\"}[5m]) > (10 * avg_over_time(increase(admission_rejects_total{reason=\"hard_cap\"}[5d])))
+  FOR 5m
+  LABELS {severity=\"sev2\"}
+
+Appendix: quick curl example (client guidance)
+------------------------------------------------
+curl -X POST https://api.redwood.ai/v1/generate \
+  -H 'Authorization: Bearer $TOKEN' \
+  -H 'Content-Type: application/json' \
+  -H 'X-Request-Id: ${REQUEST_ID}' \
+  -d '{"model":"rwd-medium-qa","input":"Summarize quarterly report"}' | jq .
+
+If server returns 429 with Retry-After header, the SDK should wait the indicated seconds (or compute a backoff schedule) before attempting another request.
+
+Revision history
+----------------
+- 2025-11-12: Draft created — Maya Chen
+- 2025-12-08: Added canary guidance and metrics — Diego Alvarez
+- 2026-02-03: Finalized alerts and runbook steps; published — Maya Chen
+
+Related reading
+---------------
+- eng-serving-runtime/kernel-and-scheduling/tail-latency-circuit-and-kernel-shed-patterns-2026
+- architecture-and-standards/infra-standards/gpu-node-autoscaling-eviction-playbook-2026
+

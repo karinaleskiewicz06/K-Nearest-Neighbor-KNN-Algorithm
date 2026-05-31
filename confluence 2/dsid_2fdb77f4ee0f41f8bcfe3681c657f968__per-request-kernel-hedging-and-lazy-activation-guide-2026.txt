@@ -1,0 +1,179 @@
+Per-request Kernel Hedging and Lazy Activation Guide
+
+Overview
+-------
+This guide documents the design, operator configuration, and runbook for the per-request kernel hedging and lazy activation mechanisms implemented in the Redwood inference runtime. These features are targeted at reducing tail latency caused by kernel cold-starts, kernel contention, and cross-tenant kernel churn without sacrificing average throughput or fair resource sharing.
+
+Goals and non-goals
+-------------------
+- Goals:
+  - Reduce 99th and 99.9th percentile latency for short and medium-length generation requests by enabling hedged fallbacks and lazy kernel activation.
+  - Limit additional cost and kernel churn by constraining hedging concurrency and using heuristics to trigger lazy activation only when beneficial.
+  - Provide clear telemetry and operator controls to tune behavior per-tenant, per-model, and per-runtime-pool.
+- Non-goals:
+  - Replace the scheduler or admission control; these features are orthogonal and intentionally conservative.
+  - Change core cost accounting semantics; hedged requests are tracked for chargeback and forecasting but billed according to existing token accounting.
+
+Architecture and high-level flow
+-------------------------------
+1. Request classification: incoming RPCs are annotated with request hints (sequence_length_estimate, priority_class, model_variant_hint). The classifier runs in the front-end (service: router-proxy) and tags requests that are "hedge-eligible."
+2. Kernel lookup & probe: the runtime consults the kernel catalog for the requested model_variant. If the preferred kernel instance is unavailable or in a cold state, the runtime triggers lazy activation and marks a soft deadline (hedge_deadline_ms).
+3. Hedged probe: at hedge_deadline_ms, the scheduler may launch a hedged request to an alternative kernel variant or a pre-warmed lightweight kernel shim (see Kernel Variants below).
+4. Fast-path response: whichever path returns first wins; the other hedged request is cancelled and its metrics are recorded for hedging efficiency calculations.
+
+Key components and services
+---------------------------
+- router-proxy: tags requests with hints and enforces per-route hedging policy (config in /etc/redwood/router/hedge-policy.yaml).
+- kernel-manager: maintains kernel lifecycle (active, warming, idle) and exposes activation APIs.
+- scheduler-core: decision engine that evaluates hedging eligibility against slot quotas and queue length signals.
+- telemetry-collector: emits hedging metrics and traces (see Observability section).
+
+Kernel variants and fallbacks
+----------------------------
+We recommend a small hierarchy of kernel variants to hedge against:
+- optimized-kernel: fastest path, may require quantized kernels and certain hardware features.
+- lite-kernel-shim: reduced feature set (no KV cache) but very fast to activate; used as the first hedged fallback for short requests.
+- cpu-emulation: last-resort fallback for durability, used only when GPU options are saturated.
+
+Configuration examples
+----------------------
+Default per-tenant configuration (router/hedge-policy.yaml):
+
+---
+# Hedge policy tokens per-tenant
+tenant_id: "*"
+hedge_enabled: true
+hedge_deadline_ms: 40
+max_hedge_concurrency_per_tenant: 4
+lite_kernel_activation_timeout_ms: 120
+allow_cpu_fallback: false
+---
+
+Scheduler policy snippet (scheduler/policy.d):
+
+policy "hedge-lazy-activation" {
+  when request.is_short_sequence and kernel.state in [idle, cold]
+  and tenant.hedge_quota.available > 0
+  then schedule.lazy_activate(kernel) |> set.deadline(40ms) |> allow.hedge(alternative = lite-kernel-shim)
+}
+Observability and metrics
+-------------------------
+Required metrics (emitted by kernel-manager and scheduler-core):
+- hedging.attempts (counter)
+- hedging.successes (counter, hedged request returned first)
+- hedging.failures (counter)
+- hedging.cancellation_overhead_ms (histogram)
+- kernel.activation.latency_ms (histogram) by kernel_variant
+- kernel.usage.active_slots (gauge)
+- tenant.hedge_quota.available (gauge)
+
+Recommended tracing spans:
+- router-proxy.classify -> kernel-manager.lookup -> scheduler-core.decision -> kernel.<variant>.execute
+
+Dashboards and alerts
+---------------------
+Create a dashboard with the following panels:
+- Hedge hit rate: hedging.successes / hedging.attempts (target >= 0.6 for short sequences)
+- Hedge cost ratio: tokens_consumed_by_hedged_requests / tokens_consumed_total (warn if > 0.15)
+- Kernel activation P95/P99 per-variant (warn if p99 > 250ms for lite-kernel-shim)
+
+Alerts (examples):
+- hedging.error-rate > 5% sustained for 5m -> page oncall (pagerduty: runtime-core)
+- hedging.cost-ratio > 20% for 10m -> notify runtime-costs slack channel
+
+Operational runbook (tail-latency incident)
+------------------------------------------
+1. Pager fires for high 99th latency.
+2. Open runtime dashboard, filter by route and tenant. Check hedging.attempts and kernel.activation.latency_ms.
+3. If hedging.attempts are high but hedging.successes are low:
+   a. Reduce hedge_deadline_ms by 10ms increments to avoid launching costly hedges.
+   b. Consider increasing the limit on lite-kernel pre-warmers for the affected pool (see Pre-warm section).
+4. If hedging.cost-ratio is high (>15%):
+   a. Temporarily disable hedging for low-value tenants via router-proxy config.
+   b. Schedule capacity bump for the affected kernel_variant.
+5. If kernel.activation.latency_ms p99 spikes:
+   a. Inspect kernel-manager logs for OOMs or driver errors.
+   b. Roll back recent kernel or driver rollouts (see Rollout and compatibility).
+
+Pre-warm and capacity controls
+-----------------------------
+- Pre-warm clusters: dedicated lightweight pools of lite-kernel-shim instances. Use prewarm.policy.yaml to define min_ready_count per-pool.
+- Adaptive pre-warm heuristic: if short_sequence_rate > 60% and prewarm_utilization > 70% then scale pre-warm by +20%.
+
+Table: example pre-warm config
+Name | min_ready | max_ready | scale_increment
+short-request-pool | 8 | 32 | 4
+medium-request-pool | 4 | 12 | 2
+
+Rollout and compatibility notes
+------------------------------
+- Feature gates: hedging and lazy activation are behind feature flags (runtime.feature.hedging, runtime.feature.lazy_activation). Enable in canary clusters only.
+- Kernel ABI: lite-kernel-shim implements a subset of runtime kernel-ABI v2.2. Ensure model_variant compatibility before enabling for production.
+- Driver versions: Linux kernel module rwinf-v3+ is required for lazy activation memory hotplug optimizations.
+
+Testing and benchmarking guidance
+--------------------------------
+- Synthetic acceptance: run short-sequence synthetic benchmarks with sequence length distribution set to p25=8, p50=12, p75=24, p95=128. Measure hedging.hit-rate and total cost delta.
+- Chaos testing: introduce transient node reboots and verify hedged requests maintain SLOs for 99% of traffic.
+- Cost simulation: use the runtime cost-sim tool to simulate hedged request overhead across 7-day traces (tool: tools/runtime-cost-sim).
+
+SLO and recommended targets
+---------------------------
+- Short-sequence SLO (<=64 tokens): p95 latency <= 80ms, p99 <= 220ms.
+- Hedge subsystem targets: hedging.success_rate >= 60% and additional token overhead <= 15%.
+
+Ownership and escalation
+------------------------
+- Feature owner: Maya Chen (eng-serving-runtime).
+- Pager owner for incidents: runtime-core SRE rotation (runbook reference: /confluence/eng-serving-runtime/eng-sre/runbooks/slo-and-error-budgets).
+- Changes to default tenant policy must be reviewed by: Ravi Patel, Kernel Scheduling team.
+
+Implementation notes for engineers
+---------------------------------
+- API: kernel-manager exposes POST /v1/kernels/{id}/activate with body {"mode":"lazy","timeout_ms":120}. Example curl:
+  curl -X POST https://kernel-manager.internal/v1/kernels/12345/activate -H \"Authorization: Bearer $TOKEN\" -d '{"mode":"lazy","timeout_ms":120}'
+
+- Metrics emission: use telemetry-client.emit_counter("hedging.attempts", 1, {"tenant":tenant_id, "variant":variant})
+
+- Scheduler policy DSL example (complete):
+  when request.is_short_sequence and kernel.state in [idle, cold] and tenant.hedge_quota.available > 0 then schedule.lazy_activate(kernel, prewarm_hint=true) |> set.deadline(40ms) |> allow.hedge(alternative=lite-kernel-shim, max_concurrency=2)
+
+Open questions and future work
+-----------------------------
+- Should hedging apply to streaming/long-lived chat requests (current recommendation: disabled for streams).
+- Integrate ML-based hedging deadline prediction using sequence_length_estimate + historical activation latency. Pilot planned for Q4 2026.
+
+Appendix: YAML snippets and quick checks
+---------------------------------------
+Quick check script (bash):
+
+#!/usr/bin/env bash
+# Check hedging feature flag and health
+FLAG_URL=https://config.internal/v1/flags/runtime.feature.hedging
+HEALTH_URL=https://kernel-manager.internal/health
+curl -s $FLAG_URL | jq '.'
+curl -s $HEALTH_URL | jq '.'
+
+Example hedge-policy (full):
+---
+tenant_policies:
+  fast-startups:
+    hedge_enabled: true
+    hedge_deadline_ms: 35
+    max_hedge_concurrency_per_tenant: 3
+    allowed_fallbacks: ["lite-kernel-shim"]
+  default:
+    hedge_enabled: false
+---
+
+References
+----------
+- scheduler-policy-language-declarative-profiles (internal)
+- runtime-fallback-and-degradation-playbook (internal)
+- telemetry-rollup-and-sample-strategies-2026 (internal)
+
+Document history
+----------------
+- 2026-02-10: Draft created by Maya Chen.
+- 2026-04-02: Added pre-warm heuristics and metrics by Ravi Patel.
+- 2026-09-20: Clarified rollout notes and added SLO targets by Maya Chen.

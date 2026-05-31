@@ -1,0 +1,162 @@
+Throughput fairness scheduling and eviction guidelines
+
+Summary
+-------
+This document defines Redwood's platform-level approach to workload fairness, scheduling weights and eviction behavior for the inference runtime and shared GPU pools. The goal is to provide predictable throughput and latency for production tenants while allowing controlled burst behavior for non-critical workloads and minimizing noisy neighbor effects.
+
+Intended audience
+- Platform engineers (schedulers, capacity, SRE)
+- Product owners for Dedicated and Hosted tiers
+- Solutions engineers operating tenant configuration
+
+Motivation / Context
+--------------------
+Redwood runs a multi-tenant serving fabric where capacity (GPU pods, memory, and network) is a constrained resource. Historical incidents show two recurring failure modes: (1) a small number of high-throughput jobs saturate pooling resources and starve other tenants, and (2) aggressive preemptions cause throughput oscillation and increased tail latency. This guideline balances throughput fairness with operational simplicity and predictable eviction semantics.
+
+Scope
+-----
+Applies to: Dedicated GPU pools and any multi-tenant shared runtime configured with tenant slicing and preemption. Not intended for fully isolated private deployments with customer-dedicated hardware (those follow their own SLA contracts).
+
+Key definitions
+---------------
+- Tenant class: production | staging | dev | background
+- Weight: scheduling share assigned to a tenant or tenant class (float, e.g., 1.0, 0.5)
+- Burst credits: temporary tokens that allow a tenant to exceed steady-state share for short bursts
+- Preemptible job: workload marked as evictable when capacity is constrained
+
+Principles
+----------
+1. Predictability: production tenants should have deterministic access to their configured share (SLO-driven).
+2. Proportional fairness: when contention exists, throughput should be allocated in proportion to weights where feasible.
+3. Graceful preemption: evictions should be ordered to minimize customer impact and avoid cascading restarts.
+4. Observability: every weight change and eviction must be instrumented and visible in dashboards.
+
+Scheduling model
+----------------
+- Default class weights:
+  - production: 100
+  - staging: 20
+  - dev: 5
+  - background: 1
+- Per-tenant weight = class_weight * tenant_multiplier (tenant_multiplier in [0.1, 5.0])
+- Scheduler enforces proportional share using a token-bucket-based fair scheduler combined with short-term smoothing (5s window) to avoid microbursts flipping allocation rapidly.
+
+Burst credits and bucket policy
+------------------------------
+- Each tenant accrues burst credits when idle (1 credit per minute of idle time, capped at 300 credits). A credit allows 1× the steady-state share for 1 minute.
+- Credits are consumed first on bursts; when exhausted, the tenant falls back to base weight.
+- Admins can configure tenant-level burst caps (e.g., production tenants can have up to 600 credits).
+
+Eviction policy and ordering
+---------------------------
+Eviction is a last-resort mechanism triggered when:
+- cluster GPU utilization > eviction_threshold (default 94%) AND available schedulable capacity < required to honor production steady-state shares.
+Eviction ordering (highest to lowest priority for eviction):
+1. background preemptible (aggressive, immediate). Grace period: 10s drain + SIGTERM to process.
+2. dev/staging preemptible (defer if can scale down within 30s). Grace period: 30s.
+3. non-critical parts of production (lowest-weight subroutines) — only after bursting tenants are drained.
+4. production non-preemptible: should not be evicted except during emergency override with explicit SRE signoff.
+
+Eviction mechanics
+------------------
+- When eviction is decided, scheduler issues a pre-eviction hook that attempts a 1-minute graceful KV-cache flush.
+- Eviction attempts are limited to 2 per tenant within a 10-minute window to avoid churn.
+- If a process does not exit within grace period, platform will SIGKILL and annotate the eviction event with the following meta: evicted_by, reason, initiator, preempt_count.
+
+Backoff and cooldowns
+--------------------
+- After an eviction, scheduler reduces the victim tenant's burst credits by 50% and applies a cooldown window of 5 minutes before that tenant may receive a new allocation expansion.
+- If a tenant is evicted more than 3 times in 1 hour, escalate to tenant owner and mark the workload as 'noisy' for potential workload isolation.
+
+Instrumentation and dashboards
+------------------------------
+Required metrics (all tagged by tenant_id, tenant_class, cluster_region):
+- tenant_allocated_share (tokens/sec)
+- tenant_actual_throughput (tokens/sec)
+- tenant_burst_credits (int)
+- tenant_evictions_total (counter)
+- tenant_eviction_reason (label histogram)
+- cluster_gpu_utilization (percent)
+- scheduling_delay_p95 (ms)
+
+Suggested dashboards:
+- Tenant fairness dashboard: top-10 tenants by allocation gap (allocated - actual), with burn-down of burst credits.
+- Eviction heatmap: evictions by tenant class over time.
+- Noisy neighbor alert: tenant_evictions_total > 3 in 60m and scheduling_delay_p95 > 500ms triggers an incident.
+
+SLIs and thresholds
+-------------------
+- Production throughput SLO: 99th percentile of tenant_allocated_share/tenant_actual_throughput >= 0.98 over a 1-hour window.
+- Eviction budget: background preemptions should not exceed 0.5% of total production requests per week.
+- Fairness SLI: median allocation gap across top-50 tenants < 10%.
+
+Runbook: Responding to high eviction churn
+-----------------------------------------
+1. Open incident channel and tag owners (platform, SRE, tenant owner).
+2. Run diagnostics:
+   - kubectl get pods -l tenant_id=<tenant> -o wide
+   - platformctl scheduler describe cluster/<cluster> --since=10m
+   - query metrics: tenant_evictions_total{tenant_id="<tenant>"} and scheduling_delay_p95
+3. If eviction_count > 3 in 60m: temporarily increase victim's weight by 10% for 15 minutes to stop churn and give operators breathing room:
+   - platformctl tenant adjust-weight <tenant_id> +10 --duration=15m --reason="churn_mitigation"
+4. If noisy neighbor confirmed: schedule isolation (move to dedicated minor pool or reduce concurrency):
+   - platformctl tenant isolate <tenant_id> --pool=d-ephemeral-3
+5. Document root cause and update tenant noisy list if required.
+
+Config examples
+---------------
+Example scheduler tenant YAML snippet:
+
+```
+tenant_id: acme-analytics
+tenant_class: production
+base_weight: 100
+tenant_multiplier: 1.2
+burst_cap: 600
+preemptible: false
+eviction_policy:
+  max_evictions_per_hour: 2
+  grace_seconds: 60
+```
+
+CLI example: drain a tenant gracefully
+```
+platformctl tenant drain acme-analytics --timeout=60s --annotate="planned-maintenance-2026-02"
+```
+
+Rollout and change process
+--------------------------
+- All changes to class weights require: design doc -> peer review -> staged rollout to canary cluster -> metrics validation for 6 hours -> full rollout.
+- Emergency changes (eviction thresholds) require oncall + SRE lead approval and must be followed by a retrospective.
+
+Ownership and escalation
+------------------------
+- Policy owner: platform-scheduling team (primary: Marcus Reed).
+- Escalation path: platform oncall -> scheduling lead -> SRE manager -> CRO for customer-impacting events.
+
+Retrospective cadence and review triggers
+----------------------------------------
+- Monthly review of eviction and fairness metrics during platform review meeting.
+- Trigger a dedicated retrospective when: more than 2 production tenants are evicted in a single outage window lasting >15 minutes, or overall cluster GPU utilization > 96% for more than 30 minutes.
+
+Appendix A: Decision rationale summary
+------------------------------------
+- Token-bucketness and short-term smoothing chosen to reduce wheel-of-death oscillations observed with pure weighted fair queuing across bursty LLM workloads.
+- Burst credits chosen to allow temporary experimentation for customers without long-term capacity commitment.
+
+Appendix B: Quick tuning knobs
+------------------------------
+- eviction_threshold (default 94%) — raise to 96% only after capacity expansion is validated.
+- burst_credit_accrual_rate — default 1/min. Lower to 0.5/min for noisy clusters.
+- eviction_cooldown_minutes — default 5. Increase if churn persists.
+
+Related documentation
+---------------------
+- Platform capacity playbook (capacity-drift-detection-and-correction-playbook-2026)
+- Predictive eviction playbook (predictive-scale-and-eviction-playbook-2026)
+
+Change log
+----------
+- 2025-09-15 initial draft (Aisha Patel)
+- 2025-12-02 updated burst credit caps and per-tenant cooldowns (Lin Chen)
+- 2026-02-10 added SLI thresholds and runbook steps (Sofia Martinez)

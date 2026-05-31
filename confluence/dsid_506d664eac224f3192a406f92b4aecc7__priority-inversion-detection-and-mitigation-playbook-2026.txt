@@ -1,0 +1,168 @@
+Priority inversion detection and mitigation playbook
+
+Summary
+-------
+This playbook defines detection, profiling, and step‑by‑step mitigation for priority inversion and related starvation scenarios in the Redwood serving runtime (components: runtime-shepherd, kernel-mapper, request-router, kv-cache). It is intended for oncall SREs, runtime engineers, and release owners responsible for kernel scheduling and request orchestration.
+
+Scope
+-----
+- Applies to all production clusters running the inference runtime (hosted + dedicated pools).
+- Targets cases where low-priority long-running requests cause high-priority short requests to miss SLOs (p95/p99 latency regressions, queue growth).
+- Includes detection signals, live profiling actions, short-term mitigations, and long-term scheduler fixes.
+
+Background and definitions
+--------------------------
+- Priority inversion: higher-priority requests being delayed because resources are held by lower-priority work (e.g., long decode kernels, blocking I/O).
+- Kernel scheduling: the runtime-mapped ordering of GPU kernels invoked by requests; implemention lives in kernel-mapper and runtime-shepherd.
+- Starvation: sustained inability of a priority class to make forward progress for a defined window.
+
+Detection (alerts and observability)
+----------------------------------
+Primary alerts (Prometheus):
+1) High-priority latency breach alert (P95)
+   - Query: rate(app_request_duration_seconds_bucket{priority="high"}[5m]) and histogram_quantile(0.95, ... ) > 120ms 
+   - Alert threshold: p95 > 120ms for 3m
+2) Kernel queue skew
+   - Query: increase(kernel_invocations_total[1m]) grouped by priority / shard; if low-priority invocation rate is >150% of high-priority for same shard and high-priority queue depth > 10 -> fire
+3) GPU nowait stalls
+   - Signal from trace-agent: gpu_kernel_enqueue_latency_seconds{status="queued"} p99 > 20ms
+4) Owner breach: request-router drop rate > 0.5% for priority=high over 5m
+
+Diagnostic dashboards and traces to open on alert:
+- Runtime queue heatmap: request-router > queues by priority and shard
+- Kernel invocation waterfall: kernel-mapper traces for last 5 minutes
+- KV-cache hot vs cold access by request signature
+- GPU utilization and active-kernel-count
+
+Profiling and data collection (first 10 minutes)
+------------------------------------------------
+1) Capture a 60s flame trace (distributed) from trace-agent: POST /admin/trace?duration=60s on runtime-shepherd admin port.
+   - Example: curl -s -X POST http://runtime-shepherd-admin:9090/admin/trace -d '{"duration":"60s","tags":["priority"]}'
+2) Snapshot kernel queues: curl http://kernel-mapper:9100/debug/queues -> save as kernel-queues-<timestamp>.json
+3) Collect Prometheus range for the last 15m for these metrics: request_duration, kernel_invocations_total, kernel_queue_depth, gpu_active_kernels. Use grafana-export or promql curl.
+4) If pprof is enabled for C++ agents, run pprof for the shard experiencing skew: ssh to node -> /usr/local/bin/pprof -http=:8080 /var/profiler/shard-XX.pb.gz
+
+Immediate mitigations (order of operations)
+-----------------------------------------
+Goal: restore high-priority SLOs within 5–15 minutes while preserving safety. Escalate to runtime engineers if mitigation cannot be applied within 10 minutes.
+
+1) Canary fallback to alternate model variant (stateless mitigation) — 0–2 minutes
+   - Use request-router policy to reroute priority=high to a compatible model variant with lower kernel latency (e.g., gpt-q4_0 -> gpt-q8_0).
+   - API example: PATCH /admin/routing/policy
+     Payload (example):
+     {
+       "route":"/v1/generate",
+       "selector":{"priority":"high"},
+       "fallback":"gpt-q8_0-small",
+       "timeout_ms":1000
+     }
+   - Verify: p95 for high priority drops within 2 minutes.
+
+2) Force preemption window (kernel-shepherd soft shrink) — 2–6 minutes
+   - Enable soft-preempt on the affected pool: curl -X POST http://kernel-mapper:9100/admin/soft_preempt -d 'shard=shard-7&window_ms=50'
+   - This instructs kernel-scheduler to allow eviction points after each kernel batch to service high-priority queue.
+   - Monitor: kernel_enqueue_latency p50/p95 and high-priority p95.
+
+3) Drain or throttle low-priority long tail requests — 3–10 minutes
+   - Apply a per-route throttle: /admin/quotas -> add token-bucket for low priority: rate=5rps, burst=10.
+   - For sessions with known large sequence lengths, mark as "background" and move to background queue via request metadata tag.
+
+4) Emergency scale-up (if latency continues) — 5–15 minutes
+   - Temporarily allocate additional shard capacity: increase desired_shards for pool-id in autoscaling API. Example: PATCH /admin/pool/pool-4/scale {"desired_shards": 8}
+   - Note: scaling takes 2–8 minutes depending on available nodes. Use only if fallback/preempt fail.
+
+Long-term fixes and scheduler patches (post-incident)
+-----------------------------------------------------
+- Implement priority-aware kernel credit accounting (design doc reference in related_pages).
+- Add bounded preemption points in long-running kernels (op-level changes) to reduce blocking windows > 50ms.
+- Improve request-router hinting: attach estimated-kernel-cost to incoming requests (model-size, sequence length) so kernel-mapper can make informed placement.
+- Add acceptance tests in benchmarking suite to simulate priority-inversion patterns (see Benchmarking and Validation).
+
+Benchmarking and validation
+--------------------------
+Purpose: ensure mitigations bring back SLOs and regression tests prevent reintroduction.
+
+Required benchmarks to run after mitigation and before merge:
+- Priority inversion synthetic test (recommended harness: perf-bench/priority-inversion):
+  - Scenario: 20% high-priority short requests (seq_length 32), 80% low-priority long requests (seq_length 1024) for 10 minutes.
+  - Assertions: high-priority p95 < 120ms, overall GPU utilization < 90%, kernel_queue_skew < 2x for >2m windows.
+- Kernel preemption microbench: measure kernel context-switch overhead after adding preemption points; target p50 additional overhead < 8ms.
+
+Configuration matrix (example table):
+| variable | accepted threshold |
+|---|---|
+| high-priority p95 | < 120ms |
+| high-priority p99 | < 300ms |
+| kernel_queue_depth (per-shard) | < 25 |
+| gpu_active_kernels | < 16 |
+| kernel_enqueue_latency p99 | < 40ms |
+
+Release notes and changelog template
+-----------------------------------
+When shipping scheduler changes include the following fields in the runtime release notes:
+- Summary of change (one line)
+- Impacted components: kernel-mapper, runtime-shepherd
+- Behavioral change: preemption, credit accounting, queue ordering
+- Feature flags required and safe rollout steps
+- Benchmarks run and results (attach CSV)
+
+Example entry:
+- Title: Add bounded preemption windows to kernel-scheduler
+- Date: 2026-02-04
+- Rollout: feature flag runtime.scheduler.preempt_v2, canary 10% pools -> 50% -> 100% over 6 hours
+- Benchmarks: priority-inversion synthetic passed; high-priority p95 improved from 220ms -> 96ms; overhead p50 +4ms.
+
+Known issues and caveats
+-----------------------
+- Preemption can increase tail latency for low-priority requests if preemption frequency is too high. Use conservative windows.
+- KV-cache hot state (hot prefixes) may hold GPU kernels indirectly via synchronous reads. If kv-cache is the causal chain, throttling requests or warming prefixes is recommended rather than kernel preemption.
+- Hardware-level constraints (older CUDA drivers) may not support fine-grain preemption; fall back to routing-level mitigations.
+
+Runbook: play-by-play checklist (for oncall)
+-----------------------------------------
+1) Acknowledge alert and page runtime oncall.
+2) Collect traces and kernel queue snapshot (Profiling and data collection).
+3) Apply routing fallback to alternate variant and observe (Immediate mitigation #1).
+4) If not resolved in 2 minutes, enable soft-preempt (Immediate mitigation #2).
+5) If p95 still > threshold after 10 minutes, apply throttles and notify infra to scale shards.
+6) When resolved, note incident, attach collected artifacts to Jira incident, and create post‑mortem if SLOs were missed for >30 minutes.
+
+Ownership, SLAs and escalation
+------------------------------
+- Primary owner: eng-serving-runtime oncall (rotation: runtime-oncall@redwood.com).
+- Secondary owner: runtime-platform team (pager: runtime-platform-leads).
+- Escalation: after 10 minutes without improvement escalate to Senior Runtime Engineer (pager) and schedule a conference bridge.
+- SLOs referenced: hosted API p95 goal = 80ms (small sequences), hard SLO = 200ms; see product docs for customer-facing thresholds.
+
+Post-incident actions and tickets
+--------------------------------
+- Create a ticket in PROD-OPS with label priority-inversion and link traces + kernel queue snapshots.
+- If mitigation involved feature-flag changes, submit a PR that reverts the quick fix and replaces with long-term scheduler patch behind the flag.
+- Add a new unit/regression test to perf-bench suite that reproduces the incident pattern.
+
+References and related pages
+----------------------------
+- Kernel scheduler spec: see related pages above.
+- Runtime profiling guidelines: see related pages above.
+- Perf harness: git://repo/perf-bench (priority-inversion harness).
+
+Appendix: common PromQL and CLI snippets
+---------------------------------------
+- High-priority p95 (example):
+  histogram_quantile(0.95, sum(rate(app_request_duration_seconds_bucket{priority="high"}[5m])) by (le))
+
+- Kernel queue depth per shard:
+  sum(kernel_queue_depth) by (shard, priority)
+
+- Snapshot kernel queues:
+  curl -sS http://kernel-mapper:9100/debug/queues > /tmp/kernel-queues-$(date +%s).json
+
+- Enable feature flag on canary:
+  curl -X POST http://featuregate:8080/api/v1/flags -d '{"flag":"runtime.scheduler.preempt_v2","state":"on","target":"canary-pool-*"}'
+
+Contact and maintenance
+-----------------------
+- Maintainers: Lena Ortiz (runtime-shepherd), Priya Nair (kernel-mapper).
+- Quarterly review: schedule after any two incidents or post-major-release.
+
+End of document.

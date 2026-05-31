@@ -1,0 +1,136 @@
+Service Health Orchestration: Decision Graph & Observability Spec
+
+Overview
+
+Purpose: This document defines the Service Health Orchestration decision graph, the required telemetry to support it, and the observable artifacts (dashboards + alerts + runbook actions) platform operators use to preserve customer SLOs during performance and capacity incidents. It is intended for platform operators, SREs, and services authors who onboard workloads to Redwood’s inference planes.
+
+Scope: Applies to all multi-tenant inference control-plane and runtime services (api-gateway, route-proxy, batch-router, kv-cache, runtime-executor). Does NOT describe model-level quality regressions (see eng-serving-runtime/llm-quality-regression-alerting-and-dashboard-guidelines).
+
+Goals
+- Provide a deterministic operator decision graph for common degradation patterns (latency tail, token-cost spikes, KV-cache thrashing, GPU OOMs).
+- Standardize dashboards and alert rules so first responders have consistent context across regions and model families.
+- Reduce mean time to mitigation by prescribing automatic actions and safe manual interventions.
+
+Owners & Contacts
+- Primary owner: eng-platform - Observability team (oncall: platform-observability@redwood.com)
+- Secondary owners: eng-serving-runtime, eng-sre oncall rotation
+- Pager: platform-pager (see oncall handbook for schedule)
+
+SLOs referenced
+| SLO | Target | Component owner | Notes |
+| --- | --- | --- | --- |
+| API 95th perc latency (inference request) | < 250ms | eng-serving-runtime | Measured at route-proxy before batching |
+| Token-generation throughput (tenant-level) | >= committed | eng-platform | Compared against tenant commit window |
+| Control plane availability | 99.95% monthly | eng-platform | Includes routing and metadata APIs |
+
+Decision Graph (high level)
+1) Detect degradation class (input): alerting signals grouped by signature.
+   - Latency tail: 95/99/99.9pct latency increases, request queue depth rising, longer GPU service times.
+   - Cost/token spike: sudden increase in tokens billed or token generation rate vs baseline.
+   - KV-cache thrash: high eviction rate, kv-cache miss ratio increase, prefix-miss correlated with latency.
+   - Capacity preemption/oom: pod restarts, OOMKilled, GPU preemption metrics.
+
+2) Map class -> containment actions (automatic) -> mitigation actions (operator/manual) -> postmortem triggers.
+
+Containment actions (examples)
+- Soft-throttle low-priority tenants (auto): reduce throughput target by 30% for tenants with priority = standard when cluster SLO crossing threshold.
+- Switch to model-variant fallback: route to quantized model variant if model-variant-fallback eligibility policy is enabled.
+- Prefix-KV-local-read bias: temporarily bias reads to local dense shard to reduce network hops for hot prefixes.
+
+Mitigation actions (operator-run)
+1. Assess impact via standardized dashboard (see Dashboard spec below).
+2. If KV-cache thrash: trigger cache shard rebalance job (manual button) or increase cache size by 10% (paramized via autoscaler).
+3. If latency tail with high queue depth: enable burst pool (operator toggle) for impacted region and move a subset of tenant routes to reserved GPU pool.
+4. If GPU preemption/OOMs: cordon affected hosts, trigger live-migration and failover policy for in-flight requests.
+
+Escalation and Postmortem Triggers
+- Auto-open postmortem if any incident matches: > 30m SLO burn at 99.9pct or > 5 customer-impacting 1:1 escalations in 24h.
+- Notify product & customer success for tenants where sustained throughput < 50% for > 1 hour.
+
+Telemetry Minimum Viability Matrix (what must be present for a service to participate)
+| Signal category | Key metrics (Prometheus/Grafana) | Reason / consumer |
+| --- | --- | --- |
+| Latency distributions | route_proxy_request_duration_seconds{quantile} / 95/99 histogram | Detect tail and service degradation for decision graph |
+| Queue depth & processing time | request_queue_depth{service,region} ; worker_process_time_ms | Suggests backpressure and threading issues |
+| Token-level accounting | tokens_generated_total{tenant,model} ; token_rate_per_min | Cost spikes and billing mismatches, customer-facing alerts |
+| KV-cache health | kv_cache_hit_ratio ; kv_cache_evictions_total ; kv_cache_local_hit_ratio | Drives cache-rebalance and prefix-localization actions |
+| GPU health | node_gpu_memory_bytes_free ; node_pod_gpu_oom_count | To detect preemption and OOM trends |
+| Pod lifecycle | kube_pod_status_phase ; pod_restart_count | Basic operational signal for failover decisions |
+
+Dashboard Spec (panels required per service)
+- Overview panel (single row)
+  - Global SLO slider (current burn rate), 95/99 pctl latency sparkline, token throughput trend.
+- Latency & Queueing row
+  - Heatmap of 95/99 per region/model-family, request queue depth timeseries, worker process time histogram.
+- Cache & Model variants row
+  - KV-cache hit ratio, eviction rate, % traffic on fallback model-variant.
+- Resource health row
+  - GPU memory utilization by host, pod OOM events, node CPU steal.
+- Affected-tenants row (table)
+  - Tenant id, priority, current throughput vs commit, estimated impact score
+
+PromQL examples (copyable)
+- 95th latency (route-proxy): histogram_quantile(0.95, sum(rate(route_proxy_request_duration_seconds_bucket[5m])) by (le, route))
+- KV-cache miss ratio: 1 - (sum(rate(kv_cache_hits_total[5m])) by (shard) / sum(rate(kv_cache_requests_total[5m])) by (shard))
+- Request queue depth by region: sum(queue_depth) by (region)
+
+Alerting Rules (examples, severity mapping)
+- Sev1 (Pager): sustained 99.9pct latency > 2x SLO for 10m AND queue_depth > 100 for the region.
+- Sev2 (Slack + Runbook): KV-cache eviction rate > 200 evictions/min for 5m AND kv_cache_hit_ratio < 0.6.
+- Sev3 (email): token throughput > 3x baseline (non-billing window) for 15m.
+
+For each rule include: name, expression (PromQL), for (duration), severity, owner_team, automated_action.
+
+Runbook excerpts (play-by-play for common scenarios)
+Scenario A: Latency tail (95/99 rise)
+1. Acknowledge pager and open decision canvas (link in dashboard).
+2. Check Overview -> impacted services and top 5 tenants (table).
+3. If queue_depth > 200: enable burst pool (operator toggle) -> monitor for throughput stabilization for 5m.
+4. If cache miss ratio increased in same window: run cache-shard-inspect (CLI) to list hot prefixes, then trigger rebalance if > 3 hot shards.
+5. If degraded > 45m: execute canary rollback to last known-good model-variant for impacted routes and start postmortem.
+
+Scenario B: KV-cache thrash
+1. Open cache health panel and run the query for hot prefixes.
+2. If one shard shows > 70% evictions, trigger cache-rebalance job: 
+   CLI: redwoodctl cache rebalance --shard <shard-id> --max-threads 8
+3. If rebalance fails or eviction persists: escalate to eng-serving-runtime oncall and consider increasing cache capacity via autoscaler policy: autoscaler:cache-size-scale +10%
+
+Manual tools & CLI snippets
+- Open decision canvas via UI: [Platform -> Decision Canvas] (internal link)
+- redwoodctl: useful commands
+  - redwoodctl observe dashboard open --service route-proxy --region us-west-2
+  - redwoodctl cache rebalance --shard <id> --max-threads 8 --dry-run
+  - redwoodctl tenant throttle --tenant <id> --percent 30 --reason "auto-containment"
+
+Safe rollout steps for new automated containment
+1. Feature flag switch behind platform-safety-cage.
+2. Deploy to staging and run synthetic integrity suite (latency & correctness).
+3. Canary in single region for <24h with 0.1% of traffic.
+4. Increase to pilot tenants (10 tenants) for 48h and collect SLO telemetry and false-positive rate.
+5. Full rollout and add to automation-oncall rotation.
+
+Retrospective & tagging requirements
+- Every incident resolved via decision-graph actions must be tagged with incident:decision-graph in PagerDuty ticket.
+- Postmortem template must include: trigger signals, containment action taken, time to mitigation, false-positive control metrics, suggested decision-graph changes.
+
+Roadmap alignment & next work items (Q1-Q3 2026)
+- Q1 2026: Instrument per-tenant token-latency histograms and integrate with tenant-impact scoring.
+- Q2 2026: Implement safe automated reroute to fallback model variants with shadow validation.
+- Q3 2026: Deploy ML assisted incident classifier that proposes containment action from historical incidents.
+
+Appendix: Example Grafana dashboard excerpt (JSON snippet placeholder)
+{
+  "dashboard": {
+    "title": "Service Health Orchestration - route-proxy",
+    "panels": [/* panels as defined above - redacted for brevity */]
+  }
+}
+
+Related documents & links
+- Platform runbooks: /confluence/eng-platform/runbooks/platform-operator-resumption-after-region-split-and-traffic-reconverge-2026
+- Observability onboarding guide: /confluence/eng-platform/dashboards-and-alerts/platform-observability-sli-onboarding-playbook-2026
+
+Change log
+- 2025-11-02: Initial draft (Priya Anand).
+- 2025-12-10: Added PromQL examples and KV-cache rebalance CLI (Marcus Li).
+- 2026-02-15: Finalized escalation thresholds and roadmap (Dana Carroll).

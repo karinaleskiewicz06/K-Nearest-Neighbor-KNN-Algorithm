@@ -1,0 +1,165 @@
+GPU node attach/detach idempotency tests and Terraform contract
+
+Summary:
+This document defines an idempotency contract and automated test harness for GPU node attach/detach operations (including network interface, NVMe volume, and device plugin lifecycle) and the Terraform modules that drive them. The goal is to prevent races that produce orphaned attachments, double-attaches, or leaked cloud resources during fast scale events and CI-driven infra changes.
+
+Why this matters:
+- Orphaned attachments create gradual capacity loss and billing surprises.
+- Double-attaches or mid-attach failures can break serving runtimes and KV-cache warmups.
+- Terraform-level races are a frequent root cause during rapid canary promotion and multi-account bursts.
+
+Scope:
+- Cloud providers: AWS (primary), GCP reference notes.
+- Surface area: GPU node lifecycle, eni/eni-attachment, EBS/NVMe device attachment, TF resource move, and node termination flows.
+- Automated tests: unit-level TF contract tests, integration harness that runs in ephemeral sandbox account, and CI gates for module promotion.
+
+Idempotency contract (plain-language):
+1) Attach operations must be safe to re-run within a 120-second retry window: repeated attach attempts must be no-op if the cloud resource is already attached to the expected node identity.
+2) Detach operations must be retryable: if the device is already detached (or detached-but-not-yet-terminated), the operation must succeed and leave the system in a consistent state.
+3) Partial failures must be detectable and reconciled automatically: any transient mismatch between Terraform state and cloud reality must be resolved by a reconciliation step (see Reconciliation policy).
+4) Strong-identity requirement: every attachment has a stable, unique attachment token (attachment_id) that includes a deployment id, tenant id, and request nonce. This token is persisted in tag/metadata and used to gate idempotency checks.
+
+Concrete definitions and SLOs:
+- Idempotency retry window: 120s (configurable per provider).
+- Reconciliation latency SLO: 10 minutes for 95% of mismatch events to be reconciled automatically. Critical reconciliation: 30 minutes to manual operator action.
+- Acceptance threshold for CI: <0.1% false-positive orphan detection in the integration harness over 1,000 test attach/detach permutations.
+
+Terraform module interface (contract):
+- Module inputs (required):
+  - node_id (string): canonical node identifier used by runtimes
+  - attachment_token (string): unique token used to label cloud attachment
+  - desired_state (string): "attached" | "detached"
+  - force_detach_timeout (number): seconds to wait before forcing detach
+  - provider_region (string)
+  - enable_reconciliation (bool)
+
+- Module outputs (required):
+  - attachment_id (string): cloud provider attachment id
+  - last_operation_status (string): "success" | "pending" | "failed"
+  - diagnostics_url (string): link to the ephemeral run logs for the operation
+
+API-level invariants the module must enforce:
+- If desired_state == "attached": either attachment_id points to a cloud attachment owned by attachment_token and node_id OR the module triggers a bounded attach attempt and returns last_operation_status==pending while the attach finishes asynchronously.
+- If desired_state == "detached": ensure no block device mapping and no provider-level attachment referencing node_id or attachment_token. If a race is detected the module must annotate state with reconciliation=true and emit a diagnostic event.
+
+Example Terraform snippet (appendix A):
+```
+module "gpu_attach" {
+  source = "git::ssh://git.internal.redwood/scm/modules/gpu-attach.git//aws"
+  node_id = local.node_name
+  attachment_token = format("%s-%s", var.deployment_id, random_id.attach_hex.hex)
+  desired_state = "attached"
+  force_detach_timeout = 60
+  provider_region = var.region
+  enable_reconciliation = true
+}
+```
+
+Acceptance tests and CI gating:
+1) Unit/contract tests (fast): run in PR for module code change. Tests assert pure-Terraform plan semantics and that the module always emits stable tags. Tools: terratest (Go), kitchen-terraform (Ruby), and a small python harness that verifies tag schemas.
+2) Integration harness (slow): runs in ephemeral sandbox AWS account. The harness exercises:
+   - concurrent attach(×10) with same attachment_token -> expect single attachment returned and all callers succeed (idempotent).
+   - concurrent detach(×10) during attach -> expect final state detached and no orphaned volumes.
+   - simulated provider throttling and mid-attach network failures.
+3) Canary in staging: promote module to a limited subset of nodes (5% of fleet) and run synthetic attach/detach workload for 1 hour. Metrics collected: attach-failure-rate, orphaned-attachment-count, reconciliation-duration.
+4) Promotion gate to main registry: requires green unit tests, integration harness < 0.1% orphan events, and canary metrics within defined baselines.
+
+CI Job definitions (example):
+- job: tf-module-idempotency-test
+  runs-on: runner-gpu-ci-small
+  steps:
+    - checkout
+    - setup-go (for terratest)
+    - go test ./test/contract -timeout 10m
+    - kitchen test idempotency-suite
+    - publish-artifact: test-result.json
+
+Integration harness design:
+- Isolated AWS sandbox accounts are provisioned by infra-ci with 1 GPU node template, 4 small workloads used to stress attach concurrency.
+- Each test run is labelled with run_id and writes a run_manifest to S3 (path: s3://redwood-infra-test/{run_id}/manifest.json) for forensic analysis.
+- Harness includes a teardown verifier that asserts zero unattached block devices older than 5 minutes unless intentionally preserved by test.
+
+Observability and telemetry contract:
+Emit the following telemetry events (structured JSON) to the infra event-bus (kafka) under topic infra.gpu.attach: 
+- attach.requested {attachment_token, node_id, request_ts, requestor} 
+- attach.succeeded {attachment_id, attachment_token, node_id, duration_ms} 
+- attach.failed {attachment_token, node_id, error_code, retry_count} 
+- reconcile.started {attachment_token, node_id, reason} 
+- reconcile.completed {attachment_token, outcome, duration_ms} 
+
+Metrics to surface in dashboards:
+- attach_success_rate (1m, 5m windows)
+- orphaned_attachment_count by region
+- reconcile_latency_p50/p95
+- terraform_apply_error_rate for modules/gpu-attach
+
+Alerting thresholds (example):
+- P1: orphaned_attachment_count > 5 across PROD in 15 minutes -> page infra-sre escalation channel and runbook (immediate manual remediation).
+- P2: reconcile_latency_p95 > 20m for 10% of events in 1 hour -> notify infra-oncall Slack channel and create incident if trending.
+
+Runbook: detected idempotency contract violation (operator steps):
+1) Triage: check infra.gpu.attach logs for run_id and attachment_token.
+2) Run verification script (internal) to compare TF state vs cloud state: ./scripts/verify-attachment --run-id <run_id> --attachment-token <token>
+3) If orphaned volume exists and age < 1 hour: snapshot then detach and tag for reclamation.
+4) If orphaned volume exists and age > 1 hour: escalate to infra-sre with run manifest, attach diagnostic logs, and quarantine node.
+5) If Terraform state drift is detected: mark the module version as blocked in the module registry, roll back to last good version, and trigger a gated reapply for affected accounts.
+
+Post-incident reconciliation steps:
+- Run full fleet scan (ad-hoc job) that asserts node->attachment uniqueness and reports to /alerts/attachment-audit.
+- Create follow-up remediation RFC if recurring (>3 incidents in 30 days).
+
+Safety knobs and defensive patterns built into modules:
+- Tag-based ownership: every attachment includes attachment_token and deployment metadata in provider tags/labels.
+- Optimistic-locking via Dynamo (AWS) or GCS-backed lease store: modules take a short-lived lease before performing cloud-level attach/detach to avoid cross-account races.
+- Bounded retry policy with jitter and exponential backoff: 5 retries, base 250ms, cap 6s.
+- Reconciliation controller: asynchronous background reconciler (k8s controller or lambda) that inspects attachments and aligns TF state.
+
+Terraform CI / promotion lifecycle (recommended):
+1) PR with module changes triggers contract tests.
+2) If green, open a gated integration run (ephemeral sandbox).
+3) Integration green -> create module release candidate.
+4) RC canary to staging fleet (5% nodes) for 6 hours.
+5) If canary stable, promote to registry and create a deprecation window for older versions.
+
+Ownership and responsibilities:
+- Module maintainers: eng-infra/terraform-team (primary)
+- Integration harness: eng-infra/ci-cd team (owns sandbox accounts)
+- Reconciler and telemetry: eng-platform/observability (instrumentation)
+- Oncall owner for P1 pages: eng-sre (pager rota)
+
+Appendix A: Example verification script (excerpt)
+```
+#!/usr/bin/env python3
+# verify-attachment --run-id <run_id> --attachment-token <token>
+import boto3, json, sys
+s3 = boto3.client('s3')
+# pseudo-code: fetch manifest, compare ec2.describe_volumes filters by tag:AttachmentToken
+# If mismatches: print JSON with 'orphaned_volumes' list and exit code 2
+```
+
+Appendix B: Test matrix (summary table):
+| Test case | Concurrency | Fail mode simulated | Expected outcome | Notes |
+|---|---:|---|---|---|
+| Concurrent attach (same token) | 10 | none | single attachment created, all calls succeed | asserts idempotency |
+| Attach during detach | 8 | network interruption | final state detached or single attachment owned by token | tests race handling |
+| Provider throttle recovery | 3 | 429/Throttling | retries with backoff, eventual success or controlled failure | decorrelated by jitter |
+| Terraform reapply with missing attachment | 1 | tf state removed | reconciler creates/marks for operator action | state drift test |
+
+Related pages and references:
+- infra runbooks: gpu-warm-pool-eviction-minimizer-runbook (link internal)
+- module registry policy (link internal)
+- reconciler design doc (eng-infra/team-wiki/reconciler-aws-lease-store - link)
+
+Next steps and open questions:
+- Implement provider-agnostic lease store reference (Dynamo vs CloudSQL) and run performance baseline.
+- Add deterministic stress tests to the nightly chaos grid that include Terraform reapply during attach storms.
+- Decide SLA for cross-account attach races (currently recommended manual escalation).
+
+Contact and ownership notes:
+- Primary contact: Aisha Malik (aisha@redwood.ai)
+- Secondary: eng-infra oncall rotation
+
+Document history:
+- 2024-11-05 created by Aisha Malik
+- 2024-12-18 integration harness prototype results added
+- 2025-02-14 added reconciliation SLO and CI gating steps

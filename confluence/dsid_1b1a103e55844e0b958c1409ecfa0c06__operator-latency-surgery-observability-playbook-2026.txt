@@ -1,0 +1,126 @@
+Operator latency surgery: observability playbook for tail-latency incidents
+
+Summary:
+This playbook describes the "operator latency surgery" workflow: a focused, observable-first investigation and remediation procedure for stubborn tail-latency incidents in LLM inference stacks. It is intended for platform operators and on‑call engineers who need to diagnose and restore service latency SLOs (p50/p95/p99) while preserving throughput and cost constraints.
+
+Scope and intent:
+- Scope: production runtime services that participate in inference request paths (edge/ingress proxies, routing, batching, KV prefix cache, model runtime workers, GPU scheduler, and dependent infra such as redis/cassandra).
+- Intent: give operators a repeatable prioritized checklist for fast detection, triage, mitigation, and post-incident learning. Emphasize safe mitigations (non-destructive), observability hygiene, and owner-driven RCA.
+
+When to run this procedure:
+1. Any p99/p999 token-latency SLO breach longer than 5 minutes.
+2. User-facing latency degradation reported that affects multiple tenants or routes.
+3. Sustained increase in tail latency without corresponding token-cost changes (suggests infra, not workload).
+
+Pre-flight checks (first 3 minutes) — quick facts to gather:
+- Which routes / model_ids are affected? (console request traces or route labels)
+- Which regions and availability zones show symptoms?
+- Is the degradation correlated with traffic spikes, background deploys, or scheduled maintenance?
+- What SLOs are burning? p50/p95/p99 token latency heatmap.
+
+Observable-first investigation (ordered, with PromQL/ES examples):
+1) Confirm alert and scope:
+   - Check SLO dashboard and traces. Look for sudden jumps in p95/p99 across: runtime_proxy, batcher, model_worker.
+2) Heatmap of request categories by latency and token_count (Prometheus example):
+   - PromQL: sum by(route,region)(histogram_quantile(0.99, sum(rate(request_duration_seconds_bucket[2m])) by (le, route, region)))
+3) Check batching and queueing backlog:
+   - PromQL: sum(rate(batcher_queue_size[1m])) by (queue_name, model_id) and histogram of batch sizes: rate(batcher_batch_size_sum[1m]) / rate(batcher_batch_size_count[1m])
+4) Inspect kernel / runtime worker stalls and GPU scheduling:
+   - Metric: model_worker_busy_seconds / model_worker_cpu_seconds_total, and gpu_scheduler_pending_jobs.
+5) KV prefix cache and cold miss flood:
+   - Query: rate(kv_cache_miss_total[5m]) by (cache_shard); check prefix miss amplification.
+6) Downstream datastore latency (Redis/Cassandra):
+   - ES/Kibana query: latency > 10ms for redis GETs in the last 5m, or cassandra read95 > 200ms.
+7) Correlate with deploy/infra events:
+   - Look at deployment change events, kernel upgrades, node reboots in the timeframe.
+
+Quick decision matrix (on-call):
+- If batcher queueing high & p99 up: prefer emergency batching cap reduction or route-level soft-queueing.
+- If gpu_scheduler backlog with idle workers: check container placement and preemption logs.
+- If kv_cache miss amplification: enable read-through cache warmup or limit tenant prefix eviction.
+- If downstream datastore slow: route to degraded datastore tier or enable local fallback cache.
+
+Safe mitigation recipes (apply in controlled order):
+1) Traffic shaping (soft):
+   - Apply route-level slow-down: increase sampling ratio for heavy routes, reduce max_tokens and max_input_length for degraded route. Example RPC: curl -X POST https://console.internal/api/route-configs/{route} -d '{"soft_quota":0.7}'
+2) Batching caps:
+   - Reduce max_batch_size on the batcher (non-destructive). kubectl patch deployment batcher --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/env/0/value","value":"64"}]'
+3) Circuit isolation:
+   - Enable per-tenant circuit-breaker for noisy tenant IDs using the OPA policy gate. (See OPA policy examples below)
+4) Model fallback:
+   - Route to a compatible lower-latency quantized model variant with A/B fallback; flip traffic through the routing API with gradual steps (10% -> 50% -> 100%).
+5) Operator hotfixes:
+   - If kernel-level stalls suspected, trigger an operator-safe-cache-drop on the affected shard with the internal tool: /opt/bin/cachectl drop-shard --shard x --grace 30s
+
+Alert tuning and recommended thresholds (table):
+| Component | Metric | Example threshold (global) | Operator action |
+|-----------|--------|---------------------------:|-----------------|
+| runtime-proxy | request_duration_seconds p99 | > 1500ms for 5m | Run entire playbook / page oncall |
+| batcher | batcher_queue_size | > 500 requests backlog | Reduce batching cap, disable elastic-batching |
+| model_worker | model_worker_cpu_steal | > 10% over 5m | Investigate node preemption / GPU contention |
+| kv_prefix_cache | kv_cache_miss_rate | > 1k misses/min | Warmup cache shards, lower eviction aggressiveness |
+| redis | redis_avg_latency_ms | > 20ms p95 | Failover to read-replica, cache local copies |
+
+Note: thresholds must be tuned by region and tenant tier; alert noise reduction is prioritized over aggressive global firing.
+
+Example Prometheus queries (copy/paste):
+- p99 by route: histogram_quantile(0.99, sum(rate(request_duration_seconds_bucket[5m])) by (le, route))
+- batcher backlog: sum(batcher_queue_size) by (region,queue)
+- gpu pending: sum(gpu_scheduler_pending_jobs{state="pending"}) by (region)
+
+Tracing and flamegraphs:
+- Use the tracing console to inspect a set of slow traces (p99 samples). Key spans to inspect: runtime-proxy->batcher->kv-prefix-cache->model_worker->gpu-kernel. Export flamegraph of top 100 traces and look for repeated hot spans.
+
+Operator commands and scripts (examples):
+- Check pod restart and OOMs: kubectl get pods -l app=model_worker -o json | jq '.items[] | {name:.metadata.name, restarts:.status.containerStatuses[0].restartCount}'
+- Temporarily reduce batch size for a deployment: kubectl rollout restart ds/batcher --patch='{"spec":{"template":{"spec":{"containers":[{"name":"batcher","env":[{"name":"MAX_BATCH","value":"32"}]}]}}}}'
+- Re-route traffic to fallback model: curl -X POST https://routing.internal/api/switch -d '{"route":"/v1/generate","variant":"quantized-v2","step":0.1}'
+
+Post-mitigation verification: checklist (do not skip):
+1. Confirm p99 has returned below threshold for 10 minutes.
+2. Confirm token throughput is within expected bounds (no silent throttling).
+3. Verify no increased error rates or hallucination regressions introduced by fallback models (run quick eval suite).
+4. Collect conservative trace samples and persist a zipped artifact for RCA.
+
+Post-incident actions and RCA template:
+- Owner: assign a 3-person RCA team (owner, telemetry lead, infra lead).
+- Timeline: produce an initial RCA within 48 hours and a mitigation roadmap within 7 days.
+- RCA should include: root cause hypothesis, evidence (graphs, trace excerpts, CLI logs), corrective actions, and preventive work items (dashboards, alerts, platform changes).
+
+Observability hygiene and instrumentation improvements (recommended):
+- Tag requests with tenant_id, route, model_variant, model_version, and token_count at ingress.
+- Emit batcher-level histograms (batch_size, wait_ms) and instrument KV cache hit/miss with prefix labels.
+- Add a lightweight synthetic p99 canary per region that runs a 32-token generation every 30s.
+
+Owner and escalation contacts:
+- Primary oncall: platform-operators@redwood.internal (pager)
+- Secondary: runtime-infra@redwood.internal
+- Observability engineering owner: Priya Nambiar (priya@redwood.internal)
+
+Appendix A — OPA policy example (snippet):
+# allow request when tenant score < limit
+package routing
+
+default allow = false
+
+allow {
+  input.tenant_score < 0.8
+}
+
+Appendix B — Example artifact collection checklist:
+1) Export Prometheus query results (CSV) for key metrics 30m before and after mitigation.
+2) Save 50 p99 traces (trace IDs) and aggregate flamegraphs.
+3) Collect kube events, node kernel logs (dmesg), and GPU host logs for affected nodes.
+4) Archive batcher and model_worker logs for the incident window.
+
+Appendix C — Related dashboards to check:
+- Service overview: runtime p50/p95/p99 by route and model_variant
+- Batcher internals: queue size, batch size distribution, latency per batch
+- KV prefix cache: miss heatmap by shard and tenant prefix
+- GPU scheduler: pending queue, preemption events, device saturation
+
+Maintenance and review cadence:
+- Run a quarterly "latency surgery" game day: recreate noisy-tenant and datastore slow scenarios in the synthetic lab.
+- Maintain an annual review of alert thresholds following traffic growth and new model variants.
+
+Document owner: Sofia Alvarez (platform observability) — update this playbook when we add new routing primitives or when SLO definitions change.

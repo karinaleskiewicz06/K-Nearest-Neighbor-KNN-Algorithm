@@ -1,0 +1,276 @@
+Provision-to-Ready Automation Overview (GPU Fleet & Dedicated Capacity)
+
+h1. Overview
+This page describes the high-level architecture for Redwood’s *Provision-to-Ready* automation used to bring GPU nodes online for *Dedicated* pools (and, where applicable, shared fleet expansions). It defines pipeline stages, the readiness state model, boundaries between Fleet/Infra, Platform Control Plane, and SRE, and the operator-facing signals used to confirm a pool is safe to serve inference traffic.
+
+*Primary outcomes*
+- Reduce “time-to-ready” for new capacity by standardizing images, automating orchestration, and enforcing validated configuration gates.
+- Make fleet bring-up repeatable across regions and GPU types with minimal manual intervention.
+- Surface actionable failure reasons and provide safe remediations (retry, reimage, quarantine) with clear ownership.
+
+h2. Scope (what this overview covers)
+- Golden image channels (candidate/stable) and how they’re selected for new nodes.
+- Orchestrated steps: instance allocation → bootstrapping → cluster join → validations → Ready gating.
+- Readiness states and what signals are authoritative.
+- Observability: metrics, tracing, dashboards, and alerting for time-to-ready and failure modes.
+- Dedicated pool bring-up flow and staged rollout controls.
+
+h2. Non-goals
+- Detailed state machine transition rules (see ADR-017).
+- Deep implementation details of Terraform module layouts (see dedicated fleet Terraform conventions).
+- Customer-facing UX beyond exposing readiness status/failure reason fields to internal tooling.
+
+h1. Terminology
+- *Node*: a GPU worker VM/instance managed by Redwood (hosted/dedicated) running Kubernetes worker components.
+- *Pool*: a logical capacity group (e.g., Dedicated pool for a specific customer) mapped to a set of nodes and scheduling constraints.
+- *Golden image*: baked GPU worker image including OS hardening, NVIDIA driver, CUDA/NCCL, container runtime, kubelet settings.
+- *Provision-to-ready*: end-to-end process from “allocated” capacity to “Ready” node eligible to join serving pools.
+- *Validation*: pre-flight and post-flight checks that must pass before a node is marked Ready.
+- *Quarantine*: state for nodes that repeatedly fail validations or are deemed unsafe; nodes are excluded from serving and surfaced for remediation.
+
+h1. Architecture at a glance
+h2. Major components
+1) *Image Pipeline (Golden GPU Images)*
+- Produces versioned images, promotes candidate → stable, and supports rollback.
+- Ensures driver/CUDA/NCCL parity for a target GPU type and region.
+- Emits provenance (build metadata, commit refs, base image, CVE patch level).
+
+2) *Provisioning Orchestrator (Fleet)*
+- Drives the step-by-step workflow for new nodes.
+- Applies retries/backoff where safe and initiates quarantine when thresholds are met.
+- Writes step events and validation summaries to the control-plane readiness service.
+
+3) *Node Bootstrap & Join (Fleet / Cluster Services)*
+- Cloud-init/user-data/bootstrap scripts configure the node and join it to the appropriate cluster.
+- Ensures baseline node config (kubelet/containerd/sysctls/disk layout/time sync) matches standards.
+
+4) *Validation Agent (DaemonSet on the node)*
+- Runs standardized checks and reports results (pass/fail + artifacts pointers).
+- Performs both pre-flight (before join) and post-flight (after join) checks depending on the check type.
+
+5) *Fleet Readiness Service (Control Plane)*
+- Source of truth for current readiness state and failure reason.
+- Stores validation artifacts pointers and step timing metadata.
+- Exposes APIs used by internal tooling (ops console) and by automation to enforce readiness gates.
+
+6) *Observability (SRE + Observability Eng)*
+- Metrics and traces for step durations, failure rates, state counts, and SLO computations.
+- Dashboards and alerts for time-to-ready, regression detection, and rollout safety.
+
+h2. Text diagram (data/control flow)
+*Terraform/IaC* → (creates instances + tags/outputs) → *Provisioning Orchestrator* → (bootstrap + join) → *Validation Agent* → (results/artifacts) → *Fleet Readiness Service* → (Ready gate) → *Serving Pool Membership*
+
+- Telemetry is emitted by orchestrator/agent/service to Grafana/Tracing.
+- Operators interact primarily via the readiness service APIs + dashboards.
+
+h1. End-to-end workflow
+h2. Dedicated pool bring-up (happy path)
+1) *Capacity request approved* (Dedicated expansion or new pool)
+   - Inputs: pool ID, region, GPU type, target node count, image channel (default: stable)
+
+2) *Terraform apply (Fleet/Infra)*
+   - Creates instances with standardized tags/metadata used by the orchestrator.
+   - Outputs: instance identifiers, pool metadata, image channel/version.
+
+3) *Allocated → Provisioning*
+   - Orchestrator detects newly allocated instances and begins provisioning.
+   - Bootstrap configures:
+     - NVIDIA driver stack (as baked) + runtime prerequisites
+     - containerd/kubelet baseline configuration
+     - time sync, kernel params, disk mounts
+
+4) *Cluster join*
+   - Node registers with the cluster and the validation agent DaemonSet becomes active.
+
+5) *Validating (pre-flight + post-flight)*
+   - Agent executes a configured checklist; results streamed/stored as artifacts pointers.
+   - Orchestrator aggregates step status and writes status/failure reason to readiness service.
+
+6) *Ready gating + pool membership*
+   - Only nodes in *Ready* are eligible to join serving pools.
+   - Serving control-plane enforces a hard gate (no Ready → no traffic).
+
+7) *Post-ready smoke/perf canary (pool-level)*
+   - A lightweight inference/perf canary validates “real workload readiness” (latency/throughput sanity, basic model load).
+   - Canary failures do not silently roll forward; they trigger rollback/quarantine policies depending on severity.
+
+h2. Workflow stages (standard names)
+The orchestrator and dashboards use a consistent set of step names for attribution.
+
+| Stage | Step name (metric tag) | Output | Typical owner |
+|---|---|---|---|
+| Allocation | allocated | instance visible + tagged | Fleet/Infra |
+| Provisioning | bootstrap | baseline OS/runtime config applied | Fleet/Infra |
+| Provisioning | join_cluster | node registered + agent scheduled | Fleet/Infra |
+| Validation | gpu_health | GPU health signals green | Fleet/Infra |
+| Validation | driver_parity | driver/CUDA/NCCL versions match expected | Fleet/Infra |
+| Validation | network_baseline | MTU/throughput checks pass | Fleet/Infra (consult NetOps) |
+| Validation | storage_baseline | disk layout + IOPS sanity | Fleet/Infra |
+| Validation | nccl_smoke | fabric all-reduce sanity | Fleet/Infra |
+| Validation | runtime_smoke | minimal runtime sanity (container pull, permissions) | Fleet/Infra |
+| Readiness | mark_ready | readiness state = Ready | Control Plane |
+| Post-ready | perf_canary | pool-level canary green | Fleet/Infra + Serving Runtime (consulted) |
+
+*Note:* exact ordering is designed to make failures actionable and reduce wasted work (e.g., fail fast on obvious GPU/driver issues before running longer tests). See the validation checklist draft for current ordering.
+
+h1. Readiness states (canonical model)
+The readiness service stores a *current state* for each node (and retains an event/history log for audit and debugging).
+
+*States*
+- *Allocated*: Instance exists and is associated with a pool/cluster, but orchestration has not started.
+- *Provisioning*: Bootstrap/join in progress.
+- *Validating*: Validation checks running and/or results pending.
+- *Ready*: Node is validated and eligible for serving pool membership.
+- *Quarantined*: Node is excluded due to repeated failures or unsafe signals; requires remediation.
+
+h2. Authoritative signals
+- *Orchestrator step events* are authoritative for stage progression and timestamps.
+- *Validation agent results* are authoritative for pass/fail of checks (with artifact pointers).
+- *Readiness service writes* are authoritative for the current state and for the failure reason surfaced to operators.
+
+h2. Failure reason model (operator-facing)
+For non-Ready states, the readiness service surfaces:
+- *failed_step*: the step name most responsible for the failure.
+- *failure_code*: normalized, low-cardinality reason (e.g., DRIVER_MISMATCH, GPU_ECC, NCCL_TIMEOUT, KUBELET_JOIN_FAILED).
+- *failure_summary*: short human-readable summary.
+- *artifacts_uri*: pointer(s) to logs/bundles.
+- *retryable*: boolean hint used by automation and oncall.
+
+h1. Validation gates (what “Ready” means)
+A node is only marked Ready after *all required validations pass* for its GPU type, region, and pool policy.
+
+h2. Required validations (baseline)
+- GPU health
+  - Detects ECC error thresholds, common Xid codes, missing devices, PCIe issues.
+- Driver/toolkit parity
+  - Ensures the running stack matches the image channel/version policy for that pool.
+- Kubernetes join correctness
+  - Node is schedulable, correct labels/taints applied, required DaemonSets running.
+- Network baseline
+  - MTU, basic throughput, and error counters sanity.
+- Storage baseline
+  - Disk mounted as expected; minimum IOPS sanity check.
+- NCCL smoke test (where applicable)
+  - Detects common fabric misconfigurations early; tuned for low false positives.
+- Runtime smoke test
+  - Container runtime sanity, basic permissions/paths, ability to run a minimal workload.
+
+h2. Optional / policy-driven validations
+- Region-specific network checks.
+- GPU-type-specific checks (e.g., different thresholds for A100 vs H100).
+- Pool-tier checks (Dedicated vs shared baseline).
+
+h2. Quarantine rules (high level)
+Nodes are quarantined when automation determines that retries are unlikely to succeed or that the node is unsafe.
+Typical triggers:
+- Non-retryable GPU health failures (e.g., repeated ECC or severe Xid).
+- Driver parity failures that indicate drift outside permitted versions.
+- Repeated validation failure beyond retry budget (step-specific max attempts).
+- Validation flake protections: if a check is known flaky, prefer bounded retries with jitter and do not quarantine aggressively unless failure persists.
+
+For exact thresholds and retry budgets, see the retry/backoff policy and quarantine policy pages.
+
+h1. Ownership boundaries and responsibilities
+h2. Fleet/Infra (GPU Fleet & Capacity)
+Owns:
+- Golden image pipeline and channel promotion/rollback for GPU worker images.
+- Provisioning orchestrator, step definitions, retry/backoff policy.
+- Terraform/IaC requirements for provisioning automation hooks (tags/outputs).
+- Validation agent configuration, packaging, and operational defaults.
+- Primary oncall response for provisioning step failures and image regressions.
+
+h2. Platform Control Plane
+Owns:
+- Fleet readiness service (persistence, APIs, authz).
+- Canonical readiness state machine implementation and schema.
+- Enforcement points in control plane (readiness gate before serving pool membership).
+- Audit events for readiness mutations and image channel changes.
+
+h2. SRE
+Owns:
+- SLO definitions, SLI calculation methodology, and error budget policy.
+- Alerting strategy (paging vs ticket), incident coordination for high-severity fleet readiness regressions.
+- Observability standards review (metric naming, cardinality constraints, retention).
+
+h2. Escalation guidance (quick)
+- *Provisioning step failures (bootstrap/join/agent)* → Fleet/Infra first, consult SRE for incident.
+- *Readiness service/API errors or state mutation issues* → Platform Control Plane.
+- *Alert noise, SLI discrepancies, dashboard gaps* → SRE/Observability.
+
+h1. Observability and SLOs
+h2. Core SLIs (as measured)
+- *Time-to-ready*: duration from first “allocated” timestamp to transition into “Ready”.
+- *Success rate*: % of allocated nodes that reach Ready without quarantine within the measurement window.
+- *Quarantine rate*: % of nodes that end in Quarantined per pool/region/GPU type.
+
+h2. Target SLOs (initial; subject to tuning)
+- Time-to-ready:
+  - P50 ≤ 25 minutes
+  - P95 ≤ 60 minutes
+- Success rate: ≥ 98% of nodes reach Ready (excluding deliberate cancellations).
+
+Exact SLO language, paging thresholds, and error budget policy live in the SRE reliability initiative page.
+
+h2. Telemetry (recommended metric set)
+Metrics are emitted with low-cardinality tags: region, gpu_type, pool_tier, image_channel, step, failure_code.
+Avoid per-node IDs in metric tags.
+
+Examples:
+- fleet_provision_time_to_ready_seconds (histogram)
+- fleet_provision_step_duration_seconds{step=…} (histogram)
+- fleet_provision_failures_total{step=…,failure_code=…} (counter)
+- fleet_readiness_state_count{state=…} (gauge)
+- fleet_validation_flake_rate{check=…} (gauge; derived)
+
+Traces:
+- One parent span per node provisioning run with child spans per step.
+- Trace tags follow the same cardinality constraints as metrics.
+
+h2. Dashboards
+Standard dashboards include:
+- Step latency breakdown (P50/P95) by region and GPU type.
+- Failure heatmap by step/failure_code.
+- Quarantine counts and top quarantine drivers.
+- Validation flake rate over time.
+
+h1. Rollout model and safety controls
+h2. Staged rollout
+Provision-to-ready automation is enabled progressively using feature flags:
+- Initially constrained to a single region and GPU type (e.g., us-east / A100).
+- Expanded by region and GPU type once success metrics hold for a sustained period.
+
+h2. Image channels
+- *candidate*: used for limited exposure; must pass validations and canary criteria.
+- *stable*: default for new capacity.
+
+h2. Rollback triggers (examples)
+- Sustained increase in validation failures (e.g., driver parity or NCCL smoke) correlated to an image version.
+- Time-to-ready P95 regression beyond agreed threshold.
+- Systemic readiness service/API errors preventing gating.
+
+Rollback actions may include:
+- Reverting pool image channel stable ← prior stable.
+- Disabling the feature flag for automated gating (last resort; requires explicit approval).
+- Draining/quarantining only affected cohorts to reduce blast radius.
+
+h1. Known failure classes (high-level)
+- *Image/driver mismatches*: often manifest as driver parity failures, missing devices, or container runtime GPU errors.
+- *Cluster join issues*: kubelet registration failures, RBAC problems for agent, or taint/label misconfiguration.
+- *Fabric issues*: NCCL smoke timeouts/poor bandwidth; may be regional/network dependent.
+- *Observability regressions*: metric cardinality explosions (must be prevented by review + tests).
+
+For signatures and step-by-step remediation, see the triage runbook.
+
+h1. Security and compliance notes
+- Golden images follow hardening and patch cadence; changes should be auditable and reversible.
+- Readiness state mutations are authenticated/authorized; write access is limited to automation and approved operator roles.
+- Audit events are emitted for image channel changes and critical readiness mutations to support forensics.
+
+h1. References
+- ADR-017: Provision-to-ready readiness state machine
+- Golden GPU image build and rollbacks
+- Node configuration baseline (GPU workers)
+- Fleet readiness service (control plane)
+- Provision-to-ready SLO and error budget policy
+- Provision-to-ready failures triage runbook
+- Provision-to-ready dashboards catalog

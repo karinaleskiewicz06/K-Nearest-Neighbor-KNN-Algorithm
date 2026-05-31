@@ -1,0 +1,134 @@
+Probe heatmap -> rollout decision protocol
+
+Summary
+-------
+This document defines a reproducible protocol to convert probe heatmaps (telemetry-driven failure density views) into rollout decisions for model promotions, quantization migrations, and configuration changes. The goal is to make decisions auditable, time-bounded, and aligned with SLOs so product and ops can act consistently across hosted, dedicated, and private deployments.
+
+Scope
+-----
+- Applies to any promotion or rollout that is gated by probe-driven quality signals: model promotions, quantized rollouts, prompt rewrites, and routing policy changes.
+- Focuses on probe heatmaps produced by the eval harness and live shadow probes (not human labelling pipelines).
+- Excludes legislated/regulatory decisions (finance/compliance) - see separate compliance approval flow.
+
+Key definitions
+---------------
+- Probe heatmap: a time-windowed 2D histogram where rows are probes (slice identifiers) and columns are failure modes (fidelity, hallucination, latency, embeddings drift). Each cell contains count and a severity score.
+- Decision score (DS): a normalized scalar computed from heatmap aggregates that maps to GO / CAUTION / HOLD / ROLLBACK actions.
+- Tiered slice: pre-defined group of probes that share an SLO (e.g., CriticalTenantFlows, BillingIntents, LowRiskExplorations).
+
+Inputs required
+---------------
+1) Heatmap snapshot covering the last N hours (default N=24) with per-probe metrics: total_calls, failure_count, avg_severity, median_latency_ms, embedding_drift_score.
+2) Active rollout plan metadata: target model id, variant (quantized/float16), percent_traffic, scheduled_start.
+3) Baseline reference heatmap from the control population (previous model or canary).
+4) SLO manifest for target slices (SLO window, allowed error budget, latency SLO).
+5) Operational constraints: maintenance windows, capacity headroom, and dependency map.
+
+Decision scoring algorithm (summary)
+----------------------------------
+We compute three sub-scores and aggregate them into DS (range 0..100):
+
+- StabilityScore (SS): weighted failure density normalized by probe priority. Formula: SS = 100 * sum_p (w_p * (failure_count_p / max(1,total_calls_p))) / sum_p(w_p)
+- LatencyPenalty (LP): 10 * max(0, (median_latency_ms - latency_slo_ms) / latency_slo_ms) clipped at 30
+- DriftFactor (DF): 50 * embedding_drift_score_95pct_quantile normalized against baseline drift
+
+Final Decision Score: DS = clamp(SS + LP + DF, 0, 100)
+
+Action mapping (recommended)
+---------------------------
+- DS <= 15: GO (promote / continue rollout)
+- 15 < DS <= 35: CAUTION (slow rollout to 10% and schedule targeted human review within 4 hours)
+- 35 < DS <= 60: HOLD (pause rollout; trigger automated bisect & focused probes)
+- DS > 60: ROLLBACK (automatically revert to baseline variant and open incident ticket)
+
+Configuration table (defaults)
+-----------------------------
+- heatmap_window_hours: 24 -- Time window to compute the snapshot
+- probe_priority_weights: CriticalTenantFlows:10, BillingIntents:8, UXTextGen:3 -- Priority map used in SS
+- latency_slo_ms: 250 -- latency SLO used for LP calculation
+- drift_baseline_window_days: 7 -- Days used to compute baseline drift
+- slow_roll_threshold: 35 -- DS threshold to switch to slow rollout
+- human_review_timeout_hours: 4 -- Max time to complete targeted review
+
+Ownership and roles
+-------------------
+- Eval Oncall (primary): validates heatmap integrity, runs automated bisect and approves/requests human review.
+- Model Owner (secondary): responsible for quick triage of failing slices and submitting patch/rollforward.
+- Release Engineer: executes percent traffic adjustments and rollbacks in the serving control plane.
+- Oncall Platform SRE: monitors capacity/latency regressions and authorizes emergency rollbacks for tail latency incidents.
+
+Procedure: from snapshot to decision (operational runbook)
+------------------------------------------------------
+1. Fetch heatmap snapshot and baseline. Verify telemetry completeness (missing probes < 5% of expected).
+2. Run validation script to confirm probe schema and timestamps: 'python tools/heatmap_validate.py --snapshot /tmp/heatmap.json'
+3. Compute DS using the scoring algorithm and emit a decision document to /incidents/probe-decisions/YYYYMMDD-HHMM.json. Example: curl -X POST 'https://ops-api.internal/decisions' -d '{'ds': 27, 'action': 'CAUTION', 'top_slices': ['BillingIntents:charge-failure'] }'
+4. If action == GO: continue rollout. Log event and schedule a 24h follow-up check.
+5. If action == CAUTION: cap rollout at 10% for 6 hours, assign Model Owner and Eval Oncall for targeted human validation, and run automated bisect on top 5 degrading slices.
+6. If action == HOLD: pause rollout, mark the release as blocked in release tracker, and create a regression investigation ticket with pre-populated triage fields.
+7. If action == ROLLBACK: trigger automated rollback playbook and notify the incident channel #regression-ops with summary and rollback links.
+
+Automated bisect integration
+---------------------------
+- The decision pipeline calls the bisect service with the top N probes by (failure_count * avg_severity). The bisect run ID is included in the decision document.
+- If bisect identifies a single suspect change (probability > 0.7) the Model Owner must decide to either patch or rollback within human_review_timeout_hours.
+
+Telemetry contract (minimal required fields)
+-----------------------------------------
+Emitters must provide a compact heatmap JSON with the following fields (example snippet):
+
+'{'
+  'snapshot_ts': '2025-01-08T08:00:00Z',
+  'window_hours': 24,
+  'slices': [
+    {
+      'slice_id': 'BillingIntents:charge-failure',
+      'total_calls': 12450,
+      'failure_count': 312,
+      'avg_severity': 2.8,
+      'median_latency_ms': 430,
+      'embedding_drift_score': 0.34
+    }
+  ]
+}'
+
+Required export fields (flat): snapshot_ts, window_hours, slices[].slice_id, slices[].total_calls, slices[].failure_count, slices[].avg_severity, slices[].median_latency_ms, slices[].embedding_drift_score. Optional: host_cluster, model_variant, tenant_id.
+
+Safety checks and hard gates
+---------------------------
+- If any CriticalTenantFlows slice has failure_rate > 0.5% AND avg_severity >= 3.0 the system must ROLLBACK regardless of DS.
+- If more than 10% of probes lack current telemetry, mark decision state as INCONCLUSIVE and require human approval.
+- For private/on-prem customers with per-customer SLO overrides, consult the customer SLO manifest before automatic rollback - use the per-customer override endpoint.
+
+Rollback criteria and runbook steps
+----------------------------------
+1. Lock the rollout in the control plane: 'redwoodctl rollout lock --id <rollout-id>'
+2. Execute the variant revert: 'redwoodctl rollout revert --id <rollout-id> --target <baseline-model>'
+3. Post-rollback verification: run a 2-hour fast-probe sweep across top 20 slices and confirm DS falls below 20.
+4. Create incident with severity mapping: DS>80 -> Sev2, DS 60-80 -> Sev3.
+
+Example: case study (short)
+-------------------------
+- Scenario: Quantized v1.2 was promoted to 20% across US-hosted tenants. After 12 hours heatmap snapshot showed elevated embedding_drift_score in 3 billing-related slices. Computed DS = 42 -> HOLD. Automated bisect pointed to a tokenizer change in the preprocessor. Model Owner rolled back quant patch and re-run priming probes; DS dropped to 12 within 3 hours and rollout resumed at a slow cadence.
+
+Appendix A: configuration YAML sample
+------------------------------------
+'heatmap_window_hours: 24
+probe_priority_weights:
+  CriticalTenantFlows: 10
+  BillingIntents: 8
+  UXTextGen: 3
+latency_slo_ms: 250
+drift_baseline_window_days: 7
+slow_roll_threshold: 35
+human_review_timeout_hours: 4'
+
+Appendix B: links and references
+--------------------------------
+- Eval mesh and workload fingerprinting: /applied-ml-and-evals/eval-harness/eval-mesh-and-workload-fingerprinting-2026
+- Regression prioritization index: /applied-ml-and-evals/regression-triage/regression-impact-index-and-prioritization-framework-2024
+
+Appendix C: change history
+--------------------------
+- 2024-11-12 (Anjali Mehta): First draft and internal review.
+- 2024-12-02 (Evan Park): Added bisect integration details and telemetry contract.
+- 2025-01-08 (Marina Cole): Clarified safety gates for private deployments and updated example.

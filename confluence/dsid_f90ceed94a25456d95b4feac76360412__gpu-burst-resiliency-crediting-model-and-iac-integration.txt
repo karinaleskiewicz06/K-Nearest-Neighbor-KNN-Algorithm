@@ -1,0 +1,242 @@
+GPU burst resiliency crediting model and IaC integration
+
+Summary
+
+This document defines a resilient GPU bursting and crediting model, the operational rules for applying it at tenant and fleet levels, and the recommended Terraform/IaC integration patterns and CI/CD gating to ensure safe rollouts. The design balances cost predictability, fairness across tenants, and SLO preservation during transient load spikes.
+
+Purpose
+
+- Provide a single canonical definition for GPU burst credits and the capacity floor used by Redwood’s multi-tenant GPU allocator.
+- Describe how credits are earned, consumed, and reconciled across billing windows.
+- Show concrete Terraform module changes and CI/CD checks required to deploy policy updates.
+- Offer an on-call runbook for bursting incidents (exceeded credits, noisy tenant throttles, and preemption storms).
+
+Scope
+
+This applies to: hosted API tenants, Dedicated pools with shared bursting, and ephemeral test/eval pools. It does NOT change reserved capacity contracts or Dedicated strict isolation modes where bursting is disabled.
+
+Background and motivation
+
+We operate a heterogeneous GPU fleet with a mix of on-demand, reserved, and spot-backed capacity. To maximize utilization and reduce wasted reserved capacity, Redwood supports a burst mechanism that allows tenants to temporarily exceed their steady-state allocation. Without strict rules, bursting can cause noisy-neighbor issues, exceed provider quotas, and create unstable latency SLOs. The crediting model ensures bursts are constrained, auditable, and reversible.
+
+Key concepts
+
+- Capacity floor: guaranteed baseline vGPU/slice per tenant (steady-state allocation).
+- Burst credit: a consumable budget (measured in GPU-credit-seconds) that lets a tenant exceed their floor for limited time.
+- Replenishment window: rolling 24-hour window when credits regenerate.
+- Throttle policy: ordered fallback actions when credits are exhausted (soft-degrade -> model fallback -> queuing -> hard-throttle).
+- Fleet reservoir: an emergency global pool used for critical tenants or safety net during partial outages.
+
+Design: credit accounting and formulas
+
+1) Units: GPU-credit-seconds (GCS). 1 GCS = 1 GPU * 1 second at baseline utilization. We normalize multi-GPU instances and fractional multiplexing into equivalent GCS.
+
+2) Baseline allocation: each tenant has an allocated baseline B (GCS/sec). Typical baseline examples: 0.05 GCS/s (light), 0.5 GCS/s (medium), 2.0 GCS/s (heavy).
+
+3) Credit pool size (P) formula:
+
+P = min(MAX_POOL, floor_multiplier * B * REPLENISH_WINDOW_SECONDS)
+
+Where:
+- floor_multiplier = default 6 (configurable by tenant tier)
+- REPLENISH_WINDOW_SECONDS = 24 * 3600 = 86_400
+- MAX_POOL = 1_000_000 GCS (global per-tenant cap)
+
+4) Consumption during burst:
+
+consumed = sum_over_time((consumed_gpus(t) - B) * delta_t) for consumed_gpus > B
+
+5) Soft recovery: if consumed < B, credits are replenished at a configurable reclaim rate (default 1.0x real-time up to the pool cap).
+
+Policy tiers and knobs
+
+- Free/Starter: floor_multiplier = 3; MAX_POOL = 50_000 GCS; soft-reclaim capped at 0.5x real-time.
+- Professional: floor_multiplier = 6; MAX_POOL = 300_000 GCS; soft-reclaim 1.0x.
+- Enterprise: floor_multiplier = 12; MAX_POOL = 1_000_000 GCS; soft-reclaim 2.0x; access to fleet reservoir subject to SLA.
+
+Fleet reservoir behavior
+
+- Reservoir is funded from idle capacity and admin allocations.
+- Reservoir allocation is discretionary and requires an active ReservoirGrant policy binding (owner team: capacity-ops).
+- Reservoir grants are time-limited (default 15 minutes) and require telemetry checks before and after grant (latency, GPU util, preemption rate).
+
+Examples (calculation)
+
+- Tenant A (Professional): B = 0.5 GCS/s => P = min(300_000, 6 * 0.5 * 86_400) = min(300_000, 259_200) => P = 259_200 GCS.
+- If Tenant A runs 2.0 GCS/s for a sustained 30 minutes: consumed = (2.0 - 0.5) * 1_800 = 2_700 GCS => credits remaining = 256_500.
+
+IaC / Terraform integration pattern
+
+Guiding principles
+
+- Policies are controlled through a dedicated Terraform module (module: gpu_burst_policy) and parameterized per-tenant via a tenant_env layer.
+- Runtime decisions (enforcement) are made by allocator services reading the policy via the config store (e.g., Consul or SSM) that Terraform updates as part of deployments.
+- All changes require automated policy-linting and a canary toggle for 1% of tenants before a fleet-wide rollout.
+
+Recommended module (example)
+
+Code: examples/terraform configuration
+
+```
+# module usage for tenant policy
+module "tenant_gpu_burst_policy" {
+  source        = "git::ssh://git@repo.internal/tf-modules//gpu_burst_policy?ref=v2025.02"
+  tenant_id     = var.tenant_id
+  tier          = var.tenant_tier # starter | professional | enterprise
+  floor_seconds = var.baseline_gcs_per_sec
+  enabled       = true
+  canary_pct    = 1
+  labels        = var.labels
+}
+```
+
+Policy manifest (JSON blob written to config store):
+
+```
+{
+  "tenant_id": "tenant-123",
+  "tier": "professional",
+  "floor_gcs_per_sec": 0.5,
+  "pool_gcs": 259200,
+  "reclaim_rate": 1.0,
+  "throttle_sequence": ["soft-degrade","model-fallback","queue","hard-throttle"],
+  "canary_pct": 1
+}
+```
+
+Terraform deployment checklist
+
+1) Update module version and commit policy change in feature branch.
+2) Run `terraform plan` and `policy-lint` (see policy-lint config below).
+3) Create Dynamic Canaries: set `canary_pct=1` and route traffic via allocator canary flag.
+4) Monitor canary for 30-60 minutes. If no regressions, gradually increase canary to 5% -> 20% -> 100% with 30–60 minute observation windows.
+
+policy-lint snippet (part of CI):
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+terraform init -backend=false
+terraform validate
+# policy-lint enforces numeric ceilings and required fields
+polylint --module module/tenant_gpu_burst_policy --rules ./ci/policy-rules.json
+```
+
+CI/CD gating and observability
+
+- Every change to the module must pass unit tests (module-level), integration tests (using a local allocator mock), and canary smoke tests (in staging).
+- Canary must exercise the throttle sequence: simulated spike causing soft-degrade, then model fallback and queue progression.
+- Observability: dashboards should include per-tenant credit burn, credit remaining, throttle events, average latency P95/P99, and GPU preemption rate.
+
+Required monitoring metrics and alerts
+
+Table: key thresholds and alerts
+
+| Metric | Normal / Threshold | Alert | Owner |
+|---|---:|---|---|
+| Credit burn rate (tenant) | > 80% of pool in 1h | Pager if > 90% remaining < 10% and latency > SLO | capacity-ops |
+| Throttle event rate | > 5/min | Pager | oncall |
+| Preemption rate (fleet) | > 3% / 10m | Pager + reservoir freeze | infra-sre |
+| Canary regression count | any regression during canary | Block rollout | release-eng |
+
+Operational runbook: bursting incident (short form)
+
+1) Detection
+   - Alert: tenant-credit-exhausted OR sustained throttle events.
+   - Check dashboard: credit burn, credit remaining, throttle sequence, latency P95/P99.
+
+2) Triage (5 minutes)
+   - Identify tenant and tier.
+   - Confirm burst source: production traffic, scheduled eval runs, CI jobs, or eval sandbox.
+   - If caused by CI/eval: block job and reclaim credits.
+
+3) Immediate mitigations (10–30 minutes)
+   - Apply soft-degrade policy (reduce allowed concurrency / sample rate) via allocator admin API:
+     curl -X POST -H 'Authorization: Bearer $ADMIN_TOKEN' https://allocator.internal/api/v1/admin/tenants/tenant-123/actions -d '{"action":"force_soft_degrade"}'
+   - If latency continues to spike and tenant is enterprise: request reservoir grant from capacity-ops.
+   - If noisy neighbor and credits exhausted across tenants: toggle队列 (queue) + preemption shielding.
+
+4) Recovery and reconciliation (30–120 minutes)
+   - If credits used legitimately, check billing/export records and mark as chargeable overage.
+   - If caused by runaway job, refund credits and add rate-limits to tenant CI config.
+
+5) Post-incident
+   - Create incident summary with root cause, changes to pool parameters, and recommended safeguards (guardrails, e.g., job-level GPU request limits).
+
+Ownership and escalation
+
+- capacity-ops: owns policy parameters, reservoir grants, and tier definitions.
+- infra-sre: owns allocator service, preemption behavior, and fleet telemetry.
+- release-eng: owns Terraform module and CI gating.
+- customer-success/product: owns communication for any customer-visible overages.
+
+Rollout plan for policy changes
+
+1) Dev branch: update module and add unit tests.
+2) Internal staging: deploy policy change with canary_pct=1 and steady-state synthetic load.
+3) Gradual ramp: 1% -> 5% -> 20% -> 100% with automated health checks.
+4) Post-rollout audit: run credit-reconciliation for 48h and compare expected vs observed burn.
+
+Backout/rollback guidance
+
+- If canary fails or fleet-level regressions detected, revert Terraform to previous tagged module (git tag), set `canary_pct=0`, and run `terraform apply`.
+- If rollback not possible quickly, apply runtime emergency knob: set global `bursting_enabled=false` via allocator admin API and notify affected tenants.
+
+Safeguards and hard limits
+
+- All tenant policies must have a MAX_POOL hard ceiling defined in the module (prevent runaway totals).
+- CI pipelines that run evals must include a `gpu_quota` annotation; pipeline runners will be checked by admission webhook.
+- Terraform module enforces ACLs: only release-eng and capacity-ops groups can change pool caps.
+
+Appendix A: Example admin API snippets
+
+```
+# force soft degrade
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"force_soft_degrade","duration_seconds":600}' \
+  https://allocator.internal/api/v1/admin/tenants/tenant-123/actions
+
+# request reservoir grant (automated ticket)
+http POST https://capacity-ops.internal/grants Authorization:"Bearer $TOKEN" \
+  tenant_id=tenant-123 duration=900 reason="emergency latency mitigation"
+```
+
+Appendix B: Minimal Terraform policy-lint rule example (ci/policy-rules.json)
+
+```
+{
+  "rules": [
+    {"id": "max_pool_ceiling", "type": "numeric_max", "field": "module.tenant_gpu_burst_policy.pool_gcs", "max": 1000000},
+    {"id": "require_reclaim_rate", "type": "exists", "field": "module.tenant_gpu_burst_policy.reclaim_rate"}
+  ]
+}
+```
+
+Appendix C: Frequently asked questions
+
+- Q: Can we disable bursting per-tenant?
+  - A: Yes — set `enabled=false` in the tenant module. Reserved Dedicated tenants default to `enabled=false` to honor isolation contracts.
+
+- Q: How do credits affect billing?
+  - A: Credit usage is exported to billing every hour. Excess consumed by a tenant is either charged at the overage rate or reconciled per account agreement.
+
+- Q: How are fractional GPUs accounted?
+  - A: The allocator converts vCPU/slot multiplexing to equivalent GCS using a calibration table maintained by capacity-ops.
+
+Related reading
+
+- GPU demand forecasting and ML-backed scaling playbook (link in related_pages)
+- Spot fallback autoscaler module and runbook (link in related_pages)
+
+Contact and owners
+
+- Primary owner: capacity-ops@redwood.internal (team lead: Marco Nguyen)
+- Infra SRE on-call: see oncall rota in eng-sre team space
+- Terraform module owner: release-eng@redwood.internal (Priya Desai)
+
+Document history
+
+- 2024-07-18: Initial draft by Asha Patel.
+- 2024-09-03: Added reservoir grant flow and example API snippets (review: Marco Nguyen).
+- 2025-02-12: Finalized Terraform canary rollout and CI policy-lint rules (review: Priya Desai).

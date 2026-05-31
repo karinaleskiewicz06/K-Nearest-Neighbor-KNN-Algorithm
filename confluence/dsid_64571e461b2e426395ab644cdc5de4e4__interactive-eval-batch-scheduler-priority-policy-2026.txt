@@ -1,0 +1,158 @@
+Interactive eval batch scheduler and priority policy
+
+Overview
+
+This document specifies the design, configuration, and operational playbook for the Interactive Eval Batch Scheduler (IEBS) and the Priority Policy used across Redwood's eval harness. IEBS is the orchestrator that turns submitted evaluation workloads (unit tests, batch experiments, regression runs) into GPU worker assignments while respecting latency-sensitive interactive runs and cost-focused long background runs.
+
+Goals and scope
+- Provide a predictable scheduling model for mixed workloads (interactive, nightly, long-run stress tests).
+- Minimize latency for interactive developer feedback while maintaining high utilization for bulk evals.
+- Support preemption with graceful checkpointing for long runs.
+- Integrate with CI gating, cost accounting, and the model promotion pipeline.
+- Apply the policy across hosted, dedicated, and private evaluation fleets.
+
+Key concepts
+- Job types:
+  - Interactive: short (<2m) runs, developer-facing, low tokens, high priority.
+  - Priority-batch: targeted regression or benchmark runs with SLA (e.g., run within 2 hours).
+  - Background-batch: cost-optimized, low priority, preemptible, often long-running.
+  - Canary/Smoke: tiny sample runs used in promotion pipelines.
+- Slots and workers:
+  - A worker equals one GPU allocation unit (may be multi-GPU for large-model sims).
+  - Jobs request slots and a memory footprint. The scheduler enforces memory + kernel compatibility.
+- Preemption and checkpointing:
+  - Background jobs must checkpoint at configurable intervals (default 15m) to allow preemption.
+  - Interactive and Priority-batch jobs cannot be preempted except in emergency (incident-mode).
+
+Priority policy rules (summary)
+1. Interactive jobs: top priority, immediate allocation if any compatible worker is idle or interruptible background job exists.
+2. Priority-batch: scheduled within declared SLA window. If SLA approaches and capacity is lacking, background jobs are preempted in LRU order by cost/remaining_time heuristic.
+3. Background-batch: disposable; scheduled opportunistically and preempted first.
+4. Canary/Smoke: scheduled to dedicated small-pool to avoid interference.
+
+Scheduling algorithm (high level)
+1. On job submit, compute job_score = priority_weight / sqrt(est_resources) + urgency_factor.
+2. Maintain two queues: interactive_queue (FIFO with time decay) and batch_heap (max-heap by job_score).
+3. Periodic reconciler (every 10s):
+   a. Fill idle workers with highest-scoring jobs subject to compatibility constraints.
+   b. If interactive_queue non-empty and no idle worker, find lowest-cost background job with valid checkpoint and preempt it.
+   c. For Priority-batch nearing SLA deadline, escalate urgency_factor to force preemption of background jobs.
+
+Config parameters (table-style plaintext)
+- max_interactive_wait: 30s (time before forced preemption allowed)
+- background_checkpoint_interval: 900s (15m)
+- preemption_grace_period: 45s (time given to job to flush in-memory buffers)
+- escalation_window_priority_batch: 20m (when priority-batch will start preempting background)
+- scheduling_tick: 10s (reconciler frequency)
+- max_preemptions_per_worker_per_hour: 4
+
+YAML job spec example
+``yaml
+job_id: eval-2026-09-rlf1
+job_type: priority-batch
+priority: 70   # 0-100
+requested_slots: 4
+gpu_type: a100-80gb
+est_memory_gb: 180
+estimated_duration_minutes: 120
+checkpoint_policy:
+  interval_seconds: 900
+  s3_prefix: s3://redwood-eval-checkpoints/eval-2026-09-rlf1
+labels: [regression, llm-8k]
+notify_on: [start, complete, preempt]
+ci_gate: true
+``
+
+CLI examples
+- Submit a job via evalctl:
+  evalctl submit --spec eval-job.yaml
+- Query queue status:
+  evalctl queue status --wide --filter=interactive
+- Force drain a worker for maintenance:
+  evalctl worker drain --worker-id w-1234 --until 2026-04-01T03:00:00Z
+
+Integration with CI and promotion pipelines
+- Jobs submitted with ci_gate: true must pass smoke and canary stages before model promotion.
+- The scheduler supports a 'blocking lock' tag that guarantees slot reservation for rollout-critical canaries for up to 10 minutes.
+- CI runners should include a minimal job spec that prefers the canary pool and sets low resource requests to expedite allocation.
+
+Telemetry and observability
+Collect these metrics per-job and per-worker:
+- job_submitted, job_started, job_completed, job_preempted, job_resumed
+- scheduler_fill_rate (percentage of time slots are occupied)
+- avg_interactive_latency_to_start (SLA: 95% < 20s)
+- preemption_rate_by_label
+- checkpoint_success_rate
+- cost_estimate_per_job_usd
+
+Dashboards and alerts (recommended)
+- Scheduler health: reconciler_duration > 5s (alert)
+- Interactive SLO breach: avg_interactive_latency_to_start 95p > 30s (pager)
+- Checkpoint failures > 1% over 10m (page to oncall)
+- Preemption surge: preemption_rate_by_label increase > 3x baseline (notify planner)
+
+Operational runbook: common scenarios
+1) Interactive jobs waiting > 2 minutes
+  - Check: scheduler queue length (evalctl queue status) and worker health.
+  - Action: scale the interactive pool (if autoscaler healthy) or temporarily bump interactive pool capacity.
+  - Mitigation: identify long-running background jobs via evalctl jobs list --state running and consider manual preemption if they are non-checkpointed.
+2) Priority-batch missed SLA window
+  - Check: job_score and escalation logs in scheduler trace.
+  - Action: increase escalation_window_priority_batch to force preemption, then investigate capacity shortfall.
+  - Postmortem: record root cause and whether model-card workload estimates were inaccurate.
+3) Checkpoint errors on preempted jobs
+  - Check: object store (S3/HSM) connectivity and job logs for serialization exceptions.
+  - Action: mark job as failed-with-retriable if checkpoint retry succeeded; otherwise tag as checkpoint-corrupt and notify author.
+
+Preemption safety checklist
+- Ensure background job has a successful checkpoint within configured interval.
+- Confirm preemption_grace_period is honored by worker (process receives SIGTERM and has preemption_grace_period to flush).
+- Verify checkpoint consistency by comparing last_checkpoint_sha in job metadata.
+
+Promotion gating and regression triage flow (how schedule ties to model lifecycle)
+1. New model candidate triggers canary: small-run scheduled in canary pool. Failure -> abort promotion.
+2. If canary passes, full priority-batch regression runs are submitted with ci_gate=true.
+3. If regressions fail, priority-batch jobs are replayed with additional debugging labels and moved to regression-triage team queue.
+4. Regression triage tickets must include job_id, snapshot S3 path, scheduler trace ID, and config diff from baseline.
+
+Ownership and SLAs
+- Scheduler service owner: eng-platform/eval-scheduling (primary)
+- Oncall: eng-platform oncall rotation (pager for SLO breaches)
+- SLOs: interactive allocation 95p < 20s, priority-batch completion within declared SLA 90% of runs.
+
+Change management and rollout plan
+- Feature flags: scheduler_priority_v2 must be toggled per-cluster.
+- Canary rollout: 5% of clusters for 48h, then 25% for 72h, then 100% if no SLO regressions.
+- Rollback: switch off feature flag and revert to scheduler v1 configuration; postmortem required within 72h.
+
+Appendix: scheduler pseudo-code
+``text
+function schedule_tick():
+  drain_list = []
+  for job in interactive_queue:
+    if allocate_if_possible(job): continue
+    victim = find_preemptable_background()
+    if victim and victim.last_checkpoint_age <= background_checkpoint_interval:
+      preempt(victim)
+      allocate(job)
+    else:
+      continue
+  for job in batch_heap: # highest score first
+    allocate_if_possible(job)
+``
+
+Appendix: compatibility matrix checklist
+- Worker labels must match job.gpu_type and job.memory footprint.
+- Quantized-model runs require 'quant-runtime-v2' kernel label on worker.
+- KV-cache sensitive workloads require worker with ephemeral NVMe scratch.
+
+Contact and escalation
+- Primary: Aisha Kapoor (aisha@redwood.ai)
+- Scheduler oncall Slack: #schedulers-oncall
+- Escalate to eng-platform manager (Jonas Becker) if issue persists > 2 hours and affects promotions.
+
+Document maintenance
+- Review cadence: quarterly or after any major incident affecting scheduling.
+- Owners must update checkpoints, SLOs, and config defaults when fleet changes (new GPU types, node sizes).
+
+This doc is intended to be a single-source-of-truth for scheduling policy decisions and operational handling of mixed evaluation workloads. Keep links to related notebooks, scripts, and CI templates in the related_pages list above.

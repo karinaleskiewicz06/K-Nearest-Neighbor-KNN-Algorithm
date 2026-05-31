@@ -1,0 +1,158 @@
+GPU watchdog: intermittent node hang investigation and mitigation
+
+Summary
+-------
+This document captures the investigative findings, short-term mitigations, and long-term remediation plan for a class of intermittent GPU node hangs observed in the production serving fleet during Q4 2025. The pattern is characterized by a kernel-space watchdog firing followed by an immediate kubelet restart and a multi-minute node unavailable window. This page is intended for SRE and runtime engineers who perform triage and for release owners planning a preventative rollout.
+
+Scope
+-----
+- Affects: a subset of dedicated and private pools running NVIDIA A100 and A10X nodes with GPU driver versions 535.x and specific firmware revisions.
+- Services impacted: runtime-gateway, shard-manager, schedulerd, model-evictor; customer-visible effect: elevated 99th-percentile latency and transient 5xx errors while node is flapping.
+- Not affected: small CPU-only pools and older driver versions 520.x (no incidents observed).
+
+Observed impact and SLO implications
+----------------------------------
+- Symptom window: node enters 'NotReady' for 90–420s after watchdog trigger.
+- Typical customer impact: short-lived burst of 504/502 for in-flight sessions; streaming connections drop and must reconnect.
+- SLOs affected: request-level latency (p99) and success rate (error budget burn correlated with pool size). Example: a single A100 node hang in a 16-node pool caused a 0.9% availability regression for the pool over 8 minutes during a production rollout.
+
+Symptoms / How this shows up in tooling
+--------------------------------------
+- Kubernetes: repeated kubelet restarts on the node; pod re-scheduling patterns look like a flock of pods moving simultaneously.
+- Node logs: dmesg entries with lines similar to: "NVRM: Xid (PCI:0000:xx:00): 79, GPU has fallen off the bus" followed by kernel watchdog stack traces.
+- Driver logs: /var/log/nvidia-installer.log often contains firmware timeout entries prior to the hang.
+- Metrics: sudden drop in node_gpu_utilization, spike in node_restarts_total, and increased request queueing on shard-manager.
+
+First-response checklist (for oncall)
+-------------------------------------
+1. Identify affected node(s): kubectl get nodes --selector=pool=<pool-name> -o wide and check for 'NotReady' / kubelet AGE.
+2. Collect kernel and driver logs: scp or run remote tail of /var/log/messages, dmesg, /var/log/nvidia-installer.log.
+3. Capture GPU metrics snapshot: grafana -> GPU pool -> export time range covering the event (5m before to 10m after).
+4. Evacuate traffic from the node (if still reachable): kubectl cordon <node>; kubectl drain --ignore-daemonsets --delete-local-data --force <node>.
+5. If the node is unresponsive at SSH level and remains in NotReady > 10m, escalate to infra for host power-cycle.
+6. Add an incident note with affected customer IDs and the pool name.
+
+Quick mitigation options (short-term)
+------------------------------------
+- Automatic circuit-breaker: enable node-level automatic failing of scheduling for nodes with kubelet_restart_count > 1 within 10m. This prevents repeated placement on unstable nodes.
+- Scheduler policy tweak: reduce concurrent long-lived streaming sessions per node by 20% to lower surface area during known risk windows (e.g., during driver upgrades).
+- Runtime fallback: configure shard-manager to keep a warm standby routing for hot sessions to avoid full reconnects when a node goes NotReady.
+
+Detection queries and alerts (examples)
+--------------------------------------
+- PromQL to detect surges of kubelet restarts across a pool:
+  sum by (pool) (increase(node_kubelet_restart_total{job="node-exporter"}[15m])) > 2
+- PromQL to flag GPU firmware errors in driver metrics (if exposed):
+  increase(nvidia_driver_errors_total{type="firmware_timeout"}[10m]) > 0
+- Alert rule guidance: fire P1 if >2 nodes in a dedicated pool restart within 30m; fire P2 if a single node restart correlates with >10% p99 latency regression for the pool.
+
+Repro steps (safest non-prod reproduction)
+-----------------------------------------
+1. Create a staging pool matching production node image, driver, and firmware (tagged 'staging-a100-watchdog').
+2. Deploy a synthetic workload that pins the GPU: run a continuous 75%+ utilization workload for 30+ minutes (the benchmark-runner container is available in images/runtime/synthetic-gpu-burner:stable).
+3. Run a targeted firmware stress test by toggling ECC on/off and running memory-fill patterns (do not run on prod).
+4. Monitor dmesg and nvidia-smi -q for early signs of timeouts. If reproduced, collect full system trace using sosreport and nv-hostengine debug toggles.
+
+Root cause analysis (summary)
+----------------------------
+After correlating multiple incidents we determined two contributing factors:
+- A race condition in the kernel-level GPU driver interaction when heavy sustained SM utilization coincided with an asynchronous firmware housekeeping task. This occasionally produced a GPU 'fall off bus' (Xid 79) and subsequent watchdog path triggering.
+- The host kernel watchdog configuration and kubelet restart policy resulted in an aggressive and non-idempotent restart behavior that extended the outage window. Specifically, the kubelet triggered a systemd restart of the node agent rather than isolating the GPU device and allowing a graceful driver reset.
+
+Permanent remediation plan (high level)
+--------------------------------------
+1. Driver and firmware upgrade: collaborate with Nvidia to obtain a driver build that fixes the observed race (target window: Q1 2026). Test on staging pool.
+2. Kubelet and systemd policy changes: modify kubelet restart thresholds and add a device-level isolation handler that attempts a driver reset (nvidia-smi --reset) before full kubelet restart.
+3. Runtime-level safeguards: extend shard-manager's warm-standby and session-mirroring so customer sessions can continue on alternate nodes without full reconnect requirements.
+4. Automated canaries: add continuous canaries exercising firmware housekeeping with health checks that simulate long-lived streaming connections.
+5. Fleet rollout plan: phased kernel/driver rollout with canary pools (5% -> 20% -> 60% -> 100%) and a two-hour observation window per phase. Abort criteria: any increase in node_restarts_total or Xid-related driver errors.
+
+Suggested kernel and kubelet config snippet (for change PR)
+----------------------------------------------------------
+- systemd override for kubelet.service (/etc/systemd/system/kubelet.service.d/10-restart.conf):
+
+```
+[Service]
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=600
+StartLimitBurst=5
+```
+
+- kubelet startup flag suggestion (kubelet.yaml):
+```
+--eviction-hard=memory.available<100Mi,nodefs.available<5%
+--pod-infra-container-image=our-registry/pause:1.8
+--feature-gates=DeviceShutdown=true
+```
+
+Operational runbook: step-by-step (for engineers)
+------------------------------------------------
+1. Triage: Confirm the node identity and time range using kubectl and Grafana. Attach initial incident ticket and severity.
+2. Isolate: cordon & drain the node if the node is reachable. If pods are stuck evacuating (Evicted -> Terminating for >5m), proceed to node power-cycle with infra.
+3. Collect: run the following collection script (example):
+```
+#!/bin/bash
+NODENAME=$1
+ssh root@${NODENAME} 'mkdir -p /tmp/incident-logs && dmesg > /tmp/incident-logs/dmesg.txt && journalctl -u kubelet --no-pager > /tmp/incident-logs/kubelet.log && nvidia-smi -q > /tmp/incident-logs/nvidia-smi.txt && tar czf /tmp/incident-logs.tgz -C /tmp incident-logs && cat /tmp/incident-logs.tgz | base64'
+```
+Paste the base64 blob into the incident ticket for offline analysis.
+4. Mitigate: if driver logs show Xid 79 sequence, attempt graceful driver reset:
+```
+ssh root@<node> 'nvidia-smi --gpu-reset -i 0 || nvidia-smi --reset -i 0'
+```
+If reset fails, escalate to infra for power cycle.
+5. Restore: after node recovers, uncordon and monitor pod rescheduling. Ensure no duplicate Xid errors post-restore.
+
+Post-incident timeline and notes
+------------------------------
+- 2025-10-21 03:12 UTC: first large occurrence during model-rack throughput test; 3 nodes in pool-a100-2 restarted within 12 minutes.
+- 2025-10-22 18:40 UTC: full collection from staging reproduction and initial vendor contact opened (Case #NV-2025-117).
+- 2025-11-05 09:00 UTC: vendor sent patched driver candidate for internal validation.
+- 2025-12-07 14:15 UTC: candidate driver passed synthetic stress canaries in staging; phased rollout scheduled.
+
+Ownership and contacts
+----------------------
+- Primary owner: Linnea Sorensen (runtime reliability)
+- Secondary owner: Arjun Patel (gpu-fleet)
+- SRE on-call: see /confluence/oncall-and-incident-response/oncall-rotations
+- Vendor liaison: Maya Li (NV driver program)
+
+Tests and validation matrix
+--------------------------
+| Test | Target env | Pass criteria | Notes |
+| Smoke GPU stress | staging-a100-watchdog | No Xid 79 observed in 6 hours | Run 75% sustained util workload |
+| Long-term soak | canary pool (5 nodes) | 0 node_restarts_total in 72 hours | Real traffic mirror |
+| Kubelet restart policy | canary nodes | Node recovers within <90s w/o full kubelet restart | Validate with induced device error |
+
+Follow-ups and engineering tickets
+----------------------------------
+- RUNTIME-1234: Add nvidia-driver sanity-check and auto-disable node on first Xid-79 event.
+- RUNTIME-1278: Implement device-level reset handler in kubelet wrapper.
+- INFRA-2042: Coordinate firmware upgrade window and backout plan.
+- OBS-1210: Add new Grafana dashboard panel for Xid error rate and per-pool electron counts.
+
+Appendix: example logs (sanitized)
+----------------------------------
+- dmesg excerpt: 
+```
+[ 1234.567890] NVRM: Xid (PCI:0000:65:00): 79, GPU has fallen off the bus.
+[ 1234.567921] NVRM: Xid (0000:65:00): PID 4412: Name: python
+[ 1234.567947] kernel: watchdog: BUG: soft lockup - CPU#2 stuck for 22s!
+```
+
+- kubectl event pattern: multiple pods show following: 
+```
+Warning  NodeNotReady  2m   kubelet, ip-10-0-1-23  Node ip-10-0-1-23 status is now: NodeNotReady
+```
+
+Document maintenance
+--------------------
+- This page will be updated as vendor fixes are validated and rollout completes.
+- Next review scheduled: 2026-04-01.
+
+Related reading
+---------------
+- Kernel watchdog design notes: /confluence/eng-serving-runtime/runtime-architecture/runtime-op-pathways-and-shard-topology-2024
+- Kubelet restart and systemd behavior: /confluence/eng-serving-runtime/runbooks/sigterm-connection-drain-and-graceful-shutdown-playbook-2025
+

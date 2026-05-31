@@ -1,0 +1,197 @@
+shadow-traffic-fidelity-and-load-profile-tracing-2026
+
+Title: Shadow Traffic Fidelity and Load Profile Tracing
+
+Overview
+-------
+This document describes the design, implementation, dashboards, alerting, and operational runbook for our Shadow Traffic Fidelity service and Load Profile Tracing pipeline. The goal is to safely inject realistic shadow traffic and capture high-fidelity traces and load profiles so platform teams can:
+
+- Validate routing and fallback policies under realistic shapes
+- Measure SLO impact of traffic mixes before production rollouts
+- Calibrate autoscalers, batching, and KV-cache heuristics with representative workloads
+- Reproduce production anomalies in a safe, reproducible sandbox environment
+
+Scope
+-----
+Included:
+- Shadow traffic generation architecture and fidelity controls
+- Load profile extraction and canonicalization format
+- Dashboards (Prometheus+Grafana) and example panels
+- Alerting and SLO-aware degradation signals for shadow experiments
+- Operator runbook for enabling/disabling experiments and investigating anomalies
+
+Not included:
+- Customer-specific private deployment steps (see eng-private-deployments)
+System goals and success criteria
+--------------------------------
+1) Non-impacting: Shadow traffic must never affect customer-visible capacity or billing.
+2) High fidelity: Request shape (seq length distribution, prompt templates, function calls) should match sampled production percentiles within configurable deltas.
+3) Trace completeness: KV cache hits, batch sizes, kernel selection, and fallback decisions must be captured for each shadow request.
+4) Reproducibility: Captured load profiles can be replayed in the synthetic shadowing lab with seedable RNG.
+
+Architecture and components
+---------------------------
+- Shadow Proxy (svc-shadow-proxy): receives mirrored copies of live requests, applies sampling and transformation rules, forwards to shadow runner.
+- Shadow Runner (svc-shadow-runner): stateless workers that execute requests against model variants in a sandbox VPC with isolated GPU pools.
+- Tracing Aggregator (shadow-trace-collector): consumes opentracing-compatible spans and enriches with runtime decisions (kernel, quantization, cache tags).
+- Load Profiler Service (load-profiler): normalizes request metrics to the canonical Load Profile Format (LPF) and stores artifacts in object storage (s3://redwood-shadow-profiles/).
+- Dashboard + Alerting (Grafana + Prometheus rules + Alertmanager): visualizes fidelity metrics and surfaces regressions.
+
+Data flow (high level)
+1. Production ingress copies request -> Shadow Proxy (sampling rule applies).
+2. Shadow Proxy mutates sensitive fields (PII redaction) and rewrites routing metadata.
+3. Shadow Runner executes request in isolated environment with experimental model variants.
+4. Each shadow execution emits spans and a Load Profile artifact saved to LPF bucket.
+5. Tracing Aggregator correlates traces and metrics, exposing Prometheus metrics and logs to the observability stack.
+
+Security and privacy rules
+- All payloads must be sanitized via the redaction pipeline (see redaction policy v2).
+- Shadow VPCs are isolated and have egress disabled by default.
+- LPF artifacts are encrypted at rest (KMS key: projects/redwood/shadow-lpf) and ACLed to eng-platform and applied-ml-and-evals teams.
+
+Load Profile Format (LPF) - canonical fields
+------------------------------------------
+| field                 | type   | description                         | example |
+|-----------------------|--------|-------------------------------------|---------|
+| request_id            | string | sampled production request id       | r-20260101-0001 |
+| timestamp             | string | ISO-8601                            | 2026-01-12T12:02:34Z |
+| seq_len               | int    | token count                          | 432 |
+| prompt_template_hash  | string | fingerprint of prompt template      | pth-abc123 |
+| model_variant         | string | variant run in shadow               | gptx-q8b |
+| kv_cache_hits         | int    | prefix/KV cache hits served         | 3 |
+| batch_size            | int    | runtime batch size observed         | 8 |
+| runtime_ms            | int    | total execution wall time           | 254 |
+| kernel_path           | string | selected kernel identifier          | fmha-opt-v2 |
+| trace_span_ids        | string | comma-separated span ids            | s1,s2,s3 |
+
+Prometheus metrics emitted by shadow pipeline
+------------------------------------------------
+- shadow_requests_total{experiment="canary-2026-01"}  (counter)
+- shadow_requests_sampled_ratio{policy="prod-1p"}  (gauge)
+- shadow_runtime_ms{model_variant,region}  (histogram)
+- shadow_kv_cache_hits_total{model_variant}  (counter)
+- shadow_batch_size_summary{}  (histogram)
+- shadow_fidelity_score{dimension="prompt_shape|seq_len|kernel_match"}  (gauge, 0..1)
+
+Example Grafana panels (PromQL examples)
+----------------------------------------
+1) Shadow fidelity time series (panel):
+   PromQL: avg_over_time(shadow_fidelity_score{dimension="prompt_shape"}[5m])
+   Note: display with 95th/50th percentiles and annotate experiment windows.
+
+2) Production vs Shadow latency comparison:
+   PromQL: histogram_quantile(0.95, sum(rate(shadow_runtime_ms_bucket[5m])) by (le))
+   + overlay on prod runtime histogram (prod_runtime_ms_bucket).
+
+3) KV cache hit rate by model variant:
+   PromQL: rate(shadow_kv_cache_hits_total[10m]) / ignoring(job) group_left() rate(shadow_requests_total[10m])
+
+Alerting rules (examples)
+------------------------
+- Name: Shadow fidelity drop (High)
+  Expr: avg_over_time(shadow_fidelity_score{dimension="prompt_shape"}[10m]) < 0.85
+  For: 15m
+  Labels: severity=page, team=eng-platform
+  Annotations: runbook_url=/eng-platform/runbooks/shadow-experiment-failure-2026
+
+- Name: Shadow to prod latency divergence (Medium)
+  Expr: (histogram_quantile(0.95, sum(rate(shadow_runtime_ms_bucket[5m])) by (le)) / histogram_quantile(0.95, sum(rate(prod_runtime_ms_bucket[5m])) by (le))) > 1.25
+  For: 30m
+  Labels: severity=critical, owner=serving-runtime
+
+Operational runbook: enabling an experiment
+-----------------------------------------
+1. Create experiment manifest in experiments-db:
+   - fields: name, sampling_policy, target_model_variants, sandbox_gpu_pool, redaction_profile, start_time, end_time, owner.
+   Example CLI:
+   $ rdx experiments create --name canary-shadow-2026-01 --sampling-policy prod-1p --variants gptx-q8b --gpu-pool sandbox-gpu-a --start 2026-02-15T10:00Z --end 2026-02-15T16:00Z
+2. Dry-run locally with the shadow-runner smoke test:
+   $ kubectl exec -n eng-platform $(kubectl get pods -l app=svc-shadow-runner -o name | head -1) -- /bin/sh -c 'python3 /opt/shadow/tests/smoke.py --profile samples/lpf-sample.json'
+3. Schedule the experiment during low-risk window and notify oncall channel #platform-shadow with experiment manifest and link to dashboard.
+4. Monitor fidelity panels and the shadow_fidelity_score for first 30 minutes. If score < 0.9 immediately abort (see abort steps).
+
+Abort and mitigation steps
+-------------------------
+1. Quick abort (operator): toggle experiments-db entry state -> aborted. CLI: $ rdx experiments abort <experiment-id>
+2. If abort toggle fails: scale down shadow-proxy replicas to 0 in the control namespace: $ kubectl scale deployment svc-shadow-proxy -n control --replicas=0
+3. Verify no further shadow traffic: promql: rate(shadow_requests_total[1m]) == 0
+4. If residual traffic persists, revoke mirror rule in ingress controller (owner: infra-net team).
+
+Investigation checklist (post-abort)
+-----------------------------------
+- Extract LPF artifacts from s3 for the experiment window.
+- Correlate trace ids with production traces (noting redacted fields).
+- Check kernel selection distribution for anomalies: query: topk(5, sum by (kernel_path) (rate(shadow_runtime_ms_count[10m])))
+- Re-run failing LPF artifacts in isolated replay lab with seed from artifact (document seed in artifact metadata).
+
+Dashboard ownership and maintenance
+----------------------------------
+- Dashboard: Shadow Traffic Fidelity (grafana slug: shadow-fidelity)
+  - Owner: observability squad (eng-platform)
+  - Review cadence: quarterly with applied-ml-and-evals for fidelity thresholds
+  - Dashboard test: automated synthetic query that validates panel thresholds nightly
+
+Rollout and testing plan
+------------------------
+1. Internal dogfood: run short 1h experiments targeting dev-only traffic to validate the full pipeline (week 1).
+2. Canary with 0.1% production sampling against non-critical routes (week 2).
+3. Gradually increase sampling while verifying fidelity score and GPU utilization (target <=5% of prod equivalent).
+4. Post rollout retrospective and KPI report (SLOs: fidelity_score >=0.9, shadow-induced resource consumption <5% prod baseline).
+
+Cost and capacity guardrails
+--------------------------
+- Default sandbox_gpu_pool size: 8 GPUs (n1-standard equivalent).
+- Soft quota per experiment: 40 GPU-hours. Exceeded -> auto-abort with label quota-exceeded.
+- Billing flag: experiments are tagged with project=shadow and are excluded from customer billing; finance alert on unexpected cost tags.
+
+SLOs and acceptance criteria
+---------------------------
+- Fidelity SLO: 95% of experiments must maintain shadow_fidelity_score >= 0.9 (weekly window).
+- Non-impact SLO: No customer request's p99 latency increase attributable to shadowing > 1% (continuous monitoring).
+
+Appendix A - sample LPF artifact (JSON snippet)
+------------------------------------------------
+{
+  \"request_id\": \"r-20260112-0003\",
+  \"timestamp\": \"2026-01-12T12:02:34Z\",
+  \"seq_len\": \"432\",
+  \"prompt_template_hash\": \"pth-abc123\",
+  \"model_variant\": \"gptx-q8b\",
+  \"kv_cache_hits\": \"3\",
+  \"batch_size\": \"8\",
+  \"runtime_ms\": \"254\",
+  \"kernel_path\": \"fmha-opt-v2\",
+  \"trace_span_ids\": \"s1,s2,s3\"
+}
+
+Appendix B - example alertmanager route snippet
+------------------------------------------------
+routes:
+- match:
+    severity: page
+  receiver: oncall-page
+  continue: false
+
+Related documents and links
+--------------------------
+- Redaction policy v2: /security-and-compliance/data-management/redaction-policy-v2
+- Shadow experiment runbook: /eng-platform/runbooks/shadow-experiment-failure-2026
+- LPF schema definition (proto): /eng-serving-runtime/kernel-and-scheduling/lpf-schema-v1
+
+Author and owners
+------------------
+Author: Aisha Patel (Platform Observability)
+Primary owner: eng-platform / observability squad
+Secondary owner: applied-ml-and-evals (model-fidelity)
+
+Change log
+----------
+- 2026-01-15: created (Aisha Patel)
+- 2026-02-10: clarified fidelity scoring and added abort CLI steps (Marco Chen)
+
+Review checklist before changes
+------------------------------
+- Confirm experiments are gated behind feature flag and can be globally disabled.
+- Ensure redaction is verified by security (reviewers listed).
+- Run synthetic replay lab on every major change to the shadow-runner or load-profiler components.
+

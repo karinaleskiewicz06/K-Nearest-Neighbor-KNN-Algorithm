@@ -1,0 +1,173 @@
+tenant-egress-burst-budgeting-and-cni-qos-playbook
+
+Overview
+This document defines the design and operational procedures for enforcing tenant-level egress burst budgets and applying CNI-based QoS shaping for inference (GPU-backed) pods. The goal is to provide predictable egress spend and stable network behavior for latency-sensitive inference while preserving the ability to burst for short windows.
+
+This is targeted at platform infra engineers who own multi-tenant GPU clusters, networking and cost allocation (eng-infra + cloud accounts team).
+
+Goals
+- Prevent unbounded egress spikes that cause billing surprises and noisy-neighbor effects.
+- Allow short burst windows (seconds-to-minutes) for model cold-start KV cache warmups and eval jobs.
+- Provide clear observable signals and automated throttling fallback to protect SLOs.
+- Integrate policy as code into Terraform/IaC and CI so changes are reviewable and testable.
+
+Scope and non-goals
+- Scope: Kubernetes clusters running inference services (GKE/EKS/AKS), VPC egress path accounting, per-tenant billing tags, CNI tc-based shaping via node-init daemonset.
+- Non-goal: Replacing L7 application rate-limiting (those remain in-app). This doc focuses on infra-level protection and cost control.
+
+Terminology
+- tenant: logical customer or product team mapped to cloud account or tenant label.
+- egress-burst-credit: short-duration burst allowance measured in MiB/minute or tokenized credits.
+- sustained-budget: steady-state egress rate in MiB/minute that a tenant can consume without throttling.
+
+Design summary
+- Each tenant has two policy primitives: sustained-budget and burst-credits.
+- Budgets are enforced at two layers: (1) Kubernetes node-level CNI shaping applied to pod sets via tc/netem classes, (2) VPC egress policer for cross-account/cross-region enforcement (where supported).
+- A controller (policy-operator) maps tenant labels to tc configs and reconciles kernel qdisc state on each node.
+- Billing telemetry is tagged with tenant identifiers; an aggregator correlates egress bytes to budget consumption and emits events when thresholds are crossed.
+
+Architecture (text diagram)
+- tenant app pods (node) --> CNI tc qdisc (per-tenant classes) --> node egress interface --> VPC NAT / egress gateway --> cloud egress meter --> billing collector
+
+Policy primitives and config table
+| Field | Description | Example |
+|---|---:|---|
+| tenant_id | canonical tenant label | tenant:acme-prod |
+| sustained_budget_mib_per_min | long-run rate without throttling | 50 |
+| burst_credits_mib | one-time burst window allowance | 500 |
+| burst_decay_seconds | linear decay window for credits | 300 |
+| hard_throttle_after_mib | absolute ceiling per-minute | 2000 |
+
+Implementation details
+1) Terraform module interface (IAC): create a reusable module that publishes tenant budgets and IAM bindings. Example usage: 
+
+```
+module "tenant_egress_budget_acme" {
+  source = "git::ssh://github.com/redwood-infra/terraform//modules/tenant-egress-budget"
+  tenant_id = "acme-prod"
+  sustained_budget_mib_per_min = 50
+  burst_credits_mib = 500
+  burst_decay_seconds = 300
+  quota_owner = "team-acme"
+}
+```
+
+Module outputs should include a policy resource id and a K8s ConfigMap payload that the cluster policy-operator consumes.
+
+2) Policy-operator contract
+- A lightweight controller runs in each cluster with the following responsibilities:
+  - Watch ConfigMaps in a control namespace for tenant budget records.
+  - Reconcile node-level tc qdiscs into three classes per tenant: sustained, burst, and overflow (throttled).
+  - Emit prometheus metrics: tenant_egress_bytes_total, tenant_egress_budget_remaining_mib, tenant_egress_throttle_events_total.
+
+3) Node-level shaping (CNI integration)
+We rely on CNI hooks (preStart or daemonset) to ensure qdisc and class setup per-tenant. Example tc commands that the operator applies: 
+
+```
+# create root qdisc
+tc qdisc add dev eth0 root handle 1: htb default 30
+# sustained class for tenant
+tc class add dev eth0 parent 1: classid 1:10 htb rate 50mbit ceil 50mbit
+# burst class (higher ceil but token bucket enforced by operator)
+tc class add dev eth0 parent 1: classid 1:20 htb rate 50mbit ceil 500mbit
+# overflow class to drop / drastically reduce
+tc class add dev eth0 parent 1: classid 1:30 htb rate 10mbit ceil 10mbit
+```
+
+The operator programs filters to map pod IP CIDRs or cgroups to classes. Use cgroup v2 and net_cls where available for correctness.
+
+4) VPC egress fallback
+Where cloud provider allows (egress gateway or NAT gateway policies), the control plane also provisions IAM+route-based rules to apply a coarse-grained burst cap. This prevents a single noisy node from bypassing node-level shaping.
+
+Observability and alerts
+- Metrics (prometheus):
+  - tenant_egress_bytes_total{tenant} (counter)
+  - tenant_egress_budget_remaining_mib{tenant} (gauge)
+  - tenant_egress_burst_consumed_mib{tenant} (counter)
+  - tenant_egress_throttle_events_total{tenant} (counter)
+  - node_qdisc_error_total (counter)
+
+- Key alerts:
+  1. Billing-early-warning: when tenant_egress_bytes_total in 24h > (sustained_budget_mib_per_min * 60 * 24 * 0.8) AND burst_consumed_mib > 0 -> paging to capacity-owner oncall if projected spend > $X/day.
+  2. Throttle-surge: tenant_egress_throttle_events_total > 50 in 10m -> alert oncall and owners.
+  3. Qdisc-desync: node_qdisc_error_total > 0 -> infra SRE investigation.
+
+SLOs and thresholds
+- Sustained egress budget usage must not exceed 110% of configured sustained_budget_mib_per_min for more than 10 minutes without triggering billing-early-warning.
+- Node-level enforcement success rate (fraction of tenant classes reconciled without errors) > 99.5% per 24h.
+
+CI/CD and test harness
+- Terraform module acceptance tests (run in PR):
+  - unit test verifies HCL plan contains expected resources and outputs.
+  - integration test deploys module to a sandbox cloud account with mocked billing tags and verifies policy-operator picks up ConfigMap.
+- Kubernetes e2e in CI: use KinD or a sandbox cluster to run the operator and a small synthetic tenant workload that produces controlled egress. Verify metrics and that tc classes are present on nodes.
+- Chaotic test: inject packet-surge and verify fallback to VPC-level cap.
+
+Deployment and rollout (safe path)
+1. Create tenant budget in Terraform in a canary sandbox account.
+2. Run CI integration test; validate operator metrics.
+3. Apply to a single cluster and enable only monitoring mode (operator will not throttle, only emit events) for 48 hours.
+4. Enable burst-region throttling (soft throttle) for a second cluster.
+5. Full enablement: propagate configs to prod clusters.
+
+Rollback and emergency steps
+- If a tenant reports regressions (too aggressive throttling): set policy-operator into "monitor" mode for that tenant by annotating the ConfigMap (operator ignores qdisc changes). Rollback Terraform policy to previous stable version.
+- If node-level qdisc corrupts many nodes: run automation to clear qdiscs and restart operator daemonset: 
+
+```
+kubectl -n infra exec -it <node-debug-pod> -- bash -c 'tc qdisc del dev eth0 root || true'
+kubectl -n infra rollout restart daemonset/policy-operator
+```
+
+Operational playbook (incident flow)
+1. Receive alert: Throttle-surge.
+2. Triage: check tenant_egress_budget_remaining_mib and burst_consumed_mib.
+3. If consumption is expected (e.g., known eval run) notify tenant owner and ask to reduce concurrency; consider temporary increase of sustained_budget via emergency terraform change (MUST go through emergency change process).
+4. If consumption is unexpected: run pod-level diagnosis (kubectl top pod, tcpdump on pod node) -> determine whether traffic is legitimate.
+5. If malicious/bug: isolate tenant (set operator to monitor) and revoke external egress via cloud-level firewall + IAM to stop costs.
+6. Post-incident: create incident note with root cause, explain remediation, and update regression tests.
+
+Troubleshooting checklist
+- No metrics for tenant: confirm ConfigMap present and operator logs show reconciled=true.
+- Throttling but budget remains: verify tc filters map correct cgroup/pod ips. Check cgroup v2 mode.
+- Billing mismatch: confirm cloud tags and billing collector's join keys match tenant_id. Re-run billing reconcile tool.
+
+Security and least privilege
+- Terraform module that provisions IAM roles for the operator must follow least-privilege: only allow reading ConfigMaps, writing to SSM/Parameter Store for policy metadata, and tagging resources. No broad ec2/nat gateway modify rights unless explicitly approved.
+
+Change control and testing matrix
+- Minor changes to sustained_budget: PR -> automated tests -> canary cluster monitor -> 24h -> gradual rollout.
+- Changes to operator binary or qdisc templates: PR -> e2e + canary -> staged rollout across node pools.
+
+Appendix A: Example ConfigMap payload (operator input)
+```
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tenant-egress-acme-prod
+  namespace: infra-policy
+data:
+  tenant_id: "acme-prod"
+  sustained_budget_mib_per_min: "50"
+  burst_credits_mib: "500"
+  burst_decay_seconds: "300"
+  hard_throttle_after_mib: "2000"
+```
+
+Appendix B: Verification checklist (pre-merge)
+- [ ] Terraform plan shows only expected additions.
+- [ ] Module tests pass (unit + integration).
+- [ ] Operator logs show no reconciliation errors in sandbox.
+- [ ] Prometheus metrics for tenant appear within 5 minutes post-deploy.
+
+Related pages
+- See also: egress metering and billing spec; preflight GPU deployment validation runbook.
+
+Owner and contacts
+- Primary owner: eng-infra:networking (Aisha Patel)
+- Oncall: cloud-accounts oncall rotation
+
+Document history
+- 2024-09-18: created (Aisha Patel)
+- 2024-11-04: added node-level tc examples and prometheus metrics (Carlos Mendes)
+- 2025-01-14: clarified CI harness steps and emergency rollback commands (Priya Rao)

@@ -1,0 +1,286 @@
+ADR-0172: Benchmark Metrics and Run Manifest Format (Perf Suite)
+
+## Status
+Published (effective for Perf Baseline & Representative Workload Suite program starting Q1 2026).
+
+## Decision summary
+We standardize:
+1) A canonical set of performance metrics for LLM serving (TTFT, TPOT, and throughput) with strict measurement boundaries.
+2) A run manifest format (JSON) that captures environment, model configuration, scheduler configuration, workload parameters, and seeds.
+3) A minimal results format for exporting per-run aggregates, distributions, and attribution metadata.
+
+This ADR exists to make results reproducible across tools (benchmark-lab harness, perf-canary, runtime microbenches) and attributable across changes (kernel selection, scheduling policies, driver/runtime updates).
+
+## Context and problem
+Historically, Redwood teams measured "latency" and "throughput" in different ways:
+- TTFT measured as "first token computed" in runtime code vs "first byte delivered" in the HTTP stream.
+- TPOT computed as average decode speed including prefill or excluding it.
+- Throughput reported as requests/s, tokens/s, or GPU utilization proxies.
+- Metadata capture differed across harnesses, making comparisons hard (e.g., missing GPU clocks, CUDA/driver version, kernel selection decisions, scheduler knobs).
+
+As we enter Q1 2026, the Perf Baseline & Representative Workload Suite requires:
+- Comparable metrics across regions (us-east, eu-west), GPU SKUs (H100/A100/L40S where applicable), and model families.
+- A schema that survives tool evolution (CI gating, nightly canaries) without ambiguous interpretations.
+
+## Goals
+- Provide a canonical metric vocabulary used across benchmark-lab, perf-canary, and runtime-internal perf tooling.
+- Define server-side measurement boundaries that minimize client variability while still reflecting customer-visible behavior.
+- Ensure each run is reproducible: capture environment and config, plus deterministic workload parameters and seeds.
+- Enable automated regression policies (see perf-regression-policy-and-thresholds) by ensuring sample sizes, distributions, and tags are consistent.
+
+## Non-goals
+- This ADR does not define the representative workload suite itself (see ADR-0173 and the workload suite docs).
+- This ADR does not define a dashboard layout (see perf baseline dashboard spec).
+- This ADR does not mandate a single storage backend; it defines payload schemas that can be stored in S3/GCS, a data warehouse, or git artifacts.
+
+## Decision 1: Canonical metrics
+### 1.1 Metric definitions
+All metrics MUST be reported as distributions (at minimum p50/p95/p99) per cohort (model x workload x region x SKU x config), not only as means.
+
+**A) TTFT (Time to First Token)**
+- Name: `ttft_ms`
+- Unit: milliseconds
+- Definition: time from when the server accepts a request (post-auth, post-routing, request admitted to runtime) to when the server writes the first token chunk to the response stream ("first token on wire").
+- Applies to streaming and non-streaming:
+  - For streaming endpoints: first streamed token chunk.
+  - For non-streaming: first token is still defined as the first generated token; implementations should simulate "first token on wire" by marking when token 1 would have been emitted.
+
+**B) TPOT (Time Per Output Token)**
+- Name: `tpot_ms`
+- Unit: milliseconds per output token
+- Definition: average inter-token time for generated tokens after the first token has been produced.
+- Computation:
+  - For a request with `n_out` output tokens, where `n_out >= 2`:
+    - `tpot_ms = (t_last_token_on_wire - t_first_token_on_wire) / (n_out - 1)`
+  - Requests with `n_out < 2` MUST be excluded from TPOT distributions and counted separately (`tpot_excluded_short_outputs_count`).
+
+**C) End-to-end generation latency**
+- Name: `e2e_generation_ms`
+- Unit: milliseconds
+- Definition: time from request accepted to last token written ("last token on wire").
+- Note: this metric is reported for completeness and debugging. Release gating SHOULD primarily focus on TTFT and TPOT, because they correlate better with user-perceived responsiveness and steady-state decode rate.
+
+**D) Throughput**
+Because throughput is easy to misinterpret, we standardize on two primary forms:
+- `tokens_per_second` (preferred for generation workloads)
+  - Definition: total output tokens emitted divided by wall-clock time over a measurement window.
+  - Must be paired with the concurrency target and workload mix.
+- `requests_per_second` (preferred for embeddings and small-payload workloads)
+  - Definition: total successful requests divided by wall-clock time over a measurement window.
+
+Throughput MUST be reported alongside saturation indicators and queueing metrics when available (see Decision 3: Results format) to avoid "throughput improved" claims that are actually driven by elevated tail latency.
+
+### 1.2 Measurement boundaries (what is included/excluded)
+To reduce noise and ensure comparability:
+- Measurements MUST be server-side timestamps taken in the request-serving process, using a monotonic clock.
+- TTFT and TPOT MUST exclude client-side overhead (client JSON encoding, TCP slow start variability, client read rate).
+- TTFT MUST include:
+  - Scheduler queue wait time after admission (including backpressure-induced waiting).
+  - Prefill compute.
+  - Any internal routing/fallback overhead after admission (e.g., model variant selection), if it occurs inside the serving path.
+- TTFT MUST exclude:
+  - Pre-admission time in the edge/API gateway (rate limiting, auth, global routing) unless the benchmark explicitly targets the gateway.
+  - Any optional quality checks that are not enabled in production for the same endpoint.
+
+**Streaming caveat (client read bottlenecks):**
+Benchmark clients MUST drain streams promptly. If a client becomes the bottleneck, TTFT and TPOT are no longer meaningful. Harnesses MUST record `client_backpressure_detected` as a boolean and MUST fail the run if the backpressure rate exceeds the threshold defined in the harness config (default: >0.5% of requests).
+
+### 1.3 Token accounting rules
+To make TPOT and tokens/s consistent:
+- `output_tokens` MUST be measured using the model tokenizer associated with the served model revision (not a generic tokenizer).
+- `input_tokens` MUST be recorded for each request.
+- When tool/function calling is used:
+  - Tokens for tool call JSON text count as output tokens.
+  - Any out-of-band tool execution time is out of scope for these metrics and must be measured separately (application-level metric).
+
+### 1.4 Required percentile set
+All perf suite outputs MUST at least include: p50, p95, p99 for TTFT and TPOT.
+Additionally:
+- TTFT SHOULD include p90 when used for SLO comparisons.
+- For long-context stress tests, TTFT MUST include p99.9 when sample sizes permit (see perf regression policy for minimum N).
+
+## Decision 2: Canonical run manifest schema
+### 2.1 Overview
+Each benchmark run MUST emit a single "run manifest" JSON document that fully describes:
+- Environment capture (hardware, drivers, runtime build, container image).
+- Model identity and serving configuration.
+- Scheduler and runtime knobs.
+- Workload definition and random seeds.
+- Measurement configuration (warmup, sample sizes, time windows).
+
+The manifest is designed to be:
+- Deterministic: same manifest + same artifacts should reproduce the run.
+- Comparable: fields are consistent across harnesses.
+- Versioned: schema versioned with backwards compatibility rules.
+
+### 2.2 Schema versioning rules
+- Field: `schema_version`
+- Format: `MAJOR.MINOR` (e.g., `1.0`, `1.1`)
+- Backwards compatibility:
+  - MINOR increments add optional fields or add enumerations.
+  - MAJOR increments may rename/remove fields.
+- Tools MUST:
+  - Accept manifests with the same MAJOR version.
+  - Warn (not fail) on unknown fields.
+  - Fail on missing required fields.
+
+### 2.3 Required top-level fields
+The run manifest MUST contain the following top-level keys:
+- `schema_version`
+- `run_id` (globally unique; recommended: ULID)
+- `created_at` (RFC3339)
+- `initiator` (human or automation identity)
+- `purpose` (e.g., `baseline_sweep`, `perf_canary_nightly`, `release_gating`, `local_repro`)
+- `region` (e.g., `us-east`, `eu-west`)
+- `cluster` (benchmark fleet identifier)
+- `hardware_gpu_sku` (e.g., `H100-SXM`, `A100-80GB`, `L40S`)
+- `hardware_gpu_count`
+- `software_driver_version` (NVIDIA driver)
+- `software_cuda_version`
+- `software_container_image` (fully qualified image reference)
+- `runtime_git_sha`
+- `runtime_version` (semantic version if applicable)
+- `model_id` (Redwood internal model identifier)
+- `model_family` (e.g., `llama`, `qwen`, `mistral`)
+- `model_revision` (immutable revision hash or catalog version)
+- `endpoint_type` (e.g., `chat_completions`, `completions`, `embeddings`)
+- `workload_id` (workload suite stable identifier)
+- `workload_seed` (integer)
+- `measurement_warmup_seconds`
+- `measurement_duration_seconds` OR `measurement_request_count` (at least one required; both allowed)
+
+### 2.4 Recommended fields (strongly encouraged)
+- `software_triton_version`
+- `software_nccl_version`
+- `hardware_host_cpu` (model string)
+- `hardware_host_memory_gb`
+- `hardware_numa_config` (text)
+- `hardware_gpu_clock_lock` (e.g., `enabled:1410MHz`, or `disabled`)
+- `scheduler_policy_name` (e.g., `continuous_batching_v3`)
+- `scheduler_policy_revision` (hash or version)
+- `scheduler_knobs` (serialized as a string map; see below)
+- `runtime_knobs` (serialized as a string map)
+- `kernel_selection_mode` (e.g., `auto`, `pinned`, `auto_with_fallbacks`)
+- `kernel_selection_digest` (hash of selection rules)
+- `cache_mode` (e.g., `cold`, `warm_prefix_cache`, `warm_kv_cache`)
+- `batching_mode` (e.g., `continuous`, `static`)
+- `concurrency_target`
+- `request_rate_target_rps` (if open-loop)
+- `notes` (freeform)
+
+### 2.5 Representation of knob maps (no nested objects requirement in some pipelines)
+Some ingestion paths cannot handle nested JSON consistently. To keep the manifest portable, any large structured knob map MUST be represented as a string containing JSON, with stable key ordering.
+
+Example fields:
+- `scheduler_knobs_json`: a string containing JSON
+- `runtime_knobs_json`: a string containing JSON
+- `workload_params_json`: a string containing JSON
+
+### 2.6 Example run manifest (illustrative)
+```json
+{
+  "schema_version": "1.1",
+  "run_id": "01J1ZQJ2JH5T9F1J4W8G2G8K9D",
+  "created_at": "2026-01-08T03:14:15Z",
+  "initiator": "perf-canary@redwoodinference.com",
+  "purpose": "perf_canary_nightly",
+  "region": "us-east",
+  "cluster": "bench-fleet-prod-a",
+  "hardware_gpu_sku": "H100-SXM",
+  "hardware_gpu_count": 8,
+  "software_driver_version": "550.54.14",
+  "software_cuda_version": "12.4",
+  "software_triton_version": "2.2.0",
+  "software_container_image": "us-docker.pkg.dev/redwood/serving/runtime:2026.01.07-rc2@sha256:...",
+  "runtime_git_sha": "9c13c7b8e7c9d4...",
+  "runtime_version": "2026.01.07-rc2",
+  "model_id": "catalog:qwen2.5-72b-instruct",
+  "model_family": "qwen",
+  "model_revision": "catalogrev:2026-01-05T22:10Z",
+  "endpoint_type": "chat_completions",
+  "workload_id": "rep-suite-v1/chat-streaming/default",
+  "workload_seed": 1337,
+  "measurement_warmup_seconds": 120,
+  "measurement_duration_seconds": 900,
+  "cache_mode": "cold",
+  "kernel_selection_mode": "auto",
+  "kernel_selection_digest": "ksm:q1-2026:2f4c0c...",
+  "scheduler_policy_name": "continuous_batching_v3",
+  "scheduler_policy_revision": "sched:q1-2026:7c0a1b...",
+  "scheduler_knobs_json": "{\"max_batch_tokens\":8192,\"max_queue_ms\":50,\"fairness\":\"tenant_weighted\"}",
+  "runtime_knobs_json": "{\"prefill_decode_overlap\":true,\"kv_cache\":{\"page_size\":16}}",
+  "workload_params_json": "{\"prompt_len_bins\":[32,128,512],\"output_len_bins\":[64,256],\"streaming\":true,\"concurrency\":64}",
+  "notes": "Nightly canary, cold-cache run; compare against baseline anchor 2026-01-02"
+}
+```
+
+### 2.7 Privacy and customer-safety constraints
+The run manifest MUST NOT contain:
+- Raw prompt content.
+- Customer identifiers (tenant IDs, org names), except anonymized cohort labels approved by Security & Compliance.
+- Full request payloads.
+
+Workload representativeness should be achieved through distributions and synthetic templates (see ADR-0173).
+
+## Decision 3: Canonical results export (minimum viable)
+Each run MUST produce a machine-readable results payload (separate from the manifest) that includes:
+- References to the manifest (`run_id`, `schema_version`).
+- Aggregate and percentile metrics for TTFT/TPOT/throughput.
+- Basic attribution counters to support triage (queueing time, batch sizes, drops, kernel fallback rate) when available.
+
+### 3.1 Required result fields
+- `run_id`
+- `results_schema_version`
+- `ttft_ms_p50`, `ttft_ms_p95`, `ttft_ms_p99`
+- `tpot_ms_p50`, `tpot_ms_p95`, `tpot_ms_p99`
+- `tokens_per_second` OR `requests_per_second` (depending on endpoint type)
+- `success_request_count`, `error_request_count`
+- `output_tokens_total`, `input_tokens_total`
+- `client_backpressure_detected` (true/false)
+
+### 3.2 Strongly recommended attribution fields
+If instrumented, include:
+- `queue_wait_ms_p50/p95/p99`
+- `batch_assembly_ms_p50/p95/p99`
+- `batch_size_tokens_p50/p95/p99`
+- `load_shed_count` (drops due to overload policy)
+- `kernel_fallback_rate` (fraction of requests hitting fallback kernel)
+
+These are required for fast regression attribution (scheduler vs kernels vs environment).
+
+## Alternatives considered
+1) Measure TTFT as "first token computed" instead of "first token on wire".
+- Rejected: diverges from customer-perceived streaming behavior and can mask serialization/streaming overhead and backpressure effects.
+
+2) Allow each tool to define its own manifest fields.
+- Rejected: prevents reproducibility and prevents automated comparisons across regions/SKUs.
+
+3) Store knobs as nested JSON everywhere.
+- Partially rejected: some ingestion paths and older tooling treat nested objects inconsistently. We standardize on `*_json` string fields for large knob maps to remain portable, while still allowing nested JSON in systems that support it.
+
+## Consequences
+### Positive
+- Comparable benchmarks across teams and tools.
+- Faster triage: consistent attribution metadata.
+- Cleaner release gating: a single interpretation of TTFT/TPOT.
+
+### Negative / costs
+- Tooling work required to emit schema-compliant manifests and results.
+- Some redundancy (manifest + results) and additional artifact storage.
+
+## Adoption plan
+- Benchmark-lab: manifest schema and validator merged; CI checks reject missing required fields.
+- perf-canary: nightly and gating jobs emit run manifests and results payloads to artifact storage; dashboards link `run_id` -> manifest -> traces.
+- Runtime instrumentation: scheduler and kernel selection debug dumps must attach `run_id` for correlation.
+
+## Operational guidance
+- Any performance claim (PR description, release notes, incident notes) MUST include the `run_id` and a link to the manifest.
+- If a run is re-executed, generate a new `run_id` and set `notes` to reference the prior run.
+
+## Open questions
+- Do we standardize a "gateway-inclusive" variant of TTFT for specific customer-facing API SLIs? (Out of scope for Q1 2026 baseline; track separately.)
+- Should we require clock-lock status as a required field on the benchmark fleet? (Currently recommended; may become required once fleet enforcement is complete.)
+
+## Changelog
+- 2026-01-10: Clarified TTFT boundary as "request accepted" -> "first token on wire" and added client backpressure failure criteria. Added recommendation to represent knob maps as `*_json` strings for pipeline portability.
+- 2025-11-18: Initial publish.

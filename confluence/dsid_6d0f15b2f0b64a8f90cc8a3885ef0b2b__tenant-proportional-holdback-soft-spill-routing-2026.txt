@@ -1,0 +1,185 @@
+Tenant proportional holdback & soft-spill routing (2026) — Runbook and operational guide
+
+## Overview
+This page is the operational runbook for the Dedicated fleet admission layer that implements (1) tenant-proportional holdback and (2) soft-spill routing.
+
+**Goal:** reduce hard rejects (HTTP 429/503) during transient overload while protecting contracted tenant minimum throughput and keeping fleet utilization high.
+
+**Applies to:** Dedicated fleets using the Admission service (`rw-admission`) and Router (`rw-router`) with multi-lane execution pools.
+
+**Release train:** dedicated-2026.04 (feature gated; default-on for eligible fleets as of 2026-03-15).
+
+---
+
+## Key concepts
+### Tenant proportional holdback
+Holdback is a per-tenant reserved capacity slice that is computed from:
+- Contracted throughput (reservation)
+- Recent observed usage (to avoid over-reserving idle capacity)
+- A minimum floor to prevent starvation for small-but-contracted tenants
+
+**Important update (2026-03-12):** holdback is enforced as **time-windowed reservation credits** (not a static rate limit). Credits replenish on a rolling window, and unused credits partially decay to reclaim utilization.
+
+### Soft-spill routing
+When a tenant exceeds its guaranteed share *and* the fleet is under headroom pressure, requests are preferentially routed to a lower-priority lane rather than being hard-rejected.
+
+**Soft-spill options (in priority order):**
+1. Spill to `best_effort` lane in the same Dedicated fleet
+2. Queue deferment (bounded) in the `best_effort` lane if enabled
+3. Hosted fallback **only** for tenants with Hybrid Routing enabled (explicit opt-in)
+4. Hard reject (429) when all spill paths are saturated or policy forbids spill
+
+**Important update (2026-03-14):** default behavior is now **spill-first with bounded queueing**, not queue-first. Queueing is only used when `best_effort` has headroom but is briefly bursty, to prevent oscillation and reduce tail amplification.
+
+---
+
+## Architecture (operational view)
+**Services:**
+- `rw-admission`: evaluates requests and issues reservation/spill decisions
+- `rw-router`: applies lane routing and attaches spill metadata
+- Dedicated autoscaler: consumes admission headroom signals for scale intent
+
+**Critical invariants:**
+- Guaranteed tenants should not regress sovereign SLAs under typical overload shapes.
+- Best-effort tenants may see increased tail latency during spill events.
+- Spill metadata must not leak cross-tenant contract allocation details.
+
+---
+
+## Configuration knobs (defaults)
+| Knob | Location | Default | Notes |
+|---|---|---|---|
+| `admission.holdback.enabled` | fleet config | true (eligible fleets) | Still flag-protected for some regions |
+| `admission.holdback.window_seconds` | `rw-admission` | 60 | Rolling credit window |
+| `admission.holdback.decay_half_life_seconds` | `rw-admission` | 600 | Reclaims unused reserved credits gradually |
+| `routing.soft_spill.enabled` | fleet config | true | Can be disabled per tenant |
+| `routing.soft_spill.max_queue_ms` | `rw-router` | 250 | Bounded deferment in best-effort only |
+| `routing.soft_spill.hosted_fallback_enabled` | tenant config | false | Must be explicitly enabled (hybrid routing) |
+| `autoscaler.headroom_signal_source` | autoscaler | `admission` | Reads computed deficit/pressure |
+| `autoscaler.scale_up_cooldown_seconds` | autoscaler | 120 | Helps reduce oscillation |
+
+**Per-tenant override knobs:**
+- `tenant.soft_spill_opt_out`: disables spill routing for that tenant (requests will queue/429 per policy)
+- `tenant.holdback_floor_rps`: minimum guarantee floor, used when contract data is incomplete
+
+---
+
+## Observability and dashboards
+### Primary metrics
+**Note (2026-03-10 rename):** metric names were standardized; older names may still appear in legacy dashboards.
+
+- `admission_holdback_allocated_rps` (was: `holdback_allocated`)
+- `admission_holdback_used_rps` (was: `holdback_used`)
+- `routing_soft_spill_total` (was: `soft_spill_count`)
+- `routing_spill_latency_ms` (was: `avg_spill_latency`; now histogram)
+- `routing_queue_wait_ms{quantile=...}` (was: `queue_wait_p50/p95`)
+- `tenant_reject_rate` (dimensioned by `tenant`, `reason`)
+- `admission_headroom_deficit` (signal used by autoscaler)
+
+### Logs / tracing
+- Router adds fields: `spill_reason`, `spill_lane`, `origin_tier`, `decision_id`
+- Admission adds fields: `tenant_class`, `holdback_window`, `credits_before`, `credits_after`
+
+**Security note:** redact/avoid logging contract IDs. Use tenant-visible names and internal tenant UUIDs only.
+
+---
+
+## Operational procedures
+### 1) Confirm the system is enabled
+1. Check fleet config: `admission.holdback.enabled=true` and `routing.soft_spill.enabled=true`.
+2. Verify `rw-admission` is healthy and serving: `/healthz` and `/metrics`.
+3. Verify router lane map includes `best_effort` and that capacity is non-zero.
+
+### 2) Handling a spike event (reducing hard rejects)
+**Symptoms:** rise in 429s/503s; increased `admission_headroom_deficit`; `routing_soft_spill_total` rising.
+
+Actions (in order):
+1. Validate spill is functioning: confirm increased `routing_soft_spill_total` with stable `tenant_reject_rate` for guaranteed tenants.
+2. If guaranteed tenants are rejecting:
+   - Inspect `admission_holdback_used_rps` vs `admission_holdback_allocated_rps` per tenant.
+   - Ensure holdback floor is configured and contract data is correct.
+3. If best-effort latency is unacceptable:
+   - Reduce `routing.soft_spill.max_queue_ms` (e.g., 250 → 100)
+   - If necessary, temporarily disable spill for specific tenants via `tenant.soft_spill_opt_out=true` (expect higher rejects)
+4. Coordinate with autoscaler:
+   - Confirm scale intent by checking `admission_headroom_deficit` and autoscaler events.
+   - If scale-up is too slow, adjust autoscaler constraints (region capacity permitting).
+
+### 3) Oscillation mitigation
+**Known issue (resolved by default as of 2026-03-15):** short TTL bursts caused rapid admit/spill oscillation.
+
+Mitigations:
+- Ensure `admission.holdback.window_seconds >= 60`.
+- Keep `autoscaler.scale_up_cooldown_seconds >= 120`.
+- Enable adaptive backoff (default): `admission.holdback.adaptive_backoff=true`.
+
+---
+
+## Troubleshooting guide
+### A) "Guaranteed tenant is getting 429s"
+Checklist:
+- Is the tenant marked as guaranteed/reserved in the contract feed?
+- Are credits being allocated? (`admission_holdback_allocated_rps` > 0)
+- Are credits being consumed unusually fast due to retries?
+- Is spill disabled for that tenant (opt-out)?
+- Are we saturating the entire fleet (both lanes) such that even reserved capacity cannot be served?
+
+Remediations:
+- Increase `tenant.holdback_floor_rps` temporarily.
+- Verify retry storm controls upstream.
+- If the fleet is globally saturated, scale capacity or shed best-effort earlier.
+
+### B) "Spill is happening but tail latency exploded"
+Checklist:
+- `routing_queue_wait_ms p95` > 250ms?
+- `best_effort` lane CPU/GPU saturation?
+- Hosted fallback accidentally enabled for a tenant without sufficient budget/latency tolerance?
+
+Remediations:
+- Lower `routing.soft_spill.max_queue_ms`.
+- Increase `best_effort` lane share if safe.
+- Disable hosted fallback unless explicitly required.
+
+### C) "No spill events, but rejects are high"
+Checklist:
+- `routing.soft_spill.enabled` true?
+- Lane map includes `best_effort` and is not capacity=0?
+- Router receiving admission decision tags?
+
+Remediations:
+- Roll back to previous router build if tag propagation is broken.
+- Temporarily enable bounded queueing to reduce immediate 429s.
+
+---
+
+## Rollout / migration status
+Phased rollout (current):
+1. Internal tenants only — completed
+2. Beta customers (opt-in) — completed (2026-03-11)
+3. Default enable for eligible fleets — started (2026-03-15), ongoing by region
+
+Operator notes:
+- Some fleets still run legacy metric names; use the updated dashboard linked above.
+- Support-facing guidance: describe spill as "temporary best-effort routing during congestion"; do not mention tenant-specific allocation math.
+
+---
+
+## Performance and validation results (latest)
+Synthetic spike validation (kilo-agent simulator, 100 tenants, mixed reserved/unreserved):
+- Hard rejects reduced by ~75% during 2x sudden load spikes (previous: ~73%).
+- Guaranteed tenants: <=0.5% SLA regression in worst-case adversarial mix (improved from <=1% target).
+- Median latency for priority tenants: +5–10ms depending on queueing cap; best-effort p95 can increase significantly during sustained deficits.
+
+---
+
+## Contacts / ownership
+- Primary owner: Dedicated Capacity — Admission & Routing (Engineering)
+- On-call: Platform Routing / Dedicated SRE rotation
+- Security reviewer: Karthik Iyer (ensure metadata redaction)
+
+---
+
+## Change log
+- 2026-03-18: Published runbook; updated default spill behavior (spill-first with bounded queueing) and metric renames.
+- 2026-03-15: Enabled adaptive backoff by default to mitigate oscillation.
+- 2026-03-12: Standardized holdback credits as rolling-window reservations with decay.

@@ -1,0 +1,305 @@
+Retention Policy Service (RPS) — System Overview
+
+## Overview
+Retention Policy Service ("RPS") is the control-plane service responsible for storing, validating, and serving **customer-configurable retention policies** across Redwood Inference products (Hosted API, Dedicated, Private). RPS is the source of truth for retention configuration used by:
+- TTL/purge workers for request/response logs, audit logs, and other eligible data stores.
+- Console retention settings UI (read/write + change history).
+- Compliance Reporting Pack (retention configuration export attachments).
+
+RPS does **not** delete data directly. It provides policy CRUD, evaluation, and auditable change history. Deletion enforcement is implemented in data-store-specific purge jobs and telemetry retention pipelines.
+
+## Responsibilities (in scope)
+1) Policy CRUD (create/update/read) per tenant and (where supported) per workspace/org.
+2) Policy validation (tier constraints, allowed data classes, region constraints, disabled logging compatibility).
+3) Policy evaluation (effective policy resolution and precedence rules).
+4) Change history + audit trail (who/what/when; before/after snapshots).
+5) Export endpoints for compliance evidence packages.
+
+## Non-goals (explicit)
+- Running purge jobs or managing purge job schedules.
+- Arbitrary field-level redaction rules (tracked separately under logging standards).
+- Full custom report builder (RPS supports exports only).
+
+---
+
+## Terminology
+- **Tenant**: A customer account in Redwood control plane.
+- **Data class**: A named category of stored/retained data (e.g., request_logs, audit_logs).
+- **Retention TTL**: The intended maximum age of records before eligible for deletion.
+- **Purge semantics**: How and when deletion happens (async, best-effort with verification, idempotent).
+- **Legal hold**: A state that prevents deletion for one or more data classes regardless of configured TTL.
+- **Tier defaults**: Baseline retention settings by product tier (Hosted/Dedicated/Private) when a tenant has not set overrides.
+
+---
+
+## Architecture and dependencies
+### High-level design
+RPS is a stateless API service in the control plane with Postgres persistence and a read-through cache for effective policy reads.
+
+Primary dependencies:
+- **Postgres (control-plane)**: durable storage for policy records + change history.
+- **Redis (control-plane)**: cache of evaluated effective policies (short TTL + explicit invalidation on writes).
+- **AuthN/AuthZ**: control-plane identity, service-to-service auth, Console RBAC.
+- **Audit Trail**: writes policy-change audit events into the audit log pipeline.
+
+Downstream consumers (not owned by RPS):
+- Request/response logs store purge jobs.
+- Audit logs store purge jobs + audit log exporter.
+- Traces/metrics retention configuration consumers (telemetry platform).
+- Compliance pack generator (attaches retention export).
+
+### Data residency note
+RPS stores *configuration* in the control plane and is not the system of record for customer data. Residency/region constraints are expressed in policy (where applicable) and enforced by data-plane systems that store the data.
+
+---
+
+## Data model
+RPS persists three primary logical entities:
+
+### 1) retention_policy
+- **policy_id**: stable UUID
+- **tenant_id**: UUID
+- **schema_version**: e.g., "1.1"
+- **status**: active | staged | disabled
+- **scope**: tenant (v1)  
+  (Workspace/org scope is reserved for future use; do not assume availability.)
+- **policy_payload**: JSON blob (validated) containing per-data-class rules
+- **created_at / updated_at**
+- **created_by / updated_by**: actor (user or service)
+
+### 2) retention_policy_change
+Immutable append-only history table:
+- **change_id**: UUID
+- **tenant_id / policy_id**
+- **actor**: principal id + type (user/service)
+- **change_type**: create | update | delete | legal_hold_enable | legal_hold_disable
+- **before_snapshot / after_snapshot**: JSON snapshots (compressed)
+- **reason**: free-text or ticket reference (required for break-glass and legal hold)
+- **created_at**
+
+### 3) retention_policy_effective_cache (optional)
+RPS uses Redis for effective-policy cache; it is not a source of truth. Keys are versioned to allow safe evolution.
+
+---
+
+## Supported data classes (v1)
+RPS schema recognizes the following data classes for retention configuration and evaluation:
+- **request_logs**: request/response logs (including metadata and error logs emitted by gateway/runtime, where stored)
+- **audit_logs**: control-plane audit events
+- **traces**: distributed traces (where enabled)
+- **metrics**: operational metrics (where retention is configurable)
+- **artifacts**: evaluation datasets / report artifacts stored by Redwood-managed systems (where applicable)
+
+Notes:
+- Some classes may be **not-applicable** depending on deployment mode (e.g., in Private, artifacts may be customer-managed). RPS validation will allow configuration but will label a class as "enforcement_managed_by_customer" in export outputs when applicable.
+- If logging is disabled for a tenant (e.g., request logging disabled), retention for that class is treated as "no-op" enforcement; RPS still records policy intent for compliance export.
+
+---
+
+## Policy evaluation and precedence
+RPS evaluates an **effective policy** for a given (tenant_id, region, data_class) using the following precedence:
+1) **Legal hold** (if enabled for tenant and data class) → effective retention = "hold" (no deletion)
+2) **Tenant override** for the data class (and region override, if present)
+3) **Tier default** for the tenant’s product mode (Hosted/Dedicated/Private)
+4) **System default** (fallback; used only if tier metadata cannot be resolved)
+
+Key rules:
+- If a customer requests a TTL **outside allowed bounds** for their tier, RPS rejects the write (400) with a machine-readable error code and human-readable guidance.
+- For reads/evaluation, if underlying tier metadata is temporarily unavailable, RPS returns tier = "unknown" and falls back to system default, and emits a warning metric (see Observability).
+
+Caching:
+- Effective policies are cached in Redis for a short TTL (default: 60s) and **explicitly invalidated** on policy writes.
+- Cache keys include schema_version and a policy change counter to avoid stale reads after writes.
+
+---
+
+## API surface
+All endpoints are served under the control-plane API gateway.
+
+### Authentication/authorization
+- **Console users**: authenticated via control-plane identity; authorization via RBAC permission `retention.policies:write` and `retention.policies:read`.
+- **Internal services**: mTLS + service tokens; authorization via service allowlist (`retention-policy-consumers`).
+- **Break-glass**: restricted role `security.breakglass` with mandatory reason field and enhanced audit logging.
+
+### Endpoints (v1)
+#### 1) Get current policy
+`GET /v1/tenants/{tenant_id}/retention-policy`
+- Returns the active policy if set; otherwise returns tier defaults summary + `policy=null`.
+
+#### 2) Upsert policy
+`PUT /v1/tenants/{tenant_id}/retention-policy`
+- Validates payload, persists, writes change history, emits audit event, invalidates caches.
+- Requires `If-Match` for optimistic concurrency when a prior policy exists.
+
+#### 3) Validate policy (no write)
+`POST /v1/tenants/{tenant_id}/retention-policy:validate`
+- Used by Console to preflight validation and show warnings/errors.
+- Returns structured validation results (errors + warnings).
+
+#### 4) Evaluate effective policy
+`GET /v1/tenants/{tenant_id}/retention-policy:effective?data_class={...}&region={...}`
+- Returns the effective retention decision for that class/region, including which layer applied (legal_hold | tenant_override | tier_default | system_default).
+
+#### 5) Change history
+`GET /v1/tenants/{tenant_id}/retention-policy/changes?start={iso}&end={iso}&limit=200`
+- Returns chronologically ordered change events (actor, reason, diffs summary).
+
+#### 6) Export (compliance pack attachment)
+`GET /v1/tenants/{tenant_id}/retention-policy:export?format=json`
+- Returns a stable, versioned export used for customer security reviews.
+- Includes: tier defaults, overrides, legal hold status, last changed timestamps, and enforcement notes per data class.
+
+#### 7) Legal hold controls
+`POST /v1/tenants/{tenant_id}/retention-policy:legal-hold/enable`
+`POST /v1/tenants/{tenant_id}/retention-policy:legal-hold/disable`
+- Restricted to Security/Legal roles; requires reason and (where configured) approval reference.
+
+### Example: upsert payload (schema v1.1)
+(Shown for illustration; exact schema is defined in the retention policy schema doc.)
+
+- Top-level fields: `schema_version`, `data_classes`, optional `region_overrides`, optional `legal_hold`.
+- Each data class supports: `ttl_days`, `purge_grace_days`, and `notes`.
+
+RPS rejects unknown fields to keep exports stable and prevent silent misconfiguration.
+
+---
+
+## Validation rules (high level)
+RPS validation returns both **errors** (block write) and **warnings** (allow write but highlight risk).
+
+### Blocking errors
+- TTL < tier minimum or > tier maximum for the specified data class.
+- TTL is set for a data class that is disallowed for the tenant’s deployment mode (rare; e.g., class not supported at all).
+- Payload schema_version unsupported.
+- Missing required `reason` field for break-glass updates.
+
+### Warnings
+- TTL shorter than recommended operational minimum (e.g., request_logs too short for on-call debugging in Hosted) unless tenant explicitly acknowledges.
+- Logging disabled: retention config will not have effect until logging is enabled (export will still show intent).
+- Very large TTL likely to impact storage costs and purge job performance.
+
+---
+
+## Failure modes and mitigations
+### 1) Postgres unavailable / elevated latency
+Symptoms:
+- CRUD and evaluation requests error or time out.
+
+Mitigations:
+- Read path uses Redis cache; if cache hit, RPS can serve effective policy without DB.
+- For cache miss + DB down: return 503 with `Retry-After` and emit `rps_effective_policy_fallback_total`.
+- Console UI should surface a non-destructive error; do not allow writes.
+
+### 2) Redis unavailable
+Symptoms:
+- Increased latency on `:effective` endpoints.
+
+Mitigations:
+- RPS continues operating by querying Postgres.
+- Alert on sustained p95 latency increase; this is not data-loss but can impact purge job scheduling loops.
+
+### 3) Stale effective policies after update
+Causes:
+- Cache invalidation failure or consumer-side caching beyond allowed TTL.
+
+Mitigations:
+- RPS invalidates keys on write using tenant-scoped cache version bump.
+- Consumers must cache for <= 5 minutes and respect `effective_policy_version` in response.
+- Verification dashboards detect policy drift (expected vs observed TTL lag patterns).
+
+### 4) Misconfigured TTL leads to operational blind spots
+Example:
+- Customer sets request_logs TTL to 1 day, impacting incident investigation.
+
+Mitigations:
+- Console warning + required acknowledgement for very short TTL.
+- Break-glass process documented; incident holds available with audited approval.
+
+### 5) Legal hold not enforced by a downstream store
+Cause:
+- Consumer bug: fails to check hold flag.
+
+Mitigations:
+- Hold is represented in effective policy response and export; purge jobs must treat hold as "skip deletes".
+- Integration tests: for each store, assert deletion job respects hold.
+- SRE verification: purge jobs emit a metric `purge_skipped_legal_hold_total` with tenant_id hashed label only (privacy + cardinality).
+
+---
+
+## Observability
+### Key metrics (RPS)
+- `rps_http_requests_total{route,method,status}`
+- `rps_http_request_duration_ms{route}` (p50/p95/p99)
+- `rps_policy_write_failures_total{reason_code}`
+- `rps_effective_policy_cache_hit_ratio`
+- `rps_effective_policy_fallback_total{type=system_default|tier_unknown|error}`
+- `rps_audit_event_publish_failures_total`
+
+### Logs
+- Structured logs with request id, tenant id (hashed in shared logs), actor type, and route.
+- Policy payloads are not logged verbatim; only schema version and diff summary are logged.
+
+### SLO targets (internal)
+- Availability: 99.9% monthly for read endpoints (`GET policy`, `:effective`, `:export`).
+- Latency: p95 < 50ms for `:effective` (cache hit), p95 < 200ms for DB-backed.
+- Freshness: policy updates visible to `:effective` within 60 seconds (target), 5 minutes (hard).
+
+Dashboards:
+- See: Retention Controls Verification Dashboards (links in related pages).
+
+---
+
+## Operational playbooks
+### On-call ownership
+- **Primary**: Platform / Control Plane (Eng Platform)
+- **Secondary**: SRE (for infra saturation, DB/Redis incidents)
+
+### Common procedures
+1) **Policy write incident** (customers cannot save retention settings)
+   - Check `rps_policy_write_failures_total` and error codes.
+   - Verify Postgres write health; check migration status.
+   - Confirm RBAC permissions (recent changes can manifest as 403s).
+
+2) **Effective policy fetch degraded** (purge jobs backing up)
+   - Check Redis availability and cache hit ratio.
+   - Check Postgres read latency and connection pool saturation.
+   - Confirm consumers are not over-polling (rate limits).
+
+3) **Suspected drift / incorrect enforcement**
+   - Compare `:export` output vs observed TTL lag in store metrics.
+   - Verify last policy change (change history endpoint) and actor.
+   - If needed, roll back by re-applying previous snapshot (manual, with reason).
+
+For purge-specific issues, follow the purge jobs runbook (RPS does not execute purges).
+
+---
+
+## Security and compliance considerations
+- All policy changes create both:
+  1) an immutable `retention_policy_change` record, and
+  2) an audit log event (customer-visible where applicable).
+- Legal hold endpoints are restricted and require a reason; break-glass updates are additionally labeled and alerted.
+- Exports are versioned and designed to be customer-shareable; avoid internal-only implementation details in export payloads.
+
+---
+
+## Ownership and contacts
+- **Service name**: retention-policy-service (RPS)
+- **Repo**: redwood (control plane)
+- **Slack**: #eng-platform (ops), #eng-security (policy/legal hold)
+- **Primary engineering owner**: Ethan Park
+- **Implementation lead**: Benji Okafor
+- **Policy evaluation module owner**: Jordan Lee
+- **Security reviewer**: Marcus Lin
+- **SRE partner**: Sean Gallagher
+
+---
+
+## Appendix: API error codes (selected)
+- `RETENTION_SCHEMA_UNSUPPORTED`: schema_version not supported.
+- `RETENTION_TTL_OUT_OF_RANGE`: ttl_days outside tier bounds.
+- `RETENTION_RBAC_DENIED`: caller lacks permission.
+- `RETENTION_ETAG_MISMATCH`: optimistic concurrency failure.
+- `RETENTION_LEGAL_HOLD_REQUIRES_APPROVAL`: missing required approval reference.
+
+(For the canonical list, see the schema and validation document.)

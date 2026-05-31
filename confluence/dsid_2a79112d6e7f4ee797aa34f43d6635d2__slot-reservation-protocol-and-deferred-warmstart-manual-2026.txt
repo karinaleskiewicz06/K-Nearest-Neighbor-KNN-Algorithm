@@ -1,0 +1,129 @@
+Slot Reservation Protocol and Deferred Warmstart Manual
+
+Overview
+
+This manual documents the Slot Reservation Protocol used by the Redwood serving runtime and the Deferred Warmstart mechanism that reduces first-token latency for interactive requests without excessive pre-warm cost. It is written for oncall engineers, scheduler and worker owners, and product owners who need an operational contract for admission and warmstart behavior.
+
+Goals
+- Reduce tail latency for interactive routes by pre-reserving execution slots for requests judged latency-sensitive.
+- Limit wasted GPU cycles by deferring full warmstart work until a reservation is confirmed and a short pre-execution checkpoint is reached.
+- Provide clear admission semantics, deadlines, and observable signals for SRE runbooks and automation.
+- Define safe fallback behavior so requests are served cold if warmstart is unavailable, with telemetry to measure impact.
+
+Key terms
+- Slot: a single execution unit on a worker that can be bound to one inference request at a time.
+- Reservation: a soft hold on a slot that can be confirmed, released, preempted, or expired.
+- Warmstart: preparing KV prefix state and kernel activation so generation can start with reduced latency.
+- Deferred Warmstart or DWS: the practice of delaying full warmstart actions until after reservation confirmation and a final readiness checkpoint.
+
+High-level flow
+1) Frontend classifies incoming request into a tier such as interactive, best-effort, or batch.
+2) For interactive requests, the frontend asks the admission component to reserve a slot using the SRP API. The request includes an affinity fingerprint, sequence length hint, and kernel hints.
+3) Admission forwards a reserve request to the scheduler with a short deadline; the scheduler attempts tentative reservation on candidate workers.
+4) Workers reply confirmed if they can honor the reservation within the deadline. On confirmation, admission returns a reservation acknowledgement to the frontend.
+5) After confirmation, admission starts DWS: it sends a compact KV hint and kernel activation request to the assigned worker. DWS has a configurable soft time budget.
+6) If DWS completes before its budget, the frontend sends the request payload to the warmed slot. If DWS aborts or times out, the payload is sent to the worker for cold execution and fidelity is recorded.
+
+Reservation states and transitions
+- Pending becomes Confirmed when the worker accepts.
+- Pending becomes Expired if the deadline is missed.
+- Confirmed may become Released after use or be Preempted by higher priority work.
+
+Admission API summary
+The reserve call carries the following fields in plain text: affinity fingerprint (tenant, model, route), sequence length hint, a deadline in milliseconds, a priority level, and a set of kernel hints. The response includes a status token that indicates confirmed, queued, or expired plus an optional slot identifier and ETA.
+
+Deferred Warmstart semantics
+- DWS is executed only after reservation confirmation and when affinity trust conditions are met. The default trust threshold is one previous affinity hit but is configurable per-customer.
+- DWS has three logical phases: compact KV hint injection, kernel activation, and a final readiness checkpoint.
+- The default DWS budget is 30 milliseconds. If the worker cannot finish within the budget the system aborts DWS and falls back to cold execution. Abort events are recorded.
+
+Recommended configuration defaults
+- reservation.deadline_ms = 15
+- warmstart.time_budget_ms = 30
+- affinity.trust_threshold = 1
+- preempt.policy = preempt-by-priority
+- reservation.max_pending_per_node = 64
+
+Operational runbook: common failure modes
+- Symptom: Elevated DWS abort rate
+  1. Inspect metrics: reservation latency percentiles and worker KV prepare latency percentiles.
+  2. If admission latency exceeds reservation deadline, investigate control plane saturation and network latency.
+  3. If worker KV prepare latency is high, check GPU utilization, kernel unload events, and memory pressure.
+  4. Short-term mitigation: increase warmstart.time_budget_ms to a conservative value such as 60 milliseconds for affected pools.
+
+- Symptom: Confirmations frequently expire for interactive traffic
+  1. Examine scheduler pending counts per node and the scheduler queue length.
+  2. If pending counts approach the per-node maximum, scale worker pools or reduce the per-node pending limit.
+  3. Review preemption logs; if frequent, tune preemption policy or raise priority for critical routes.
+
+- Symptom: Preemption causes missing warmstarts and SLO misses
+  1. Correlate request trace ids with scheduler event logs for the preceding window.
+  2. If preemptions align with traffic bursts, enable a short holdback window so confirmed slots complete first-token generation before preemption.
+
+Telemetry, metrics and alerts (minimum set)
+- Counters and histograms to export:
+  - admission_reservation_attempts_total
+  - admission_reservation_confirm_rate
+  - admission_reservation_latency_ms p50 p95 p99
+  - worker_warmstart_success_rate
+  - worker_kv_prepare_latency_ms p95
+  - runtime_first_token_latency_ms p95 tagged by fidelity warmstart or coldstart
+- Recommended alerts:
+  - reservation_failure_rate exceeds 3 percent over 5 minutes -> P1 paging for runtime oncall
+  - dws_abort_rate exceeds 1 percent over 10 minutes while cost exceeds budget -> P2 investigate kernel churn and memory pressure
+
+Quality versus cost considerations
+- Aggressive warmstarting yields the lowest latency but increases GPU active time and memory pressure. Use the affinity trust threshold and per-customer warmstart budgets to constrain warmstarts for cost-sensitive tenants.
+- For low-priority traffic, prefer lazy strategies with background prefetchers rather than immediate DWS.
+
+Safety and fallback patterns
+- If a worker fails during DWS, scheduler marks pending reservations as expired and attempts reseating to an alternate worker under a secondary deadline, default 25 milliseconds.
+- For customers requiring strict confidentiality, DWS is opt-in and warmth requires explicit permission to prefetch cached prefixes.
+
+Rollout checklist
+1. Add feature flags: admission.srp.enabled and worker.dws.enabled, defaulting to disabled.
+2. Canary the reservation API in a single region and enable DWS for internal test routes only. Monitor confirmation rates and first-token latency.
+3. Run synthetic traffic with mixed affinity distribution to validate worker KV prepare latency at target load.
+4. Increment traffic exposure and enable preemption holdback.
+5. At intermediate exposure, enable for a small set of low-revenue tenants while collecting cost telemetry.
+6. Proceed to full rollout after 72 hours stable operation at each stage and absence of sustained alerts.
+
+Ownership and contacts
+- Primary owner: serving-runtime scheduler team, runtime-scheduler-oncall channel.
+- Secondary owner: serving-runtime worker team, runtime-worker-oncall channel.
+- Product contact for SLA decisions: Priya Shah.
+
+Troubleshooting commands and examples
+- Tail reservation traces for a node in the last 15 minutes: redwoodctl reservations tail with node filter and status filter.
+- Inspect recent worker kernel and warmstart logs using remote access and the worker inspect tool to show warmstart history.
+
+Engineering test guidance
+- Unit tests should mock reserve responses for confirmed and expired states and assert admission behavior on timeouts.
+- Integration tests should replay production fingerprints for at least five minutes and require warmstart success rate above 90 percent for interactive tier under nominal load.
+- Load tests should use the benchmark harness with affinity skew to verify per-node pending limits and reservation saturation behavior.
+
+Security considerations
+- KV hints must never contain plaintext customer PII; admission scrubs hints and rejects any payload that exceeds configured size limits.
+- Reserve API requires internal mutual TLS and scoped tokens with reserve write permission.
+
+Appendix: simplified worker-side behavior pseudocode described in prose
+- On tentative reserve, the worker marks a slot tentative and evaluates whether it can confirm the reservation within the configured deadline. If it can, it confirms; otherwise it queues or expires the tentative reservation.
+- On DWS start, the worker checks for memory pressure and may abort early. If resources permit, it prepares KV using hints and activates kernels from idle state. The worker records prepare latency metrics and responds ready or abort.
+
+Example configuration snippet represented as key value pairs
+- reservation.deadline_ms: 15
+- reservation.max_pending_per_node: 64
+- warmstart.enabled: true
+- warmstart.time_budget_ms: 30
+- warmstart.trust_threshold: 1
+- preempt.policy: preempt-by-priority
+- preempt.holdback_ms: 10
+
+Related references
+- Runtime rejection and backpressure SLA in the eng-sre space.
+- Coldstart warmup strategies in the eng-serving-runtime runbooks.
+
+Revision history
+- 2026-02-15: Draft created by Asha Ramanathan
+- 2026-02-20: Incorporated reviewer feedback on preemption behavior
+- 2026-03-01: Published with rollout checklist and alert guidance

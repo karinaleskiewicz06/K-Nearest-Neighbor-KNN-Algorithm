@@ -1,0 +1,245 @@
+Common runtime incident types and mitigations (taxonomy appendix)
+
+## Purpose
+This page is a **runtime-focused appendix** to the v1 incident taxonomy. It captures the most common *serving runtime* failure/regression patterns we see in production and how to:
+1) Recognize them quickly via symptoms + metrics/logs
+2) Apply a consistent **incident_type / subtype** classification
+3) Use safe, repeatable **mitigations** to restore service
+
+**Scope:** issues originating primarily in the serving runtime (GPU inference workers, batching/scheduler, KV cache, kernels, model load/serialization). This is not a root-cause framework; detailed RCA belongs in the postmortem.
+
+**Primary owner:** Serving Runtime on-call. **Common consults:** SRE (incident process + comms), Infra/Fleet (capacity), Observability (metrics blind spots), Platform Routing (fallback behavior).
+
+---
+
+## Quick classification guidance (during a live incident)
+Use this page when the *customer-facing symptom* is availability/latency/streaming impact, but the **trigger appears to be inside runtime pods/workers**.
+
+1. **If you see crash loops, OOMs, illegal memory access, or workers dropping out:** classify as **Serving Runtime → OOM/Crash-loop**.
+2. **If 5xx and timeouts correlate with rising queue depth / stalled batcher while pods stay “healthy”:** classify as **Serving Runtime → Scheduler stall / queue starvation**.
+3. **If latency explodes while throughput collapses and GPU is busy but tokens/sec drops, often after long-context traffic spikes:** classify as **Serving Runtime → KV-cache thrash / cache eviction storm**.
+4. **If the incident starts immediately after rollout/model change/flag flip:** use the appropriate runtime subtype but add contributing factor **Rollout/Config change** in the postmortem.
+
+If multiple causes are plausible, choose the **primary incident_type** as the one that best explains the *fastest mitigation lever*. Capture the others as **contributing systems**.
+
+---
+
+## Where to look (signals that tend to be decisive)
+### Dashboards (typical panels)
+- **Serving runtime / Worker health:** worker count by pool, restart rate, readiness flaps
+- **GPU memory + utilization:** memory used %, allocator retries, ECC/Xid errors
+- **Batching & queueing:** queue depth, batch size distribution, batcher wait time p95
+- **KV cache:** hit ratio, eviction rate, KV bytes allocated, prefill vs decode time
+- **Kernel/runtime errors:** CUDA errors, illegal memory access, NCCL timeouts (if applicable)
+
+### Logs (common strings)
+- `CUDA out of memory` / `c10::Error` / `CUDA error: an illegal memory access was encountered`
+- `Killed process ... (OOMKilled)` (container/pod events)
+- `assert failed` / `shape mismatch` / `unexpected dtype` (often model artifact / quant profile issues)
+- `scheduler loop took` / `no eligible requests` / `queue stalled` (scheduler anomalies)
+
+### Metrics (names are indicative; use the closest available in your environment)
+- `runtime_oom_total`, `runtime_worker_restarts_total`
+- `runtime_gpu_memory_used_bytes`, `runtime_gpu_memory_utilization_ratio`
+- `runtime_scheduler_queue_depth`, `runtime_batcher_wait_ms_p95`
+- `runtime_kv_cache_hit_ratio`, `runtime_kv_cache_evictions_total`
+- `request_latency_ms_p95{route=...}`, `request_errors_total{code=~"5.."}`
+
+---
+
+## Common runtime incident patterns
+
+### 1) GPU OOM / crash-loop
+**Recommended taxonomy classification**
+- incident_type: **Serving Runtime**
+- subtype: **OOM/Crash-loop**
+
+**Typical symptoms**
+- Sudden spike in **5xx** (often 500/502) and/or increased request timeouts
+- Worker pools drop capacity quickly; autoscaling may lag
+- Elevated restart rate; pods oscillate between Ready/NotReady
+
+**Common triggers**
+- Traffic shift to longer contexts (prefill memory spike)
+- Changed `max_tokens`, context window, or batching config
+- Model version change with different memory profile
+- Fragmentation/allocator behavior after extended uptime (less common, but observed)
+
+**Fast checks**
+- Are pods showing `OOMKilled` or repeated `CUDA out of memory`?
+- Is `runtime_gpu_memory_utilization_ratio` pegged near 1.0 on affected workers?
+- Does the issue correlate to a specific model/pool/region?
+
+**Mitigations (prefer in this order)**
+1. **Stop the bleeding** (reduce memory demand):
+   - Temporarily reduce `max_tokens` (or enforce stricter server-side cap)
+   - Reduce max concurrent requests / lower batch size limit
+   - Disable optional features that increase memory footprint (e.g., speculative decoding if enabled for that pool)
+2. **Restore capacity quickly:**
+   - Restart the worst-offending worker pool (if safe) to clear allocator state
+   - Scale out the pool / shift traffic to a larger GPU class if available
+3. **Rollback:**
+   - Roll back the runtime build/model version/quant profile if incident started after change
+
+**Notes / pitfalls**
+- If routing starts failing over aggressively, you may also see secondary incidents (latency/overload). Keep the primary classification as **Serving Runtime → OOM/Crash-loop** if the initial trigger is OOM.
+
+**When to consult**
+- **Infra/Fleet:** if capacity cannot be restored quickly (insufficient GPUs)
+- **Routing:** if fallback loops or cross-region spillover occurs
+
+---
+
+### 2) KV-cache thrash / eviction storm
+**Recommended taxonomy classification**
+- incident_type: **Serving Runtime**
+- subtype: **KV-cache thrash**
+
+**Typical symptoms**
+- Latency regression (p95/p99) with degraded tokens/sec
+- GPU utilization may remain high, but work is inefficient (more prefill / re-compute)
+- Queue depth increases; customers report “slow responses” rather than hard errors
+
+**What it usually looks like in metrics**
+- Falling `runtime_kv_cache_hit_ratio`
+- Spiking `runtime_kv_cache_evictions_total`
+- Prefill time rises disproportionately vs decode time
+- `runtime_batcher_wait_ms_p95` increases even when request rate is stable
+
+**Common triggers**
+- Sudden increase in long-context traffic (e.g., retrieval-heavy prompts)
+- Mis-tuned cache sizing relative to sequence length distribution
+- Model/profile change that increases KV size per token
+- Misconfiguration: prefix caching disabled unexpectedly, or cache partitioning skew
+
+**Mitigations**
+1. **Reduce working set pressure**
+   - Lower max context / enforce a smaller prompt length cap temporarily
+   - Reduce concurrency for long-context routes (separate queue/pool if available)
+2. **Adjust batching/caching strategy (safe toggles only)**
+   - Prefer settings that reduce churn (smaller batch caps may help if prefill dominates)
+   - If there is a known-safe cache sizing override, apply it to the affected pool
+3. **Traffic shaping**
+   - Route long-context traffic to a pool tuned for it (if a split exists)
+   - If Dedicated customer: coordinate with CS on temporary limits and timelines
+
+**Notes / pitfalls**
+- KV thrash can be confused with capacity shortage. If **GPU memory is not maxed** but hit ratio/evictions are the leading indicator, keep this under runtime KV-cache.
+
+---
+
+### 3) Scheduler stall / queue starvation (continuous batching issues)
+**Recommended taxonomy classification**
+- incident_type: **Serving Runtime**
+- subtype: **Scheduler stall**
+
+**Typical symptoms**
+- Elevated time-to-first-token and/or request timeouts
+- Rising queue depth with low observed throughput
+- Pods stay “healthy” (no crash loops), but effective processing halts or slows dramatically
+
+**What it looks like**
+- `runtime_scheduler_queue_depth` rises steadily
+- `runtime_batcher_wait_ms_p95` spikes
+- GPU utilization may drop (scheduler not feeding work) or oscillate
+- Logs show scheduler loop warnings, long critical sections, or “no eligible requests” patterns
+
+**Common triggers**
+- Regression in scheduler logic (e.g., edge-case around mixed sequence lengths)
+- Lock contention or a hot mutex in request admission
+- Pathological request mix (very long + very short) causing starvation
+- Mis-sized thread pools / CPU saturation on worker nodes
+
+**Mitigations**
+1. **Confirm it’s scheduler, not routing:** validate worker pool is receiving traffic and not failing health checks upstream.
+2. **Reduce scheduler pressure:**
+   - Reduce max batch size cap temporarily
+   - Shed load / apply stricter rate limits to stabilize queues
+3. **Recover workers:**
+   - Restart affected worker set (often clears stuck state)
+4. **Rollback runtime build** if correlated with a deploy
+
+**When to consult**
+- **Observability:** if queue depth metrics are missing or delayed
+- **Infra/Fleet:** if CPU saturation on nodes is suspected (noisy neighbors)
+
+---
+
+### 4) Kernel regression / illegal instruction / GPU driver interaction
+**Recommended taxonomy classification**
+- incident_type: **Serving Runtime**
+- subtype: **Kernel/driver regression**
+
+**Typical symptoms**
+- Sudden 5xx or worker crashes after a runtime build, CUDA/cuDNN change, or node image update
+- Errors like illegal memory access, kernel launch failures, Xid events
+
+**Fast checks**
+- Compare error rate by node image / GPU type / region
+- Check for correlated infra changes (driver rollouts)
+
+**Mitigations**
+- Shift traffic away from impacted GPU type or node pool
+- Roll back runtime build or node image (coordinate with Infra)
+- If only a specific model triggers it, pin to a known-good quant/profile
+
+---
+
+### 5) Model artifact / quantization profile mismatch (load failures or wrong shapes)
+**Recommended taxonomy classification**
+- incident_type: **Serving Runtime**
+- subtype: **Model load / artifact mismatch**
+
+**Typical symptoms**
+- Workers fail during startup or during model swap
+- 5xx on a single model route; other models healthy
+- Logs: `shape mismatch`, `unexpected dtype`, `tensor not contiguous`, `missing weight key`
+
+**Mitigations**
+- Roll back to last known-good model version or quant profile
+- If Dedicated/Private: verify artifact sync integrity and checksum/signature (per deployment procedure)
+- Block further rollouts; require manual approval for the next attempt
+
+---
+
+## Mapping runtime patterns to customer-visible incident types
+Runtime failures often manifest as availability/latency/streaming symptoms. **Do not** classify based solely on the customer symptom; classify based on the primary failing subsystem.
+
+Use these rules of thumb:
+- If the runtime is crashing/OOMing and that directly causes 5xx: **Serving Runtime → OOM/Crash-loop** (not “Availability/5xx”)
+- If runtime is healthy but upstream gateway returns 5xx due to overload/limits: likely **Availability → Overload/Throttling** (not runtime)
+- If streaming disconnects are caused by runtime worker restarts: **Serving Runtime → OOM/Crash-loop** with “Streaming disconnects” as a contributing customer symptom in the postmortem
+
+---
+
+## Standard incident artifacts to capture (helps postmortems and backfills)
+During the incident (or immediately after stabilization), capture:
+- Affected **model(s)**, **region(s)**, and **pool(s)**
+- Graph screenshots or links for: error rate, p95 latency, queue depth, GPU mem
+- Representative logs (first occurrence + peak)
+- Any mitigation actions taken (limits changed, restarts, rollbacks) + timestamps
+
+---
+
+## Safe-by-default mitigations (approved for on-call)
+These actions are generally safe and reversible; use judgment and follow tier-specific guardrails:
+- Temporary reduction of `max_tokens` or context length caps for affected routes
+- Temporary reduction of batch size cap / concurrency for a pool
+- Controlled worker restart (small canary first, then widen) when crash-loop/stall is suspected
+- Rollback to last known-good runtime build or model version when change-correlated
+
+If you need a mitigation not listed here (e.g., experimental scheduler flags), escalate to the Serving Runtime incident commander and document in the incident channel.
+
+---
+
+## Appendix: example “good” classifications
+- “5xx spike + OOMKilled in inference-worker pods for llama-70b in us-east-1” → **Serving Runtime / OOM/Crash-loop**
+- “p95 latency 4x + KV evictions up 10x after long-context feature launch; no restarts” → **Serving Runtime / KV-cache thrash**
+- “Queue depth climbing, GPU util oscillating, batcher wait p95 spiking after runtime deploy” → **Serving Runtime / Scheduler stall**
+
+---
+
+## Changelog
+- 2026-02-10: Added explicit mapping guidance for customer-visible symptoms vs runtime root trigger; expanded mitigation ordering for OOM and scheduler stall.
+- 2026-01-07: Added kernel/driver regression and model artifact mismatch sections based on postmortem trends.
+- 2025-12-08: Initial publish for taxonomy v1 rollout.

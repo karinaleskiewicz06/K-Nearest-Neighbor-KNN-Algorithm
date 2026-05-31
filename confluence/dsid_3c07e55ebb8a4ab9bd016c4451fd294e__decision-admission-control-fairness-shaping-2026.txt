@@ -1,0 +1,188 @@
+Decision: Admission Control, Fairness, and SLO Shaping for Multi-tenant Inference
+
+Overview
+
+This decision record defines the admission control and fairness model used by Redwood Inference to manage multi-tenant load on shared serving pools. It specifies the algorithmic approach, configuration knobs, rollout plan, observability requirements, and ownership for the system we will operate in production.
+
+Problem statement
+
+As Redwood scales, inference clusters host workloads from many customers and internal products. GPU capacity and low-latency slots are finite: during spikes we must decide which requests to accept, delay, or shed. Current ad-hoc heuristics lead to: 
+- Noisy tenants crowding out small customers.
+- Priority customers seeing tail latency regressions during bursts.
+- Unclear accounting between CPU pre- and post-processing that affects admission decisions.
+
+Goals and constraints
+
+Primary goals (in order):
+1) Respect per-tenant SLOs (p99 latency targets and throughput budgets).
+2) Provide predictable degradation: graceful degradation strategies with clear priorities.
+3) Ensure fairness for similarly-tiered tenants (prevent starvation).
+4) Keep operational complexity manageable (configurable, auditable policies).
+5) Integrate with existing routing, caching, and token accounting systems.
+
+Non-goals:
+- Optimal global utility maximization (we accept heuristics that are simple and predictable).
+- Per-request cost optimization that requires heavy global re-balancing.
+
+Decision summary
+
+We will implement a tiered admission-control system with the following components:
+- Tenant profiles: static + adaptive budget allocation per tenant (per-minute token budget and burst headroom).
+- Weighted fair admission queue (WFQ) at the frontend routing tier to allocate GPU slots across accepted requests.
+- SLO shaping controller that reduces non-critical work (e.g., async logging, low-priority reranks) when cluster pressure rises.
+- Emergency shedding rules for hard overload scenarios with deterministic tie-breaking.
+
+Key tradeoffs: this design favors predictable tenant-level behavior and operational transparency over maximum short-term throughput.
+
+Architecture and data flow
+
+1) Ingress: requests are annotated with tenant_id, tier (free/paid/enterprise), and requested SLO (explicit or inferred from API key).
+2) Admission controller consults tenant profiles and current cluster pressure metrics (gpu_util, active_batches, kv_cache_hit_rate) and returns: ACCEPT, QUEUE, or REJECT with suggested retry-after.
+3) Accepted requests enter the WFQ scheduler which maps requests to GPU execution lanes and assigns a fairness weight.
+4) SLO shaping controller subscribes to real-time metrics and adjusts per-tenant budgets and weights.
+5) Observability pipeline emits decision trace events linked to request ids for post-facto analysis.
+
+Configuration schema (reference table)
+
+| Field | Description | Default | Notes |
+|-------|-------------|---------|-------|
+| tenant_tier | Static tier label | free | free, paid, enterprise, internal |
+| min_qps | Minimum guaranteed QPS per tenant | 0 | Applied for enterprise tenants only by default |
+| burst_headroom_tokens | Burst allowance in tokens per minute | 1000 | Drains when sustained pressure persists |
+| wfq_weight | Relative weight in WFQ | derived from tier | Lower weight => fewer GPU slots |
+| reject_policy | soft | soft / hard / queue-only | soft: provides retry-after, ingress may queue |
+| shaping_profile | latency-preserve / throughput-preserve | latency-preserve | Controls what SLO shaping drops first |
+
+Example tenant profile (YAML):
+
+---
+tenant_id: tenant-42
+tenant_tier: paid
+min_qps: 5
+burst_headroom_tokens: 2500
+wfq_weight: 10
+reject_policy: soft
+shaping_profile: latency-preserve
+---
+
+Admission decision algorithm (high-level)
+
+1) Compute cluster pressure score P in [0,1] from short-window metrics (gpu_util, run_queue_length, avg_batch_fill, kv_cache_hit_rate).
+2) For incoming request R from tenant T:
+   a) If T has remaining min_qps budget -> ACCEPT.
+   b) Else if T has burst_headroom and P < 0.75 -> ACCEPT (consume burst tokens).
+   c) Else if SLO_shaping_controller classifies request as non-critical AND P >= 0.5 -> QUEUE (with expected retry-after).
+   d) Else if P >= 0.95 -> REJECT (tie-break by wfq_weight and tenant age).
+3) WFQ schedules ACCEPTed requests into GPU lanes according to wfq_weight.
+
+Shaping and graceful degradation rules
+
+- Level 1 (P >= 0.5): Defer low-priority reranking, reduce max_generation_tokens by 10% for best-effort tiers.
+- Level 2 (P >= 0.75): Disable batched background embeddings writes, reduce concurrency targets per worker by 20%.
+- Level 3 (P >= 0.9): Reject new best-effort requests; preserve enterprise min_qps and internal health checks.
+
+Emergency shedding and tie-breaking
+
+When rejecting is unavoidable, apply deterministic ordering:
+1) Requests failing schema validation -> reject first.
+2) Best-effort/free-tier requests (lowest wfq_weight).
+3) Requests from tenants exceeding sustained budget usage (>5 min over budget).
+4) Finally, random drop among same-weight tenants to avoid targeted starvation.
+
+Metrics and SLOs to add
+
+We must instrument the following signals:
+- admission.decisions{accept,queue,reject} per-tenant and per-route (count)
+- admission.retry_after_histogram
+- tenant.burst_tokens_remaining (gauge)
+- wfq.queue_length and wfq.scheduled_per_minute
+- shaping.actions_taken (histogram of rule triggers)
+- request.latency.p{50,95,99} split by tenant_tier and by accepted/queued paths
+
+Operational SLOs for the system itself:
+- Decision latency (admission controller): 99th <= 25ms
+- WFQ scheduling latency: 99th <= 50ms
+- Correctness: <= 0.1% requests incorrectly classified (validated by trace sampling)
+
+Rollout plan
+
+1) Implementation in staging: implement admission controller as a sidecar at the ingress router with feature flags. (2 weeks dev, 1 week staging testing)
+2) Canary on a dedicated cluster for internal tenants only. Monitor metrics and error budgets for 7 days. (2 weeks)
+3) Expand canary to 5% of paid traffic with strict observability and automated rollback if decision latency SLO is violated for 30m. (1 week)
+4) 25% -> 50% -> 100% over 3 weeks with staged policy tightening.
+5) Post-rollout: 90-day monitoring window and tenant outreach for complaints.
+
+Example rollout checks (automated):
+- admission.decision_latency.p99 < 25ms for canary group
+- request.latency.p99 for enterprise tenants does not increase by >5% from baseline
+- admission.reject_rate overall < 1% when P < 0.6
+
+Alternatives considered
+
+1) Global utility optimizer that maximizes revenue per GPU second. Rejected: opaque, unstable decisions and high operational complexity.
+2) Static per-tenant quotas only. Rejected: poor responsiveness to bursts and inability to prioritize time-sensitive requests.
+3) First-come-first-served queue with priority bump for enterprise. Rejected: potential starvation and poor fairness guarantees.
+
+Implementation notes and pseudocode
+
+- Admission controller will be implemented in Go as a stateless front-end service using a small in-memory tenant store (backed by Redis for persistence) and a streaming metrics input (prometheus pushgateway or kafka).
+- WFQ will be implemented in the existing scheduler with a new weight parameter and pluggable token-bucket counters per tenant.
+
+Pseudocode:
+
+func Decide(request):
+  p := computePressure()
+  profile := tenantStore.Get(request.tenant)
+  if profile.min_qps_remaining > 0 { return ACCEPT }
+  if profile.burst_tokens > 0 && p < 0.75 { profile.burst_tokens -= request.estimated_tokens; return ACCEPT }
+  if p >= 0.95 { return REJECT }
+  if isBestEffort(request) && p >= 0.5 { return QUEUE }
+  return ACCEPT
+
+Ownership and change control
+
+- Owner team: Eng - Platform (scheduling & routing subteam)
+- Pager: Eng - SRE for production incidents
+- Code owner: scheduling repo (git path: /infra/scheduler)
+- Change approval: any policy changes that tighten rejection thresholds must be approved by SRE lead and Platform PM.
+
+Testing and verification
+
+- Unit tests for decision trees and tie-breaking (coverage target 95%).
+- Chaos tests by introducing synthetic pressure and verifying graceful degradation triggers.
+- Tenant-level canary tests using internal test tenants with synthetic workloads.
+
+Rollback strategy
+
+- Feature-flag gate to turn off admission-control logic and fall back to current router behavior within 30s.
+- If decision latency SLO is violated consistently for 15m during rollout, automatically rollback to previous flag state.
+
+Related documentation and runbooks
+
+- /confluence/eng-sre/runbooks/admission-control-runbook
+- /confluence/eng-platform/decision-records/decision-queueing-contracts-2024
+- /confluence/eng-serving-runtime/runbooks/gpu-fleet-prewarm
+
+Open questions and follow-ups
+
+- How should preemptible internal batch jobs be accounted for in tenant budgets?
+- Should we expose tenant burst_headroom to customers via billing dashboards?
+- Operational UI: a simple per-tenant dashboard to view current burst usage and recent admission history is required; product ticket created.
+
+Appendix: example observable alert rules (PromQL-like)
+
+- High admission latency (critical):
+  - expr: histogram_quantile(0.99, sum(rate(admission_decision_latency_bucket[2m])) by (le)) > 0.025
+  - for: 5m
+  - severity: page
+
+- Cluster pressure rising (warning):
+  - expr: gpu_utilization_avg[1m] > 0.85 and run_queue_length > 50
+  - for: 2m
+  - severity: ticket
+
+- Emergency shedding active (info):
+  - expr: sum(admission_decisions{result=\"reject\"}) by (cluster) / sum(admission_decisions_total) > 0.02
+  - for: 10m
+
+Note: This decision will be revisited in 12 months or earlier if we change our serving topology significantly or after the first major outage influenced by admission control.

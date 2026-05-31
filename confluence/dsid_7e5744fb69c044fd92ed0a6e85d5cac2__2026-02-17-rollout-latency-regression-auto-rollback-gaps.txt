@@ -1,0 +1,168 @@
+Postmortem: 2026-02-17 Rollout latency regression — auto-rollback did not trigger due to missing/stale monitors
+
+## Summary
+On 2026-02-17 we ran a controlled rollout (internal production route) of a new model serving profile for `redwood-api/chat-gateway` in `us-east-1` (Self-serve tier), moving traffic from **model version `rw-mistral-7b-instruct-2026.02.10`** (baseline) to **`rw-mistral-7b-instruct-2026.02.17`** (candidate).
+
+During the canary step, the candidate experienced a **p99 latency regression** (tail latency increase) and a brief **5xx spike** under bursty traffic. We expected the rollout controller to auto-pause/auto-rollback based on the configured SLO monitors. No automated action occurred.
+
+The on-call engineer manually paused the rollout after observing the degradation in Grafana. Impact was limited due to low canary percentage and quick manual mitigation, but the event revealed a critical gap: **the SLO monitor query used by the controller returned missing/stale data for the rollout scope**, and the controller treated this as “no breach” instead of “unsafe → stop rollout.”
+
+This postmortem documents what happened, why auto-rollback didn’t trigger, and the corrective actions that directly feed the **Auto-rollback on SLO breach integration** project.
+
+---
+
+## Customer impact
+- **Blast radius:** Internal production route (dogfood + a subset of low-risk Self-serve traffic in us-east-1).
+- **Traffic affected:** Canary step at 5% of eligible traffic.
+- **Observed symptoms:**
+  - p99 latency increased from ~1.9s to ~2.6s on candidate traffic.
+  - 5xx rate peaked at ~1.2% on candidate traffic for ~4 minutes.
+- **User-visible impact:** Minor; a small number of elevated-latency requests and transient errors for canary traffic only.
+- **SLA impact:** No SLA breach recorded; this was below paging thresholds for the broader service SLO.
+
+---
+
+## Detection
+- **Primary detection:** Manual observation in Grafana by on-call (no paging).
+- **Expected detection:** Rollout controller auto-pause/auto-rollback based on SLO burn-rate and error-rate monitors scoped to (route, model version, region, tier).
+- **Why paging didn’t happen:** Alerts were configured for overall service SLOs, not rollout-scoped candidate vs baseline comparisons.
+
+---
+
+## Timeline (all times PT)
+- **10:03** — Rollout `rollout_id=rl_2026_02_17_1003_chatgw_use1` initiated (baseline → candidate). Step 1 starts: 1% traffic.
+- **10:10** — Step advances to 5% traffic (canary). No controller warnings.
+- **10:14** — Tail latency begins to drift on candidate requests. p99 + ~250ms vs baseline.
+- **10:18** — Candidate p99 reaches ~2.6s; brief saturation observed (GPU queue depth spikes).
+- **10:20** — 5xx spike begins (candidate only), correlated with queue spikes.
+- **10:22** — On-call notices divergence on per-version dashboard; posts to `#eng-oncall`.
+- **10:25** — Manual pause executed in rollout controller.
+- **10:28** — Traffic returns to baseline; latency normalizes.
+- **10:41** — Initial investigation finds rollout controller shows “SLO evaluator: OK” for the entire interval.
+- **11:15** — Deeper look reveals rollout-scoped SLO query returned “no data / stale,” but the controller treated it as non-breaching.
+- **13:30** — Root cause confirmed: rollout-scoped monitor missing required labels + stale query cache path.
+- **Next day** — Action items triaged into Auto-rollback SLO integration project and release gates.
+
+---
+
+## What happened (technical)
+The rollout controller relies on SLO monitors to decide whether to:
+1) continue to next step,
+2) pause,
+3) rollback to last known-good.
+
+For this rollout, the controller attempted to query burn-rate + error-rate monitors for the following scope:
+- service: `redwood-api`
+- route: `POST /v1/chat/completions` (chat-gateway)
+- region: `us-east-1`
+- customer_tier: `self_serve`
+- model_version: `rw-mistral-7b-instruct-2026.02.17`
+
+However:
+- The **latency burn-rate monitor for the rollout scope did not exist** (monitor definition lacked `model_version` as a dimension, and an automated monitor generator failed to create the per-version monitor for the new candidate).
+- The SLO toolkit query path returned a cached response for a similar-but-not-identical scope (missing `model_version` label), and that cached response was **stale** (last datapoint timestamp older than our acceptable freshness window).
+- The controller’s evaluation code path interpreted “missing/stale monitor data” as **`HEALTHY/UNKNOWN → allow continue`** rather than **`UNSAFE → stop rollout`**.
+
+Net result: auto-mitigation logic never saw a “breach,” and no auto-pause or rollback occurred.
+
+---
+
+## Root cause
+### Primary root cause
+**Monitor coverage gap + unsafe handling of missing/stale monitor data in rollout evaluation.**
+
+Specifically:
+1) A rollout-scoped SLO monitor was missing for candidate traffic because the monitor generator did not create a per-`model_version` monitor for this route.
+2) The controller did not treat missing/stale monitor responses as a gating failure (it effectively failed open).
+
+### Contributing factors
+- **Ambiguous semantics:** We did not have a documented, enforced rule for “monitor missing/stale → pause vs rollback vs continue.”
+- **Insufficient auditability:** The controller UI/logs showed “SLO evaluator: OK” but did not capture that it was operating on missing/stale data.
+- **No rollout-scoped alerts:** Our alerting focused on global service SLOs; rollout-specific divergence didn’t page or notify by default.
+- **Label mismatch and cardinality caution:** Prior observability guidance discouraged high-cardinality labels, leading to uneven adoption of `model_version`-scoped monitors. We need explicit standards for what dimensions are required for rollout safety, with bounded cardinality strategies.
+
+---
+
+## Why auto-rollback did not trigger (explicit)
+Auto-rollback did not trigger because **the evaluator never entered a “breach detected” state**.
+
+Decision chain at the time (reconstructed):
+1) Controller requests SLO status for rollout scope.
+2) Monitor adapter returns response with `data_freshness=stale` and `monitor_found=false` (internally represented as `UNKNOWN`).
+3) Evaluator treats `UNKNOWN` as “no breach” (rather than “cannot prove safe”).
+4) Rollout controller continues/presents status as OK.
+
+This is the core gap this project must close: **lack of guardrails around monitor presence/freshness, and lack of safe defaults**.
+
+---
+
+## What went well
+- On-call caught the regression quickly via dashboard comparison and paused the rollout.
+- Canary percentage limited the blast radius.
+- Service owners and SRE were able to reconstruct the failure mode within the same day.
+- The incident provided a concrete test case for the Auto-rollback integration PRD/design.
+
+## What went wrong
+- The controller effectively failed open when SLO signals were missing/stale.
+- Monitor coverage for rollout-critical dimensions (route/model_version/region/tier) was not enforced.
+- Logs/UI lacked the detail needed to understand the evaluator inputs (monitor IDs, freshness, sample sizes, query windows).
+- No release gate prevented enabling auto-mitigation for a scope lacking the required monitors.
+
+---
+
+## Corrective actions
+The following actions are prioritized to directly feed the **Auto-rollback on SLO breach integration** workstream.
+
+### P0 (must-have before broad production enablement)
+| Action | Owner | Due | Notes |
+|---|---|---|---|
+| Define and implement evaluator semantics for `monitor_missing` / `monitor_stale` | Sean Gallagher / Jada Williams | 2026-03-15 | Default should be **pause rollout** (safe stop) with explicit suppression option; no automatic rollback without a valid signal. |
+| Add audit trail fields to capture monitor inputs and freshness | Felix Schneider | 2026-03-22 | Include monitor IDs, query windows, last datapoint timestamp, sample sizes, policy version, and decision trace. |
+| Add metrics + alerting for `monitor_missing_or_stale` on active rollouts | Aisha Bello / Allison Grant | 2026-03-22 | Notify (non-paging) by default; paging only if rollout is high-tier or >X% traffic. |
+| Add release gate: “Required monitors exist + fresh” before enabling auto-rollback for a route/model/region/tier | Connor O'Brien / Benji Okafor | 2026-03-29 | Gate to be used by service teams and Redwood release train checklist. |
+
+### P1 (hardening)
+| Action | Owner | Due | Notes |
+|---|---|---|---|
+| Monitor coverage audit for top 20 routes and all prod regions | Rafael Mendes | 2026-04-05 | Track owners + remediation dates; feed into coverage sheet and quarterly reliability review. |
+| Implement minimum sample-size gating + dual-window burn-rate logic (fast/slow) | Jordan Lee | 2026-04-12 | Align with ADR-0127; reduce false positives and prevent oscillation. |
+| E2E test: inject synthetic latency + simulate stale monitor responses | Leila Farouk | 2026-04-12 | Must verify: pause occurs, audit logs written, and UI shows “missing/stale” reason. |
+| Update observability standard: required labels/dimensions for rollout safety and bounded cardinality guidance | Allison Grant | 2026-04-19 | Clarify when `model_version` is required and how to manage retention/rollups. |
+
+### P2 (process and documentation)
+| Action | Owner | Due | Notes |
+|---|---|---|---|
+| Runbook update: triage steps for missing/stale monitors and override procedure | Kira Thompson / Rafael Mendes | 2026-04-26 | Include “how to verify monitor freshness,” “how to suppress with justification,” and “when to rollback manually.” |
+| Game day scenario: stale monitor during real rollout | Rafael Mendes / Sean Gallagher | 2026-05-03 | Validate no fail-open paths remain and alerting routes correctly. |
+
+---
+
+## Follow-ups / design decisions captured
+- We will codify the breach evaluation strategy (burn-rate windows, debounce/holdoff, minimum samples) in an ADR and ensure the controller behavior is deterministic and auditable. See: `ADR-0127`.
+- We will standardize a rollout auto-action audit event schema (including monitor metadata, snapshots, and decision traces). See: `ADR-0128`.
+- We will standardize metric names and labels for rollout evaluations and outcomes to support dashboards/alerts and avoid uncontrolled cardinality. See: `Rollouts SLO metrics naming and labeling`.
+
+---
+
+## Appendix
+### A. Evidence and debugging notes (abridged)
+- The SLO query for candidate scope returned `monitor_found=false` for latency burn-rate and an error-rate monitor response with `last_datapoint_age > 15m`.
+- The controller UI displayed “SLO evaluator: OK” without showing `UNKNOWN` / staleness state.
+- Grafana showed clear divergence in p99 for candidate traffic; the regression was strongly correlated with queue depth increases.
+
+### B. Immediate mitigations applied during event
+- Manual pause of rollout at 5% canary.
+- Candidate removed from traffic; baseline restored.
+
+### C. Open questions
+- For high-tier traffic (Dedicated/Private), do we page on missing/stale monitors immediately when a rollout is active, or only after a grace period?
+- What is the acceptable maximum data freshness lag per signal type (latency vs errors vs saturation), and does it vary by region/provider?
+
+---
+
+## Ownership
+- Incident owner: Rafael Mendes (SRE)
+- Service owners: Jada Williams (Rollout controller), Chloe Martin (Console backend), Logan Wright (Telemetry)
+- Follow-up tracking: Talia Benson (Program manager)
+
+This postmortem is considered complete once P0 actions are implemented and validated in a game day with both “latency regression” and “monitor stale/missing” scenarios.

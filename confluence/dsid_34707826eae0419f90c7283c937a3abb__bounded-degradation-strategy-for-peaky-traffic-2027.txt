@@ -1,0 +1,160 @@
+Bounded degradation strategy for peaky traffic and load-shedding
+
+Overview
+========
+This playbook documents a pragmatic, bounded-degradation approach to handling short-duration traffic spikes and sustained peaky traffic in the Redwood inference runtime. It defines: roles and ownership, observable triggers, a prioritised set of degradation modes, safe limits (bounds), automated and manual escalation paths, and rollback/validation steps. The intent is to preserve customer-facing availability while protecting core SLOs and preventing systemic instability.
+
+Why a bounded approach?
+- Keep SLA-preserving behavior predictable: avoid uncontrolled, global model fallbacks.
+- Preserve fairness: ensure high-priority tenants retain minimum guarantees.
+- Limit blast radius: degrade in defined steps with clear metrics and automated rollback.
+
+Scope and assumptions
+- Applies to Redwood hosted runtime and Dedicated pools where runtime controls are available.
+- Assumes per-tenant request classification, priority labels, and token-level billing metadata are present.
+- Assumes observability: request rate, accepted concurrency, queue depth, kernel utilization, GPU memory pressure, KV cache hit rate, and per-model latency percentiles.
+
+Owners and contacts
+- Primary oncall: eng-sre/runtime-oncall (Pager duty)
+- Runtime product owner: Priya Shah
+- Escalation: Runtime lead (Ethan Morales), Serving Runtime SRE (Sofia Liu)
+
+Key SLOs referenced
+- 99th-percentile completion latency (stable tier): 500ms
+- Availability (requests returning non-5xx): 99.9% monthly
+- Per-tenant reserved throughput (Dedicated): honoured to 95% during degraded mode
+
+Degradation modes (ordered, bounded)
+1) Soft shaping at ingress (non-blocking)
+   - Intent: reduce burstiness while avoiding immediate request rejection
+   - Mechanism: token bucket smoothing at edge with per-tenant burst credits and circuit windowing.
+   - Bound: max 30s queuing per request; drop to next mode if queue depth > 1,000 or average queue wait > 20ms for 30s.
+
+2) Priority-aware admission control (graceful rejection)
+   - Intent: protect high-priority tenants by shedding lowest priority requests first
+   - Mechanism: runtime admission controller applies per-priority thresholds (see table below).
+   - Bound: no more than 40% rejection rate for best-effort class sustained over a 5m window without human approval.
+
+3) Model fidelity stepdown (compute-sparing variants)
+   - Intent: lower per-token GPU work while maintaining semantic usefulness
+   - Mechanism: route to lower-precision / quantized variant or smaller model family per policy.
+   - Bound: maximum 2 fidelity steps (e.g., 16-bit -> 8-bit quantized -> opt-small); avoid more than one model-family reduction for paid SLA customers.
+
+4) KV-cache prefilling and prefix aggregation
+   - Intent: reduce repeated compute for conversational sessions by prefetching KV caches for hot prefixes and collapsing repeated prefixes server-side.
+   - Mechanism: adaptive cache prefetch hints and short-term prefix coalescing.
+   - Bound: additional memory reserved for prefetching capped at 10% of node GPU memory; disable if memory pressure > 65%.
+
+5) Graceful stub responses + soft-fail hooks
+   - Intent: avoid errors when even step 3 cannot meet latency SLOs by returning deterministic, labelled low-fidelity responses or partial tokens with fallback metadata.
+   - Mechanism: system injects a JSON/structured partial response with meta.reason = \"runtime_degraded\" and a deterministic hint for client to retry later.
+   - Bound: this mode is a last-resort for a tenant only after explicit authorization (auto for best-effort) and must never be used for regulated customers marked \"no-stub\".
+
+Decision matrix (short form)
+- Trigger: sustained 1-minute cluster GPU_utilization > 88% and 5m average request rate > baseline * 2.5.
+  - If per-tenant queue depth spik e > 500 and per-tenant 95p latency > SLO * 1.5 -> enact mode 1 then 2.
+  - If kernel preemption and OOMs observed -> immediately mute model-fidelity heavy ops and apply mode 3.
+
+Admission controller thresholds (reference table)
+| Priority class | Max concurrency | Max sustained reject (5m) | Preferred fallback |
+|---------------:|---------------:|-------------------------:|--------------------|
+| platinum       | unlimited       | 0%                       | none               |
+| gold           | reserved x0.9   | 0%                       | quantized variant  |
+| standard       | reserved x0.7   | 20%                      | quantized variant  |
+| best-effort    | opportunistic   | 40%                      | smaller-model      |
+
+Runbook: responding to an overload alert
+1) Triage (first 2 minutes):
+   - Acknowledge alert: public-alert: runtime:load-surge or runtime:gpu-memory-pressure.
+   - Run quick checks:
+     - kubectl get pods -n runtime -l role=inference -o wide
+     - grafana dashboard: \"Cluster runtime overview / GPU Utilization\"
+     - check last 5m: request_rate, queue_depth, 95p latency per-model
+2) Apply soft controls (2–5 minutes):
+   - Increase ingress smoothing window: curl -X POST https://runtime-admin.internal/api/v1/ingress/smoothing -d '{"window_ms":100,"tenant_overrides":{}}'
+   - If per-tenant queue depth continues to climb, enable priority-aware admission in observe-only -> enforce mode: POST /admin/admission?mode=enforce
+3) Escalate (5–15 minutes):
+   - If rejection rate > configured bound for paid tenants, notify account exec & CS and open incident channel.
+   - Consider targeted model-fidelity stepdown on the top 5 offending models: admin cli -> radmin model stepdown --model-id <id> --target-profile quantized-8bit
+4) Containment (15–60 minutes):
+   - Confirm that high-util kernels are back to <80% sustained utilization.
+   - If memory pressure persists, rotate affected GPU nodes out of LB and trigger prefetch disable: admin command: radmin node set-evict-prep <node-id> --evict=true
+5) Recovery and validate (60–120 minutes):
+   - Run smoke tests: sample prompt set for each tier and validate 95p latency and output quality checks (see validation checklist below).
+   - Gradually revert admission controller to pre-incident settings in 10% increments every 5 minutes while monitoring.
+
+Manual playbook checklist (for incident commander)
+- [ ] Record incident start time and initial alert signatures.
+- [ ] Capture kernel timelines, pod restarts, node GPU temperature logs.
+- [ ] Apply modes in order; document timestamps for each mode change.
+- [ ] Notify customer-impact list if any paid tenant saw degraded outputs.
+- [ ] After recovery, schedule a post-incident evaluation: update load-systems, add tighter telemetry.
+
+Validation checklist (post-change)
+- Run the scoped SLO smoke suite (repo: infra/bench/slo-smoke) against affected model set.
+- Validate sample of 200 responses per-critical-tenant for semantic drift (automated eval harness).
+- Confirm KV cache hit-rate recovered to pre-incident baseline ±5%.
+
+Instrumentation and alerts (examples)
+- Prometheus alert (example):
+  - name: RuntimeHighGPUUtilization
+    expr: avg by(cluster) (rate(gpu_percent_utilization[1m])) > 0.88
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: \"Cluster GPU utilization > 88% (1m avg)\"
+      runbook: \"/confluence/eng-serving-runtime/runbooks/bounded-degradation-strategy-for-peaky-traffic-2027\"
+
+- Alert for per-tenant queue depth:
+  - expr: max_over_time(tenant_queue_depth[1m]) > 500
+    for: 30s
+
+Automations and safety knobs
+- Auto-approve best-effort stubbing after continuous 10m of overload where no paid-tenant violations are detected.
+- Safety guard: never auto-stepdown a tenant that is marked \"protected-for-sla\" without human approval.
+- Audit log: every automated action writes an immutable audit event to audit-db with fields: timestamp, action, trigger, operator (system/human), affected_tenants.
+
+Kernel scheduling interactions (operator notes)
+- When applying model-fidelity stepdowns, ensure the kernel mapper is updated with hint: \"recompute_work_estimate: low\" to prefer lower-op implementations.
+- Batch-slicing thresholds should be reduced by 20% during mode 3 to reduce tail amplification due to longer kernels.
+- Monitor kernel preemption events; if preemption rate increases > 5% after a policy change, roll back.
+
+Playbook for QA / Postmortem
+1) Gather signals: traces, kernel latencies, admission events, model variants used, per-tenant request timelines.
+2) Recreate using the traffic-replay harness with a scaled-down cluster to reproduce the degradation sequence.
+3) Classify root cause: traffic spike shape, model hot-path, kernel regression, or backend dependency.
+4) Create action items: telemetry gaps, automated mitigations, priority quota rebalances.
+
+Configuration snippets (example admission controller YAML)
+--
+apiVersion: runtime.redwood/v1
+kind: AdmissionPolicy
+metadata:
+  name: priority-admission
+spec:
+  classes:
+    - name: platinum
+      concurrency: INF
+    - name: gold
+      concurrency: 0.9 * reserved
+    - name: standard
+      concurrency: 0.7 * reserved
+    - name: best-effort
+      concurrency: opportunistic
+  enforce: true
+--
+
+Notes on client integration and SDK patterns
+- Clients should be resilient to transient stubbing: use the response meta.reason to decide whether to retry, backoff, or present a cached/placeholder UX.
+- SDKs should expose a \"degraded\" callback with typed metadata so product teams can implement graceful UX fallbacks.
+
+Related work and references
+- See: runtime/fallback-and-degradation playbooks (internal) for historical incidents.
+- Kernel mapper autotune RFC (kernel-and-scheduling) for recommended hint mappings.
+
+Appendix: short changelog
+- 2027-01-12: Initial draft and runbook published.
+- 2027-02-20: Updated bounds for cache prefetch and clarified protected-tenant behavior.
+
+End of document

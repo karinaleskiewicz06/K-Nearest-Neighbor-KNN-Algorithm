@@ -1,0 +1,240 @@
+Dedicated rollout gates: SLO alignment and error-budget-based promotion policy
+
+## Purpose
+This page defines the **default rollout gate thresholds** for **Dedicated staged rollouts** and maps them explicitly to Dedicated **availability, latency, and capacity (saturation/headroom)** SLOs.
+
+It also documents the **error-budget-based promotion policy** used by SRE and the rollout policy engine to decide whether a rollout stage can be promoted automatically.
+
+This doc is intended for:
+- SRE on-call and SRE stakeholders supporting Dedicated
+- Platform + Routing engineers implementing gate evaluation and promotion semantics
+- Product/Console teams who surface gate evidence and promotion constraints
+
+## Scope
+In-scope gates (v1):
+- Request success/error rates (5xx, 429, dropped requests)
+- Latency (p95/p99)
+- Saturation/headroom (GPU utilization, queue depth, token throughput headroom)
+- GPU health (node taints/ECC/throttling summarized at pool partition level)
+- OOM / runtime crash signals
+
+Out of scope for default promotion policy (v1):
+- Fully customer-defined custom metrics
+- Offline quality eval gates as a hard requirement for promotion (supported as an optional, Redwood-defined signal when configured)
+
+## Terminology
+- **Dedicated pool**: Reserved-capacity GPU pool for a single customer account.
+- **Stage**: A partition (replica-based) or traffic split (percentage-based) directing a fraction of production traffic to the candidate change.
+- **Candidate**: New model version, runtime build, routing policy, or config being rolled out.
+- **Baseline**: Current stable deployment serving the remainder of traffic.
+- **Gate**: A boolean evaluation produced by the policy engine for a stage based on metrics over a time window.
+- **Promotion**: Move from stage N -> stage N+1.
+- **Abort/Rollback**: Revert routing and pool partition selection to baseline and terminate the rollout plan.
+
+## Dedicated SLOs (what we must protect)
+Dedicated customer contracts vary; the thresholds below are the **Redwood default SLO alignment** used for staged rollouts unless an account has an explicit exception documented by SRE + Dedicated PM.
+
+### Default production SLO targets (Dedicated)
+| SLO dimension | Target | Notes |
+|---|---:|---|
+| Availability (successful responses) | 99.9% monthly | Measured at the API gateway for Dedicated routes. Excludes customer-caused 4xx (except 429 which is treated as capacity/overload). |
+| Latency p95 | <= 2.0s (rolling 5m) | Route-specific; token streaming endpoints may have separate TTFT/TPOT tracking. For v1 rollout gating we use end-to-end request latency. |
+| Latency p99 | <= 4.0s (rolling 5m) | Used as a “spike” detector; tuned to reduce false negatives on bursty workloads. |
+| Overload / throttling (429) | <= 0.10% (rolling 5m) | Treated as an SLO-impacting symptom for Dedicated because it indicates insufficient capacity or bad partitioning. |
+
+### SLO measurement conventions
+- All “rate” signals use **requests** as denominator unless otherwise specified.
+- Unless explicitly called out, gates evaluate on **per-pool, per-region** timeseries and then aggregate using **worst-region** semantics for promotion.
+- All thresholds below assume **telemetry freshness <= 2 minutes**. Staler data triggers “unknown” handling (see Missing/Degraded Telemetry).
+
+## Gate model: mapping gate signals to SLOs
+This section provides the mapping between each gate and the SLO dimension it protects.
+
+| Gate name | SLO dimension protected | Primary failure modes caught |
+|---|---|---|
+| error_rate_5xx | Availability | runtime crash loops, bad config, bad model artifact, upstream dependency failures exposed by the candidate |
+| error_rate_total (5xx + selected 4xx) | Availability | request drop/misrouting, invalid routing policy, auth proxy regressions impacting customer |
+| rate_429 | Availability + capacity | partitioning too small, queue starvation, autoscaling lag, regional impairment |
+| latency_p95 / latency_p99 | Latency | perf regressions, kernel selection mismatch, KV cache behavior changes, contention, overload |
+| saturation_gpu_util / queue_depth | Capacity headroom | canary starving baseline, candidate slower per-token throughput, poor batching behavior |
+| oom_rate / crash_rate | Availability + latency | OOM causes retries/backpressure; can lead to 429, timeouts, and cascading latency |
+| gpu_health | Availability risk | ECC storms, thermal throttling, flaky nodes disproportionately in canary partition |
+
+## Standard stage evaluation windows and minimum samples
+These defaults are designed to balance speed (rollout velocity) and statistical confidence.
+
+### Windows
+- **Canary stages (<=10%)**: 15m evaluation window (rolling) to ensure enough samples for low-traffic pools.
+- **Mid stages (10–50%)**: 10m evaluation window.
+- **High stages (>=50%)**: 5m evaluation window.
+
+### Minimum sample requirements
+Promotion requires both:
+- **min_requests >= 1,000** in the evaluation window per region (or **>= 300** for small pools with an approved “low-traffic exception”), AND
+- **min_distinct_clients >= 3** (best-effort; used to catch single-client load-test artifacts).
+
+If minimum samples are not met, gates return **INSUFFICIENT_DATA** and the stage remains **Held (auto-hold)** until enough data accrues or an operator overrides.
+
+## Default gate thresholds (v1)
+Thresholds below are defaults for Dedicated staged rollouts. Accounts may have stricter contractual SLOs; in that case, the stricter value applies.
+
+### 1) Availability / errors
+All error gates compare the **candidate stage** against:
+- an absolute threshold (to protect global SLO), and
+- a regression threshold vs baseline (to prevent “still under SLO but worse” drift).
+
+| Gate | Absolute threshold (candidate) | Regression threshold (candidate vs baseline) | Action |
+|---|---:|---:|---|
+| 5xx_rate | <= 0.20% | <= +0.10% | Fail -> auto-abort if sustained for 2 consecutive windows at <=10%; otherwise auto-hold and page SRE on-call |
+| total_error_rate (5xx + selected 4xx excluding customer 4xx) | <= 0.35% | <= +0.15% | Fail -> auto-hold |
+| 429_rate | <= 0.10% | <= +0.05% | Fail -> auto-hold; auto-abort if 429_rate >= 0.50% for one window |
+| request_drop_rate (gateway drops, timeouts classified as drops) | <= 0.05% | <= +0.02% | Fail -> auto-abort (drops are considered severe) |
+
+Notes:
+- We treat **429** as SLO-impacting for Dedicated because customers expect reserved capacity to behave predictably; recurring 429s during rollout are usually a partitioning/throughput issue and should block promotion.
+- “Selected 4xx” includes internal routing/proxy 4xx classes (e.g., malformed upstream requests caused by the candidate). Customer-originated 4xx (bad payloads) are excluded.
+
+### 2) Latency
+Latency thresholds are set to protect customer experience and to provide early warning of throughput regressions.
+
+| Gate | Absolute threshold (candidate) | Regression threshold (candidate vs baseline) | Action |
+|---|---:|---:|---|
+| p95_latency | <= 2.0s | <= +15% | Fail -> auto-hold |
+| p99_latency | <= 4.0s | <= +20% | Fail -> auto-hold; if p99_latency >= 8.0s -> auto-abort |
+| timeout_rate | <= 0.05% | <= +0.02% | Fail -> auto-abort |
+
+Implementation notes:
+- For streaming endpoints, we additionally track TTFT internally, but v1 gating uses end-to-end request latency to reduce metric fragmentation. (Streaming-specific gating is a planned v2.)
+
+### 3) Saturation / headroom
+Capacity gates are required specifically for Dedicated because partitioning mistakes can create starvation even at low traffic splits.
+
+| Gate | Threshold | Notes | Action |
+|---|---:|---|---|
+| gpu_util_p95 | <= 85% | Candidate partition GPU utilization p95. Values above this are correlated with queue growth and latency spikes. | Fail -> auto-hold |
+| queue_depth_p95 | <= 2x baseline OR <= configured limit | Queue depth is normalized by per-pool configuration; we block large regressions even if absolute is “low.” | Fail -> auto-hold |
+| headroom_tokens_per_sec | >= 15% | Estimated headroom relative to observed peak in the window. | Fail -> auto-hold; if <5% -> auto-abort |
+
+Operational guidance:
+- If a stage fails only capacity/headroom gates (but not error/latency), the first remediation is typically **repartitioning** (increase canary replicas / adjust stage sizing) rather than abandoning the candidate.
+
+### 4) GPU health and OOM/crash
+| Gate | Threshold | Action |
+|---|---:|---|
+| oom_rate | <= 0.02% of requests OR <= 1 event / 15m | Fail -> auto-hold; if repeat across 2 windows -> auto-abort |
+| crash_loop_rate | 0 crash loops in window | Fail -> auto-abort |
+| gpu_health_bad_node_fraction | <= 2% of nodes in candidate partition | Fail -> auto-hold; if >5% -> auto-abort |
+
+Notes:
+- GPU health summarizes node taints, ECC error bursts, and sustained thermal throttling. If the candidate partition is small, a single bad node can exceed thresholds; this is an argument to avoid 1-replica canaries for larger pools.
+
+## Error-budget-based promotion policy
+Beyond per-window gate thresholds, promotion is constrained by **error budget burn** so we do not “roll forward” during incidents or periods of elevated customer impact.
+
+### Policy summary
+A stage can be promoted automatically only if ALL are true:
+1) All gates are **PASS** (not FAIL/UNKNOWN/INSUFFICIENT_DATA)
+2) The pool is not in an active **incident state** (internal incident flag or SRE “no-promote” toggle)
+3) Error budget burn is within acceptable limits (below)
+
+### Error budget burn definitions
+We use a burn-rate-based policy aligned with industry practice:
+- **SLO**: 99.9% availability monthly
+- **Error budget**: 0.1% of requests in the SLO window
+- **Burn rate**: observed error_rate / error_budget_rate
+
+Where:
+- error_rate uses (5xx + drops + timeouts + 429) for Dedicated rollouts (conservative set)
+- error_budget_rate = 0.001
+
+### Burn rate thresholds for promotion
+Promotion eligibility requires:
+- **Short window burn rate (1h) < 2.0**, AND
+- **Long window burn rate (6h) < 1.0**
+
+Additionally:
+- If **1h burn rate >= 5.0**, the system sets an automatic **No-Promote hold** on the rollout plan and alerts SRE on-call.
+
+Rationale:
+- The short window prevents promoting during a sharp regression.
+- The long window prevents “death by a thousand cuts” when the system is already consuming budget.
+
+### Stage-specific promotion strictness
+For early stages (<=10%), we apply an extra constraint:
+- **Candidate vs baseline error delta must be non-positive** (candidate should be equal or better), unless the customer account is flagged as “test/preview.”
+
+This reduces the chance we promote a canary that is “barely within SLO but worse,” which is a common pattern preceding customer-visible incidents in Dedicated.
+
+### Manual overrides and audit requirements
+SRE/Operator can override policy using:
+- **Force Promote** (admin-only)
+- **Force Hold**
+- **Abort/Rollback**
+
+Override requirements:
+- Must include a **reason** and optional incident/ticket reference.
+- Must be recorded in audit logs (see: Audit events for Dedicated rollout actions).
+- Strong recommendation: attach a screenshot or link to the stage dashboard panels showing why the override was justified.
+
+## Missing or degraded telemetry handling
+Gate evaluation is designed to be deterministic and auditable, but telemetry systems are not perfectly reliable.
+
+### Freshness and staleness
+- If any required metric is **stale (>2m since last sample)** for the stage/region, the gate returns **UNKNOWN**.
+- UNKNOWN gates block auto-promotion.
+
+### Fail-closed vs fail-open
+Default behavior for Dedicated rollouts is **fail-closed**:
+- UNKNOWN -> block promotion and auto-hold.
+
+Exception:
+- If the stage is already at >=50% and telemetry is degraded, operators may choose **Force Promote to 100%** only if:
+  - baseline and candidate are equivalent artifacts (e.g., routing policy change that is being reverted), OR
+  - the customer is currently degraded and the candidate is a mitigation.
+
+This exception must be documented in the rollout plan audit trail.
+
+## Alerting and escalation (gate failures)
+Gate failures create alerts with severity based on the impact likelihood.
+
+| Condition | Severity | Routing |
+|---|---|---|
+| request_drop_rate fail OR crash_loop_rate fail | Page | SRE on-call + owning platform/routing on-call |
+| 5xx_rate fail (sustained across 2 windows) | Page | SRE on-call |
+| 429_rate >= 0.50% in any window | Page | SRE on-call + Infra Fleet |
+| latency gates fail | Ticket | SRE queue + owning service team |
+| gpu_health_bad_node_fraction fail | Ticket (or Page if >5%) | Infra Fleet |
+| UNKNOWN due to staleness >10m | Ticket | Telemetry on-call |
+
+## Operational guidance (how to use this during a rollout)
+1. Before starting: confirm the pool is not already burning error budget (check 1h/6h burn).
+2. At stage entry: wait for minimum samples; do not override INSUFFICIENT_DATA without confirming real traffic.
+3. On fail:
+   - If errors/drops: **abort** first, then investigate.
+   - If 429/capacity: check partition sizing and headroom; consider **repartition** then re-evaluate.
+   - If latency only: validate saturation/queue; candidate may be slower (throughput regression).
+4. Promotion should be withheld during any active incident affecting the pool or region, even if gates pass (human judgment).
+
+## Known edge cases
+- **Small pools (<=8 GPUs)**: replica partitions can create very “chunky” stages where 1 GPU is >10%. In these cases the regression thresholds may trigger frequently. Infra guidelines should be followed to avoid 1-replica canaries unless explicitly approved.
+- **Multi-region pools**: promotion uses worst-region gating. A single impaired region blocks promotion; operators may use Hold while Infra remediates.
+- **Bursty workloads**: latency gates can flap. Prefer 15m windows for <=10% stages and require 2 consecutive PASS windows before promotion if the pool is flagged as bursty.
+
+## Change control
+- SRE owns the defaults in this document.
+- Any default threshold changes require:
+  - Review from Dedicated PM (Lauren Bishop) and rollout policy PM (Paula Mendes)
+  - Observability review for query feasibility (Allison Grant / Logan Wright)
+  - A short “why change” note referencing incidents/tickets or measured false positive/negative rates
+
+## Appendix A: Metric definitions (brief)
+- 5xx_rate = 5xx_responses / total_requests
+- 429_rate = 429_responses / total_requests
+- request_drop_rate = dropped_requests / total_requests (drops include gateway timeouts categorized as drops)
+- p95_latency/p99_latency: end-to-end latency at gateway, per route
+- gpu_util_p95: GPU utilization p95 aggregated over GPUs in the stage partition
+- queue_depth_p95: request queue depth p95 at the stage partition scheduler
+- headroom_tokens_per_sec: (provisioned_tokens_per_sec - observed_peak_tokens_per_sec) / provisioned_tokens_per_sec
+
+## Appendix B: Default stage set assumptions
+This policy assumes a default stage sequence similar to: 1% -> 10% -> 50% -> 100% (or replica equivalents). If a plan deviates (e.g., 5%/25%/75%), the same thresholds apply; only the evaluation window may be adjusted as described above.

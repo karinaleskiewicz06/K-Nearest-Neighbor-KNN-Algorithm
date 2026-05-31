@@ -1,0 +1,169 @@
+GPU interconnect degradation mitigation and routing matrix
+
+Overview
+
+This page documents detection, automated mitigation, and manual runbook steps for GPU interconnect degradation (NVLink/PCIe fabric and virtualized RDMA/ENet on cloud) that impacts inference latency and throughput. It also defines the routing matrix used by the smart routing service to decide fallback paths, egress regions, and throttling during fabric impairment. This is intended for on-call infra, SRE, and platform engineering who operate the GPU fleet and associated network fabric.
+
+Background and scope
+
+- Problem: Periodic degradation of GPU interconnect (local NVLink/PCIe or cloud host-level RDMA) can cause long tail token latencies, KV cache stalls, and OOM-like symptoms despite nominal free memory on host.
+- Impacted services: serving-runtime, batch-eval pool, warm-pool seeding, and CI ephemeral GPU islands.
+- Scope: both physical (data center) and cloud-hosted GPU nodes. This doc focuses on detection, short-circuit mitigations, and the routing matrix for automatic fallbacks. Long-term remediation (hardware replacement, kernel/driver upgrades) is covered in separate maintenance playbooks.
+
+Key SLAs and thresholds
+
+- Per-tenant p50/p95/p99 token latency increase above baseline: alert if p95_generation_latency rises by >35% for 5m.
+- KV cache miss ratio spike: alert if per-model kv_miss_ratio > 15% sustained for 10m.
+- GPU thermal/PCIe error counters: PERR/PCIe_CorrectableErrors > 1000 per node per hour triggers hardware investigation.
+- Packet drop / connection reset anomalies between host pairs: >0.5% packet loss on internal mesh for 5m.
+
+Detection signals (order of precedence)
+
+1) Serving metrics: p99_token_latency, p95_generation_latency, rate of model-serving retries.
+2) Host telemetry: nvlink_error_count, pcie_uncorr_errors, rdma_queue_time_ms.
+3) Kernel logs: dmesg entries mentioning AER/PCIe, nvidia-psif, mlx5 warnings.
+4) Network telemetry: flow-level packet loss, tcp retransmits, iftop-style egress spikes.
+5) Cloud provider host health: host-degraded events, maintenance notifications.
+
+Automated mitigations (fast path)
+
+When a degradation signature is detected by the fleet monitor, the following automated steps should run (implemented in the fleet-orchestrator service):
+
+- Step A (isolate): Mark node as DRAINING for new steady-state low-latency requests and allow in-flight requests to finish with a 30s grace window.
+- Step B (fallback): Re-route new requests that require KV-seed or long context to a compatible model variant in the same region with lower cross-host dependencies. The routing decision uses the routing matrix (see below).
+- Step C (warm-pool refill): Trigger warm pool seeding in adjacent healthy racks or cloud availability zone. If warm capacity is not available, switch to cold-start but prioritize small batch sizes (batch_size <= 4).
+- Step D (telemetry escalate): Create an incident event and add node id and all recent nvlink/pcie error counters to the incident payload. Attach top 10 slow traces for the last 15m.
+
+Routing matrix (decision table)
+
+This table is consumed by the smart-routing service to pick a fallback path during interconnect impairment. Columns represent condition, available fallback, latency target, cost multiplier, and notes.
+
+| Condition | Fallback target | Latency target (p95) | Cost multiplier | Notes |
+|---|---:|---:|---:|---|
+| Local rack NVLink degradation, host-level error counters > threshold | Same region, different rack (warm pool) | +20% | x1.4 | Prefer racks with NVLink affinity and recent successful KV cache syncs |
+| Host-level RDMA degradation on cloud host | Same AZ, different host type (e.g., g5 -> g6i or p4) | +30% | x1.6 | If different hardware, verify model quantization compatibility |
+| AZ-wide fabric impairment | Different AZ same region | +40% | x2.0 | Apply tenant throttling and prioritize paid tiers |
+| Region egress congestion detected | Cross-region fallback (nearest region) | +60% | x3.0 | Only for critical traffic; require customer opt-in for cross-region |
+
+Note: the routing matrix is a living artifact; update entries behind feature flag and run small canaries before global rollout.
+
+Manual runbook: triage and mitigation steps
+
+- Owner: infra-networking on-call (primary), eng-serving-runtime (secondary)
+- Pager escalation: 15m no automated mitigation = page infra-lead
+
+1) Confirm alerts: Open Grafana dashboard 'gpu / interconnect health' and check p99_token_latency and nvlink_error_count for the node(s) indicated. Link: grafana.internal.redwood.com/d/gpu-interconnect
+2) Collect host-level artifacts:
+   - SSH into host: ssh ubuntu@gpu-node-123
+   - Capture driver and dmesg: sudo dmesg -T | tail -n 200 > /tmp/dmesg-incident.txt
+   - Query NVLink counters: sudo nvidia-smi nvlink --query-gpu=link_replays,link_bit_errors -i 0
+   - RDMA stats (if present): sudo ibstat; sudo cat /sys/class/infiniband/mlx5_0/ports/1/counters/*
+3) Check kernel AER/PCIe counters: sudo journalctl -k | grep -i "AER\|PCIe\|uncorr"
+4) Repro workflows in staging: run the inference micro-bench marked 'kv-stress' against the node to observe replication. Use the local benchmark script: ./bench/kv_stress.sh --target gpu-node-123 --concurrency 4
+5) If automated isolate failed: manually drain node in k8s and trigger warm-pool refill:
+   - kubectl cordon gpu-node-123
+   - kubectl drain gpu-node-123 --ignore-daemonsets --delete-local-data --grace-period=30 --timeout=2m
+   - Trigger warm pool refill API: curl -X POST https://fleet.internal.redwood.com/api/v1/warm-pool/refill -d '{"region":"us-west-2","reason":"interconnect-degradation"}'
+6) If PCIe uncorr errors present and immediately increasing: open hardware-ticket with datacenter ops and mark node as quarantine. Attach dmesg and nvlink counters.
+7) For cloud-hosted nodes with host-level degradation: request vendor host-evacuation or reboot via cloud console and tag instance with incident id: t-INC12345-host-evac.
+8) Post-incident: annotate node in inventory (silverstag internal asset db) with incident tag and schedule hardware replacement as needed.
+
+Terraform / IaC considerations and module snippets
+
+- Add labels and taints via GPU node bootstrap module so routing and fleet-orchestrator can identify interconnect topology at deploy time. Example variables to add to module:
+
+```
+variable "nvlink_affinity" {
+  description = "Optional affinity label for NVLink topologies: 'full-mesh'|'partial'|'none'"
+  type        = string
+  default     = "none"
+}
+
+resource "kubernetes_node" "gpu" {
+  metadata {
+    labels = {
+      "gpu" = "true"
+      "nvlink_affinity" = var.nvlink_affinity
+    }
+    annotations = {
+      "gpu-topology.id" = var.topology_id
+    }
+  }
+}
+```
+
+- Ensure cloud host template exports PCIe/host-health meta via instance metadata so fleet monitor can ingest counters. Add cloud-init snippet to the AMI/instance template:
+
+cloud-config snippet:
+
+```
+write_files:\n  - path: /etc/redwood/host-meta.json\n    content: |
+      {\n        "host_type": "g5.4xlarge",\n        "topology": "nvlink-partial",\n        "monitoring_endpoint": "http://localhost:9571/host_metrics"\n      }
+```
+
+- IaC migration note: When changing labels used by smart-routing, run a 2-week canary to ensure no tenant experience regressions. Use feature flag 'routing-matrix-v2' and a percentage rollout in the fleet-orchestrator.
+
+CI/CD and automated testing
+
+- Add a CI job 'gpu-network-integration' that runs in the ephemeral GPU pool and verifies:
+  - nvlink counters do not regress after kernel upgrades
+  - rdma heartbeat latency under 5ms for p50 in synthetic tests
+  - routing-matrix decision returns expected fallback for simulated node error responses
+
+Example GitHub Actions job (concept):
+
+```
+- name: gpu-network-integration
+  runs-on: ubuntu-latest
+  steps:
+    - uses: actions/checkout@v3
+    - name: Run interconnect sim
+      run: ./ci/simulate_interconnect_fault.sh --target ephemeral-pool --assert p50<=5ms
+```
+
+Alerting and dashboards
+
+- Alert rules (Prometheus style):
+  - alert: GPURoutingLatencySpike
+    expr: increase(p95_generation_latency[5m]) > (0.35 * baseline_p95)
+    for: 5m
+    labels: { severity: "page" }
+  - alert: NVLinkErrorBurst
+    expr: increase(nvlink_error_count[10m]) > 1000
+    for: 2m
+    labels: { severity: "ticket" }
+
+- Dashboards: 'gpu / interconnect health', 'routing decision log', 'warm-pool capacity' must show side-by-side comparisons for quick triage. Include a panel that shows per-node nvlink_error_count heatmap.
+
+Post-incident review checklist
+
+1) Create postmortem within 48 hours including timeline, metrics, and root cause hypothesis.
+2) Tag all involved runbook steps with owner and estimated remediation time.
+3) If hardware: create procurement/hardware replacement ticket and update asset db.
+4) If software: schedule driver/kernel/firmware upgrade window with canary set.
+
+Appendix: quick commands and artifacts to collect
+
+- sudo nvidia-smi -q -d ECC,LINK,POWER -i 0 > /tmp/nvidia-full.txt
+- sudo nvidia-smi nvlink --query-gpu=link_replays,link_bit_errors -i 0
+- sudo ethtool -S eth0 | grep -i "rx_errors\|tx_errors"
+- sudo perf top -p $(pgrep serving-runtime) for 30s (sample hot paths)
+- curl -sS http://localhost:9571/host_metrics | jq '.' > /tmp/host-metrics.json
+
+Change log
+
+- 2025-11-12: Document created (Marisol Ortega)
+- 2026-01-04: Added Terraform snippets and cloud-init host-meta guidance (Aisha Patel)
+- 2026-02-15: Updated routing matrix cost multipliers and added CI job suggestion (Daniel Kim)
+
+Related pages and references
+
+- Link: gpu fleet placement SLOs (internal)
+- Link: kernel and driver upgrade playbook
+- RFC: fleet-orchestrator fallback semantics
+
+Contact and ownership
+
+- Primary: infra-networking@redwood.internal
+- Secondary: eng-serving-runtime@redwood.internal
+- On-call runbook owner: Marisol Ortega

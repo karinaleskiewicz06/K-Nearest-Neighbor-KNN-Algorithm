@@ -1,0 +1,155 @@
+Kubernetes admission controls and runtime feature gating for private deployments
+
+Overview:
+
+Purpose: This document standardizes Kubernetes admission controls (mutating and validating), policy enforcement, and runtime feature-gating patterns we use for Redwood private deployments (VPC and on-prem). It defines a minimal policy catalog, rollout and test procedures, monitoring checkpoints, and operator runbook actions for feature flag driven runtime changes (e.g., KV cache migration, batching, quantization fallback, and model swap safemode).
+
+Scope:
+- Applies to all private deployment clusters managed by Redwood (tenant-facing control plane, operator-managed runtime clusters, and edge appliances).
+- Focuses on admission-time governance and runtime feature flags that affect inference behavior and tenant isolation.
+- Does NOT replace host-level security guidance (see /security-and-compliance) or the private deploy operator installation guide.
+
+Motivation:
+Private deployments require a stricter guardrail set than hosted environments: we must ensure consistent runtime safety across heterogeneous Kubernetes distributions, enforce tenant boundaries at admission time, and allow controlled dynamic toggles of runtime behavior without full cluster upgrades. Admission controls + feature flags let us:
+- Prevent risky pod specs reaching the runtime (e.g., privileged containers, hostPath exposures).
+- Enforce resource and QoS contracts before scheduling (avoid noisy neighbor regressions).
+- Gate rollout of runtime changes to a small canary set of nodes/tenants, with automated rollback on regressions.
+
+Architecture and components:
+- MutatingAdmissionWebhook: injects required sidecars and runtime annotations (e.g., instance-labels, sidecar proxies, seccomp profile selectors).
+- ValidatingAdmissionWebhook: blocks disallowed fields (e.g., hostNetwork, hostPath unless allowlist) and enforces tenant-specific pod resource guarantees.
+- OPA (Gatekeeper) policies: declarative constraint templates that express security, network, and resource policies.
+- Runtime feature flag service: lightweight HTTP endpoint (internal) used by the operator to toggle features per-tenant or per-node-label. Features are also encoded as ConfigMaps with a simple schema and a revisioned change history.
+- Canary orchestration runner: small controller that stages feature flags to a canary cohort, runs smoke tests, and promotes/rolls back automatically.
+
+Minimal policy catalog (recommended defaults):
+- DisallowPrivilegedContainers: deny pod.spec.containers[*].securityContext.privileged == true
+- RequiredSeccompProfile: enforce seccomp annotation 'runtime.seccomp.restrictive' unless tenant is on allowlist.
+- NoHostPathUnlessSigned: deny hostPath mounts unless the image is signed and the hostPath appears in the customer-approved inventory.
+- PodResourceFloor: require requests.cpu >= 100m and requests.memory >= 256Mi for inference service pods.
+- ImmutableModelMount: prevent mutable hostPath or emptyDir mounts for /models and /kv unless operator flag model-refresh-unsafe=true.
+- EgressWhitelist: validate that pod-level egress addresses conform to tenant egress contract (VPC-peered endpoints, telemetry gateway).
+
+Policy table (human-readable):
+Name | Enforced by | Failure action | Owner | Escalation
+DisallowPrivilegedContainers | ValidatingWebhook | reject | runtime-security | eng-sre
+RequiredSeccompProfile | Gatekeeper | reject | runtime-security | eng-sre
+NoHostPathUnlessSigned | Gatekeeper + webhook | reject + evidence log | ops-field | eng-field-ops
+PodResourceFloor | Webhook | reject | runtime-platform | eng-platform
+ImmutableModelMount | Webhook | reject | runtime-platform | eng-platform
+EgressWhitelist | Gatekeeper | audit -> reject after 30d | security | security-team
+
+Implementation notes and examples:
+- Mutating webhook connector (snippet): injects the sidecar service mesh proxy and operator annotations used by the canary runner. Example YAML (abbreviated):
+
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: redwood-mutating-webhook
+webhooks:
+  - name: inject-runtime-sidecars.redwood.internal
+    clientConfig:
+      service:
+        name: runtime-webhook
+        namespace: redwood-system
+        path: /mutate
+    rules:
+      - operations: ["CREATE"]
+        apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods"]
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+
+- Gatekeeper constraint example (rego-like policy summarized):
+
+package redwood.allowed
+
+violation["hostPathNotAllowed"] {
+  input.review.object.spec.volumes[_].hostPath
+  not input.review.object.metadata.annotations["redwood/hostpath-approved"]
+}
+
+- Feature flag ConfigMap schema (single-line example):
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: runtime-feature-flags
+  namespace: redwood-system
+data:
+  feature-flags.json: |-
+    {"kv_cache_migration": {"state": "gradual", "cohort_selector": "nodeLabel=kv-candidate", "started_at": "2026-09-01T00:00:00Z", "revision": "v3"}, "quantization_fallback": {"state": "on", "safety_threshold_rpm": "0.98"} }
+
+Operational workflows:
+1) Feature rollout (canary -> staged -> global):
+  1. Author change and create new ConfigMap with incremented revision. Add human-friendly changelog in annotation.
+  2. Stage to canary cohort via cohort_selector (nodeLabel or tenant label).
+  3. Trigger synthetic smoke tests: 50 small generation requests, 10 embedding queries, latency and correctness checks against baseline prompt set.
+  4. Observe for 60 minutes; required pass criteria: 95th percentile latency not worse than baseline + 15%, error rate < 0.25%, quality regression measured via eval harness score delta <= -0.02.
+  5. If smoke tests pass, extend cohort to 20% of nodes/tenants for 6 hours; repeat checks.
+  6. If staged pass, promote to 100% with a scheduled quiet window and longer monitoring (24 hours).
+  7. If any stage fails, automated rollback to previous revision and create incident with priority P1 if customer-facing SLA impacted.
+
+2) Quick rollback criteria (operator-triggered):
+  - 95th percentile latency regression > 30% or absolute increase > 250ms for inference endpoints; OR
+  - request error rate > 1% sustained for 5 minutes; OR
+  - model output quality alerts from eval monitors (regression > 0.05).
+
+3) Admission policy change procedure (for Gatekeeper/OPA templates):
+  - Create PR in infra-policy repo with policy change + unit tests (rego test).
+  - Deploy to staging cluster Gatekeeper in audit-only mode for 72 hours and gather violations.
+  - Host a 30-minute policy review with security and platform owners if violations exceed 5 unique tenants.
+  - After signoff, schedule a controlled enforcement window and publish change notes to customer-facing T&Cs if required.
+
+Observability and SLOs for feature rollouts and admission controls:
+- Admission enforcement latency (webhook avg latency): target < 25ms p50, < 100ms p99. Alert if p99 > 200ms for > 5m.
+- Policy violation spike: alert when new violation rate > 10x baseline or > 5 incidents in 1h.
+- Feature rollout guardrails:
+  - Latency regression: alert if p95 increases by > 15% vs baseline over rollout window.
+  - Error spike: alert if 5xx rate > 0.5% on inference endpoints during rollout.
+  - Quality monitors: push evaluation results to the quality-guardrails service; alert if eval delta exceeds configured threshold.
+
+Testing matrix (minimum):
+- Unit: rego policies (local tests), webhook unit tests.
+- Integration: deploy webhook and Gatekeeper in a cluster with sample tenant manifests. Run canary runner in dry-run mode.
+- E2E: load test with synthetic traffic that approximates 80th percentile tenant load plus occasional spikes. Verify rollback behaves as expected.
+
+CLI & debugging tips:
+- Viewing admission traces: kubectl get events -n redwood-system --field-selector reason=FailedAdmission.
+- Live webhook latency: kubectl logs deploy/runtime-webhook -n redwood-system | grep "admission-latency"
+- Gatekeeper violations: kubectl get constraints --all-namespaces; use gatekeeper-audit to export historical violations.
+- Force rollback of feature flag: kubectl apply -f runtime-feature-flags-v2.yaml && annotate rollback-reason="observability-regression"; the canary controller will detect the revision change and reconcile quickly.
+
+Incident runbook (high level):
+- Trigger: monitoring alerts (latency, error rate, quality).
+- Triage (T+0-5min): oncall checks canary cohort and verifies ConfigMap revision; determine whether change aligns to active rollout.
+- Mitigation (T+5-15min): if associated with a revision deployed < 60m ago, rollback to previous revision via the controller 'rollback' endpoint (/api/v1/flags/rollback) or apply previous ConfigMap.
+- Communication (T+15-30min): notify customer success and any affected customers using templated messages; update status page if customer-facing SLA affected.
+- Post-incident (within 72h): produce a short incident summary covering the root cause, detection timeline, mitigation steps, and follow-up actions (e.g., stricter test case, additional synthetic checks).
+
+Ownership and responsibilities:
+- runtime-platform: owns the mutating/validating webhook code, canary runner, and ConfigMap schema.
+- runtime-security: owns Gatekeeper constraints, security review, and policy signoff.
+- eng-sre: owns monitoring dashboards, alert rules, and oncall runbooks.
+- eng-field-ops: handles tenant allowlists and customer special-case approvals.
+
+Backwards compatibility and audit evidence:
+- All policy changes must be logged to the policy-change ledger (immutable S3 bucket) with diff, author, and timestamp.
+- Feature flag ConfigMaps are revisioned and kept for 90 days; we snapshot and store canary test results alongside each revision.
+
+Appendix: common regression thresholds (for quick reference)
+- Latency: p95 increase > 15% or absolute > 500ms (whichever is smaller) triggers staged rollback.
+- Error rate: > 1% sustained for 5m triggers rollback.
+- Quality eval delta: drop in eval score > 0.05 requires immediate rollback and forensic snapshot.
+
+References and links:
+- Gatekeeper docs and our policy templates: /eng-private-deployments/reference-architectures/policy-templates
+- Canary runner controller API: /eng-private-deployments/deployment-guides/canary-controller-api-2026
+- Quality guardrails and eval harness: /applied-ml-and-evals/quality-guardrails
+
+Notes and caveats:
+- Admission webhooks must be highly available across API server endpoints. Use node anti-affinity for runtime-webhook pods and scaled replicas (minimum 3 in multi-zone clusters).
+- For air-gapped deployments: host Path allowlists must be prepopulated via the field onboarding manifest.
+
+Contact: runtime-platform@redwood.example.com for implementation questions; runtime-security@redwood.example.com for policy review.

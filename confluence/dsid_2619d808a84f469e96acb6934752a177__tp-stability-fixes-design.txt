@@ -1,0 +1,366 @@
+TP Stability Fixes (Multi-GPU) — Design: Hang Taxonomy, Root Causes, and Runtime Hardening Plan
+
+## Summary
+Tensor-parallel (TP) replicas (2–8 GPUs per replica) are now the dominant mode for our largest Dedicated clusters and several high-throughput Hosted workloads. Under sustained mixed load (prefill + decode, long context, bursty concurrency, client cancels), we have observed failure modes that manifest as:
+- “Silent stalls” (no progress, GPUs appear busy or idle, requests hang)
+- Downstream request timeouts (streaming or non-streaming)
+- Autoscaling thrash due to inflated p99/p999
+- Occasional Sev1 incidents requiring draining/replacing replicas
+
+This document proposes a targeted hardening plan focused on **correctness + stability** (not a TP architecture rewrite), with an emphasis on:
+1) A clear **taxonomy** of stall/hang signatures
+2) Concrete **root-cause hypotheses** mapped to instrumentation and fixes
+3) Scheduler and comms-boundary changes that reduce the probability of deadlocks
+4) **Safe failure semantics** (watchdogs + abort/drain) to prevent indefinite hangs
+5) A rollout strategy with guardrails and regression coverage
+
+## Goals / non-goals
+### Goals
+- Eliminate known hang/timeouts in TP execution under load.
+- Improve diagnosability: separate **compute**, **comms (NCCL)**, and **scheduler starvation**.
+- Add regression coverage (repro harness + perf canary + fault injection).
+- Provide safe mitigations: watchdogs, controlled abort/retry paths, operational runbooks.
+
+### Non-goals
+- Major refactor of TP execution model.
+- Model quality/evals work beyond using models as workload generators.
+- New user-facing product features unrelated to reliability.
+
+## Background: current TP execution (high level)
+In a TP replica, each request is executed across N ranks (GPUs) using:
+- Runtime scheduler: builds prefill and decode “steps” and dispatches work across streams
+- Kernel + comms boundary: NCCL collectives (e.g., all-reduce / reduce-scatter / all-gather) are issued on a designated comm stream and synchronized with compute streams
+- KV cache: per-rank allocation + eviction/compaction; shared scheduling decisions require consistent rank-local state
+
+**Key constraint:** collectives require **all ranks** to participate in the same collective sequence with compatible shapes and ordering. Any divergence (control flow, scheduling, cancellation paths, memory errors) can lead to indefinite waits.
+
+## Taxonomy of TP hang / stall signatures
+This taxonomy is meant to be operational: each signature should map to measurable signals and specific mitigations.
+
+### Signature A — Collective ordering mismatch (classic deadlock)
+**Symptoms**
+- Some ranks blocked inside an NCCL call; others blocked earlier/later in a different collective
+- No forward progress; request(s) hang until client timeout
+- Often correlated with mixed prefill/decode and high concurrency
+
+**Likely causes**
+- Scheduler creates different step/collective sequences across ranks (e.g., starvation, interleaving differences)
+- Cancellation path triggers early exit on a subset of ranks
+- Error path (OOM, invalid shape) returns early on a subset of ranks without synchronizing abort
+
+**What we need to measure**
+- Per-rank “collective sequence number” and “in-flight collective count”
+- Rank-local step id (prefill vs decode) and batch composition hash
+- Time since last completed collective per rank
+
+
+### Signature B — Stream/event synchronization bug (silent stall)
+**Symptoms**
+- NCCL is called, but the stream waits on an event that is never recorded (or recorded on a different stream)
+- GPU utilization may be low; one stream appears stuck
+- Reproduces more frequently with CUDA graphs or conditional graph paths
+
+**Likely causes**
+- Missing or incorrect `cudaEventRecord` / `cudaStreamWaitEvent` ordering
+- Using default stream semantics inadvertently (implicit dependencies differ by build/runtime flags)
+- Graph capture constraints causing unexpected stream dependencies
+
+**What we need to measure**
+- Structured logs for “sync points” around comms boundaries (enter/exit, event ids)
+- Optional debug counters for stream waits and event records (sampled)
+- NCCL debug traces (limited window, safe enablement)
+
+
+### Signature C — Scheduler starvation of collectives (fairness / backpressure)
+**Symptoms**
+- Under heavy prefill, decode progress slows dramatically; some ranks continue issuing prefill-heavy work
+- Collectives required for decode are delayed long enough to trigger timeouts or watchdog
+- Appears as “hang” from the client perspective, but may be a starvation-induced stall
+
+**Likely causes**
+- Fairness logic allows prefill-heavy batches to dominate a rank’s compute stream
+- Coordination points (barriers) are not treated as high priority; collectives can be queued behind long kernels
+- Different ranks observe different queue pressure, producing divergence in which collectives are reached
+
+**What we need to measure**
+- Scheduler queue depth by class: prefill vs decode vs collective
+- Time-in-queue metrics for “collective-ready” steps
+- Per-rank heartbeat that includes “last forward-progress timestamp” at step granularity
+
+
+### Signature D — KV cache compaction / memory pressure causing rank divergence
+**Symptoms**
+- One or more ranks enters compaction/eviction paths while others proceed
+- Eventually results in collective mismatch or prolonged stall
+- Often correlated with long context + high churn (many concurrent sequences) + fragmented KV
+
+**Likely causes**
+- Compaction path changes allocation decisions that affect batch composition or tensor shapes per rank
+- An allocation failure causes early-return on one rank
+- Shared decisions (e.g., which sequences to evict) not consistently applied across ranks
+
+**What we need to measure**
+- KV cache pressure signals: fragmentation score, compaction duration, allocation failures
+- Cross-rank agreement checks on “batch plan” (sampled hash compare)
+
+
+### Signature E — Cancelled streaming request leaves collectives waiting
+**Symptoms**
+- Client disconnect during streaming; server cancels request
+- Subset of ranks drops the request early; other ranks continue and block in a collective
+
+**Likely causes**
+- Cancellation is handled per-rank without a synchronized “cancel barrier”
+- Cancellation occurs between “plan” and “execute” steps
+
+**What we need to measure**
+- Cancel events tagged with request id + step id + rank
+- Whether cancel was “synchronized” (all ranks observed) vs “local-only”
+
+
+## Proposed instrumentation (diagnostics first)
+This project prioritizes actionable signals before (and alongside) fixes.
+
+### 1) TP heartbeat + stall reason tagging
+Add per-rank heartbeats emitted at key points:
+- start/end of prefill step
+- start/end of decode iteration
+- start/end of each NCCL collective
+
+Heartbeat fields (labels)
+- `replica_id`, `rank`, `tp_world_size`, `model`, `cluster`, `runtime_version`
+- `step_kind` = {prefill, decode, collective}
+- `stall_reason` (best-effort) = {none, comms_wait, compute_long, scheduler_starvation, kv_compaction, cancel_path, unknown}
+
+Principle: heartbeats must be lightweight and safe at high QPS. Use counters + last-seen timestamps rather than high-cardinality logs.
+
+### 2) Collective sequence counters and tracing correlation
+- Maintain a monotonic per-rank `collective_seqno`
+- Emit `in_flight_collectives` gauge per rank
+- Add tracing span fields (sampled) for `collective_seqno`, `rank`, and `batch_plan_hash`
+
+### 3) Scheduler visibility
+Add metrics:
+- queue depth by class: `prefill_ready`, `decode_ready`, `collective_ready`
+- age (p50/p95/p99) of oldest `collective_ready` item
+- “fairness decisions” counter (when decode is boosted over prefill)
+
+
+## Proposed runtime changes
+We propose changes in three layers: (1) scheduler ordering/fairness, (2) comms boundary sync, (3) safe abort/drain semantics.
+
+### Change 1 — Scheduler guardrails: prevent collective starvation and reduce divergence
+**Problem:** The scheduler can delay collective-requiring work behind long prefill kernels, and ranks can drift in which steps they reach under load.
+
+**Design**
+1) Introduce an explicit priority class for **collective-ready** work.
+2) Enforce a **maximum prefill run-ahead budget** when decode collectives are pending.
+3) Ensure all ranks use consistent “step plan” boundaries:
+   - A step plan is computed once per replica tick and broadcast to ranks (or derived deterministically from shared inputs).
+   - If a rank cannot execute the step plan (e.g., memory failure), it triggers the abort path rather than locally skipping.
+
+**Implementation notes**
+- Treat NCCL collective scheduling as a first-class resource: comm stream occupancy and event dependencies must be respected.
+- Keep determinism boundaries small: we do not want global barriers on every micro-step; only at “plan” points.
+
+**Risk**
+- Potential throughput reduction if decode is boosted too aggressively.
+
+**Mitigation**
+- Feature flag the fairness guardrail.
+- Expose tunables per model family (prefill-heavy vs decode-heavy workloads).
+
+
+### Change 2 — NCCL stream/event synchronization hardening
+**Problem:** Silent stalls can occur due to missing or inconsistent stream/event synchronization around collectives (especially under CUDA graphs).
+
+**Design**
+- Standardize the comms boundary sequence:
+  1) Record event on compute stream after producing collective input buffers
+  2) Comm stream waits on that event
+  3) Issue NCCL collective on comm stream
+  4) Record event on comm stream after collective completes
+  5) Compute stream waits on comm-complete event before consuming outputs
+
+- Explicitly avoid relying on implicit default-stream ordering.
+- Under CUDA graph capture:
+  - Ensure event objects are capture-safe
+  - For unsupported capture paths, fall back to non-captured execution (configurable)
+
+**Risk**
+- Additional sync can reduce overlap and slightly increase latency.
+
+**Mitigation**
+- Conditionalization: only enable extra sync in TP mode and only where needed.
+- Microbench and perf canary thresholds; rollback if regression exceeds agreed limits.
+
+
+### Change 3 — Watchdog + safe abort/drain semantics
+**Problem:** Indefinite waits are unacceptable in production. Even if root causes remain, we need a bounded failure mode that protects the fleet.
+
+**Design (high level; see ADR-0127 for details)**
+- Add watchdog timers at these boundaries:
+  - decode iteration (end-to-end)
+  - collective execution (per collective)
+  - “no heartbeat progress” threshold
+
+- On watchdog trigger:
+  1) Mark replica as unhealthy and stop admitting new work
+  2) Attempt to fail in-flight requests with a structured error code (actionable for routing/fallback)
+  3) Drain the replica from service and restart the process (or replace the pod/VM)
+
+**Key principles**
+- Prefer **controlled abort** over indefinite waiting.
+- Avoid “half aborts”: abort must be coordinated to prevent leaving other ranks stuck.
+- Errors must surface with enough context to distinguish comms stall vs scheduler starvation.
+
+**Open question (captured for ADR):** whether to attempt in-process recovery vs always draining. Current recommendation: drain by default to avoid wedged GPU contexts.
+
+
+### Change 4 — KV cache compaction safety in TP
+**Problem:** Compaction and allocation failures can cause rank-local divergence.
+
+**Design**
+- Make compaction decisions deterministic across ranks for a given step plan.
+- If a rank cannot allocate required buffers:
+  - do not locally drop sequences
+  - trigger the replica abort path (so ranks fail together)
+- Add a “compaction in progress” signal so the scheduler can avoid scheduling large prefill bursts that exacerbate fragmentation.
+
+
+### Change 5 — Cancellation synchronization for streaming
+**Problem:** Client cancel/disconnect can cause some ranks to exit earlier than others.
+
+**Design**
+- Introduce a synchronized cancel protocol:
+  - cancellation is treated as a step-plan event
+  - ranks acknowledge cancellation and converge at the next safe point
+- If a cancel occurs mid-collective, the cancel is deferred to after the collective boundary (unless abort triggers).
+
+
+### Change 6 — Load-shed hooks on TP stall signals
+**Problem:** Once a replica is wedged or slow, continued admission amplifies tail lat and increases blast radius.
+
+**Design**
+- Wire stall detectors (heartbeat gap + queue age + watchdog warnings) into overload protection.
+- When stall risk is high, reject/redirect new requests rather than queueing behind a potentially stalled replica.
+
+
+## Proposed configuration & feature flags
+All safety features must be rollable and reversible.
+
+| Feature | Flag | Default | Notes |
+|---|---|---:|---|
+| Scheduler collective fairness guardrail | `tp.scheduler.collective_fairness` | OFF (canary ON) | Tunable prefill run-ahead budget |
+| Extra NCCL stream/event sync | `tp.nccl.sync_hardening` | OFF (canary ON) | Enable per-model if graph capture requires fallback |
+| TP watchdog | `tp.watchdog.enabled` | OFF (canary ON) | Thresholds model-specific |
+| Replica drain on watchdog | `tp.watchdog.drain_on_trigger` | ON when watchdog ON | Prefer safety over recovery |
+| Cancellation synchronized protocol | `tp.cancel.sync_enabled` | OFF (canary ON) | Requires client cancel signal propagation |
+| Load-shed on stall | `tp.stall.load_shed` | OFF (staged ON) | Guard against false positives |
+
+
+## Performance vs safety tradeoffs
+### Expected overheads
+- Extra stream/event sync: small latency increase; can reduce overlap between comm and compute.
+- Scheduler fairness: may decrease throughput in prefill-heavy workloads if decode is boosted.
+- Heartbeats/tracing: minimal if implemented as counters + sampled spans.
+
+### Why we accept these tradeoffs
+- Our current cost of failure is high: timeouts, Sev1 incidents, customer escalations, and fleet instability.
+- A small average-case regression is acceptable if it significantly improves p99/p999 and reduces hang rate.
+
+### Guardrails
+- All features are feature-flagged and can be rolled back independently.
+- Canary gates include:
+  - hang rate (should approach zero in stress scenarios)
+  - request timeout rate
+  - p99 latency delta bounded per workload
+  - watchdog trigger frequency (must be near-zero in steady state)
+
+
+## Rollout strategy
+### Phase 0 — Triage + deterministic repro (Week 1)
+- Select top 2–3 hang signatures based on incident history.
+- Build deterministic repro harness in benchmark-lab and add initial perf-canary scenario.
+- Tag and catalog logs/traces to validate taxonomy mapping.
+
+### Phase 1 — Instrumentation + targeted fixes (Weeks 2–4)
+- Land heartbeat + stall reason tagging.
+- Land scheduler fairness guardrail (flagged).
+- Land NCCL sync hardening (flagged).
+- Validate with repro harness and stress suite.
+
+### Phase 2 — Regression + canary rollout (Weeks 4–6)
+- Add TP stress scenarios (long context, bursty concurrency, replica churn) to perf-canary.
+- Dedicated-first canary (selected accounts/clusters) with enhanced debug window (time-boxed).
+- Then staged Hosted rollout by region.
+
+### Phase 3 — Operationalization (Weeks 6–8)
+- Finalize runbook, dashboard, and alert policies.
+- Document known issues, mitigations, and version guidance.
+- Postmortem / incident review follow-ups linked to Linear.
+
+### Rollback criteria
+Rollback any individual feature if:
+- p99 latency regression exceeds agreed threshold for a canary workload
+- watchdog triggers exceed baseline by >X per hour (cluster-dependent) and are correlated with false positives
+- new error codes increase customer-visible failure rate without improving hang/timeouts
+
+
+## Testing & regression coverage
+### Repro harness requirements
+- Mixed prompt lengths (short + long), streaming decode enabled
+- Concurrency bursts and sustained steady-state
+- Client cancel/disconnect injection
+- Memory pressure mode to trigger KV compaction
+
+Acceptance criteria
+- Repro should trigger at least one previously observed stall signature within a bounded time on A100/H100 lab environments.
+
+### Fault injection
+- Simulate delayed/stuck collective on a subset of ranks to validate watchdog and abort propagation.
+- Simulate cancellation at unsafe boundaries.
+
+### CI / perf lab gating
+- Add TP stress suite as a nightly gate; select scenarios as PR-level canary where GPU capacity allows.
+
+
+## Observability deliverables (what “good” looks like)
+When a TP issue occurs, we should be able to answer within 5–10 minutes:
+1) Is this compute, comms, or scheduler starvation?
+2) Which replicas/ranks are affected?
+3) What was the last completed collective seqno and step kind?
+4) Did a cancel/compaction event precede the stall?
+5) What is the recommended mitigation (drain, cap concurrency, disable feature flag)?
+
+
+## Open questions / follow-ups
+- CUDA graphs: Which graph capture paths are required for top workloads, and where must we fall back?
+- Threshold tuning: watchdog defaults per model size and per workload profile (long-context vs short).
+- Abort semantics: do we ever attempt in-process recovery for comm stalls, or always drain?
+- Cross-rank agreement checks: how much sampled “plan hash compare” can we afford without introducing overhead or new failure modes?
+
+
+## Owners
+- Overall technical lead: Noah Patel
+- Scheduler (fairness/ordering): Sofia Ivanova (+ Lena Fischer)
+- NCCL + stream/event sync: Hiro Tanaka (+ Grace Kim, Yuki Sato)
+- KV cache / compaction safety: Omar El-Sayed (+ Samir Qureshi)
+- Regression/perf canary: Marcus Reed (+ Rina Kobayashi)
+- SRE rollout + dashboards: Rafael Mendes (+ Aisha Bello)
+
+
+## Appendix A — Quick reference: signals and likely causes
+- Heartbeat gap + rising `collective_seqno` mismatch across ranks → collective ordering mismatch or cancellation divergence
+- Heartbeat gap + `collective_seqno` equal but no completion → stream/event sync stall or NCCL hang
+- High `collective_ready_age_p99` + heavy prefill queue depth → scheduler starvation
+- KV compaction duration spikes + subsequent seqno divergence → compaction-induced divergence
+
+
+## Appendix B — Glossary
+- TP: Tensor parallelism (single model shard across multiple GPUs)
+- Rank: One participant GPU in the TP world
+- Prefill: Prompt processing pass
+- Decode: Token-by-token generation iterations
+- Collective: NCCL multi-rank communication op
+- Replica: One serving instance (process/pod/VM) handling requests

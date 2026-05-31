@@ -1,0 +1,170 @@
+Transit-gateway design and onboarding playbook for GPU bursting
+
+Overview
+--------
+This playbook describes the recommended Transit Gateway (TGW) topology, security posture, Terraform patterns, and step-by-step onboarding procedure for tenant GPU bursting that requires shared egress while preserving tenant isolation and auditable traffic flows. It is intended for infra engineers and platform SREs implementing cross-account bursting in AWS (patterns are applicable to other clouds with equivalent TGW/Transit concepts).
+
+Goals and constraints
+---------------------
+- Provide low-latency, high-throughput egress for burst traffic from Dedicated and Ephemeral GPU pools.
+- Ensure per-tenant egress metering and attribution for billing and throttling.
+- Maintain tenant network isolation and least-privilege access.
+- Minimize blast radius for network changes; support safe rollback and canarying.
+
+Scope
+-----
+- Applies to: GPU tenant accounts (dev/prod), Central Networking account, Shared egress appliances (NAT/Proxy/LB), and TGW attachments.
+- Not covered: application-layer routing, tenant IAM roles, or on-host firewall rules.
+
+Architecture summary (text diagram)
+----------------------------------
+- Central Networking Account (TGW hub)
+  - TGW core (attachments, route domains)
+  - Shared NAT/egress fleet (autoscaled, containerized proxy), per-tenant SNAT pools
+  - VPCs for observability & telemetry collectors
+- Tenant Accounts (spoke VPCs)
+  - GPU pools in private subnets (no direct internet egress)
+  - VPC attachments to TGW via TransitGatewayAttachment (one per tenant environment)
+- Optional: Edge filtering account for customer-specific allowlists
+
+Traffic flow
+------------
+1. Tenant workload -> private subnet -> route to TGW attachment
+2. TGW forwards to central route table -> egress appliance (NAT/proxy)
+3. Egress appliance applies per-tenant SNAT translation and sends to internet
+4. Telemetry exporter mirrors flow logs to Observability VPC and ledger for billing
+
+Key design decisions
+--------------------
+- Centralized egress appliance: simplifies NAT pool management and gives a single place for TLS interception, DLP, and monitoring.
+- Per-tenant SNAT prefixes: allows metering at the IP level without relying on application tagging.
+- TGW route domains & route tables per tenant cohort: enable canarying and gradual rollouts.
+- Use of AWS Resource Access Manager (RAM) for cross-account route propagation where appropriate.
+
+Requirements and constraints table
+--------------------------------
+| Requirement | Minimum spec / config | Rationale | Owner |
+|-------------|-----------------------|-----------|-------|
+| TGW throughput | t3 (default) with ENI scaling (upgrade to c5/c6 instance sizes for NAT) | High-concurrency UDP/TCP flows | infra-networking |
+| SNAT pool size | /27 per high-throughput tenant (32 IPs) | Avoid SNAT exhaustion under burst | infra-networking + tenant owner |
+| HA NAT/service | autoscale group across AZs (min 2 per AZ) + healthchecks | Avoid single AZ egress outage | infra-ops |
+| Flow logs | VPC Flow Logs + VPC Traffic Mirroring for sample captures | For billing, forensics, and QBRs | observability |
+| IAM cross-account pattern | AssumeRole with least privilege + RAM for TGW attachments | Principle of least privilege | security & infra |
+
+Terraform and IaC guidance
+--------------------------
+- Modularize: provide modules for tgw-hub, tgw-attachment, egress-appliance, and per-tenant-route-domain. Keep variables minimal and explicit.
+- State: central S3 bucket per environment with state locking. Use separate state for hub and spokes to allow independent promotions.
+- Example usage (pseudo):
+
+```
+module "tgw_hub" {
+  source = "git::ssh://git@repo/internal/terraform/modules//tgw-hub"
+  name   = "redwood-tgw-hub-prod"
+  region = "us-west-2"
+}
+
+module "tenant_spoke" {
+  source           = "git::ssh://git@repo/internal/terraform/modules//tgw-attachment"
+  tenant_id        = "tenant-42"
+  vpc_id           = "vpc-0abcd1234"
+  allowlist_prefix = ["10.100.0.0/24"]
+}
+```
+
+- Canaries: deploy a single tenant attachment and route domain with scaled-down NAT appliance (reduced SNAT size) when onboarding a new tenant class.
+- Promotion: once validated, promote Terraform state of attachment by importing outputs to the hub's route domain list via controlled plan/apply in CI.
+
+Onboarding checklist (step-by-step)
+----------------------------------
+1. Pre-onboard (tenant & product owner): submit request with expected RPS/peak tokens/min and egress destinations.
+2. Networking: allocate SNAT prefix and CIDR blocks, create TGW attachment request, and open a PR with terraform module usage.
+3. Security review: verify least-privilege roles and proxy policies; run static IAM checks.
+4. CI/CD: create a branch in infra repo that references the tenant module. Attach a CD gate that runs plan and a smoke apply in sandbox account.
+5. Canary apply: apply attachment and egress appliance with reduced capacity in staging; run test suite (see "Testing checklist").
+6. Traffic validation: run synthetic traffic generator for 30 minutes at 50% expected peak; collect flow logs and metric reports.
+7. Promote: merge PR and run production apply in a scheduled maintenance window.
+8. Monitor: verify metrics for 60 minutes then remove canary tags.
+
+Rollback and emergency procedures
+--------------------------------
+- If NAT CPU > 85% or SNAT port exhaustion observed, immediately:
+  1) Scale up egress appliance ASG (fast path)
+  2) If scaling fails, detach route to central egress and reroute to pre-provisioned fallback egress (lower-tier NAT pool)
+  3) Open incident channel #infra-egress and page oncall with priority P1 if customer impact detected
+- Rollback Terraform: revert the last apply in infra repo and run apply in hub and spoke states. Document applied change-id in incident notes.
+
+Monitoring, alerts and SLOs
+-------------------------
+- Metrics to emit:
+  - NAT CPU (per instance)
+  - SNAT port utilization (per SNAT prefix)
+  - TGW packet drop rate
+  - Egress latency (p95) to monitored destinations
+- Alert thresholds:
+  - NAT CPU > 75% (warn) | > 90% (critical)
+  - SNAT port utilization > 80% (warn) | > 95% (critical)
+  - TGW packet drop > 0.2% (critical)
+- SLOs (for bursting traffic):
+  - 99% of egress requests return within 200ms p95 for samples to core public endpoints under expected load.
+
+Testing checklist
+-----------------
+- Unit: terraform fmt/validate, tfsec, and policy-as-code (OPA) checks in PR gating.
+- Integration: apply to ephemeral sandbox account with a traffic generator that validates SNAT mapping and sticky routing.
+- Performance: run a burst simulation at 2x expected peak for 15 minutes; capture flow logs and ensure no SNAT exhaustion and <5% packet loss.
+- Security: run proxy policy tests (TLS passthrough vs. interception), ensure DNS leak prevention rules apply.
+
+Operational playbook excerpts (commands)
+--------------------------------------
+- Create TGW attachment (cli):
+```
+aws ec2 create-transit-gateway-vpc-attachment --transit-gateway-id tgw-0123456789abcdef0 --vpc-id vpc-0abcd1234 --subnet-ids subnet-aaaa subnet-bbbb
+```
+- Add route to route table (cli):
+```
+aws ec2 create-transit-gateway-route --destination-cidr-block 0.0.0.0/0 --transit-gateway-route-table-id tgw-rtb-0abc123
+```
+- Inspect SNAT utilization (sample script):
+```
+# uses CloudWatch metrics and NAT instance tags
+python scripts/query_snat_utilization.py --prefix 198.51.100.0/27
+```
+
+Ownership and run cadence
+-------------------------
+- Ownership: Central networking owns TGW hub and egress appliances. Tenant infra owns their spokes and GPU fleets. Observability owns flow log ingestion.
+- Weekly: infra-networking runbook review and capacity forecast sync (include top 5 burst tenants).
+- Quarterly: SNAT prefix reclamation and audit; update per-tenant SNAT allocation map.
+
+Security and compliance notes
+-----------------------------
+- All cross-account actions require preapproved AssumeRole with MFA enforced for changes to hub route tables.
+- Flow logs retained for 90 days in hot storage; 7 years in archived storage for customers with contractual requirements.
+- Any tenant-requested egress allowlist additions must go through security review and VPC endpoint pattern if possible.
+
+Appendix: sample Terraform variable matrix
+----------------------------------------
+| var | example value | notes |
+|-----|---------------|-------|
+| tenant_id | tenant-42-prod | used in tagging and SNAT allocation |
+| snat_prefix | 198.51.100.0/27 | assigned from central pool |
+| desired_appliance_min | 4 | min instances across AZs |
+| monitoring_log_group | /infra/egress/tenant-42 | CloudWatch group |
+
+References and related pages
+----------------------------
+- TGW best practices (internal): /confluence/eng-infra/cloud-accounts-and-networking/tgw-best-practices.json
+- Central NAT appliance module: repo://infra/terraform/modules/egress-appliance
+- Billing ledger pattern: /confluence/finance-and-legal/billing/gpu-egress-ledger-pattern.json
+
+Changes and revision history
+---------------------------
+- 2024-01-15: Initial draft (Diego Moreno)
+- 2024-04-02: Added SNAT sizing guidance and canary pattern (Asha Patel)
+- 2025-10-05: Hardened rollback steps and added SLOs (Maya Chen)
+
+Contact
+-------
+- Primary: Diego Moreno (infra-networking)
+- Slack: #infra-networking, Pager: infra-oncall

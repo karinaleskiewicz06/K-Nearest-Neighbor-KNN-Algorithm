@@ -1,0 +1,141 @@
+GPU e2e network chaos and validation framework
+
+Overview
+
+Purpose: This document describes the GPU end-to-end (E2E) network chaos and validation framework used by the infra team to detect, validate, and prevent networking regressions that can impact latency-sensitive inference workloads. It covers test design, CI integration, IaC/terraform guardrails, telemetry requirements, automated remediation steps, and runbook procedures for oncall.
+
+Scope
+- Applies to all GPU-backed inference clusters and tenant VPC constructs serviced by Redwood Inference ground pools and burst pools.
+- Focuses on networking failure modes that materially affect model SLOs: increased tail latency, packet loss >0.5% on RPC paths, and cross-account NAT egress saturation.
+- Not in scope: application-level model logic validation, customer data content checks.
+
+Goals
+- Detect common network regressions pre-merge via CI and pre-provision tests.
+- Reproduce and validate incidents in a production-like staging environment using safe chaos experiments.
+- Provide automated Terraform plan checks that block risky network/IaC changes.
+- Standardize telemetry and alert thresholds tied to SLOs for serving (99th percentile token latency, request success rate).
+
+Design overview
+1) Test harness: a declarative YAML-driven harness that runs synthetic workloads through the full network path: client -> ingress layer -> service mesh/sidecar -> inference runtime -> model shard -> egress.
+2) Chaos injector: an operator (k8s-chaos) that applies network perturbations at four control planes (pod, node, host-ENI, and NAT) with deterministic schedules and revert safety.
+3) Validation checks: assertion library that compares pre-run baselines to post-run signals across latency, packet loss, TCP retransmits, KV cache hit ratio, and inference error rates.
+4) Policy enforcement: Terraform and CI gates that require passing a defined set of validation suites before merging network/IaC changes.
+
+Test types and examples
+- Latency spike (egress path): add delay on the NAT gateway or egress router for 200–1000ms; assert P99 token latency increases by <30% for supported SLAs or fail.
+- Packet loss burst: inject 0.5–2% packet loss on the service mesh path for 30–120s; assert 99% request success or trigger degraded-mode fallback.
+- Partial subnet blackout: blackhole one AZ’s podCIDR for 60s and validate autoscaler and routing fallback behave within expected thresholds (warm-pool handoff < 15s).
+- MTU fragmentation regression: lower MTU on host interfaces to 1300B and validate model shard KV cache and streaming reassembly do not drop sessions.
+
+Example YAML test manifest (simplified)
+
+```
+name: nat-egress-latency-spike
+description: Simulate transient NAT egress latency to validate P99 behavior
+targets:
+  - type: nat-gateway
+    id: nat-gw-prod-west-1
+inject:
+  delay_ms: 400
+  duration_s: 45
+validations:
+  - metric: inference.p99_token_latency_ms
+    baseline_window: 10m
+    threshold: 1.3    # fail if >130% of baseline
+  - metric: request.success_rate
+    threshold: 0.99
+```
+
+CI integration and gating
+- Location: we run network-validation tests in the infra/e2e pipeline (Jenkins or GitHub Actions depending on repo).
+- Strategy: fast smoke suites run on every PR that touches terraform modules or service mesh code (target ~15–20 minutes). Full staged suites run on merge to main for terraform/iac changes and nightly for runtime changes.
+- Blocking checks: terraform plan guard (see Terraform guard rules section) + mandatory smoke tests must pass before merges that touch network modules.
+- Artifacts: every test run publishes a summary artifact (JSON) and a full metrics bundle (Prometheus snippets, pcap if enabled) to the cluster test-buckets for postmortem.
+
+Terraform / IaC guardrails
+- pre-commit hooks: terragrunt/terraform fmt and tfsec linting are enforced in CI.
+- plan-time checks: we run a custom plan-time analyzer that blocks the following risky edits unless feature-flagged and reviewed: removal of AZ-level NAT redundancy, changing default egress CIDR to 0.0.0.0/0, reducing subnet route table propagation, and modifying tenant egress throttles without a documented migration.
+- Example check command (run in CI):
+
+```
+./tools/plan-guard --plan=plan.out --require-reviewers=networking,infra --block=nat_reduction,egress_allows
+```
+
+Telemetry signals and thresholds (table)
+
+Metric | Ideal baseline | Alert threshold | Owner
+--- | --- | ---: | ---
+inference.p99_token_latency_ms | 120ms | >250ms | eng-serving-runtime
+request.success_rate | 0.999 | <0.995 | eng-sre
+network.tcp_retransmits_per_min | 0.3 | >2.0 | eng-infra-networking
+nat.egress_queue_depth | <50 | >200 | eng-infra
+packet_loss_percent (service_mesh) | <0.05 | >=0.5 | eng-infra
+
+Test environment provisioning pattern
+- Each test run uses ephemeral infra: a tenant-sandbox VPC created from single-source Terraform modules, with the same routing, NAT, and mesh config as prod but isolated accounts and rate-limited egress (controlled by test-burst-limiter).
+- Lifetime: default TTL 4 hours; auto-teardown enforced by a controller that reconciles TTL every 5 minutes.
+- Secure defaults: kms-backed secrets, no production data ingress, and explicit consent required to enable packet capture (pcap).
+
+Automated remediation and safe kill-switch
+- All chaos experiments require a watchman controller with a two-tier kill switch: soft (revert changes in-cluster) and hard (drain and evict test infra) tied to SLO breach detectors.
+- If request.success_rate drops below 0.99 for >30 seconds during a test, the watchman initiates an immediate revert and a notification to #infra-ops and oncall.
+
+Runbook: responding to a network-related GPU incident (short version)
+1) Pager received: check the incident playbook and open the incident channel.
+2) Quickly identify scope: query telemetry dashboards for the last 15m across the following: inference.p99_token_latency_ms, request.success_rate, network.tcp_retransmits_per_min, nat.egress_queue_depth.
+3) If metrics indicate packet loss or retransmits, run the pre-built validation suite against staging mirrors to reproduce.
+4) If reproduction succeeds, run the containment steps: 1) shift traffic to secondary region or dedicated pool, 2) increase autoscaler warm-pool size, 3) roll back any recent IaC/network changes that match the plan-time change set.
+5) If no IaC changes are implicated, escalate to network infra oncall to inspect router/NAT health and peering metrics.
+6) Post-incident: run the full chaos validation with the failing disturbance injected to ensure the fix prevents recurrence.
+
+Ownership, SLOs and release requirements
+- Ownership: eng-infra (networking) owns the framework and test harness. eng-serving-runtime owns interpretation of inference metrics and acceptance criteria. eng-sre owns alert rules and incident coordination.
+- Release gating: any change to network modules or service mesh must ship accompanied by: 1) passing smoke validation suite, 2) updated terraform plan-guard signature, 3) a documented rollback plan in the PR description.
+
+Operational cost considerations
+- Ephemeral sandbox allocation: cap daily budget for test infra (quota) via central billing tags. The harness will refuse to provision when daily budget is exceeded and notify the requestor.
+- Data retention: full pcap retention is disabled by default; it must be enabled per-request and is limited to 7 days.
+
+Appendix A: sample CI job snippets
+
+GitHub Actions sample (simplified):
+```
+name: infra-network-smoke
+on: [pull_request]
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Setup terraform
+        run: |
+          curl -fsSL https://apt.releases.hashicorp.com/gpg | gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          sudo apt-get update && sudo apt-get install terraform
+      - name: Run smoke validation
+        run: |
+          ./infra/e2e/run_smoke.sh --manifest tests/smoke/nat-latency.yaml --publish-artifact
+```
+
+Appendix B: safe-parameters for chaos experiments
+- Max allowed duration: 120s for latency, 180s for packet loss; experiments that request more must include an explicit risk waiver and approval from the networking oncall.
+- No experiments may target production NATs without a two-party approval and scheduled low-traffic window.
+
+Appendix C: troubleshooting checklist (quick)
+- Are the ephemeral sandbox VPCs provisioning? (terraform apply logs)
+- Is the watchman controller healthy? (kubectl -n infra get pods watchman)
+- Do metrics match pcap evidence? (download metrics bundle and compare)
+- Was there a terraform plan change in the last deploy window? (CI artifacts)
+
+Related artifacts and links
+- Tools: /tools/plan-guard, /infra/e2e/run_smoke.sh, /infra/chaos/k8s-operator
+- Dashboards: infra/gpu-networking-slo, infra/egress-health, runtime/inference-p99-overview
+
+Contact and escalation
+- Primary owner: eng-infra-networking (oncall roster in PagerDuty: team:infra-networking)
+- Secondary: eng-serving-runtime (Slack: #runtime-performance)
+- For IaC gating failures: reach out to the change author and the reviewer lists configured in the plan-guard output.
+
+Revision history
+- 2025-07-01: Initial draft and test harness prototype (Priya Kannan).
+- 2025-09-04: Added terraform plan-guard rules and CI job templates (Li Wei).
+- 2025-10-12: Finalized runbook steps and safe-parameters; expanded telemetry thresholds (Ethan Morales).

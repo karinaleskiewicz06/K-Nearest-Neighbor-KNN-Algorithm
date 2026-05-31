@@ -1,0 +1,176 @@
+Runtime Execution Orchestra: Scheduler Synthesis, Profiling Playbook, and Benchmarking Matrix
+
+Overview
+
+This playbook synthesizes cross-cutting runtime concerns into a single, experiment-driven operational guide: how the Scheduler (scheduler-service) integrates with the Execution Orchestra (runtime-orchestrator), how we profile scheduler and kernel behaviour end-to-end, and a compact benchmarking matrix to validate tuning changes before rollout. It is intended for runtime engineers, SREs, and profiling squad members.
+
+Goals
+
+- Provide deterministic, repeatable steps to evaluate scheduler changes and their impact on tail latency, cost, and kernel utilization.
+- Standardize profiling hygiene for scheduling experiments so results are comparable across clusters.
+- Define a lightweight benchmark matrix that exercises common production shapes and quantization variants.
+
+Service & Component Inventory
+
+- runtime-orchestrator: control plane that composes kernel dispatch plans and routes requests to kernel-dispatcher.
+- scheduler-service: admission controller and slot allocator; implements priority buckets and credit accounting.
+- kernel-dispatcher: GPU-side dispatcher that executes mapped kernels.
+- kvcache-service: shared KV cache with warmup and eviction telemetry hooks.
+- request-classifier: sidecar component that assigns incoming requests to pre-configured execution cohorts.
+
+Key Performance Targets (SLOs)
+
+- Stability SLO (short requests, seq <= 64): p99 latency <= 250ms; p95 <= 80ms.
+- Long-sequence SLO (seq 512): p99 <= 2.2s; p95 <= 1.1s.
+- Kernel tail safety: no single kernel should have >15% invocation rate variance across active slots for a sustained 10-minute window.
+- Cost SLO: per-token GPU time change <= +10% after scheduler changes for steady-state mixed workloads.
+
+Experiment Matrix and Benchmarking Table
+
+Run each experiment in a dedicated canary cluster or shadow lane. The matrix below covers three canonical workload shapes: interactive chat (short), document summarization (long), and embeddings mix (small dense batches).
+
+| Workload               | Seq len | Concurrency | Kernel hint    | Quant profile | Key metrics collected               |
+|------------------------|---------|-------------|----------------|---------------|-------------------------------------|
+| Interactive Chat       | 8-64    | 50-300      | small-attn     | q4f           | p50/p95/p99 latency, tokens/sec     |
+| Document Summarization | 256-1024| 10-40       | sharded-attn   | fp16 / q8_1   | p95/p99 latency, kernel-util, evicts|
+| Embeddings Mix         | 1-32    | 100-1000    | dense-matmul   | fp16          | throughput, kernel-queue-length     |
+
+Benchmarking notes:
+- Use the operational-workload-simulator with the same request provenance headers used in prod to ensure equivalence.
+- For each cell run: 10m warmup, 30m steady-state sampling, 5m cool-down.
+
+Profiling Playbook (step-by-step)
+
+1) Prepare the environment
+   - Reserve a canary GPU pool (tag: canary-scheduler-experiment).
+   - Deploy the candidate scheduler binary behind a feature flag (flags: scheduler.new_priority_map=true).
+   - Ensure kvcache-service telemetry is at debug level for the experiment window.
+
+2) Baseline capture (control)
+   - Run the benchmark matrix against current production scheduler.
+   - Collect kernel traces (ktrace), scheduler traces, and kvcache hit-rate histograms.
+   - Commands (example):
+
+   # Start a profiler capture (example CLI)
+   infra-cli profiler start --service scheduler-service --session experiment-run-001 --duration 40m
+
+   # Start kernel dispatcher trace (on canary nodes)
+   node-ctl trace start --target kernel-dispatcher --label canary-scheduler-experiment --out /tmp/ktrace-control.pb
+
+3) Candidate capture (treatment)
+   - Flip the feature flag and re-run the same benchmark cells. Keep all other infra constants identical.
+   - Capture the same traces and aggregate.
+
+4) Signal extraction
+   - Extract the following per-request signals: scheduler_decision_time_ms, kernel_enqueue_delay_ms, kvcache_lookup_time_ms, and overall_end_to_end_latency_ms.
+   - Use the trace-correlation utility:
+
+   trace-corr --input /tmp/ktrace-control.pb,/tmp/ktrace-treatment.pb --keys request_id --out /tmp/trace-diff.json
+
+5) Attribution checks
+   - For any latency regression >10% at p95 or p99: construct causal hypothesis and search for correlated spikes in kernel_enqueue_delay_ms or priority-rebalancing events.
+   - Check kernel utilization per-GPU and per-kernel type. If a single kernel shows >25% uplift in p99 execution time, tag as kernel-regression.
+
+6) Quality gates
+   - Block rollout if: p99 regression > 15% on short workloads OR kernel tail safety SLO violated.
+   - Soft rollout allowed if cost delta <= +5% and p99 regression < 10%, with live monitoring for 24h.
+
+Observability & Telemetry Contract
+
+Every scheduler experiment must emit the following metrics at 10s and 1m resolution:
+- scheduler.admit_latency_ms.p95, p99
+- scheduler.slot_fill_ratio (0-1)
+- scheduler.priority_rebalances.count
+- kernel.dispatch_queue_length.avg
+- kvcache.evictions_per_minute
+- request.cohort_end_to_end_latency.p50,p95,p99
+
+Trace annotations (required):
+- scheduler_decision_id: unique id for scheduler decision that can be correlated to kernel events.
+- kernel_dispatch_id: id assigned by kernel-dispatcher.
+- cohort_label: the request-classifier cohort name.
+
+Runbook: Incident Triage (scheduling-related)
+
+Symptoms: sudden p99 rise in short requests, excess scheduler.rebalance events, disproportionate kernel queue length on a subset of nodes.
+
+Immediate actions (0-10m)
+1. Page runtime-oncall and @runtime-platform Slack channel.
+2. Activate runbook channel (ops-channel: #runtime-incidents).
+3. Toggle scheduler -> safe-mode: infra-cli flag set-scheduler-mode safe (falls back to admission-by-cost).
+4. Re-route new traffic to backup GPU pool (tag: fallback-dedicated) using runtime-orchestrator policy: runtime-orchestrator route --policy fallback-dedicated --reason "incident".
+
+Diagnostic steps (10-45m)
+- Capture a 15m trace of scheduler decisions and kernel dispatch traces.
+- Run quick histogram diff: trace-diff-analyzer --metric scheduler.admit_latency_ms --window 15m
+- Check for: priority inversion signals, KV cache coldness, node-level GPU thermal throttling (node-ctl metrics).
+
+Mitigations (45m-3h)
+- If priority inversion: temporarily disable low-priority bursting (scheduler-service config: allow_burst_low_starve=false).
+- If kvcache cold: trigger targeted prefetch for top-10 keys per cohort (kvcache-service API: prefetch --cohort <name> --keys-file /tmp/top10.json).
+- If node thermal: cordon affected nodes and shift batches using runtime-orchestrator node-drain policy.
+
+Post-incident (3h-72h)
+- Run the full profiling playbook and compare control vs incident traces.
+- Create an incident postmortem with the following sections: timeline, impact, root cause hypothesis, remediation plan, roll-forward/rollback plan, owners.
+- If change was due to scheduler code, revert to previous release and open a regression ticket with kernel team.
+
+Rollout & Release Guidance
+
+- Canary phases: alpha (1 node), small-canary (5 nodes), canary-pool (20 nodes), fleet-rollout (gradual 5% increments every 6h).
+- Required sign-offs: runtime-platform lead, kernel-owner, SRE on-call.
+- Monitoring checklist before each percentage bump: p95 and p99 within thresholds, no new error signatures in scheduler logs, eviction rate stable.
+
+Configuration Examples
+
+1) scheduler-service config (YAML snippet)
+
+scheduler:
+  mode: "priority"               # priority | cost | safe
+  slot_size_ms: "8"            # nominal slot unit
+  max_slots_per_gpu: "64"
+  allow_burst_low_starve: "true"
+  rebalance_window_s: "30"
+  credit_decay_s: "300"
+
+2) runtime-orchestrator route policy (JSON example)
+
+{ "policy_name": "fallback-dedicated", "criteria": ["latency>200ms","load>0.85"], "actions": ["reroute_pool:dedicated-03","notify:sre-team"] }
+
+Known Issues & Short-term Workarounds
+
+- Issue: transient priority oscillation when slot_size_ms is less than kernel microbatch latency.
+  Workaround: increase slot_size_ms to 12ms for affected kernel families and enable slot coalescing.
+
+- Issue: kvcache prefetch storms during synchronized warmups cause eviction spikes.
+  Workaround: stagger cohort warmup by 10-30s using request-classifier delay window.
+
+- Issue: scheduler metrics undercount when trace sampling is set below 2%.
+  Workaround: temporarily raise sampling to 10% during experiments.
+
+Ownership & Contacts
+
+- Author: Priya Shah (runtime-platform)
+- Owners: runtime-platform (primary), kernel-team (secondary), eng-sre (oncall)
+- Slack: #runtime-platform, #runtime-incidents
+- Pager: runtime-oncall rotation
+
+Appendix: Experiment templates and expected artifacts
+
+- Required artifacts for every scheduler experiment: control and treatment ktrace pb, aggregated trace-diff.json, metric rollup CSV (10s/1m), experiment runbook with hypothesis, and JIRA ticket linking artifacts.
+
+- Template command to upload artifacts to experiment bucket:
+
+  infra-cli artifact upload --session experiment-run-001 --files /tmp/ktrace-control.pb,/tmp/trace-diff.json --bucket gs://runtime-experiments/2025-03-12/experiment-run-001
+
+- Minimum artifact retention: 90 days for cross-reference during regressions.
+
+Revision History
+
+- 2025-03-12: Initial draft (Priya Shah)
+- 2025-06-02: Added kernel tail safety gate and bench matrix tweaks (reviewers: Marco Alvarez)
+- 2026-01-15: Updated rollout cadence and added thermal node mitigation steps (Ethan Brooks)
+
+Related pages
+
+See also: scheduler-policy-language reference, continuous-runtime-profiling-strategy, runtime-inference-cost-model-and-simulation-workbook.

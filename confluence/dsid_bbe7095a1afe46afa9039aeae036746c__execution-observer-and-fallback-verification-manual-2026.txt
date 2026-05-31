@@ -1,0 +1,189 @@
+Execution Observer and Fallback Verification Manual
+
+Overview
+
+Purpose: This manual describes the Execution Observer subsystem and the verification procedures for the runtime's fallback orchestration. The Execution Observer (exec-observer) is the deterministic diagnostic and verification component used in CI, canary rollouts, and incident replay to validate that fallback decisions preserve SLOs and maintain state correctness.
+
+Scope: architecture, decision telemetry, verification harnesses, profiling scenarios, benchmarking profiles, runbook steps for validation and rollback, ownership, and acceptance criteria for changes to fallback policies and observer instrumentation.
+
+Audience: runtime engineers, SREs, release engineers, and oncall responders.
+
+1) System summary
+
+What exec-observer is:
+- A light-weight sidecar-style observer process that subscribes to the routing/decision events emitted by the runtime decision fabric.
+- Responsible for: verifying that fallback transitions occurred within expected windows, asserting cache/kv consistency across model swaps, and generating enriched trace events for postmortem and automated verification.
+
+Key outputs:
+- decision-verification metrics (counters and histograms)
+- a verification report JSON per rollout (artifact stored in /opt/runtime/observer/reports/)
+- a set of synthesized benchmark traces used by CI to validate SLO preservation under synthetic failures
+
+Primary SLOs validated by the observer:
+- 99th percentile request latency for production chat routes must not degrade > 15% during a single-tier fallback event (verification tolerance: 15%).
+- Functional correctness: model-output checksum match rate > 99% for deterministic reruns using the same prompt set (non-deterministic models have separate quality gates).
+
+2) Architecture and data flows
+
+Components:
+- exec-observer (service) — deploys as a container in the runtime node; API: /internal/observer/verify (POST).
+- decision-fabric (existing runtime component) — emits DecisionEvent messages over Kafka topic runtime.decisions.v2 with envelope format described below.
+- trace-enricher — lightweight module that joins DecisionEvent with KernelTelemetry and KVCache annotations.
+- verification-harness — CI job that replays saved traces and asserts SLO/quality gates.
+
+DecisionEvent envelope (text description):
+- request_id, tenant_id, route, model_variant, decision_timestamp (ms), fallback_reason_code, prior_variant, kv_cache_shard, kernel_hint, sequence_length_profile_id
+
+Data flow:
+1. DecisionEvent emitted by runtime at decision commit.
+2. exec-observer subscribes and enriches with live kernel telemetry via trace-enricher.
+3. When a fallback happens, exec-observer computes a verification window (default 120s) and collects per-request: latency_ms, tokens_generated, fallthrough_count, kv_cache_warmms.
+4. exec-observer writes a verification report and emits metrics to promotheus pushgateway and a status to /internal/observer/last-report.
+
+3) Verification harness and test scenarios
+
+CI harness (high level):
+- Test runner name: runtime-fallback-verifier
+- Inputs: recorded trace (JSONL), synthetic traffic profile, config.yaml (gating thresholds), expected_report.json
+- Outputs: PASS/FAIL, report artifact, annotated trace with reason codes
+
+Representative test scenarios (must be present for PRs that touch fallback logic):
+- Controlled model unavailability: simulate model plugin returning capacity errors and assert fallback to lower-fidelity variant within 200ms for low-latency routes.
+- KVCache cold-start: evict KV shard and assert that warmup within window produces <= 10% latency spike for 50th percentile.
+- Kernel slow-path injection: add 50ms synthetic delay to half of kernels and verify degradation never exceeds configured per-tenant guardrail.
+- Mixed tenant burst: 80% of requests from high-priority tenant (tier=dedicated) while background tenants produce burst noise; ensure priority queueing preserved and best-effort fallbacks applied to background tenants only.
+
+Acceptance criteria (CI):
+- All verification gates in config.yaml must be within thresholds.
+- Report must include: total_requests, fallback_events, avg_latency_ms_before, avg_latency_ms_after, functional_checksum_pass_rate.
+
+4) Profiling and benchmark suite integration
+
+How to create a benchmark trace for the observer:
+1. Run trace-capture tool on a canary that exercises the target route for 30 minutes: ./tools/trace-capture --route=/api/v1/chat --duration=1800 --out=trace-<route>-<ts>.jsonl
+2. Annotate trace with sequence_length_profile_id: use seq-profile-lookup tool.
+3. Create a benchmark scenario in benchmarks/observer/ with a short YAML. Example config (YAML snippet):
+
+  scenario_name: fallback-low-latency-chat
+  duration_s: 600
+  traffic_profile: bursty-60-40
+  inject_faults:
+    - type: model-unavailable
+      start_s: 60
+      duration_s: 30
+      target_variant: v2-quantized
+  gating_thresholds:
+    p99_latency_increase_pct: 12
+    checksum_pass_rate: 0.995
+
+Benchmark output and storage:
+- Benchmarks produce a compressed trace and an observer report; both are stored in the artifact bucket: s3://redwood-ci/observer-bench/<scenario>/<date>/
+- Benchmarks are required for major kernel or scheduling changes (see changelist acceptance matrix).
+
+5) Runbook: verifying a canary rollout with exec-observer
+
+Owners: oncall (SRE) + rollout owner (eng) listed in the release ticket.
+
+Pre-check (before traffic shift):
+- Ensure the observer sidecar image matches the runtime version: kubectl get pod -l app=runtime-canary -o jsonpath='{.items[*].spec.containers[*].image}' | grep observer:2026.02
+- Confirm trace ingestion health: curl -s http://<canary-host>/internal/observer/health -> {"ok":true}
+
+During rollout (automated steps):
+1. Start canary at 1% for 10 minutes.
+2. Exec-observer will produce report at /internal/observer/last-report and push metrics to prometheus under observer.canary.<route>.status (0=OK,1=degraded).
+3. Automated gate: if observer.canary.<route>.status == 1 for two consecutive windows -> hold rollout and notify Slack #runtime-alerts with report artifact.
+
+Manual verification checklist (if hold triggered):
+- Inspect verification report: cat /opt/runtime/observer/reports/<canary-id>.json - Check fallback_reason histograms and map to prior_variant counts.
+- Run the verification harness locally against the stored trace: ./tools/verifier --trace /opt/runtime/observer/reports/<canary-id>-trace.jsonl --config ci/gating-config.yaml
+- If checksum_pass_rate < 0.99 or p99 latency increased > 15% -> rollback to prior release and open a JIRA ticket with label runtime-fallback-regression.
+
+Rollback commands (emergency):
+- kubectl rollout undo deployment/runtime --to-revision=<previous-rev> --namespace=prod
+- Force model routing back: curl -XPOST http://control-plane.internal.local/api/routing/force -d '{"route":"/api/v1/chat","variant":"v2-stable","reason":"observer-failed-gate"}'
+
+6) Kernel scheduling/observer interactions
+
+The observer depends on kernel hints emitted by the scheduler to validate whether kernel-level scheduling choices match expected policy. The scheduler must annotate DecisionEvent with kernel_hint (e.g., "tensorcore:fast-path" or "sharded:evict-first"). Observer validations that rely on kernel_hint:
+- Kernel hint mismatch: if policy requested "tensorcore:fast-path" but actual kernel dispatched is slow-path, this is flagged as kernel-mismatch and increments kernel_mismatch_counter.
+- Preemption reclaim verification: observer verifies preemption windows and validates that preempted request traces have a preemption_reason tag and that the fallback route was applied.
+
+7) Observability contract and metrics (Prometheus names)
+
+Mandatory metrics emitted by exec-observer:
+- observer.canary.<route>.status (gauge: 0=ok,1=degraded)
+- observer.fallbacks.total{route,reason} (counter)
+- observer.kv_warmup.ms_histogram{route} (histogram)
+- observer.kernel_mismatch.count (counter)
+- observer.verification_run.duration_ms (histogram)
+
+Tracing: attach observer.trace_id to all enriched spans and store sample in jaeger under service=exec-observer for 7 days.
+
+Logs: structured JSON logs with fields: ts, level, request_id, route, model_variant, fallback_reason_code, verification_step, metric_values. Log retention: 14 days in ELK for production.
+
+8) Change/process for modifying fallback logic
+
+Required artifacts in a PR that modifies fallback policies:
+- Design doc (overview, expected decision graph, incremental rollout plan)
+- Observer unit tests and a new verification scenario in benchmarks/observer/
+- CI green: runtime-fallback-verifier must pass for the touched routes
+- Rollout matrix updated in release ticket with acceptance gates
+
+Approval workflow:
+1. Author creates PR and tags reviewers: @runtime-arch, @sre-oncall
+2. Reviewer verifies that observer produced verification scenarios are included and that gating thresholds were not loosened without product sign-off
+3. Merge only after a canary-level dry-run in staging passes verification harness
+
+9) Troubleshooting and common failure patterns
+
+Common symptom: frequent fallback events with no clear prior_variant changes.
+- Likely causes: intermittent model worker OOM, NVLink flapping, or transient scheduler misclassifications.
+- Troubleshooting steps:
+  1. Check observer.fallbacks.total by reason. If reason=="kernel-timeout" -> escalate to runtime-kernel oncall.
+  2. Inspect kernel_mismatch.count. If non-zero, retrieve kernel_trace: curl http://<node>/internal/kernel/trace/<trace-id>
+  3. Re-run verification harness with captured trace and add synthetic delay to kernel to reproduce.
+
+Common symptom: checksum_pass_rate drop for deterministic tests.
+- Causes: quantization rollouts, plugin regression, or trace mismatch due to timestamp drift.
+- Steps: pin model_variant, re-run single-request replay with --deterministic flag, and compare token sequence checksums.
+
+10) Ownership and escalation
+
+Primary owner: eng-serving-runtime (runtime-architecture subteam)
+Secondary: eng-sre for rollout and observability concerns.
+Escalation matrix:
+- 0-30 minutes: SRE oncall (pager duty)
+- 30-120 minutes: runtime-architecture senior engineer (pager)
+- >120 minutes: Eng VP oncall and incident commander
+
+11) Appendices
+
+A. Example verification report (JSON excerpt)
+{
+  "canary_id": "canary-2026-03-01-01",
+  "total_requests": 12432,
+  "fallback_events": 72,
+  "avg_latency_ms_before": 24.2,
+  "avg_latency_ms_after": 26.8,
+  "p99_latency_increase_pct": 8.3,
+  "checksum_pass_rate": 0.998,
+  "kernel_mismatch_count": 2
+}
+
+B. Quick CLI tools
+- ./tools/trace-capture --route <route> --duration <s> --out <file>
+- ./tools/verifier --trace <file> --config <config.yaml>
+- ./tools/bench-runner --scenario benchmarks/observer/<scenario>.yaml --out <artifact-dir>
+
+C. FAQ
+Q: What is the canonical location for observer reports?
+A: /opt/runtime/observer/reports/ on each canary node; CI artifacts copied to s3://redwood-ci/observer-bench/.
+
+Q: When do we require a full benchmark for a change?
+A: Full benchmark required for: kernel scheduler changes, model quantization rollout, changes to decision-fabric routing policies, or modifications to KV cache shard topology.
+
+D. Related links
+- Runtime decision catalog (internal): /confluence/eng-serving-runtime/runtime-architecture/runtime-decision-graph-and-observed-behaviour-catalog-2026
+- Canary rollout playbook: /confluence/eng-serving-runtime/runbooks/runtime-deployment-circuit-breakers-and-sla-fallback-playbook-2026
+
+If you are running a verification and need help, contact @runtime-oncall or open a thread in #runtime-alerts with the canary_id and the observer report attached.

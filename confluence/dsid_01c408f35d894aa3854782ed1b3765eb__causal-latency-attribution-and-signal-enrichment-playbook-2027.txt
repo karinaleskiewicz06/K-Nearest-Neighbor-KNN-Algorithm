@@ -1,0 +1,146 @@
+Causal Latency Attribution and Signal Enrichment Playbook
+
+Summary and purpose
+
+This playbook defines a repeatable approach for attributing causal sources of request latency in the serving runtime and enriching traces and metrics with synthesized signals that improve root-cause diagnosis. The intended audience is runtime engineers, SREs, and profiling/product teams who investigate tail-latency incidents or validate scheduler/kernel changes against real traffic.
+
+Goals
+- Produce an actionable causal hypothesis for >80% of investigated tail-latency incidents within 48 hours.
+- Ensure enriched telemetry is available for post-incident analysis and automated detection rules within 6 hours of rollout.
+- Keep incremental instrumentation cost increase under 12% of telemetry budget for a standard region.
+
+Scope and non-goals
+- Scope: production serving runtime (request surface -> kernel dispatch -> GPU execution -> response), associated request routing, KV cache behavior, and kernel scheduling decisions. Includes streaming, chat, and embedding request shapes.
+- Non-goals: model-family quality regressions, client-side application logic, and offline evaluation harnesses. Quality regressions should be investigated using the eval-harness docs.
+
+Signal catalogue (what to collect)
+Collect the following signals for each traced request. Where possible, attach a single trace_id and request_id to correlate logs, metrics, and kernel traces.
+
+Primary signals (always-on):
+- request_id, trace_id, timestamp_start, timestamp_end
+- request_shape: token_count, prompt_length, max_decode_length, batch_size, priority_class
+- rpc_spans: inbound_http, auth, router, proxy-layer, runtime_api
+- kernel_spans: kernel_start_ns, kernel_queue_ns, kernel_execution_ns, kernel_end_ns, kernel_name
+- kvcache_hits: prefix_hits, kvcache_warmup_ms
+- gpu_counters: sm_util_pct, mem_alloc_bytes, warp_stall_cycles
+- host_metrics: numa_node, cpu_steal_ms, irq_drop_counts
+
+Enrichment signals (high-cardinality; sample and attach heuristics):
+- model_variant_hash, quantization_profile_tag, compiled_kernel_version
+- scheduling_decision: preempted_by, time_in_priority_queue, admission_reason
+- shard_topology: replica_id, numa_zone, local_gpu_id
+- batching_context: batch_trigger_reason (timeout/size), constituent_request_ids
+
+Sampling and cost strategy
+1) 100% lightweight metrics: counters, duration histograms, basic request metadata. Retain for 14d.
+2) 10% deterministic sampling for full tracing of production traffic (uniform across tenants). Retain traces for 30d.
+3) Spike sampling: on SLO breach (p95 > configured threshold) automatically increase trace sampling to 50% for impacted routes for the next 1h.
+4) High-fidelity kernel traces (GPU perf counters + nvtx) on 0.5% of requests. Escalate to 5% during incident windows.
+
+Instrumentation implementation notes
+- Use trace context propagation header X-Redwood-Trace to join router, runtime, and GPU trace collectors. Ensure header is present on internal RPCs and passthrough to private deploys only if configured.
+- Kernel instrumentation should use lightweight entry/exit probes with a separate binary that collects NVTX ranges and GPU counters and attaches them by trace_id. Avoid synchronous RPCs from kernel probes; write to local ring buffer and flush asynchronously.
+- KV cache metrics should be emitted at two levels: aggregate counter per shard and per-request kvcache_hit fields. Per-request kvcache fields should be added to sampled traces only (see sampling policy).
+
+Causal analysis methodology (step-by-step)
+1) Triage: Confirm SLO breach and scope impact (routes, models, customers). Pull p50/p95/p99 histograms and error rates for the last 30m, 2h, 24h.
+2) Surface anomalies: Run automated anomaly detectors against enriched signals (kernel queue growth, nvlink error rates, sudden drop in prefix_hits). If detector flags present — mark candidate signals.
+3) Correlate with deployment/rollout metadata: map anomalies to rollout windows, kernel rollouts, or canary changes.
+4) Build causal graph: for the candidate timeframe, assemble the sequence of dependent spans (router -> admission -> kernel_queue -> kernel_exec -> fetch_kv). Enrich nodes with host and kernel signals.
+5) Use counterfactual checks: replay small subset of requests on a mirrored infra (shadow) with alternative scheduler settings or kernel version to test causality.
+6) Validate by targeted mitigation: e.g., revert kernel flag, route traffic to fallback kernel, or pin model_variant. Observe expected latency regression rollback.
+
+Investigation runbook (actionable play steps)
+- Step A: Gather baseline
+  1. Identify impacted route(s) and window: `redwood-observability query \"latency.p95{route=\\\"/v1/generate\\\"}\" --from=-2h --to=now`
+  2. Collect traces: filter traces by high-latency (>p99 threshold) and `sample_rate>0`.
+  3. Export top 50 kernel_spans ordered by kernel_queue_ns.
+
+- Step B: Quick hypothesis checks (first 30 mins)
+  1. Kernel queue growth: check kernel_queue_ns histogram per replica. If > 3x baseline, inspect recent scheduling policy changes.
+  2. KV cache coldness: compare prefix_hits ratio for impacted requests vs baseline. If prefix_hits dropped >25%, suspect cache churn.
+  3. Host-level contention: check cpu_steal_ms and pci_bandwidth_errors.
+
+- Step C: Escalation and mitigations
+  1. If kernel_queue growth is causal, apply emergency mitigation: increase admission_caps for impacted priority_class or route traffic to a less-loaded pool. Use `redwood-admin admission adjust --route /v1/generate --add-cap 20`
+  2. For KV cache issues, trigger targeted prefetch warmups for top prompt prefixes or pin sessions to warmed replicas.
+  3. For GPU-level stalls, disable the suspect kernel variant and roll back to previously stable kernel: follow runtime-upgrade-validation-and-canary-matrix.
+
+Template investigation checklist (for incident postmortem)
+- Incident window and scope
+- Evidence of change (deployments, kernel flags, autoscaler events)
+- Key enriched signals correlated with latency spike
+- Counterfactual replay results and mitigation outcome
+- Root cause classification (scheduling, kernel bug, resource contention, routing)
+- Estimated user impact and duration
+- Follow-up remediation and owners
+
+Signal enrichment pipeline (design)
+- Ingress collection: routers attach request metadata and initial trace headers.
+- Short-term enrichment: runtime proxies add kernel and kvcache metrics to sampled traces.
+- Asynchronous aggregator: writes enriched records to a trace-enrichment topic (Kafka). An enrichment worker joins kernel counters, host metrics, and batch composition and emits a single enriched trace payload.
+- Storage and index: enriched traces are stored in the tracing backend with indexed fields for kernel_name, quantization_profile_tag, and batch_trigger_reason.
+
+Configuration table (operational knobs)
+| parameter | default | unit | purpose | owner |
+|---|---:|---:|---|---|
+|trace_sampling.rate|0.10|fraction|Deterministic sampling rate for end-to-end traces|observability-team|
+|kernel_trace.high_fidelity_rate|0.005|fraction|Proportion of requests with NVTX + perf counters|serving-runtime|
+|spike_increase.multiplier|5|x|Multiplier applied to sampling when SLO breached|sre|
+|enrichment.flush_interval|15|seconds|How often kernel probe flushes ring buffer|serving-runtime|
+|telemetry_budget_pct|12|percent|Max extra telemetry spend from enrichment|finance|
+
+SLOs and alert thresholds (examples)
+- Route /v1/generate: p95 < 240ms, p99 < 900ms. Trigger: sustained p95 breach for 10m.
+- Kernel queue growth: alert when median kernel_queue_ns increases 2.5x over baseline for 5m.
+- KV cache eviction surge: alert when global prefix_miss_rate increases by +15% in 3m.
+
+Common causal patterns and remediation matrix
+- Pattern: kernel_queue growth + high batch sizes -> Remediation: lower max_batch_size for latency-sensitive priorities; enable batch_slicer.
+- Pattern: sudden nvlink_errors + mem_alloc spikes -> Remediation: failover replica, reduce concurrent_session_limit, schedule maintenance to repro NIC/driver issues.
+- Pattern: prefix_hits drop after rollout -> Remediation: rollback model_variant change or pre-warm KV cache using production-sourced prompt prefixes.
+
+Verification and testing
+- Always test instrumentation changes in the staging sandbox with production-synth traffic generator. Follow the runtime-scaling-experiment-protocol.
+- Use deterministic replay of sampled traces in a shadow infra to validate mitigation effects before wide rollback.
+
+Rollout checklist for enrichment changes
+1. Implement feature flag gating for enrichment fields.
+2. Canary to 5% of traffic for 24h; validate no tail impact.
+3. Evaluate telemetry cost delta and adjust sampling rates.
+4. Promote to 50% for 48h; monitor SLOs and kernel queue metrics.
+5. Full rollout with staged increases to 100% over 7 days.
+
+Ownership and contacts
+- Primary owner: serving-runtime observability subteam (oncall: runtime-profiling).
+- Secondary: eng-sre (oncall: runtime-sre).
+- Pager escalation: follow oncall runbook and incident-bridge setup.
+
+Appendix: example commands and traces
+- Query top kernel queue contributors (CLI):
+```
+redwood-traces query --filter 'latency>500ms and route==\"/v1/generate\"' --fields trace_id,kernel_name,kernel_queue_ns --sort kernel_queue_ns --limit 50
+```
+- Minimal enriched trace JSON (sampled):
+```
+{
+  \"trace_id\": \"abc123\",
+  \"request_id\": \"r-984\",
+  \"route\": \"/v1/generate\",
+  \"kernel_spans\": [{\"kernel_name\":\"matmul_v2\",\"kernel_queue_ns\":4200000,\"kernel_execution_ns\":230000}],
+  \"kvcache\": {\"prefix_hits\":0,\"prefix_miss_reason\":\"cold-start\"}
+}
+```
+
+Related artifacts and reading
+- See runtime-telemetry-sampling-cost-aware-profiling-2027 for sampling strategies.
+- Refer to runtime-upgrade-validation-and-canary-matrix-2026 for safe rollback steps.
+- Integration notes for private deployments: ensure X-Redwood-Trace header passthrough is enabled in the VPC control plane.
+
+Change log
+- 2026-11-12 (Ava Chen): initial draft and prototype enrichment schema.
+- 2027-01-18 (Ethan Park): sampling policy updates and spike sampling automation.
+- 2027-02-03 (Miguel Alvarez): added example commands and verification checklist.
+
+Document maintenance
+This playbook is maintained by the serving-runtime observability subteam. Review cadence: quarterly or after any major kernel/scheduler rollout.

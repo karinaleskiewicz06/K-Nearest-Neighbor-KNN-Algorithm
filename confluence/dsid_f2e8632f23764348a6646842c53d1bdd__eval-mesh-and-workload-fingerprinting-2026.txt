@@ -1,0 +1,157 @@
+Eval Mesh and Workload Fingerprinting: Orchestration & Decisioning
+
+Design and runbook for the Eval Mesh: mapping production workload fingerprints to targeted eval workloads, prioritizing scheduling, and decision rules for routing traffic to shadow/dedicated eval variants.
+Overview
+========
+This document defines the Eval Mesh: an orchestration layer and fingerprinting specification used to (1) capture lightweight production workload characteristics, (2) map them to canonical eval workloads, and (3) drive priority routing and scheduling decisions in the eval harness. The goal is to make evaluations reflect production signal distribution while keeping privacy, cost, and reproducibility constraints.
+
+Motivation
+----------
+- Production traffic is heterogeneous: latency, context length, few-shot pattern, and function-calling density vary by customer and route.
+- Traditional static eval suites drift from production and miss failure modes tied to rare workload slices.
+- Eval Mesh allows continuous, targeted, and cost-aware evaluation: create small representative eval jobs that mirror production slices and route them for regression detection and model promotion gating.
+
+High-level architecture (components)
+-----------------------------------
+- traffic-tap: lightweight tap running in the serving runtime that emits anonymized fingerprints to fingerprint-db and a streaming topic (kafka/eval-ingest).
+- fingerprint-db: time-series store for fingerprints (TTL 90d) used to compute slice prevalence and trends.
+- eval-orchestrator: central decision engine that maps fingerprints -> eval-workload-id, computes priority, and schedules runs on the eval cluster.
+- scheduler: eval harness scheduler (k8s jobs + priority-queue) that executes eval workloads, respecting cost and SLAs.
+- result-aggregator: collects eval outputs and writes signals to metrics-store and regression-triage queue.
+
+Key definitions
+---------------
+- Fingerprint: compact anonymized descriptor of a request (schema below).
+- Workload ID: a canonical eval workload recipe (prompt set, input distribution, model config).
+- Slice: a named subset of traffic identified by fingerprint matching rules.
+
+Fingerprint schema (textual):
+- id_version: v1
+- timestamp_utc: iso8601
+- route: service route identifier (e.g., text-gen/v1)
+- token_histogram_bucket: one of ["<=64","65-256","257-1024","1025+"]
+- call_pattern: one of ["pure-gen","function-heavy","rerank","embed"]
+- avg_shots: numeric (0,1, few, many) encoded as string buckets ["0","1","2-5","6+"]
+- kv_cache_hit_rate: bucket ["0-10","11-40","41-70","71+"]
+- anonymized_user_locale: normalized locale code or "unknown"
+- PII_flag: boolean (always false when exported)
+
+Example fingerprint JSON (emitted by traffic-tap):
+
+{
+  \"id_version\": \"v1\",
+  \"timestamp_utc\": \"2026-02-28T13:22:07Z\",
+  \"route\": \"chat/commerce-v2\",
+  \"token_histogram_bucket\": \"65-256\",
+  \"call_pattern\": \"function-heavy\",
+  \"avg_shots\": \"1\",
+  \"kv_cache_hit_rate\": \"41-70\",
+  \"anonymized_user_locale\": \"en-US\",
+  \"PII_flag\": false
+}
+
+Mapping rules: fingerprints -> workload id
+------------------------------------------------
+Mapping is expressed as an ordered rule set owned by eval-orchestrator. Rules are applied top-to-bottom. A rule example:
+- Rule 110: if route == \"chat/commerce-v2\" AND call_pattern == \"function-heavy\" AND token_histogram_bucket in [\"65-256\",\"257-1024\"] -> workload: commerce-function-heavy-v2, priority: high, retention: 14d.
+- Rule default-low: otherwise -> workload: baseline-sampled, priority: low, retention: 7d.
+
+Priority categories and scheduling constraints
+---------------------------------------------
+- critical: run within 15m of detection; used for production regressions and safety regressors. Max concurrency: 20; budget cap: 50k tokens/hr.
+- high: run within 2h; used for high-prevalence slices or customer-flagged routes. Max concurrency: 50; budget cap: 250k tokens/hr.
+- medium: daily cadence; aggregate trend checks. Max concurrency: 200; budget cap: 1M tokens/day.
+- low: weekly sampled; for long-tail coverage. Max concurrency: 500; strictly preemptible.
+
+Config snippet: workload routing table (YAML style, for eval-orchestrator):
+| workload_id | match_expression                                      | priority | ttl_days | max_run_minutes | owner_team |
+|-------------|-------------------------------------------------------|----------|----------|-----------------|------------|
+| commerce-function-heavy-v2 | route =~ \"chat/commerce\" && call_pattern == \"function-heavy\" | high     | 14       | 30              | applied-ml |
+| baseline-sampled           | true                                                  | low      | 7        | 120             | applied-ml |
+
+SLOs and observable metrics
+----------------------------
+- Coverage SLO: 95% of top 20 production slices (by 30d prevalence) should have a corresponding workload ID in fingerprint->mapping table (monitor: eval.mesh.coverage_ratio, target: 0.95).
+- Freshness SLO: 90% of high-priority fingerprints must be scheduled to run within 2 hours (eval.mesh.freshness, target: 0.90).
+- Cost SLO: average cost per token across eval jobs should remain < 1.5x production per-token baseline for high priority workloads (eval.mesh.cost_ratio).
+- Regression detection latency: time from run completion to triage alert < 10m for critical workloads.
+
+Integration and APIs
+--------------------
+- fingerprint ingestion (kafka topic): eval.fingerprints.v1.
+- eval-orchestrator API: POST /v1/schedule (body: workload_id, priority, context_tag) -> returns schedule_id.
+- admin UI: /internal/eval-mesh (read-only for most; write access gated to applied-ml and infra teams).
+- Exported signals: metrics-store (Prometheus) and regression-triage queue (task-bus).
+
+Privacy and storage
+------------------
+- No raw inputs or outputs are exported to fingerprint-db. Only buckets and normalized fields are kept.
+- All fingerprints must be filtered by PII detector in traffic-tap; any fingerprint with PII_flag == true is dropped locally and counted in a metric (eval.mesh.pii_drops).
+- Retention defaults: 90d for fingerprint-db; sampling-only exports (baseline-sampled) kept 7d.
+
+Runbook: responding to a coverage gap alert
+------------------------------------------
+1. Alert fires: eval.mesh.coverage_ratio < 0.9 for 3h. Pager to applied-ml oncall.
+2. Triage steps (owner: applied-ml oncall):
+   a. Open /internal/eval-mesh -> slice dashboard and identify missing fingerprints by prevalence.
+   b. If slice prevalence > 0.5% of 30d traffic, escalate: create new mapping rule (temp) in eval-orchestrator with priority=high and add owner tag.
+   c. If slice is sensitive (customer-specific), notify privacy and customer-success before scheduling.
+   d. Kick off a targeted daily-run (manual override) using schedule API: POST /v1/schedule {\"workload_id\":\"ad-hoc-slice-<id>\", \"priority\":\"high\"}.
+3. Close alert once coverage_ratio >= 0.95 for 24h.
+
+Runbook: regression triage handoff
+---------------------------------
+1. result-aggregator emits regression alert to regression-triage queue with schedule_id and trace link.
+2. Oncall inspects diffs in result-aggregator UI (compare baseline vs candidate) and follows triage checklist: sample-level inspection, prompt reproduction, KV-cache sensitivity test, quantization toggle test (fast path).
+3. If reproducer found: create regression ticket assigned to responsible model-onboarding team, attach reproducer, sample IDs, and fingerprint slice.
+4. If no reproducer in 2h and alert persists, escalate to runtime team to check kernel/caching regressions.
+
+Quantization and cache-sensitivity hooks
+--------------------------------------
+- Eval workloads carry tags: quant_profile (e.g., q4_0, q8_1), kv_cache_mode (on/off), and compile_flags. The scheduler can add a matrix of runs for high and critical slices: e.g., commerce-function-heavy-v2 -> runs: [candidate(q8_1, cache=on), baseline(q8_1, cache=on), candidate(q4_0, cache=on), candidate(q8_1, cache=off)].
+- Use the quant-tuner quick-check script on candidate runs before promotion: scripts/quant-quick-check.sh --job <schedule_id>.
+
+Rollout plan for Eval Mesh (canary -> global)
+--------------------------------------------
+1. Canary (2 weeks): enable traffic-tap on non-customer routes in eu-west-1 only. Monitor eval.mesh.pii_drops and coverage_ratio.
+2. Stage (4 weeks): expand to 25% of routes (opt-in by route owners). Add automated rule set for top-10 routes.
+3. Global: enable for all hosted routes after incident-free run and coverage SLO met for 30d.
+
+Ownership and governance
+------------------------
+- Applied-ML team: mapping rules, workload definitions, prompt sets.
+- Eng-serving-runtime: traffic-tap code, kernel-safe sampling, PII detector.
+- Eng-platform: scheduler, quota enforcement, and priority queueing logic.
+- Security/Privacy: review and sign-off on fingerprint schema and retention.
+
+Alerts and dashboards (recommended panels)
+----------------------------------------
+- eval.mesh.coverage_ratio (single stat + 30d timeseries)
+- eval.mesh.freshness (heatmap by priority and route)
+- eval.mesh.cost_ratio (trend and per-workload breakdown)
+- eval.mesh.pii_drops (count by route)
+
+Troubleshooting checklist (common cases)
+----------------------------------------
+- Missing fingerprints for a route: check traffic-tap rollout, network policies, and tap logs (service: traffic-tap /var/log/tap.log).
+- False positives in PII detector: update detector rules and reprocess a small sample in offline mode.
+- Scheduler backlog: verify quota settings in eng-platform and backpressure signals to eval-orchestrator (metric: eval.scheduler.backlog_count).
+
+Appendix: small sample mapping rules (canonical)
+------------------------------------------------
+1) commerce-function-heavy-v2 -> match: route =~ \"chat/commerce\" && call_pattern == \"function-heavy\" -> priority high, run_matrix [candidate(q8_1, cache=on), baseline(q8_1, cache=on)].
+2) long-context-support -> match: token_histogram_bucket == \"1025+\" -> priority medium, retention 30d.
+3) baseline-sampled -> match: random_sample(0.05) -> priority low.
+
+Related pages and references
+---------------------------
+- Serving simulation harness (internal): /confluence/applied-ml-and-evals/eval-harness/serving-simulation-eval-harness-2026
+- Priority scheduler policy: /confluence/applied-ml-and-evals/eval-harness/interactive-eval-batch-scheduler-priority-policy-2026
+- Quantization tuner runbook: /confluence/applied-ml-and-evals/quantization-profiles/per-workload-quant-tuner-and-safety-guidelines-2026
+
+Document history
+----------------
+- 2026-02-10: Draft created by Asha Patel.
+- 2026-02-18: Added quantization hooks and scheduling constraints (review by Marco Liu).
+- 2026-03-01: Published with canary rollout plan and runbooks.
+

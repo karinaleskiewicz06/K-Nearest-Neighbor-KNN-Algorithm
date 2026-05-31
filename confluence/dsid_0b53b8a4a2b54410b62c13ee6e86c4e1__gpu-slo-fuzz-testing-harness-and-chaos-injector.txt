@@ -1,0 +1,157 @@
+GPU SLO fuzz testing harness and chaos injector
+
+Summary:
+
+This page describes the GPU SLO fuzz testing harness and lightweight chaos injector used by infra to validate placement, eviction, and routing policies against realistic perturbations. The harness integrates with our CI (Buildkite) to run nightly and with canaries for major allocator or kernel rollouts. The goal is to detect SLO regressions (latency/availability/cost) earlier in the CI/CD pipeline and provide reproducible failure scenarios for performance triage.
+
+Scope and goals:
+
+- Validate token-latency (p50/p95/p99) and tenant throughput SLOs under noisy conditions.
+- Inject transient network congestion, host preemptions, disk/attach delays, and KV cache eviction storms.
+- Measure allocator fallback correctness (burst orchestration, fractional GPU fallback, and routing to cheaper model variants).
+- Provide deterministic replay artifacts (trace IDs, input workload profiles, override configs) for postmortem.
+
+SLOs targeted by the harness:
+
+- Serving p50 latency: <= 65 ms for short-requests (<= 128 tokens)
+- Serving p95 latency: <= 160 ms for latency-first tenants
+- Tail availability: >= 99.95% over 24h window
+- Cost leakage: < 8% additional token cost during perturbation window (measured by token-cost delta metric)
+
+Failure modes we test:
+
+1. Spot/preemptible GPU eviction with warm-pool refill delays.
+2. Inter-region egress surge and NAT gateway saturation.
+3. Kernel incompatibility under mixed-precision rollout.
+4. KV cache inconsistency and cache-warmup storms.
+5. API gateway or rate-limiter misconfiguration that causes throttling spikes.
+
+High-level architecture of the harness:
+
+- Workload generator: Replay-based runner that replays production-shaped request traces (stored in S3: s3://redwood-infra/slo-fuzz/traces).
+- Chaos injector: Lightweight controller (k8s job) that can apply a set of fault primitives to specific node pools or namespaces.
+- Controller API: Small Flask service (slo-fuzz-controller.redwood.svc) that orchestrates step sequences and records experiment metadata.
+- Collector: Prometheus federation / eBPF traces and OTLP spans stored into trace-archive (GCS) for analysis.
+- Validator: Post-run analyzer that compares baseline run to experimental run and produces a regression scorecard in HTML/CSV.
+
+Components and ownership:
+
+- Workload generator (team: infra/eval): owner Priya Patel
+- Chaos injector (team: infra/sre): owner Diego Ramos
+- Controller API (team: infra/platform): owner Maya Chen
+- Collector & dashboards (team: infra/observability): owner Lina Ho
+
+Experiment matrix (example):
+
+| Experiment ID | Fault type | Target pool | Intensity | Duration | Expected observable | Rollback trigger |
+|---------------|------------|-------------|-----------|----------|---------------------|-----------------|
+| E-001         | preempt   | spot-gpu-pool-a | 10% nodes at t0 | 10m    | p95 increase > 2x   | auto-degrade allocator + resume baseline |
+| E-011         | net-egress | region-eu-west | 30% egress throttle | 20m | increased tail latency, egress errors | disable egress-shaper and alert |
+| E-022         | kv-evict  | warm-pool-nodes | evict 50% keys | 15m | cache-miss spike, latency reg | restore snapshot + warmup |
+
+Criteria for a 'failed' experiment:
+
+- Any SLO breach that is persistent (>= 5 minutes) in at least two independent runs of the same experiment configuration.
+- Cost leakage > configured tolerance (default 10%).
+- Fallback behaviour deviates from expected (e.g., allocator did not route to dedicated pool when spot nodes were lost).
+
+CI/CD integration and pipeline:
+
+- Nightly job: runs a representative set (subset) of experiments against the staging allocator. This runs every night at 02:00 UTC and is gated by a housekeeping token bucket so it cannot exceed warm-pool budget. Failures are sent to #infra-slo-fuzz.
+- Pre-merge job (optional): can be attached to allocator or kernel PRs as a short run (E-001 and E-022 only) to catch regressions early.
+
+Example Buildkite step (Appendix A contains full YAML we use in the repo):
+
+- run: ./ci/run-slo-fuzz --experiment E-001 --replay s3://redwood-infra/slo-fuzz/traces/short-128-2025-01-06.json
+  agents: [k8s-worker-slo-fuzz]
+
+Chaos injector primitives (what the injector supports):
+
+- host-preempt --node-selector "pool=spot" --percent 10 --stagger 30s
+- net-shape --egress-percent 30 --target-subnet 10.12.0.0/16 --duration 20m
+- device-attach-delay --device nvme0n1 --delay-ms 500 --percent 5
+- kv-evict --namespace tenant-cache --percent-keys 50
+- iptables-blackhole --target-pod-selector "app=router" --duration 3m
+
+Runbook: how to execute an experiment manually:
+
+1. Check prerequisites: ensure staging allocator cluster health = green (no ongoing rolling updates) and warm-pool >= 30% free.
+2. Pick experiment ID from matrix and set run parameters in slo-fuzz-controller UI (or via CLI).
+3. Start a baseline run (no faults) for 10m to capture baseline metrics. Save the baseline artifact.
+4. Start experiment run. Monitor the following dashboards in parallel: SLO-latency, KV-cache-misses, Node-health, Egress-errors.
+5. If the run breaches a rollback trigger, immediately execute abort: slo-fuzz-controller abort --run <id> and follow 'Post-failure triage' below.
+
+Data collection, metadata, and artifacts:
+
+- Each run produces: trace-archive (OTLP), prometheus snapshot, allocator decision log (json), and a run-metadata.json with environment and seed. Artifacts are stored under gs://redwood-infra-slo-fuzz/<run-id>/
+- The validator outputs both a human-readable HTML report and a machine-readable CSV with metric deltas (p50/p95/p99/availability/cost-delta).
+
+Alerting and dashboards:
+
+- Dashboard: "SLO Fuzz — Nightly" in Grafana with panels for experiment status, latency deltas, error rates, and warm-pool utilization.
+- Alert rules (Prometheus):
+  - infra_slo_fuzz_experiment_failed_total > 0 for 1h -> PagerDuty: oncall-infra
+  - slo_fuzz_cost_delta_percent > 10 for 30m -> Slack: #infra-slo-fuzz, but not PagerDuty by default
+
+Post-failure triage checklist:(numbered steps)
+
+1. Assign an incident lead from infra/sre within 15 minutes of failure.
+2. Re-run the experiment with identical seed and capture logs. If flakiness observed, increase sample runs to N=3.
+3. Gather artifacts: allocator-decision-log.json, buildkite step log, trace-archive. Upload to the run thread.
+4. Run quick local analysis: compare baseline vs experiment CSV; if p95 delta > 2x escalate to allocator owners.
+5. If root cause is configuration drift in iac, open TF rollback PR and apply via canary first.
+
+Safety controls and limits:
+
+- The harness is rate-limited by an account-level quota; it cannot exceed a configurable cost cap (default $2,500 / 24h).
+- Chaos primitives are scoped to namespaces and node pool labels; global primitives require 2-person approval.
+- Nightly run uses a reduced intensity profile to avoid interference with tenants.
+
+Scheduling and cadence:
+
+- Nightly (regression subset): every day 02:00 UTC. Responsible: infra/eval
+- Weekly (full matrix): Sunday 06:00 UTC — longer runs and more aggressive primitives. Responsible: infra/sre
+- On rollout (manual): run minimal subset pre- and post-rollout for allocator/kernel changes. Responsible: release lead
+
+Ownership and escalation:
+
+- Primary owner: infra/platform (Priya Patel)
+- Secondary owner: infra/sre (Diego Ramos)
+- Observability contact: infra/observability (Lina Ho)
+- PagerDuty: oncall-infra (see oncall rota in team wiki)
+
+Appendix A — Example Buildkite YAML snippet:
+
+steps:
+  - label: "slo-fuzz/nightly/E-001"
+    command: "./ci/run-slo-fuzz --experiment E-001 --replay s3://redwood-infra/slo-fuzz/traces/short-128-latency-profile.json --output gs://redwood-infra-slo-fuzz/$BUILDKITE_BUILD_NUMBER"
+    agents:
+      queue: k8s-worker-slo-fuzz
+    timeout_in_minutes: 90
+    plugins:
+      - docker#v3.6.0:
+          image: gcr.io/redwood/infra-slo-fuzz:stable
+
+Appendix B — Example chaos CLI usages:
+
+# Evict 10% of spot nodes in pool-a, staggered every 30s
+$ chaosctl host-preempt --pool spot-pool-a --percent 10 --stagger 30s --run-id E-001-manual
+
+# Throttle egress to EU region by 40% for 20 minutes
+$ chaosctl net-shape --region eu-west --egress-percent 40 --duration 20m --run-id E-011-manual
+
+Appendix C — Troubleshooting quick tips:
+
+- High p95 but normal p50: inspect KV-cache-miss rate and trace tail spans for kernel context-switch stalls.
+- Large cost delta: verify fallback routing logs — unexpected routing to higher-cost pools often indicates misclassified tenant labels.
+- Flaky failures: increase seed runs and ensure the baseline was recorded within 1h of the experiment to avoid production workload drift.
+
+Change history:
+
+- 2024-07-10 — created (Priya Patel)
+- 2024-11-04 — added net-shape primitive and cost-delta gating (Diego Ramos)
+- 2025-01-15 — expanded CI integration and nightly/weekly cadence (Maya Chen)
+
+Related documents:
+
+- See linked pages for warm-pool strategies, preflight deployment checks, and allocator rollout playbooks.

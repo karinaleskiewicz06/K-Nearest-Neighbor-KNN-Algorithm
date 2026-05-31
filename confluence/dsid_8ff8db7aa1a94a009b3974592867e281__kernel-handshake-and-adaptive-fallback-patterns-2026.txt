@@ -1,0 +1,211 @@
+Kernel handshake and adaptive fallback patterns
+
+Overview
+
+This document describes the 'kernel handshake' pattern we use to safely coordinate request routing with per-GPU kernel schedulers and how the runtime performs adaptive fallback when preferred kernels are unavailable or failing. The goal is to make fallbacks deterministic, explainable, and observable while minimizing latency and preserving SLOs.
+
+Audience
+
+- Runtime engineers implementing or modifying schedulers and routing policies
+- Oncall and SRE teams who need runbook steps for kernel-induced degradation
+- Product engineers who require guarantees about fallback behavior for SLAs
+
+Goals and non-goals
+
+- Goals:
+  - Define a lightweight, versioned handshake protocol between the router and kernel scheduler that captures capability, health, and cost signals.
+  - Standardize adaptive fallback policies and preemption semantics across GPU pools.
+  - Provide observability and rollout guidance to minimize regression risk.
+- Non-goals:
+  - Replace the global scheduler language (DSL) — this pattern plugs into the existing policy layer.
+  - Solve long-term capacity planning; it is an operational/runtime contract for request handling.
+
+Design principles
+
+1. Idempotent negotiation: handshake messages can be retried safely without side-effects.
+2. Backward compatibility: support protocol version negotiation to allow staggered kernel rollouts.
+3. Fast-path first: attempt the low-latency preferred kernel; if not possible, fall back quickly to an alternative.
+4. Signal-driven decisions: prefer decisions based on current kernel health, queue depth, and observed tail latency.
+5. Observability by design: generate events for handshake start/complete/fail and fallback decisions with contextual metadata.
+
+High-level flow (text diagram)
+
+1) Ingress router receives request with routing policy / model variant preference.
+2) Router issues a KernelHandshakeRequest to the selected GPU shard's scheduler.
+3) Scheduler evaluates capabilities, availability, and local constraints and replies with KernelHandshakeResponse.
+4) If response == ACCEPT and slot_id assigned, request proceeds.
+5) If response == DEFER or REJECT, router evaluates fallback policies (fast fallback, queued retry, or alternative model variant).
+
+KernelHandshakeRequest / Response schema (JSON examples)
+
+- Request (router -> scheduler):
+
+{
+  "protocol_version": "2026-01",
+  "request_id": "req-1234-abcd",
+  "model_variant": "redwood-v2-8k-quant",
+  "sequence_length": 512,
+  "latency_budget_ms": 80,
+  "priority": "standard",
+  "trace_context": "trace-..",
+  "client_tier": "hosted",
+  "features": ["kvcache-enabled","temperature:0.2"]
+}
+
+- Response (scheduler -> router):
+
+{
+  "protocol_version": "2026-01",
+  "request_id": "req-1234-abcd",
+  "status": "ACCEPT|DEFER|REJECT|NEEDS_FALLBACK",
+  "slot_id": "slot-5",
+  "expected_queue_ms": 12,
+  "reason": "gpu_busy|kernel_mismatch|memory_pressure",
+  "kernel_hint": "q4b_hybrid_kernel_v3",
+  "telemetry_tokens": ["khs-evt-5432"]
+}
+
+Status semantics
+
+- ACCEPT: Scheduler has reserved compute slot; router should forward the request immediately.
+- DEFER: Scheduler suggests retry after expected_queue_ms; router may either wait up to latency_budget_ms or perform a fast fallback depending on policy.
+- REJECT: Scheduler cannot serve (capacity, incompatible kernel, or critical error). Router must select fallback immediately.
+- NEEDS_FALLBACK: Scheduler can serve a compatible but lower-cost/quality kernel variant (explicit kernel_hint provided).
+
+State machine (router perspective)
+
+1. TRY_PREFERRED -> (ACCEPT) -> SENT_TO_KERNEL -> COMPLETED
+2. TRY_PREFERRED -> (DEFER) -> WAIT_OR_FALLBACK -> (retry handshake) or (FALLBACK_DECISION)
+3. TRY_PREFERRED -> (REJECT/NEEDS_FALLBACK) -> FALLBACK_SELECT -> HANDSHAKE_FALLBACK
+
+Adaptive fallback policies (recommended presets)
+
+- Fast fallback (default for latency-sensitive keys): On DEFER > 10ms or REJECT, immediately select the next compatible kernel variant and attempt handshake. Max two fallback hops.
+- Quality-preserving fallback (for high-quality routes): Allow one deferred retry with exponential backoff (10ms -> 25ms), then fallback.
+- Budget-aware fallback: Factor in per-token cost budget; prefer cheaper kernel_hint when cost remaining < threshold.
+
+Preemption and cooperative eviction
+
+- Cooperative preemption: Scheduler can return a DEFER with 'preemption_window_ms' indicating it will preempt a lower-priority active slot to free capacity. Router should treat this as a conditional DEFER and may choose to wait for the window only for 'high' priority requests.
+- Forced eviction: Only used when memory_pressure == true or watchdog signals. Response provides 'eviction_impact' and affected session IDs for correlation.
+
+Observability contract
+
+Emit the following structured events (examples are flattened JSON for ingestion into telemetry pipelines):
+
+- kernel_handshake.start {request_id, model_variant, router_node, target_shard, protocol_version, timestamp} 
+- kernel_handshake.result {request_id, status, slot_id?, expected_queue_ms?, reason?, latency_ms, scheduler_revision} 
+- kernel_fallback.decision {request_id, chosen_variant, fallback_hop, reason, cost_estimate_tokens} 
+- kernel_preemption.warning {shard, preemption_window_ms, active_low_priority_sessions} 
+
+All handshake events must include trace_context and request_id to allow join with request traces. Tag events with kernel semantic labels to support downstream dashboards.
+
+Metrics to track (recommended)
+
+- handshake_success_rate (per variant, per shard)
+- handshake_latency_p50/p95/p99 (router->scheduler roundtrip)
+- fallback_rate and fallback_hops distribution
+- deferred_retry_success_rate
+- preemption_count and forced_eviction_count
+
+Rollout checklist for changes to handshake/scheduler logic
+
+1. Unit + integration tests validating backward and forward protocol version negotiation.
+2. Canary rollout to single region and non-critical tenant pool for 48 hours.
+3. Observe handshake latency and fallback_rate; require fallback_rate delta < 0.5pp and handshake_latency_p95 delta < 10ms for approval.
+4. Expand to cross-region canary for 24 hours.
+5. Gradual ramp with sibling shard isolation and automatic rollback if forced_eviction_count spikes.
+
+Debugging and runbook (incident scenarios)
+
+- Symptom A: Sudden spike in NEEDS_FALLBACK for variant X
+  1. Query telemetry: filter kernel_handshake.result where model_variant == X and status == NEEDS_FALLBACK.
+  2. Check scheduler logs for kernel compatibility errors and kernel_hint availability.
+  3. Run CLI to check shard health:
+     rrt-cli shard inspect --shard shard-45 --fields=queue_depth,mem_free,kernel_versions
+  4. If kernel binary missing or crashed, switch routing policy to temporary variant: update-policy --name=route-ml-lowlatency --priority=hosted --model_fallbacks=[redwood-v2-8k-fp16]
+  5. If widespread, execute escalation to kernel-platform oncall and follow rollback matrix in "kernel binary rollback" section.
+
+- Symptom B: Handshake latency elevated (p95 > SLA threshold)
+  1. Identify whether router->scheduler RTT or scheduler decision time is root cause. Use trace_id from kernel_handshake.start/result pairs.
+  2. If router network RTT high, verify cross-AZ connectivity and DNS resolution.
+  3. If scheduler decision path slow, capture a scheduler profile sample (see Profiling section below) and annotate change.
+
+Profiling guidance (quick recipe)
+
+- When investigating scheduler CPU/latency regressions:
+  1. Enable debug-profile mode on target shard (for short windows only):
+     rrt-cli shard set-profile --shard shard-45 --mode=ephemeral-debug --duration=60s
+  2. Collect and upload profile with metadata:
+     rrt-cli profile upload --file=shard45-sched-20260218.pb --meta="build_rev=kernel_v3.2,canary=true,trace_id=trace-..."
+  3. Correlate with handshake_latency events and examine hot paths (policy_evaluator and resource_check).
+
+Compatibility and versioning rules
+
+- Protocol version must be included in every handshake message. Schedulers MUST support at least the last two major protocol versions.
+- Routers vend protocol_version header set to their implementation version; schedulers may reply with negotiated_version when downgrading.
+- When introducing new status codes, default routers to treat unknown statuses as REJECT and use safe-fallback policies.
+
+Configuration table (example default settings)
+
+| setting | default | meaning |
+|---------|---------|---------|
+| handshake_timeout_ms | 25 | Max time router waits for handshake response before treating as DEFER |
+| defer_fast_threshold_ms | 10 | DEFERs with expected_queue_ms <= this are considered candidates to wait |
+| max_fallback_hops | 2 | Maximum number of kernel variant hops before a hard reject |
+| preemption_wait_policy | high-only | Whether routers will wait for preemption windows for high-priority requests only |
+
+Note: The runtime config is expressed as a per-route JSON blob in the control plane. Example:
+
+{
+  "route": "chat.stream.lowlatency",
+  "handshake": {
+    "timeout_ms": 25,
+    "defer_fast_threshold_ms": 10,
+    "max_fallback_hops": 2,
+    "preemption_wait_policy": "high-only"
+  }
+}
+
+Testing matrix (recommended tests before merge)
+
+- Unit: handshake serialization/deserialization, unknown status handling, retry backoff.
+- Integration: router <-> scheduler simulated network partition and DEFER/ACCEPT flows.
+- Performance: measure handshake_latency under 1k rps per shard; ensure p99 < 20ms.
+- Chaos: moderate kernel crash injection and ensure fallback_rate < 5% of baseline for lowlatency routes.
+
+Security and safety considerations
+
+- Validate trace_context doesn't leak PII. Strip PII from handshake payloads in logs.
+- Authenticate handshake messages between router and scheduler with mutual TLS and short-lived service tokens.
+- Rate-limit handshake attempts per shard to avoid amplification under traffic spikes.
+
+Examples of real incidents and learnings
+
+- Incident 2025-06-10: Canary kernel_v2.1 introduced a kernel_hint mismatch that caused NEEDS_FALLBACK to spike to 18% for a canary shard. Root cause: mismatch between kernel packaging metadata and the scheduler version. Mitigation: Added schema validation step in build pipeline and relaxed max_fallback_hops during canary.
+
+- Postmortem takeaway: enforce end-to-end metadata checks and add a handshake schema contract test to CI.
+
+Open design questions
+
+- Should the scheduler provide a confidence score for NEEDS_FALLBACK suggestions to enable probabilistic selection in the router?
+- Can we add a token-based crediting mechanism so the scheduler can accept lower-priority requests and bill credit back to tenant budgets?
+
+Appendices
+
+A. Glossary
+- kernel_hint: a scheduler-suggested alternative kernel variant optimized for memory or cost.
+- slot_id: ephemeral reservation id that maps to a GPU execution context.
+
+B. CLI snippets
+- Inspect recent handshake events for a request:
+  curl -H 'Authorization: Bearer $TOKEN' "https://telemetry.internal/v1/events?query=request_id:req-1234-abcd" | jq '.'
+
+- Force a route to prefer a fallback variant (temporary emergency):
+  rrt-cli route override --route chat.stream.lowlatency --preferred_variants=redwood-v2-8k-fp16 --ttl=15m
+
+C. Contact and ownership
+- Kernel scheduler platform: kernel-platform@redwood.ai (oncall: #kernel-sched-ops)
+- Router / routing policy: runtime-routing@redwood.ai
+
+If you are editing this page: update the related checklist and include a link to any new scheduler revisions in the 'related_pages' field.

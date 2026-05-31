@@ -1,0 +1,410 @@
+Offline bundle signing + verification design (Redwood Private on-prem)
+
+## Overview
+This document defines the engineering design for cryptographically signing Redwood Private offline bundles and verifying them during air-gapped installation and upgrade.
+
+We are solving two problems:
+1) **Integrity + provenance** for offline artifacts (bundle content cannot be modified without detection).
+2) **Safe operational UX** in air-gapped environments (clear failures, predictable rotation, break-glass path).
+
+This design intentionally piggybacks on the existing on-prem/offline bundle installer architecture. It does not redesign packaging, registry mirroring, or Helm chart structure.
+
+---
+
+## Goals
+- Sign offline bundles in the Redwood release pipeline using protected keys and auditable steps.
+- Verify signatures and artifact hashes during installer preflight, failing closed by default.
+- Support key rotation without bricking offline customers (multi-key trust store).
+- Provide actionable error messages and stable error codes for Support/SE.
+- Provide local audit events suitable for SIEM export in Private deployments.
+
+## Non-goals (initial phase)
+- Customer-provided signing roots / customer-signed bundles (future work).
+- Remote transparency log dependencies (Sigstore Rekor) required at install time.
+- Full attestation framework beyond “bundle signed + deterministic manifest canonicalization”.
+
+---
+
+## Design summary (what we’re building)
+**Bundle artifacts** include:
+- `bundle.manifest.json` (canonical manifest, includes hashes + version metadata)
+- `bundle.manifest.sig` (detached signature envelope for the manifest)
+- `keys/` (optional: intermediate metadata; *no private keys*)
+- `sbom/` (optional: referenced by manifest and hash-verified offline)
+
+**Signing model**
+- We sign the **manifest** only.
+- The manifest lists **every artifact** and its hash; verification of the manifest signature + hashes guarantees bundle integrity.
+
+**Installer model**
+- `redwood-private-installer preflight` verifies:
+  - bundle layout + manifest schema
+  - manifest signature using a local trust store
+  - every artifact hash from the manifest
+  - downgrade prevention using signed version metadata + local install state
+
+---
+
+## Cryptographic choices
+### Algorithms
+We standardize on:
+- **Signing:** Ed25519
+- **Digest:** SHA-256
+- **Canonicalization:** RFC 8785 JSON Canonicalization Scheme (JCS)
+
+Rationale:
+- Ed25519 is modern, fast, widely supported, and straightforward for detached signatures.
+- We avoid PKI complexity (X.509) for phase 1. Key validity windows are managed via the signature envelope metadata and the trust store.
+- Canonical JSON (JCS) avoids signature drift across different JSON serializers.
+
+Compatibility notes:
+- The installer implementation MUST canonicalize using the same JCS rules used in the release pipeline.
+- All manifest fields are UTF-8, and canonicalization is performed on the normalized JSON byte sequence.
+
+### Why not (initially)
+- **PGP/GPG:** UX and key management complexities; frequent customer misconfigurations; weaker fit for deterministic signing automation.
+- **X.509 code-signing certs:** adds certificate chain validation and time dependency; still possible in future.
+- **Sigstore/cosign with online transparency log requirements:** great for connected environments; not suitable as a hard dependency in air-gapped verification.
+
+---
+
+## Signature envelope format
+We use a **detached signature file** stored alongside the manifest.
+
+### Files
+- `bundle.manifest.json` (the signed payload)
+- `bundle.manifest.sig` (signature envelope; JSON)
+
+### Envelope schema (v1)
+`bundle.manifest.sig` is JSON (not canonicalized) and includes:
+- `envelope_version`: `1`
+- `payload`: fixed string `bundle.manifest.json`
+- `payload_digest`: `sha256:<hex>` of the canonicalized payload bytes
+- `signature_alg`: `ed25519`
+- `signature`: Base64 (standard) of Ed25519 signature over `payload_digest` bytes (see below)
+- `key_id`: stable identifier for the signing public key (e.g., `ri-prod-2025q4`)
+- `signing_time`: RFC3339 timestamp (for audit/debug; not a hard dependency)
+- `bundle_build_id`: build identifier (ties back to release pipeline metadata)
+
+Signing input (exact):
+- Compute `payload_digest = SHA256(JCS(bundle.manifest.json))`
+- Sign the ASCII bytes of `payload_digest` (e.g., `sha256:...`) with Ed25519.
+
+Notes:
+- We do not sign the envelope JSON to avoid recursive complexity. Only the payload digest is signed.
+- The envelope is included in support bundles and audit events.
+
+Example (abridged):
+- envelope_version: 1
+- payload: bundle.manifest.json
+- payload_digest: sha256:9f2c…
+- signature_alg: ed25519
+- signature: 0l9gYH…==
+- key_id: ri-prod-2025q4
+- signing_time: 2026-01-15T03:14:12Z
+- bundle_build_id: private-2026.01.15+build.1827
+
+---
+
+## Trust roots and key management
+### Trust store location
+The installer maintains a local trust store of allowed public keys.
+
+Default locations:
+- Linux: `/etc/redwood/trust/offline-bundle-keys.json`
+- Kubernetes-based installer container: `/opt/redwood/trust/offline-bundle-keys.json` (mounted from a ConfigMap in on-prem flows)
+
+The installer also ships with an embedded trust store to support “fresh install” without extra steps. If an external trust store file exists, it is merged with (and can override) embedded metadata by key_id.
+
+### Trust store format
+A JSON file containing:
+- `store_version`
+- `keys[]` entries with:
+  - `key_id`
+  - `public_key` (Base64 of Ed25519 public key)
+  - `purpose` (must include `offline_bundle_signing`)
+  - `status` (`active` | `deprecated` | `revoked`)
+  - `not_before` / `not_after` (optional; soft enforcement, see below)
+  - `comment` (operator notes)
+
+### Key rotation strategy
+We support overlap:
+- Installer trusts **multiple active keys** simultaneously.
+- Release pipeline signs with exactly **one current key** for a given train.
+
+Rotation plan:
+1) Add new key to installer trust store (embedded + docs for customer trust store update).
+2) For at least one release train, ship releases signed by old key while new key is trusted.
+3) Switch signing key in pipeline.
+4) Mark old key as `deprecated` after N releases.
+5) Mark old key as `revoked` only under compromise or explicit end-of-life.
+
+Air-gapped customer considerations:
+- Customers can update the trust store via offline media (USB/approved transfer process).
+- Support will provide a signed “trust store update bundle” only as a last resort; the default is documentation + file drop.
+
+### Time and validity handling
+Because air-gapped systems frequently have time skew, verification must not depend on an online time source.
+
+Policy:
+- Ed25519 signature cryptographic verification is always required.
+- `not_before` / `not_after` in the trust store are enforced as follows:
+  - If system time is sane (within configurable bounds), enforce normally.
+  - If system time is obviously invalid (e.g., < 2019-01-01 or > current build time + 365d), raise a warning and treat validity as “unknown”.
+
+Installer behavior:
+- Preflight prints explicit guidance when time is suspicious.
+- Install is blocked only if:
+  - signature is cryptographically invalid, OR
+  - key is explicitly `revoked`, OR
+  - key is untrusted/unknown.
+
+Diagnostic-only override:
+- `--diagnostic-time "YYYY-MM-DDTHH:MM:SSZ"` may be used to re-run preflight to confirm whether time skew is the root cause.
+- The override MUST NOT be available for `install` unless break-glass is used (see Break-glass section).
+
+---
+
+## Verification flow in the installer
+Verification is implemented in the installer preflight and re-used by install/upgrade commands.
+
+### High-level flow
+1) Validate bundle path and expected layout (no network fetch attempts in offline mode).
+2) Load and validate `bundle.manifest.json` schema and version.
+3) Canonicalize manifest using JCS.
+4) Compute `payload_digest` (SHA-256) and compare with `bundle.manifest.sig.payload_digest`.
+5) Load trust store and find key by `key_id`.
+6) Verify Ed25519 signature.
+7) Verify manifest contents:
+   - every referenced artifact exists
+   - every artifact hash matches the manifest
+   - optional: SBOM pointer exists and hash matches if required by manifest
+8) Enforce downgrade prevention and installer compatibility.
+9) Emit local audit event (success/failure) and write structured logs.
+
+### Downgrade/rollback policy
+The manifest includes signed metadata:
+- `bundle_version` (semantic)
+- `release_train` (e.g., `private-2026.01`)
+- `min_installer_version`
+- `bundle_build_id`
+
+The installer maintains a local state file:
+- Linux default: `/var/lib/redwood/installer/install-state.json`
+
+Rules:
+- **Upgrade** allowed if `bundle_version >= installed_version`.
+- **Downgrade** blocked by default if `bundle_version < installed_version`.
+- **Rollback** supported only through explicit documented procedures that include:
+  - uninstall/restore steps, or
+  - break-glass (policy-gated) in emergencies.
+
+---
+
+## Failure modes, error taxonomy, and UX
+We standardize on stable, searchable error codes: `RWI-OFFLINE-###`.
+
+### Principles
+- Fail closed: do not proceed to install/upgrade if verification fails.
+- Provide a single, actionable “next step” per failure.
+- Always print paths to:
+  - installer log file
+  - verification report output
+  - support bundle command
+
+### Common errors
+| Code | Category | Trigger | User-facing message (summary) | Suggested remediation |
+|------|----------|---------|------------------------------|-----------------------|
+| RWI-OFFLINE-101 | Bundle layout | Missing manifest/signature file | “Bundle is missing required file: bundle.manifest.json or bundle.manifest.sig.” | Re-download bundle; confirm transfer completed; do not rename files. |
+| RWI-OFFLINE-201 | Manifest schema | Unsupported manifest version | “Manifest schema version is not supported by this installer.” | Upgrade installer to required version (`min_installer_version`). |
+| RWI-OFFLINE-301 | Signature | Payload digest mismatch | “Manifest digest does not match signature envelope.” | Bundle likely modified; re-transfer using binary-safe tooling. |
+| RWI-OFFLINE-302 | Signature | Signature invalid | “Signature verification failed for key_id=….” | Do not install; obtain a valid bundle; escalate to Redwood Support. |
+| RWI-OFFLINE-303 | Trust | Unknown key | “Signing key is not trusted (key_id=…).” | Update trust store per docs; confirm you are using the correct release bundle. |
+| RWI-OFFLINE-304 | Trust | Key revoked | “Signing key is revoked (key_id=…).” | Stop; escalate immediately; treat as potential compromise. |
+| RWI-OFFLINE-401 | Integrity | Artifact hash mismatch | “Artifact hash mismatch: …” | Verify transfer (zip/tar tools), avoid line-ending conversion, re-transfer bundle. |
+| RWI-OFFLINE-402 | Integrity | Missing artifact | “Manifest references missing artifact: …” | Bundle incomplete; re-download; confirm extraction preserved symlinks/permissions. |
+| RWI-OFFLINE-501 | Policy | Downgrade attempt | “Bundle version is older than installed version; downgrade is blocked.” | Use supported rollback procedure; contact Support if emergency. |
+| RWI-OFFLINE-601 | Time | Suspicious system time | “System time appears invalid; validity checks may be unreliable.” | Fix time source (NTP/manual); re-run preflight. |
+
+### Output formatting
+- Preflight prints a concise summary:
+  - bundle version/build
+  - signing key_id
+  - verification: PASS/FAIL
+  - top failure reason + code
+
+- `redwood-private-installer offline-bundle inspect` prints:
+  - manifest metadata
+  - artifact inventory
+  - signature envelope fields
+  - trust store match status
+
+### Logging
+- Human-readable logs: `/var/log/redwood-installer/installer.log`
+- Structured JSON logs (optional): `/var/log/redwood-installer/installer.jsonl`
+- Include correlation id: `verify_run_id`
+
+---
+
+## Break-glass override (policy-gated)
+We provide a break-glass mechanism to allow installation when verification cannot be performed normally (e.g., emergency restoration where the trust store cannot be updated in time).
+
+Constraints:
+- Break-glass is **disabled by default**.
+- Break-glass requires a local policy file set by cluster/operator administrators (not by app-level users).
+
+Mechanism:
+- CLI flag: `--break-glass-allow-unverified-bundle`
+- Requires `--break-glass-ticket <ID>` and `--break-glass-reason <TEXT>`
+- Requires policy allowlist at `/etc/redwood/policy/break-glass.json` (operator-managed)
+
+Behavior:
+- Installer prints a multi-line warning and requires an interactive confirmation unless `--non-interactive` + policy allows.
+- Installer emits a high-severity audit event with reason + ticket id.
+- Installer writes a marker file in install state indicating the install was unverified.
+
+Reference policy and approval process:
+- See: exception-process-unsigned-bundle-hotfix (break-glass policy and matrix)
+
+---
+
+## Migration plan from unsigned bundles
+### Phases
+**Phase A (Pilot / Limited availability)**
+- Installer supports both:
+  - Signed bundles (preferred)
+  - Unsigned bundles only with explicit break-glass flag
+- Default: if signature files are missing, preflight fails with `RWI-OFFLINE-101` and instructs signed bundle usage.
+
+**Phase B (GA)**
+- Signed bundles required for all new Private releases.
+- Unsigned bundles permitted only via documented exception process and break-glass.
+
+**Phase C (Enforcement hardening)**
+- After 2–3 release trains, unsigned bundle path may be removed or further restricted (decision required).
+
+### Customer comms and compatibility
+- Release notes must call out:
+  - minimum installer version
+  - how to update trust store offline
+  - what to do if key_id is unknown after rotation
+
+---
+
+## CI/CD integration (signing step)
+Signing occurs after deterministic bundle assembly and before publication.
+
+Pipeline requirements:
+- Bundle build is deterministic (same inputs => same manifest payload digest).
+- Signing step:
+  - runs in a locked-down environment
+  - requires protected credentials
+  - produces an auditable record including:
+    - build id
+    - manifest digest
+    - signing key_id
+    - operator approval chain (where applicable)
+
+Key custody:
+- Private keys are stored in a managed KMS/HSM-backed signing service.
+- Direct key export is prohibited.
+- Access is controlled via least privilege (separation of duties between release operators and approvers).
+
+Operational references:
+- CI pipeline doc: offline-bundle-signing-ci-pipeline
+- Key ceremony: offline-bundle-signing-key-ceremony
+
+---
+
+## Audit/telemetry events (Private)
+The installer emits local audit events for verification outcomes.
+
+Events (summary):
+- `offline_bundle.verify.success`
+- `offline_bundle.verify.failure`
+- `offline_bundle.verify.break_glass_used`
+
+Required fields:
+- timestamp
+- verify_run_id
+- bundle_version
+- bundle_build_id
+- key_id
+- outcome
+- failure_code (if any)
+- redaction flags (to avoid leaking file paths if configured)
+
+Retention guidance:
+- Default local retention: 30 days (configurable).
+- Export via audit-log-exporter when present; otherwise customers can pull logs from filesystem.
+
+See: bundle-verification-audit-events
+
+---
+
+## Security considerations
+Threats addressed:
+- Tampering with artifacts inside the bundle
+- Replacing manifest with altered hashes
+- Replay/downgrade attacks via old but valid bundles
+- Compromised signing key and rapid revocation needs
+
+Key mitigations:
+- Signature covers manifest digest; manifest covers all artifact hashes.
+- Downgrade protection with signed metadata + local state.
+- Multi-key trust store for rotation.
+- Revocation support (installer blocks revoked keys).
+- Fail-closed default and explicit break-glass with auditing.
+
+Open questions (tracked separately)
+- Whether to hard-enforce validity windows when time is “sane” vs always treat as warnings.
+- Whether to ship an optional signed “trust store update bundle” as a productized artifact.
+
+---
+
+## Testing plan
+Required automated tests:
+- Valid signed bundle verifies successfully.
+- Tampered manifest fails signature verification.
+- Swapped artifact fails hash verification.
+- Truncated bundle fails layout/integrity.
+- Unknown key_id fails.
+- Revoked key blocks.
+- Downgrade attempt blocks.
+- Time-skew scenario produces warning + deterministic behavior.
+
+Manual tests for pilots:
+- Verify behavior across:
+  - offline filesystem extraction tools (tar/bsdtar/7zip)
+  - Windows copy workflows (line-ending corruption risks)
+  - constrained environments with no NTP
+
+---
+
+## Rollout checklist (engineering)
+- [ ] Manifest canonicalization implemented identically in builder + installer.
+- [ ] Signature envelope v1 implemented and documented.
+- [ ] Trust store format implemented with multi-key support.
+- [ ] Preflight blocks install on failures; error codes wired.
+- [ ] Break-glass gated by policy file + audit event.
+- [ ] Release pipeline produces signed bundles; gating prevents unsigned release.
+- [ ] Support docs: inspect + verify commands; common remediation.
+- [ ] Key rotation runbook validated in a dry run.
+
+---
+
+## Appendix: CLI examples
+Preflight verification:
+- `redwood-private-installer preflight --offline-bundle /mnt/media/redwood-private-2026.01.bundle`
+
+Inspect bundle and signature details:
+- `redwood-private-installer offline-bundle inspect --path /mnt/media/redwood-private-2026.01.bundle --verify`
+
+Update trust store (example):
+- `sudo install -m 0644 offline-bundle-keys.json /etc/redwood/trust/offline-bundle-keys.json`
+
+Diagnostic time override (preflight only):
+- `redwood-private-installer preflight --offline-bundle … --diagnostic-time 2026-01-15T00:00:00Z`
+
+Break-glass (requires policy + approval):
+- `redwood-private-installer install --offline-bundle … --break-glass-allow-unverified-bundle --break-glass-ticket SEC-1842 --break-glass-reason "Trust store update blocked by change window"`

@@ -1,0 +1,131 @@
+Kernel Sandbox — Network Partition Detection and Mitigation Playbook
+
+Summary:
+This playbook defines detection, containment, and recovery procedures for network partitions that affect kernel sandboxes (in-process kernel plugins, accelerator-sidecar communication, and scheduler control plane paths). It focuses on protecting SLOs and KV-cache consistency while minimizing blast radius during transient or prolonged network disruptions.
+
+Scope and assumptions:
+- Applies to nodes running the runtime kernel sandbox (kernel sidecar, kernel plugin process, and LocalScheduler agent).
+- Covers partitions that break control-plane RPCs (gRPC/HTTP/QUIC) between: LocalScheduler <-> KernelSidecar, KernelSidecar <-> KVCacheShard, and NodeAgent <-> ControlPlane.
+- Does NOT replace general cluster-network runbooks (CNI, cloud-provider network faults). Use in conjunction with eng-infra networking runbooks.
+
+Goals / SLO impact:
+- Preserve 99th percentile tail latency SLOs where possible by isolating affected cohorts.
+- Prevent KV-cache corruption or inconsistent warmstart data across shards.
+- Avoid unsafe kernel-handoff operations during partition.
+
+Ownership:
+- Primary: serving-runtime-kernel (oncall rotation)
+- Escalation: eng-sre (if >30m or cross-region impact)
+- Communications: incident commander from eng-sre for P1s
+
+Detection and automated triggers (observability):
+1) Short signals (automated):
+  - kernel_sidecar_rpc_failures_total > 5/min for a node for 3 consecutive minutes
+  - kvcache_replica_sync_lag_seconds > 10s for a shard
+  - scheduler-heartbeat-missed_count >= 3 for a LocalScheduler agent
+2) Composite trigger (higher confidence):
+  - (rpc_failures AND heartbeat_missed) OR (packet_loss_node_percent > 3% AND request_tail_99_latency > baseline + 40ms)
+
+Prometheus queries to surface on Ops dashboard (copy into alert & pager rules):
+- alert: KernelSidecarRPCsHighFailureRate
+  expr: increase(kernel_sidecar_rpc_failures_total[3m]) > 5
+- alert: KVCacheReplicaLag
+  expr: max_over_time(kvcache_replica_sync_lag_seconds[5m]) > 10
+- useful ad-hoc query:
+  sum by(node) (increase(kernel_sidecar_rpc_failures_total[5m])) / sum by(node) (increase(kernel_sidecar_rpc_requests_total[5m]))
+
+Immediate containment (automated actions recommended):
+- Mark node as degraded in RuntimeClusterState to prevent new warmstarts: POST /runtime-admin/nodes/{node}/degrade (example tool below).
+- Fallback routing: route new requests from that node’s router to cross-region fallback pools if latency budget allows.
+- Disable cross-node KV-cache writes for affected shards (set kvcache.shard.<id>.write_enabled = false) to prevent split-brain writes.
+
+Runbook: step-by-step manual procedure
+1) Triage (5–10 min)
+   - Confirm alert: check Prometheus graphs and query the three signals above.
+   - Identify scope: run `rtctl node list --filter=node=<node>` and `rtctl shard status --node <node>` to list affected kernels and shards.
+   - Check node-level networking: `kubectl -n runtime get pod -o wide | grep <node>` and `kubectl exec -it <kernel-sidecar-pod> -- ss -tunap` to inspect connections.
+2) Short-term containment (10–30 min)
+   - Run: `rtctl node annotate <node> degraded=network-partition --owner=<your-name>` (prevents automated warmstart scheduling).
+   - Disable KV-cache writes for shards with lag: `rtctl kvcache set <shard-id> write_enabled=false --reason=\"partition\"`
+   - Trigger immediate fallback policy: `rtctl routing force-fallback --node <node>`
+3) Recovery actions (30–120 min)
+   - If partition appears to be due to node-local firewall/CNI, coordinate with infra: collect `tcpdump` from node and kernel-sidecar namespace: `kubectl exec -it <sidecar> -- tcpdump -i any -w /tmp/partition.pcap` then collect.
+   - For control-plane partitions, consider temporarily enabling control-plane proxying: `kubectl apply -f /configs/controlplane-proxy-nginx.yaml` (see Appendix).
+   - When connectivity restored, re-enable writes and warmstarts in this order per shard: re-enable writes -> warm cache with staff-initiated replay -> monitor kvcache_replica_sync_lag_seconds until <1s for 5m -> remove node degraded annotation.
+4) Validation and monitoring (post-recovery, next 60 min)
+   - Watch key metrics: request_tail_99_latency, kernel_sidecar_rpc_failures_total, kvcache_replica_sync_lag_seconds.
+   - Run a synthetic traffic replay against the affected node’s pods: `loadgen --target=<node-pod-ip> --profile=warm-path-10pps --duration=2m` and validate fidelity.
+
+Automated remediation tool snippets
+- Degrade node (example curl):
+  curl -X POST https://runtime-admin.internal/api/v1/nodes/<node>/degrade -H \"Authorization: Bearer $ADMIN_TOKEN\" -d '{\"reason\":\"network-partition-detected\",\"owner\":\"oncall\"}'
+- Toggle kvcache writes (example JSON payload):
+  {"shard_id":"shard-23","write_enabled":false,"reason":"partition-isolation"}
+
+Config table: recommended thresholds and enforcement actions
+| Signal | Threshold | Automated action | Owner |
+|---|---:|---|---|
+| kernel_sidecar_rpc_failures_total (per node) | >5 in 3m | Mark node degraded, fallback routing | serving-runtime-kernel |
+| kvcache_replica_sync_lag_seconds (per shard) | >10s | Disable writes | serving-runtime-kernel |
+| scheduler-heartbeat-missed_count | >=3 | Pause new warmstarts | eng-sre |
+
+Edge cases and safety notes:
+- If a node is in a partial partition (can reach control-plane but not specific KV shard), do NOT perform global cache clears—only isolate affected shards.
+- Avoid immediate orchestrated kernel handoffs while any kvcache write-disabled flag is set. Handoffs should be performed only when `kvcache_replica_sync_lag_seconds < 1s`.
+- For prolonged partitions (>90m), escalate to eng-sre to consider pod eviction and reprovisioning if the node cannot reliably recover.
+
+Testing and rollout guidance:
+1) Unit test: simulate rpc failure by toggling an iptables rule in the kernel-sidecar test harness. Verify node enters degraded state and fallback routing occurs.
+2) Stage rollout (canary): enable auto-degrade-on-failure for 5% of nodes in the canary pool for 2 weeks. Collect false-positive rate and recovery windows.
+3) Pre-merge checklist for changes to auto-degrade logic: code-level unit tests, integration test against synthetic partition harness, and SLO regression run.
+
+Post-incident analysis template (to fill after incident):
+- Incident start/end times:
+- Affected nodes / shards:
+- Root cause hypothesis:
+- Containment actions taken and timeline:
+- Recovery steps and time-to-repair:
+- Post-mortem action items (owner + due date):
+  1) Improve alert sensitivity threshold (owner: )
+  2) Add automated pcap collection (owner: )
+  3) Runbook clarifications (owner: )
+
+Appendix: useful snippets and configs
+- controlplane-proxy-nginx.yaml (short):
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: controlplane-proxy
+    namespace: runtime-admin
+  spec:
+    replicas: 2
+    template:
+      spec:
+        containers:
+        - name: nginx-proxy
+          image: nginx:stable
+          ports:
+          - containerPort: 8080
+          volumeMounts: []
+
+- Observability playbook additions (Grafana panels to add):
+  - Per-node RPC failure heatmap (3m window)
+  - KV-cache sync lag by shard (5m moving max)
+  - Node degraded annotation overlay on request latency charts
+
+Related docs and references:
+- Runtime routing fallback policies (internal link)
+- KV-cache replica design spec (internal link)
+- eng-infra CNI incident response runbook
+
+Revision history:
+- 2025-03-12: Initial draft by Aisha Patel
+- 2025-04-20: Added automated triggers and PromQL examples (review Jordan Kim)
+- 2025-06-10: Added controlplane-proxy pattern and canary guidance (review Sofie Müller)
+
+Contact and escalation quick list:
+- serving-runtime-kernel oncall: #service-serving-runtime (pager)
+- eng-sre ops lead: eng-sre-ops@redwood.ai
+- Slack channel: #runtime-kernel
+
+End of document.

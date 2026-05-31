@@ -1,0 +1,136 @@
+Adaptive request shaping and GPU shelf management standards
+
+Overview
+
+This page defines Redwood standards for two tightly related concerns in the serving runtime: adaptive request shaping (a runtime policy that shapes incoming inference requests by latency/cost/priority) and GPU shelf management (a lifecycle model for keeping GPUs warm/idle/reserved in a way that balances latency SLOs and unit cost). The goal is to provide a single, auditable policy surface that teams can adopt to achieve predictable tail latency and predictable cost while supporting multi-tenant priority classes.
+
+Scope
+
+- Applies to all inference-serving endpoints in the hosted and dedicated fleets and to runtime-sidecars used in Private deployments.
+- Affects the front-end edge and the scheduling layer on the serving nodes (worker scheduler, batching pool, and prewarming controller).
+- Does not replace token-level cost accounting or the per-tenant billing pipeline; it integrates with cost tags and quota systems.
+
+Motivation
+
+Redwood supports diverse workloads: bursty web chat, long-running completions, and background batch embedding jobs. Historically we saw two failure modes:
+
+1) Sudden tails when cold GPUs are introduced under bursty traffic; 2) Long-lived idle GPUs kept warm without contribution to throughput, increasing unit cost.
+
+Adaptive shaping + GPU shelf management reduces tail events by prioritizing and shaping work while keeping a small, policy-driven set of GPUs "on-shelf" and quickly cycling additional capacity based on signals.
+
+Goals
+
+- Maintain P50/P95/P99 SLOs per traffic class with clear tradeoffs to cost.
+- Provide a machine-readable request-shaping contract that clients can use to express latency and cost hints.
+- Ensure predictable scaling decisions: prewarming, spillover, and offload.
+- Make behavior auditable and reversible via feature flags and rollout gates.
+
+Definitions
+
+- Priority class: an enumerated label (P0, P1, P2, background) assigned to requests; controls scheduling precedence and budget.
+- Shape profile: a named profile describing maximum tokens, max duration, and acceptable tail latency budget.
+- GPU shelf: a small pool of GPUs kept in a prewarmed/ready state for a given shard/region to absorb bursts.
+
+Design and Standards
+
+1) Client hints and API contract
+
+- Clients MAY include an optional header/field "x-rd-priority" with values {p0, p1, p2, background}. Default is p1.
+- Clients MAY include an optional JSON block "run_hints" in request payload: { "latency_target_ms": <int>, "cost_sensitivity": <enum: low|med|high>, "max_tokens": <int> }. The server uses these hints as soft constraints; they do NOT change billing.
+- Server-side mapping: each service maps client hints to an internal shape profile. The mapping table MUST be stored in the service-config repo and versioned. Example mapping: p0+latency_target_ms<200 -> shape: small-chunk-low-batch; background+cost_sensitivity=high -> shape: batched-low-priority.
+
+2) Shaping algorithm (runtime responsibilities)
+
+- Admission: incoming requests are admitted into one of three queues: interactive (P0/P1), normal (P2), background. Admission respects per-tenant concurrency quotas.
+- Adaptive batching: the batching pool adjusts target batch size per shape profile based on moving average of observed latency and GPU occupancy.
+- Fallback and trimming: when queue delay forecast exceeds tail threshold, the shaping policy may trim requests by reducing max_tokens, invoking a shorter generation path, or migrating to a lower-cost model variant (see model-variant fallback table). Any trimming decision MUST be logged with request_id, user_id, original_profile, new_profile, and reason code.
+
+3) GPU shelf concept and lifecycle
+
+- Each shard maintains a configurable GPU shelf with two categories: warm (prewarmed, model loaded, KV cache populated for last-N users) and standby (driver initialized but model not loaded).
+- Shelf size is computed via policy: shelf_size = ceil(max(1, min(0.05 * average_active_gpus, shard_min))) where shard_min is configured per-customer-tier (hosted:1, dedicated:2).
+- Shelf replenishment: when warm_count < shelf_target, prewarming controller should: a) allocate standby -> warm by loading model and precomputing KV state, or b) reassign from other shards when cross-shard migration is allowed.
+- Idle drain: GPUs that remain warm > idle_max_minutes (default 30m) without serving requests are moved to standby to reclaim memory-critical resources.
+
+4) Signals and autoscaling integration
+
+- Signals used for scaling: queue length per priority, 95th percentile completion latency per shape profile, GPU utilization, cold-start rate, and prewarm success ratio.
+- Autoscaler decision rules must include a cooldown period >= 60s, and a conservative scale-down policy that waits for sustained low traffic across two cooldown windows.
+
+Operational SLOs and Metrics
+
+- Per-priority SLOs (default): P0: P95 <= 150ms, P99 <= 350ms; P1: P95 <= 350ms, P99 <= 800ms; P2: P95 <= 800ms; background: best-effort.
+- Core metrics (all exported with request tags): request.queue_delay_ms, request.processing_ms, gpu.prewarm_time_ms, gpu.shelf_count.{warm,standby}, shaping.trim_rate, shaping.fallback_rate, shaping.error_injection_rate.
+- Traces: any trimming/fallback MUST have a span annotated with shaping.reason and original_profile.
+
+Configuration table (example)
+
+- shape_profiles.yaml (example snippet):
+
+  - name: small-chunk-low-batch
+    max_tokens: 128
+    max_duration_ms: 400
+    preferred_batch_size: 8
+    latency_budget_ms: 150
+
+  - name: burst-embedding
+    max_tokens: 1024
+    preferred_batch_size: 64
+    cost_sensitivity: high
+    latency_budget_ms: 2000
+
+Implementation guidance and examples
+
+- Example admission pseudocode:
+
+  def admit_request(req):
+    profile = map_hints_to_profile(req.headers, req.run_hints)
+    if tenant_concurrency_exceeded(req.tenant_id, profile):
+      return reject_with_quota_error()
+    enqueue(profile.queue, req)
+
+- YAML feature flag for toggling shaping per service:
+
+  shaping: enabled: true
+  shaping: rollout_percent: 100
+  shaping: default_profile_map: '/configs/profile-maps.yaml'
+
+- CLI snippet to inspect shelf status on a shard:
+
+  rdsctl shard inspect --shard-id s-1234 --fields shelf_count,warm_gpus,standby_gpus,prewarm_failures
+
+Rollout and safety
+
+- All changes to shape profiles or shelf sizing must go through a canary rollout: 1% -> 10% -> 50% -> 100% with health checks at each stage. Health checks include queue-delay < threshold and prewarm success ratio > 99%.
+- Default for new services: shaping disabled by default. To opt-in, add shaping: enabled:true in service-config and provide a mapping file.
+
+Auditing and tracing
+
+- Every shaping decision (admit, trim, fallback) must emit a structured log line and a trace event with request_id and reason_code. Logs should include before/after profile and CPU/GPU shard id.
+- Monthly audit: ops runs a report of trimming/fallback rates by service and tenant; any tenant with >1% sustained trimming for two weeks triggers a platform review.
+
+Security and privacy considerations
+
+- No client-provided hints may be used to override tenant-isolation or billing. Hints are advisory only.
+- Prewarming must not load tenant-specific secrets into shared GPU memory. If KV cache materialized contains PII, it must be encrypted per the data-management policy.
+
+Ownership and contacts
+
+- Primary owner: serving-runtime/scheduler team (oncall: serving-runtime@s.redwood.internal).
+- Secondary owner: infra-autoscale team.
+
+Related pages and references
+
+- See: graceful GPU preemption and prewarming guidelines (infra-standards).
+- See: sequence length-aware kernel selection guidelines (eng-serving-runtime).
+
+Appendix: model-variant fallback table (example)
+
+- If a profile cannot meet latency target after trimming, the scheduler should: 1) try a quantized model variant (q8_2) 2) try truncated-generation with early-stopping 3) route to background model instance (higher latency, lower cost). Each step annotated with reason code (FALLBACK_Q, FALLBACK_TRUNC, FALLBACK_BG).
+
+Change log
+
+- 2026-01-15: initial draft by Aisha Patel.
+- 2026-02-10: added audit thresholds and prewarm signals (review by Jordan Kim).
+- 2026-03-01: updated SLOs and shelf sizing formula (published).
+

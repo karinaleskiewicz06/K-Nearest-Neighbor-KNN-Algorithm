@@ -1,0 +1,285 @@
+Runbook: Hosted Overload Circuit Breaker (Detection, Mitigation, Rollback, Comms)
+
+## Purpose
+This runbook covers how oncall responds when Redwood Hosted API overload protection (circuit breakers + load shedding) is suspected to be:
+1) correctly protecting the platform during real overload, or
+2) misfiring (false positives / overly aggressive shedding), or
+3) partially degraded (inconsistent Retry-After, missing correlation IDs, fallback loops).
+
+It includes detection/verification, safe toggles, rollback steps, comms templates, and post-incident data capture.
+
+## Scope
+Applies to Redwood Hosted API request paths where overload protection is enforced:
+- API Gateway admission control (tenant/route/model caps)
+- Smart Routing fallback-on-overload (model/region)
+- Serving runtime admission/backpressure signals (queue depth, token/sec saturation, memory pressure proxies)
+
+Out of scope: Dedicated and Private deployments (different controls and SLAs).
+
+## Quick glossary
+- **Breaker**: state machine controlling admission (closed → open → half-open) based on saturation signals and error/latency thresholds.
+- **Shed**: explicit rejection/degradation of requests to prevent overload cascades (e.g., return 429/503 with stable error codes + Retry-After).
+- **Degradation mode**: policy-driven feature reduction (e.g., lower max_tokens cap, tighter streaming concurrency) to preserve SLOs.
+- **Correlation ID**: `x-redwood-correlation-id` header, included in error payload.
+
+## Severity guidance (Hosted API)
+Use this to decide paging/escalation and comms.
+
+- **SEV-1**: Multi-region outage, sustained inability to serve, or overload controls causing widespread customer impact (e.g., >20% requests shed across multiple tiers for >10 min) and no stable mitigation.
+- **SEV-2**: Single-region major degradation, sustained elevated overload errors for enterprise/critical tiers, or fallback routing not functioning as configured.
+- **SEV-3**: Localized overload in one model/route, short-lived spike, or minor misconfiguration with safe workaround.
+
+## Primary detection signals
+Check these in the Overload Protection dashboard (see related page) and standard Hosted API dashboards.
+
+### 1) Customer-visible symptoms
+- Spike in 429/503 with overload taxonomy codes (examples):
+  - `overload.breaker_open` (typically 503)
+  - `overload.shed_rate_limit` (typically 429)
+  - `overload.runtime_queue_full` (typically 503)
+  - `overload.dependency_unhealthy` (typically 503; treat as dependency incident)
+- Increased timeouts (client-side) despite shedding being enabled (may indicate missing early admission or stuck half-open).
+- Missing/incorrect `Retry-After` headers.
+
+### 2) Platform signals
+- **Breaker open rate** by region, route, and model
+- **Shed rate** (overall and by tier)
+- **p95/p99 latency** (prefill + decode) rising before error spike
+- **Runtime queue depth** (prefill/decode), scheduler backlog
+- **Token/sec saturation** (model pool) and GPU utilization plateaus
+- **Memory pressure proxy / KV cache pressure** increasing
+
+### 3) Alert triggers (common)
+- `hosted_overload_shed_rate{region=*} > 5% for 10m` (tune per region/model)
+- `breaker_open_events > baseline + 3σ for 5m`
+- `p99_latency > SLO threshold` paired with rising queue depth
+- `Retry-After missing rate > 0.5% for 5m` (compliance with client retry contract)
+
+## First 5 minutes (stabilize + classify)
+1. **Acknowledge the page** and post in `#incidents`:
+   - “Investigating possible Hosted API overload / circuit breaker event in <region>.”
+2. **Confirm scope**:
+   - Which region(s)? which route(s) (`/v1/chat.completions`, `/v1/completions`, embeddings)? which model(s)?
+   - Is the impact tier-specific (self-serve vs enterprise hosted)?
+3. **Check if the breaker is doing the right thing**:
+   - If shed rate increased but p99 latency and timeouts improved/stabilized, it may be working as intended.
+   - If shed rate increased AND timeouts still rising, admission may be too late (runtime saturation without early shed) or retries are storming.
+4. **Verify error semantics** (spot-check 5–10 events):
+   - Response includes: stable `error.code`, `error.type`, message, `x-redwood-correlation-id`, and `Retry-After` when applicable.
+   - Ensure HTTP status matches ADR-014 mapping (429 vs 503).
+5. **Decide escalation**:
+   - Page/loop in based on suspected layer:
+     - Gateway admission/policy: **Platform Control Plane/Gateway** (Ethan Park / Amara Diallo)
+     - Routing fallback loops/misroutes: **Smart Routing** (Mina Haddad / Ravi Menon)
+     - Runtime queue/saturation: **Serving Runtime** (Sofia Ivanova / Lena Fischer)
+
+## Verification steps (avoid false positives)
+### A) Determine if overload is real
+- Look for:
+  - Runtime queue depth rising steadily
+  - Token/sec saturation at/near cap
+  - GPU utilization high but throughput not increasing (flatline)
+  - Increasing prefill time and decode time
+- Cross-check if a traffic spike occurred:
+  - Request rate, concurrency, prompt length distribution (if available)
+  - Large tenant traffic burst (noisy neighbor)
+
+If system is not saturated (queue depth flat, utilization moderate) but breaker opens, suspect:
+- Misconfigured policy thresholds
+- Bad saturation signal export (stale/NaN)
+- Metric aggregation bug (cardinality drop causing wrong rollup)
+
+### B) Determine if a dependency brownout is the trigger
+If `overload.dependency_unhealthy` is high:
+- Identify dependency: auth, policy store, routing config service, model registry, tokenization service, etc.
+- If dependency is failing, treat as dependency incident and consider temporarily enabling more permissive caching or bypass modes only if approved (see Safe toggles).
+
+### C) Check for retry storms
+Signs:
+- Rising request rate following shed spike
+- High `429/503` plus repeated identical requests (same idempotency key or same prompt hash patterns, if logged)
+Actions:
+- Ensure `Retry-After` is present and non-zero where required
+- Prefer longer `Retry-After` under severe overload to dampen retry storms
+
+## Mitigation playbook (choose the least risky first)
+### Mitigation priority order
+1) **Protect core availability** (admit fewer requests early) 
+2) **Preserve tenant isolation** (avoid one tenant taking all capacity)
+3) **Enable graceful degradation** (reduce expensive features)
+4) **Enable safe fallback routing** (if configured and proven)
+5) **Scale capacity / drain traffic** (if available, region-specific)
+
+### 1) Safe toggles (gateway admission + policy engine)
+Use these when load shedding is needed or thresholds are too aggressive. Apply changes narrowly (region + route + tier) and with a clear rollback plan.
+
+**Common toggles** (names are representative; see Policy Engine Integration doc for canonical keys):
+- Enable/disable breaker evaluation at gateway:
+  - `overload.gw_breaker.enabled = true|false`
+- Adjust shed response behavior:
+  - `overload.response.retry_after_seconds = <int>`
+  - `overload.response.force_503 = true|false` (avoid unless directed; prefer taxonomy mapping)
+- Tighten tenant fairness:
+  - `overload.fairness.per_tenant_concurrency_cap = <int>`
+  - `overload.fairness.per_tenant_rps_cap = <int>`
+- Reduce streaming concurrency (high cost under overload):
+  - `overload.degrade.streaming_concurrency_cap = <int>`
+- Reduce max tokens cap (reduce tail latency amplification):
+  - `overload.degrade.max_tokens_cap = <int>`
+
+**Procedure (policy change)**
+1. Apply to a single region first (or to canary cohort):
+   - Region: `<us-east|us-west|eu-central|...>`
+   - Cohort: `canary=true` or a small set of tenant IDs
+2. Monitor 10 minutes:
+   - p99 latency trend
+   - shed rate by tier
+   - timeouts
+   - breaker open/close transitions (ensure it recovers)
+3. Expand gradually.
+4. Document the exact change in the incident timeline.
+
+**Example (CLI-like pseudo)**
+- “Set Retry-After to 15s for overload 503 in us-east for chat completions”
+  - `ri policy set --region us-east --route chat.completions --key overload.response.retry_after_seconds --value 15`
+
+### 2) Runtime overload mitigation (if runtime saturation is primary)
+If runtime queue depth is critically high and admission is too late:
+- Increase early shedding at gateway (preferred) rather than letting runtime thrash.
+- If runtime has emergency caps available (coordinate with runtime oncall):
+  - tighten batching caps to reduce latency blowups (trade throughput)
+  - reduce concurrent decodes
+  - temporarily disable expensive features (tool calling / structured output) if supported by policy flags
+
+Follow the dedicated runtime runbook for deeper actions (see related pages).
+
+### 3) Smart Routing: fallback on overload
+Use only if:
+- Fallback is configured for impacted tenants/routes AND
+- Loop prevention is healthy AND
+- The fallback target has available capacity.
+
+Checklist before enabling broader fallback:
+- Confirm fallback attempt rate and success rate in routing dashboard.
+- Confirm no route/model mismatch (compatibility constraints).
+- Ensure bounded retries are enforced (avoid request multiplication).
+
+Mitigations:
+- Enable fallback for a subset of tenants (enterprise first if contractually required) or for self-serve to preserve overall SLO.
+- Prefer same-region model variant first; cross-region only if latency/SLA permits.
+
+### 4) Address missing Retry-After / bad error payloads
+If customers are seeing overload responses without `Retry-After` or correlation IDs:
+- Treat as SEV-2 if widespread (can cause retry storms and support escalation).
+- Workaround (short-term): force a default `Retry-After` at gateway for overload-coded errors.
+- Rollback the specific canary/flag associated with response formatting changes.
+
+### 5) If breaker appears stuck open
+Symptoms:
+- Breaker open rate remains high despite queue depth returning to normal.
+Actions:
+- Validate signal freshness (timestamps).
+- If stale signals: restart/refresh signal exporter component or fail over to a simpler signal.
+- Temporarily force half-open probing (if supported) to allow recovery.
+- As a last resort: disable gateway breaker evaluation for the affected selector while keeping rate limits (avoid full removal of protections).
+
+## Rollback steps
+Rollback should be fast, scoped, and explicit.
+
+### Rollback triggers
+- Shed rate increases but p99 latency does not improve within 10–15 minutes
+- Enterprise tenants impacted unexpectedly (tier policy violated)
+- Fallback attempts spike with low success (or loops detected)
+- Retry storms detected after change
+
+### Rollback procedure
+1. Identify the last applied change (flag/policy key) and its scope.
+2. Revert to the previous value for the same selector (region/route/model/tier/tenant).
+3. Confirm within 5–10 minutes:
+   - breaker open rate decreases appropriately
+   - error mix returns to expected
+   - p95/p99 latency stabilizes
+4. Add a clear incident note: “Rolled back <key> from <x> to <y> at <time> due to <reason>.”
+
+## Communications
+### Internal channels
+- `#incidents`: incident timeline + decisions
+- `#eng-oncall`: coordination with service owners
+- `#support` (if customer tickets are active): what customers will see and recommended guidance
+
+### What to communicate (minimum viable)
+- Impacted region(s), route(s), model(s)
+- Current error codes/status behavior (429 vs 503)
+- Whether Retry-After is present and recommended backoff
+- Estimated time to next update
+
+### Customer-facing status update template (status page or support macro)
+**Title:** Elevated overload errors for Hosted API in <region>
+
+**Body:**
+We are investigating elevated request rejections for the Redwood Hosted API in <region>. During this period, some requests may receive **429** or **503** responses with an overload error code. These responses are an intentional protection mechanism to keep the platform stable.
+
+**What to do:**
+- Respect the `Retry-After` header and retry with exponential backoff + jitter.
+- Avoid immediate high-concurrency retries.
+- If you are streaming or sending very large prompts, consider reducing concurrency or request size temporarily.
+
+**Next update:** <time, e.g., 30 minutes>
+
+### Support handoff snippet (for active tickets)
+- “This is a capacity-protection response. Please share the `x-redwood-correlation-id` and approximate timestamp/region/model. Recommended retry behavior: respect `Retry-After`, exponential backoff with jitter, and cap concurrent retries.”
+
+## Data to capture during the incident (for postmortem + tuning)
+Capture these as you go (paste into incident doc or #incidents thread).
+
+### Incident header
+- Start time (UTC):
+- Region(s):
+- Routes:
+- Models:
+- Tiers affected:
+- Primary symptom: (shed spike / timeouts / stuck open / missing Retry-After / fallback failure)
+
+### Key metrics (before and after each change)
+- Shed rate (%), by tier
+- Breaker open events/min
+- p95/p99 latency
+- Runtime queue depth (prefill/decode)
+- Token/sec saturation (if available)
+- 5xx/timeouts rate
+- Retry-After missing rate
+- Fallback attempt rate + success rate
+
+### Configuration deltas
+For each change:
+- Timestamp (UTC)
+- Selector: region + route + model + tier/tenant
+- Key changed + old value + new value
+- Expected effect
+- Observed effect (5–10 minutes later)
+
+### Customer impact highlights
+- Top affected tenants (if permitted for internal visibility)
+- Number of support tickets opened (link IDs)
+- Any enterprise escalation (name + account team)
+
+## Post-incident follow-ups (within 48 hours)
+- File issues for:
+  - False positives (thresholds too low, bad signals)
+  - Missing Retry-After/correlation ID
+  - Fallback routing failures or loops
+  - Poor tier isolation behavior
+- Update the tuning sheet (region/model thresholds) with evidence.
+- Confirm SLO/error-budget classification for overload errors is correct for the window.
+
+## Escalation matrix
+- **Gateway admission / policy eval issues**: Platform Control Plane + API Gateway oncall (Ethan Park / Amara Diallo; Benji Okafor / Jordan Lee)
+- **Routing fallback issues**: Smart Routing oncall (Mina Haddad / Ravi Menon / Elena Popov)
+- **Runtime saturation / signal issues**: Serving Runtime oncall (Sofia Ivanova / Lena Fischer / Omar El-Sayed)
+- **Dashboards/alerts anomalies**: SRE + Observability (Aisha Bello / Logan Wright / Allison Grant)
+
+## Appendix: Overload error handling reminders (for oncall)
+- Prefer explicit overload errors (429/503 with stable `error.code`) over allowing timeouts/ambiguous 5xx.
+- Ensure consistent `Retry-After` to prevent retry storms.
+- Changes should be scoped (region/route/model/tier) and reversible.
+- Tenant isolation is a requirement: avoid global disables that allow a single tenant to dominate capacity.

@@ -1,0 +1,283 @@
+ADR-048: Experiment metrics attribution schema
+
+## Status
+Published.
+
+## Summary
+This ADR defines the canonical attribution dimensions and event schema used to measure route-level experiments (A/B/n) in Redwood Inference. The goals are:
+- Ensure all experiment-related latency/cost/error/throughput metrics can be consistently attributed by {route, experiment_id, variant}.
+- Provide a stable contract between data plane (router/runtime), telemetry ingestion, analytics rollups, and Console.
+- Avoid unbounded cardinality and cost blow-ups while keeping metrics useful for debugging and guardrails.
+
+This ADR is intentionally minimal: it defines *required* dimensions and *required* per-request metrics, plus an optional token-level event intended primarily for debugging and TTFT/streaming investigations.
+
+## Context
+Route-level experiments are applied at the routing layer and may select different models, quantization profiles, or capacity tiers. Console needs to show per-variant:
+- Latency (p50/p95/p99), including streaming-specific measures (TTFT)
+- Error rate (HTTP/gRPC and runtime categories)
+- Throughput (requests/sec) and token throughput
+- Unit economics (prompt tokens, completion tokens, total tokens, and cost)
+
+Telemetry must work across:
+- Hosted API, Dedicated, and Private
+- Streaming and non-streaming responses
+- Retries and fallbacks
+- Multi-region deployments
+
+We also need to support:
+- Deterministic assignment (ADR-047) and the ability to reproduce attribution during debugging
+- Guardrail alerts and automated stop triggers
+- Reasonable defaults that are safe for broad GA enablement
+
+## Decision
+### 1) Canonical attribution dimensions
+All experiment-attributed events MUST include the following dimension set, with the specified semantics.
+
+#### Required dimensions (canonical)
+1. route_id
+- Definition: A stable identifier for the logical API route (not the raw URL path).
+- Format: "route:<product_area>/<route_name>@<version>".
+- Examples:
+  - "route:chat/completions@v1"
+  - "route:responses/create@v1"
+  - "route:embeddings/create@v1"
+- Rationale: Avoids raw-path cardinality and provides a stable join key for Console and rollup tables.
+
+2. experiment_id
+- Definition: Immutable identifier of the route experiment configuration applied to the request.
+- Format: "exp_<ulid>" (ULID recommended for time-sortability).
+- Example: "exp_01J0M9D4Z3Q1Y7J4W7A9N2Q6K2".
+- Notes:
+  - MUST be absent/null when no experiment applies.
+  - MUST remain stable even if experiment name is edited.
+
+3. variant_id
+- Definition: Identifier of the selected variant within experiment_id.
+- Format: "var_<short>" (stable within an experiment).
+- Examples: "var_control", "var_b", "var_q4".
+- Notes:
+  - MUST be present when experiment_id is present.
+  - For "holdout" or "baseline" variants, still use a normal variant_id.
+
+4. model_id
+- Definition: The resolved model identifier that actually served the request.
+- Format: "model:<publisher>/<name>@<revision>".
+- Examples:
+  - "model:redwood/llama-3.1-70b-instruct@2025-02-10"
+  - "model:meta/llama-3.1-8b-instruct@hf:9f3a1c"
+- Notes:
+  - For fallback scenarios, model_id MUST reflect the final served model.
+  - This is required because many experiments compare model variants; Console must attribute cost/latency to the served model.
+
+5. region
+- Definition: Redwood serving region where the request was executed.
+- Format: "<cloud>-<geo>-<az_or_cluster>" (exact format determined by infra conventions).
+- Examples:
+  - "aws-us-east-1"
+  - "gcp-europe-west4"
+  - "onprem-customer-dc1"
+
+#### Optional (strongly recommended) dimensions
+These are not considered canonical for rollups, but are recommended for debugging and limited-scope analysis.
+
+6. experiment_config_version
+- Definition: Monotonic version of the experiment configuration used for evaluation.
+- Purpose: Detect propagation lag and explain attribution mismatches across regions.
+
+7. assignment_id
+- Definition: A deterministic identifier derived from (experiment_id, stickiness_key, salt).
+- Format: "asmt_<hash-prefix>".
+- Purpose: Join router debug explanations with telemetry without exposing PII.
+
+8. deployment_mode
+- Values: "hosted" | "dedicated" | "private".
+- Purpose: Enables safe filtering in dashboards and SLO reporting.
+
+### 2) Canonical events and schemas
+We standardize on two event types emitted by the data plane and runtime:
+- inference.request_summary (REQUIRED)
+- inference.token_sample (OPTIONAL; sampled)
+
+All fields below are represented as attributes on OTel spans and/or as structured log events, then transformed into metrics and rollups.
+
+#### 2.1 inference.request_summary (required)
+Emitted exactly once per request attempt *that reaches model execution*.
+- For retries: emit one request_summary per attempt, linked by request_id and attempt.
+- For early rejects (authz, rate limit, payload validation): do not emit experiment-attributed request_summary, because routing/assignment may not have occurred.
+
+Required attributes:
+- request_id: globally unique request id (UUID/ULID)
+- attempt: integer starting at 1
+- route_id: canonical route id (see above)
+- experiment_id: if applicable
+- variant_id: if applicable
+- model_id: resolved served model
+- region
+
+Required metrics attributes (numeric fields):
+- latency_ms: end-to-end latency for the attempt (server-side)
+- ttft_ms: time-to-first-token (0 for non-streaming or if not measurable)
+- input_tokens: prompt tokens for the attempt
+- output_tokens: completion tokens for the attempt
+- total_tokens: input_tokens + output_tokens
+- billed_tokens: tokens used for billing (may differ from total_tokens due to rounding/minimums)
+- cost_usd_micros: cost attributed to the attempt in micro-dollars (integer)
+- http_status: integer (or rpc_status for gRPC)
+- error_class: one of:
+  - "none"
+  - "rate_limited"
+  - "timeout"
+  - "capacity"
+  - "upstream"
+  - "model_runtime"
+  - "invalid_request"
+  - "internal"
+- stream: "true" | "false"
+
+Recommended attributes (string/bool):
+- fallback_applied: "true" | "false"
+- fallback_reason: e.g. "capacity", "model_unhealthy", "policy"
+- cache_hit: "true" | "false" (prefix/KV cache or response cache, if applicable)
+- batch_size: integer (as string in OTel attribute context if needed)
+- quantization_profile: e.g. "fp16", "int8", "q4_k_m" (if available)
+
+Example (illustrative; not literal JSON payload):
+- event_name: inference.request_summary
+- route_id=route:chat/completions@v1
+- experiment_id=exp_01J0M9D4Z3Q1Y7J4W7A9N2Q6K2
+- variant_id=var_q4
+- model_id=model:redwood/llama-3.1-70b-instruct@2025-02-10
+- region=aws-us-east-1
+- latency_ms=842
+- ttft_ms=118
+- input_tokens=812
+- output_tokens=164
+- total_tokens=976
+- billed_tokens=976
+- cost_usd_micros=428000
+- http_status=200
+- error_class=none
+- stream=true
+
+#### 2.2 inference.token_sample (optional, sampled)
+This event exists to support debugging streaming performance regressions and attribution loss in retry/streaming paths.
+- Emission policy: sampled at a low rate by default (e.g., 0.1% of requests) and/or limited to internal accounts and beta allowlists.
+- Cardinality controls: token_index is NOT allowed as a metrics dimension; it may exist only in logs/traces.
+
+Required attributes:
+- request_id
+- attempt
+- route_id
+- experiment_id (if applicable)
+- variant_id (if applicable)
+- model_id
+- region
+
+Required numeric fields:
+- token_count: number of tokens represented in the sample record
+- inter_token_latency_ms_p50: p50 for the sampled segment (if segment-based)
+- inter_token_latency_ms_p95: p95 for the sampled segment
+
+Optional numeric fields:
+- token_index_start
+- token_index_end
+- stream_chunk_count
+
+This event MUST NOT be required for guardrails, billing, or standard Console charts.
+
+### 3) Minimal metrics derived for dashboards and guardrails
+Telemetry pipelines MUST be able to produce the following metrics grouped by:
+{route_id, experiment_id, variant_id, model_id, region}.
+
+Required metrics:
+- requests: count of request_summary events
+- errors: count where error_class != "none"
+- error_rate: errors / requests
+- latency_ms: distribution for p50/p95/p99
+- ttft_ms: distribution for p50/p95/p99 where stream=true
+- input_tokens_total: sum(input_tokens)
+- output_tokens_total: sum(output_tokens)
+- total_tokens_total: sum(total_tokens)
+- cost_usd_total: sum(cost_usd_micros) converted to USD
+- tokens_per_second (derived): total_tokens_total / total_latency_seconds (or use a dedicated runtime measure if available)
+
+Required data quality metrics (internal):
+- attribution_drop_rate: fraction of eligible requests missing {experiment_id OR variant_id} when an experiment is expected to apply
+- config_version_skew: distribution of experiment_config_version across regions for the same experiment
+
+### 4) Naming conventions and tag keys
+To align with existing OTel conventions and avoid collisions:
+- Use dotted keys for attributes in spans/logs:
+  - redwood.route_id
+  - redwood.experiment_id
+  - redwood.variant_id
+  - redwood.model_id
+  - redwood.region
+  - redwood.experiment_config_version
+  - redwood.assignment_id
+- Avoid embedding human-readable experiment names in high-cardinality tags. Names belong in control plane metadata and Console UI, not metrics tags.
+
+## Rationale
+### Why these dimensions?
+- route_id: stable logical grouping; prevents raw-path cardinality explosions.
+- experiment_id + variant_id: required to compute per-variant deltas and guardrails.
+- model_id: critical for experiments that change model or quantization; needed for drill-down and debugging.
+- region: required to detect regional skew, capacity issues, and propagation lag.
+
+### Why a request_summary event?
+- Most guardrails and business reporting are request-based (latency, error, cost, tokens). A single per-attempt summary is sufficient and cheap.
+- Token-level metrics are expensive and are not required for GA.
+
+## Consequences
+### Positive
+- Console can reliably attribute metrics and compute deltas by variant.
+- SRE can alert on guardrails and attribution integrity using standard rollups.
+- Telemetry costs remain predictable due to explicit dimension constraints.
+
+### Negative / trade-offs
+- Token-level analysis will be limited unless token_sample is enabled and sampling is temporarily increased.
+- Some debugging requires joining with traces/logs (e.g., detailed per-chunk streaming timing).
+
+## Implementation notes
+- Data plane must set experiment attribution in request context *before* invoking runtime and must propagate it through retry/streaming paths.
+- For retries, attribution MUST remain constant for the request_id across attempts (same experiment_id/variant_id) unless the control plane explicitly dictates re-assignment (not supported in GA).
+- Where experiment does not apply, omit experiment_id and variant_id rather than using sentinel values.
+
+## Rollout and validation
+- Phase 1: emit request_summary with required dimensions behind the route-experiments feature flag.
+- Phase 2: enable aggregation and Console queries; validate attribution_drop_rate < 0.5% for eligible traffic in staging.
+- Phase 3: enable optional token_sample for a small allowlist during beta when investigating streaming regressions.
+
+## Open questions (tracked outside this ADR)
+- Whether to include a dedicated "capacity_tier" dimension in canonical rollups (currently recommended only).
+- Whether to add a standardized "customer_account_id" (hashed) dimension for internal-only debugging; high risk of cardinality/PII concerns.
+
+## Appendix A: Quick reference (required fields)
+Required dimensions on experiment-attributed request summaries:
+- redwood.route_id
+- redwood.experiment_id
+- redwood.variant_id
+- redwood.model_id
+- redwood.region
+
+Required numeric fields on request_summary:
+- latency_ms
+- ttft_ms
+- input_tokens
+- output_tokens
+- total_tokens
+- billed_tokens
+- cost_usd_micros
+- http_status (or rpc_status)
+- error_class
+
+## Appendix B: Error class mapping guidelines
+- rate_limited: explicit rate limit response
+- timeout: request timed out in router/runtime
+- capacity: no capacity / admission control / overload
+- upstream: upstream dependency failure (non-model)
+- model_runtime: runtime execution error (OOM, kernel failure)
+- invalid_request: schema/parameter errors that reached routing
+- internal: unexpected exception
+
+Keep this mapping stable; add new values only with an ADR update to avoid breaking rollups and alerting.

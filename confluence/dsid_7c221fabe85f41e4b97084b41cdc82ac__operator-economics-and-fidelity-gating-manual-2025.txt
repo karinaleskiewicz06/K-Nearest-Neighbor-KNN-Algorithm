@@ -1,0 +1,203 @@
+Operator Economics and Fidelity Gating Manual
+
+Purpose
+-------
+This document codifies operator-facing economics and fidelity-gating controls used by the serving runtime. It explains the decision surface between cost, latency, and output fidelity and provides prescriptive operator procedures, telemetry checks, and safe rollback paths. Intended audience: SREs, runtime engineers, and platform owners.
+
+Summary and scope
+-----------------
+- Scope: runtime-level controls (scheduler quotas, kernel selection hints, KV cache warmup, model variant fallback) and the observability/benchmark artifacts needed for safe gating.
+- Goal: keep production SLAs while minimizing incremental cost and preserving highest-possible fidelity for priority traffic.
+- Not covered: model training or offline eval pipelines (see /confluence/applied-ml-and-evals).
+
+Key concepts and definitions
+---------------------------
+- Fidelity band: discrete levels of model execution quality we expose to the runtime: high, balanced, economical. Each band maps to kernel variants, quantization profile, KV cache eviction aggressiveness, and max sequence length.
+- Cost delta: estimated additional $/token or $/request when upgrading fidelity band.
+- Fidelity gate: a runtime policy (per-route or global) that controls which fidelity bands are eligible for a request.
+- Operator budget: a time-boxed cost allocation (e.g., additional $5000/week) used to permit temporary fidelity upgrades for experiments.
+
+Architecture overview (operator view)
+------------------------------------
+The runtime exposes a Fidelity Controller service that synthesizes signals and programs the scheduler/kernels and routing plane. High-level flow:
+1) Request classification: route-level tags + customer tier + dynamic QoS (latency headroom, token budget).
+2) Fidelity scoring: small in-rack scorer computes a score (0..100) using historical latency, delta cost, and a lightweight quality estimate from the shadow-eval service.
+3) Gate decision: score mapped to fidelity band using configured thresholds.
+4) Program runtime: scheduler receives a per-request execution profile (kernel hints, max tokens, kvcache hint).
+5) Observability: fidelity decisions are annotated in traces and roll up to the Fidelity Controller dashboard.
+
+Operators should understand these contracts before changing thresholds or kernel hints.
+
+Operator configuration reference
+-------------------------------
+Below are the canonical fields and recommended defaults stored in the runtime config service. Change via the control-plane API (see CLI examples).
+
+Table: Fidelity gating fields (canonical)
+| field | description | recommended default | units | owner |
+|-------|-------------|---------------------|-------|-------|
+| fidelity_threshold_high | score above which high fidelity is allowed | 90 | score | runtime-scheduler |
+| fidelity_threshold_balanced | lower bound for balanced band | 60 | score | runtime-scheduler |
+| kv_warmup_ms | recommended prefetch window to warm KV for high band | 1200 | ms | kv-team |
+| quant_profile | quantization profile applied per band | q8_0 (balanced), q4_0 (economical) | string | runtime-optimizer |
+| max_sequence_override | hard cap for economical band | 512 | tokens | runtime-scheduler |
+
+CLI and API examples
+--------------------
+To view current gating config:
+
+```
+redwoodctl runtime fidelity get --env prod --cluster us-west-2
+```
+
+To set balanced->high threshold to 85:
+
+```
+redwoodctl runtime fidelity set --env prod --cluster us-west-2 --fidelity_threshold_high 85
+```
+
+Rollback example (aka emergency revert):
+
+```
+redwoodctl runtime fidelity rollback --to revision=2025-11-03 --reason "regression: increased hallucination in route /compose"
+```
+
+Operational runbook: fidelity gate changes
+----------------------------------------
+Prerequisites: owner on-call, runbook approvals from product and SRE, and a small canary percentage (1%).
+
+Steps:
+1) Create a canary blueprint: pick 1% traffic and a single model variant. Record baseline metrics (tail P99 latency, quality eval on golden prompts, cost-per-token).
+2) Apply gate change to a named canary (control-plane API).
+3) Monitor 0-20 minutes: using the fidelity-dashboard, watch for regressions in quality signals and tail latency. Abort if P99 > baseline + 40ms or quality-signal drop > 3% absolute.
+4) If stable at 1% for 1 hour, escalate to 10% for 2 hours. Watch cost burn rate; abort if projected weekly cost delta exceeds operator budget (see cost calc below).
+5) Full rollout by doubling cadence (10% -> 25% -> 50% -> 100%) with at least 2x the stabilization window at each step.
+
+Quality rollback triggers (automated):
+- Shadow eval regression: +5% failure on golden prompt set.
+- Customer-facing error increase: >0.5% increase in partial/invalid responses.
+- Latency SLO breach: sustained P99 > SLO + 50ms for 15 minutes.
+
+Cost calculus and projection examples
+-----------------------------------
+Operators should use the projection helper to estimate weekly cost deltas. Example calculation (simplified):
+- Baseline: 10M tokens/day at $0.0003/token = $3,000/day.
+- High fidelity increases per-token cost by estimated 12%. Projected increase: +$360/day -> $2,520/week.
+
+Command to run projection locally (developer helper):
+```
+python tools/cost_projection.py --tokens-per-day 10000000 --delta-pct 12
+```
+
+Profiling & benchmarking tie-ins
+--------------------------------
+When changing kernel hints or scheduler admission, always run the local microbenchmark suite with identical sequence-length distributions. The canonical benchmark command (CI lab):
+
+```
+./benchmarks/run_workload.py --profile fidelity-gate-candidate --samples 1000 --seq-dist heavy-long
+```
+
+Record these outputs into the bench-results store and link them in the rollout ticket. Bench checklist:
+- steady-state throughput (rps)
+- p50/p95/p99 latency
+- kernel occupancy and context-switch rate
+- tail jitter across nodes
+
+Kernel scheduling considerations
+--------------------------------
+The Fidelity Controller can influence three scheduler knobs per request: priority class, batch-slicing hint, and kernel-variant preference. Operator guidance:
+- Do not change priority caps for the production shared pool without SRE approval.
+- When adjusting batch-slicing hint for economical band, prefer conservative slice_count values (>=4) to avoid preemption storms.
+- Prefer kernel-variant toggles during low-traffic windows (00:00-04:00 PST) and never during scheduled major releases.
+
+Table: Safe kernel toggle window
+| toggle type | recommended window | reason |
+|-------------|--------------------|--------|
+| experimental SIMD kernel | 00:00-04:00 PST (weekends prefer) | stability unknown for mixed workloads |
+| quantized-fallback kernel | rolling 20% canary during low traffic | monitor quality regressions |
+
+Telemetry and dashboards
+------------------------
+Essential metrics to watch when performing fidelity changes:
+- fidelity_decision.count (per band)
+- fidelity_rollback.count (by reason)
+- runtime.p99_latency (by band)
+- kvcache.hit_rate (by band and model)
+- kernel.handoff_errors
+- cost.estimated_delta_per_hour
+
+Tracing keys to inspect: fidelity_decision_id, request_cohort, kernel_variant, kv_prefetch_id. Tag traces with the causal_change_id for rollback tracing.
+
+Known issues and mitigations (operator-focused)
+-----------------------------------------------
+1) Symptom: intermittent hallucination spike after enabling high-fidelity on a compositional route.
+   - Likely cause: model variant mismatch (high-fidelity kernel uses slightly different positional handling).
+   - Mitigation: revert gate for that route and run the golden-prompt regression harness.
+
+2) Symptom: sudden drop in KV hit_rate after reducing kv_warmup_ms.
+   - Cause: aggressive eviction and unoptimized prefetch policy for long-tail contexts.
+   - Mitigation: increase kv_warmup_ms by +400ms on the affected cohort and bump prefetch parallelism by +1.
+
+3) Symptom: scheduler credit starvation for small but latency-sensitive customers when enabling balanced band globally.
+   - Cause: priority class leakage and insufficient credit isolation.
+   - Mitigation: activate per-tenant cap and enable emergency backstop (route-level hard cap on concurrent high-fidelity slots).
+
+Release checklist (when delivering fidelity-controller changes)
+-------------------------------------------------------------
+- Unit and integration tests for fidelity scoring logic (coverage >= 85%).
+- Microbenchmarks for the affected kernels and quant profiles attached to PR.
+- Canary plan and explicit abort conditions documented on the PR.
+- Audit log entry created and reviewed by security for changes to quant_profile.
+- Post-release 24-hour watch shift assigned.
+
+Safety-first experiments: example lab plan
+----------------------------------------
+1) Lab hypothesis: switching balanced->high reduces BLEU-like failures by 2% on summarization route.
+2) Minimal footprint: replicate 10k requests from production trace in CI lab with shadow scoring enabled.
+3) Acceptance criteria: 2% improvement on golden set with <10ms median latency increase.
+4) If acceptance criteria met, move to 1% canary in prod (see runbook).
+
+Operational play: emergency rollback and postmortem template
+---------------------------------------------------------
+Emergency rollback steps (quick):
+1) Run redwoodctl runtime fidelity rollback --to last-known-good and annotate incident in PagerDuty.
+2) Open an incident ticket and tag "fidelity-rollback". Include causal_change_id and affected routes.
+3) Initiate golden-prompt regression run and attach outputs to the incident.
+4) If rollback was triggered by quality regression, schedule a cross-team triage (runtime + applied-ml) within 24 hours.
+
+Postmortem template fields (required):
+- summary (one-paragraph)
+- timeline of events
+- root cause hypothesis (with artefacts)
+- detection vector and detection latency
+- mitigation and permanent fix plan with owners and ETA
+
+Appendices
+----------
+A. Example JSON request profile (what the scheduler receives)
+```
+{
+  "request_id": "req-20260110-7f2a",
+  "route": "/compose",
+  "cohort": "tier-enterprise",
+  "fidelity_score": 92,
+  "fidelity_band": "high",
+  "kernel_hint": "sliced_simd_v2",
+  "kv_prefetch_ms": 1200
+}
+```
+
+B. Checklist for safe kernel-variant rollouts
+- Canaries in a dedicated low-impact shard.
+- Performance counters enabled and live alerting for increased kernel.handoff_errors.
+- A/B shadow evaluation against golden prompt set.
+
+C. Contact and ownership
+- Fidelity Controller owner: runtime-scheduler team (pager: #runtime-scheduler-oncall).
+- KV team SME: @meera (Meera Iyer).
+- Applied ML contact for quality regressions: @luca (Luca Martinez).
+
+D. References and links
+- Fidelity scoring proto: /confluence/eng-serving-runtime/runtime-architecture/fidelity-orchestrator-telemetry-contract-runbook-2026
+- Benchmarking lab guide: /confluence/eng-serving-runtime/benchmarking-and-perf-suite/runtime-deployment-sanity-and-benchmark-suite-acceptance-2026
+
+If you are planning a fidelity or kernel change and do not have a template for the canary plan, copy the checklist under "Operational runbook" and open a draft change ticket in the runtime change board.

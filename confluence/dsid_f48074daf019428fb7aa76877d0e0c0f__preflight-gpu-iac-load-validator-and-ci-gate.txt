@@ -1,0 +1,181 @@
+Preflight GPU IaC Load Validator and CI Gate
+
+Summary
+
+This document describes the Preflight GPU IaC Load Validator (PGILV) — a test harness and CI gating pattern that runs realistic synthetic inference workloads against proposed Terraform/Helm changes to detect capacity, network, egress, and SLO regressions before they merge. The PGILV reduces post-deploy incidents by validating behavioral and cost-safety invariants in a short, repeatable CI stage.
+
+Goals
+
+- Prevent IaC changes that would cause: GPU contention, SLO regressions (>5% tail latency increase), cross-account egress spikes, or Terraform drift that violates tenancy constraints.
+- Provide a deterministic, low-cost synthetic load that approximates production mixes (chat vs. embeddings vs. eval batch).
+- Provide signal and remediation suggestions (fail, require canary, or auto-rollback) integrated into the GitHub Actions pipeline and Terraform plan checks.
+
+Scope and non-goals
+
+- Scope: Changes to gpu pool definitions, autoscaler policies, VPC egress rules, NAT/transit gateway routing, and tenant-affinity Terraform modules. Also useful for operator changes to allocator-svc and burst-orchestrator.
+- Non-goals: Full-scale production soak tests (those run in the long-running stress lab) or model quality evaluations. PGILV is a fast preflight (15–30 minutes).
+
+Architecture overview
+
+- Components:
+  - sim-runner: containerized executor that replays a parametric mix of request shapes (token lengths, concurrent sessions, KV cache warm vs cold) and records telemetry.
+  - tf-guard: a small Terraform provider/plan-check wrapper that exposes the planned sizing/quotas to the CI job.
+  - preflight-broker: lightweight orchestration service in CI that provisions temporary namespaces (tenant-sandbox), attaches ephemeral GPU leases, deploys the proposed artifacts, runs sim-runner, and gathers telemetry.
+  - telemetry-collector: collects Prometheus metrics, gpu-util traces, egress bytes, and topk latency histograms.
+
+Workflow (high-level)
+
+1. Developer opens PR with Terraform/Helm changes.
+2. CI triggers PGILV stage after unit tests and tf fmt/validate pass.
+3. tf-guard extracts planned capacity changes and early-qualifies trivial fixes (e.g., tag corrections).
+4. preflight-broker provisions a tenant-sandbox forged from the TF plan (uses existing sandbox account and a short-lived lease).
+5. The proposed infra is applied in the sandbox (via a focused terraform workspace and module stubbing to avoid production mutation).
+6. sim-runner runs a set of deterministic scenarios (see Scenarios section) for 12 minutes each while telemetry-collector captures signals.
+7. Analyzer evaluates invariants (SLO, egress, GPU packing, kernel fallback). The job returns PASS/FAIL and annotated artifacts (prometheus snapshots, flame graphs, and a short verdict).
+
+Preflight invariants and thresholds
+
+- Latency SLO (interactive routes): 95th p99 latency must not increase by >5% relative to the baseline snapshot.
+- Batch throughput (large-batch routes): throughput must be within 90–110% of baseline for equal resource allocation.
+- GPU oversubscription: sustained CUDA SM utilization >92% for more than 90 seconds flags potential contention.
+- KV cache miss-rate: increase >10 percentage points triggers a warning (indicates config may break warm-prefix performance).
+- Egress spike: %% increase in egress bytes per tenant must be below 20% for the simulated window.
+- Terraform safety: no changes that reduce per-tenant minimum quota, remove egress filters, or lower NAT SNAT pool size below policy threshold.
+
+Baseline snapshots
+
+- Baseline snapshots are stored per-service and digest (model:resets) in the artifacts bucket. The CI job uses the most recent stable baseline (tagged) for comparisons. Baseline refresh requires an owner-approved run (monthly or after a major runtime release).
+
+Sim-runner scenarios (examples)
+
+1. Chat-heavy (60% small tokens / 30% medium / 10% long): 200 concurrent sessions, ramp 0->200 in 60s, sustain 10m.
+2. Embedding storm: 1k short concurrent requests batched at the sidecar; measures egress and batching delta.
+3. Cold KV cache spike: new-prefix traffic that forces KV warmup across GPU shards; observe cold-miss rates and tail latency.
+4. Mixed canary: 10% noisy tenant (heavy token sequences) in a shared pool to validate fairness throttles.
+
+Terraform / module validation patterns
+
+- tf-guard performs plan-time assertions by parsing the plan output (JSON) and verifying:
+  - node pool sizes, instance types, and GPU counts match allowed families (policy).
+  - autoscaler min/max bounds are within runway budgets.
+  - egress routing changes do not remove NAT or transit gateway filters.
+
+Example tf-guard command (CI):
+
+  # run plan and validate assertions
+  terraform init -backend-config=\"bucket=ci-tf-state\" && terraform plan -out=pr.plan && terraform show -json pr.plan | tf-guard assert --policy-file=ci/policies/preflight-policy.yaml
+
+Sample preflight-policy.yaml (key checks)
+
+  allow_instance_families: [\"a100\",\"h100\",\"v100\"]
+  min_gpu_per_node: 1
+  max_preemptable_ratio: 0.6
+  nat_pool_min_ports: 2048
+
+CI pipeline snippet (GitHub Actions, simplified)
+
+  name: preflight-gpu-iac
+  on: [pull_request]
+  jobs:
+    preflight:
+      runs-on: ubuntu-22.04
+      steps:
+        - uses: actions/checkout@v4
+        - name: terraform validate
+          run: terraform fmt -check && terraform validate
+        - name: terraform plan + tf-guard
+          run: |
+            terraform plan -out=pr.plan
+            terraform show -json pr.plan | tf-guard assert --policy-file=ci/policies/preflight-policy.yaml
+        - name: apply to sandbox and run sim
+          uses: redwoodci/preflight-runner@v1
+          with:
+            plan: pr.plan
+            sim: ci/scenarios/chat-heavy.yaml
+            timeout-minutes: 40
+        - name: upload results
+          run: rcli upload-artifact --path=./preflight-results --tag=pr-1234
+
+Telemetry and observability
+
+- Collector integrates with Prometheus (pushgateway for ephemeral sandboxes) and writes snapshots to the artifacts bucket. Captured metrics:
+  - allocator_slo_latency_ms{route}
+  - gpu_sm_util_percent{node}
+  - kernel_fallback_count
+  - kv_cache_miss_ratio
+  - egress_bytes_by_tenant
+
+Prometheus queries used by the analyzer (examples):
+
+- P99 interactive latency: histogram_quantile(0.99, sum(rate(allocator_slo_latency_ms_bucket[2m])) by (le, route))
+- GPU sustained util: avg_over_time(gpu_sm_util_percent[2m]) > 92
+- Egress delta: (sum(rate(egress_bytes_total[2m])) by (tenant) - baseline_egress_bytes) / baseline_egress_bytes
+
+Analyzer verdicts and actions
+
+- PASS: No invariant violations. CI proceeds to merge checks.
+- WARNING: Non-fatal regressions (e.g., modest KV miss) — add reviewer ack required.
+- FAIL: Any hard threshold breach (latency >5% or GPU oversubscription) — block merge and attach artifact bundle.
+
+- Remediation hints included in analyzer output (e.g., recommend raising autoscaler max, reducing default tenant burst credits, or increasing NAT ports).
+
+Runbook: triage a failed preflight
+
+1. Open the preflight artifact bundle from build (artifact tag shows plan snapshot, prom snapshot, flame graphs).
+2. Re-run sim-runner locally against the same plan: redwood-sim run --plan pr.plan --scenario debug-cold-kv --output ./local-run
+3. If GPU oversubscription: check node type, gpu_count, and packing constraints in the TF plan; propose increasing node count or changing instance_family.
+4. If egress spike: inspect new routing blocks or service account changes that might force traffic through NAT.
+5. If SLO regression: compare histogram snapshots; identify which route/model produced tail. Attach flame graph and ask model-onboarding or runtime-team for kernel/fallback check.
+6. Mark the PR with the triage label and request an approver from the infra-owner list.
+
+Ownership and ops
+
+- Owners:
+  - infra-preflight: Maya Chen (infra/ci-cd)
+  - allocator-slo: Diego Alvarez (serving-runtime)
+  - tf-guard: Priya Suresh (infra-iac)
+
+Operational play: schedule and cost
+
+- Each preflight execution runs in the sandbox account and consumes a capped ephemeral lease (default 1 x a100 for 40 minutes). Billing tags are attached to the PR id.
+- Cost limits: a single PR job should not exceed $60 in compute; monitor via the cost-tag report. Jobs exceeding cost limits are aborted and marked as REVIEW_REQUIRED.
+
+Safety caveats and edge cases
+
+- False positives: Short synthetic runs can be noisy — analyzer includes a noise-tolerant comparator (statistical bootstrap with 95% confidence) but maintainers should be careful for low-sample routes.
+- Stale baselines: Baseline mismatches after runtime releases may produce spurious failures; baseline refresh requires a weekly owner job or a tagged runtime release to trigger automated baseline update.
+
+Integration roadmap and future work
+
+- Integrate with policy-as-code (OPA) to centralize guard checks and make policies reusable across repos.
+- Extend sim-runner scenarios with model-weighted mixes (replicate top-10 tenant fingerprints).
+- Add an optional longer-duration canary stage that, on PASS, will schedule a 6-hour canary in a federated warm-pool cluster before full rollout.
+
+Appendices
+
+A. Example Terraform assertion snippet (tf-guard rule)
+
+  - name: node_pool_family_check
+    type: allow-list
+    attribute: aws_instance_type
+    allowed: [\"p4d.24xlarge\",\"p5.24xlarge\",\"trn1.32xlarge\"]
+
+B. Helpful CLI commands
+
+  # re-run a preflight locally
+  redwood-preflight run --plan pr.plan --scenario chat-heavy --local
+
+  # fetch artifacts
+  rcli download-artifact --tag=pr-1234 --dest=./artifacts
+
+C. Contacts and escalation
+
+- Pager for infra-preflight: #infra-oncall (pager duty)
+- Slack channels: #infra-ci, #gpu-fleet, #runtime-perf
+
+D. Quick links
+
+- Sandbox account onboarding: /confluence/eng-infra/cloud-accounts-and-networking/onboard-tenant-gpu-portal-terraform-guardrails-and-release-playbook.json
+- Runbook for rollback: /confluence/eng-infra/runbooks/preflight-gpu-deployment-validation-and-rollback-playbook.json
+
+If you are implementing or modifying PGILV, follow the steps in the Workflow section and add new scenarios to ci/scenarios with representative seed traffic. For policy changes to tf-guard, coordinate with the infra-iac team and include a unit test that covers the new assertion.

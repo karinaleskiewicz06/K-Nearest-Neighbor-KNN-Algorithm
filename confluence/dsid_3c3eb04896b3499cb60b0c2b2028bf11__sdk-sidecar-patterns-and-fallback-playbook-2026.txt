@@ -1,0 +1,187 @@
+SDK Sidecar Patterns and Fallback Playbook
+
+Overview
+--------
+This playbook documents a recommended pattern for embedding the Redwood SDK as a local sidecar (process or container) alongside application services. The goal is to provide a consistent local integration surface that centralizes request shaping (retry, batching, backpressure), telemetry enrichment, and safe fallback routing to hosted models or fallback endpoints when local inference is degraded.
+
+Intended audience
+- Platform engineers integrating Redwood SDKs into product services
+- Backend engineers implementing predictable inference behavior
+- SREs responsible for service availability and incident response
+
+When to use the sidecar pattern
+- Services that make frequent inference calls and need to implement batching or KV-cache reuse.
+- Teams that need uniform observability and policy enforcement across polyglot services.
+- Deployments that want graceful fallback to Redwood hosted API or a cheaper model variant during capacity pressure.
+
+Design goals and constraints
+- Minimal code changes for application teams: SDK exposes simple HTTP/gRPC local endpoint.
+- Deterministic failure modes: circuit breakers and explicit fallback routes.
+- Observability-first: structured logs, traces, per-route metrics exported to existing telemetry stack.
+- Low overhead: sidecar should add <5% p95 CPU for steady-state inference traffic.
+
+Recommended architecture
+- App -> Local SDK sidecar (HTTP 127.0.0.1:12710) -> Local model or GPU pool -> Redwood control plane / hosted fallback
+- The sidecar contains: request queuer, batcher, retry/circuit breaker, KV cache layer, metrics exporter, and a config watcher for rollout policies.
+
+Quickstart: Docker sidecar (example)
+1) Minimal Dockerfile for the sidecar
+```Dockerfile
+FROM python:3.11-slim
+COPY sidecar/ /app/sidecar
+WORKDIR /app/sidecar
+RUN pip install -r requirements.txt
+CMD ["python", "sidecar_server.py", "--port", "12710"]
+```
+2) docker-compose snippet (local dev)
+```yaml
+version: '3.7'
+services:
+  product-service:
+    build: ./service
+    ports: ['8080:8080']
+    environment:
+      - REDWOOD_SDK_URL=http://sidecar:12710
+  sidecar:
+    build: ./sidecar
+    ports: ['12710:12710']
+    volumes: ['~/.redwood:/root/.redwood:ro']
+```
+
+Sidecar configuration reference (YAML)
+| key | type | default | description |
+|-----|------|---------|-------------|
+| http.listen | string | 127.0.0.1:12710 | Local listen address for SDK HTTP API |
+| batch.max_size | int | 16 | Max requests per batch |
+| batch.max_latency_ms | int | 20 | Max wait before flushing a batch |
+| retry.max_attempts | int | 3 | Attempts for transient errors |
+| circuit.trips | int | 5 | Number of consecutive failures to open circuit |
+| fallback.endpoint | string | https://api.redwood.ai/v1/fallback | Fallback route when sidecar cannot serve |
+| telemetry.exporter | string | otlp | Exporter type (otlp/prometheus) |
+
+API examples
+- Local HTTP endpoint (recommended): POST /v1/generate
+- Request shape (JSON): {"input": "...", "model_hint": "redwood-embedding-x", "metadata": {...}}
+
+Python client example with fallback logic
+```python
+import requests
+from requests.exceptions import RequestException
+
+SIDE_CAR = "http://127.0.0.1:12710/v1/generate"
+FALLBACK = "https://api.redwood.ai/v1/generate"
+
+def generate(payload):
+    try:
+        r = requests.post(SIDE_CAR, json=payload, timeout=0.8)
+        if r.status_code == 200:
+            return r.json()
+        # non-200 -> let sidecar handle standard errors, but if 503 fallback
+        if r.status_code == 503:
+            return requests.post(FALLBACK, json=payload, timeout=2).json()
+        r.raise_for_status()
+    except RequestException:
+        # local sidecar unreachable: fall back synchronously to hosted API
+        return requests.post(FALLBACK, json=payload, timeout=2).json()
+```
+
+Node.js streaming example (client integrates with local sidecar stream endpoint)
+```js
+const fetch = require('node-fetch');
+const stream = require('stream');
+
+async function streamGenerate(payload) {
+  const res = await fetch('http://127.0.0.1:12710/v1/stream', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+    headers: {'Content-Type': 'application/json'},
+    timeout: 2000
+  });
+  if (!res.ok) throw new Error('sidecar stream failed');
+  return res.body; // pipe into downstream consumer
+}
+```
+
+Policy and rollout patterns
+1) Canary first: deploy sidecar change to 5% of services for 24 hours, compare request-level quality and latency.
+2) Observe metrics for 4S windows (1m, 5m, 1h):
+   - request.latency.p95 (goal < 300ms for app-visible calls)
+   - request.error_rate (SLO: <0.5%)
+   - batch.size.avg (target depends on workload; 4–12 typical)
+   - fallback.rate to hosted (alert if > 1% sustained over 10m)
+3) Automated rollback if error_rate > 2% or p95 increases by > 40% from baseline.
+
+Troubleshooting: Top support issues and canonical fixes
+1) Authentication errors (401/403)
+   - Symptom: sidecar returns 401 for all requests after a rolling deploy.
+   - Root cause: expired service token or missing KMS access for sidecar instance.
+   - Fix: rotate token via secrets manager, restart sidecar, verify token TTL propagation. Add token refresh healthcheck.
+2) High tail latency due to tiny batches
+   - Symptom: p95 spikes while throughput is moderate.
+   - Root cause: batch.max_latency_ms set too low or batcher concurrency limited by CPU; requests flushed immediately with small batch sizes.
+   - Fix: raise batch.max_latency_ms to 30–50ms for throughput-sensitive endpoints, or increase batch.max_size. Monitor quality impact.
+3) Fallback storm (a large fraction of requests land on hosted fallback suddenly)
+   - Symptom: sudden increase in outbound calls to hosted API, billing spike risk.
+   - Root cause: sidecar circuit breaker opened incorrectly due to misclassified errors (e.g., runtime exceptions treated as service errors).
+   - Fix: adjust error classification, add hysteresis to circuit breaker (cooldown period), and implement rate-limited fallback queue. Contact Billing if outbound usage spike occurs.
+4) Missing traces / broken correlation
+   - Symptom: traces appear disconnected in honeycomb/jaeger.
+   - Root cause: sidecar not propagating X-Request-ID or traceparent header.
+   - Fix: enable automatic header propagation in sidecar config (trace.headers: [\"traceparent\", \"x-request-id\"]) and verify with sample request.
+5) Model mismatch / quality regression after upgrade
+   - Symptom: generation quality drop or structural output changes after model variant rollout.
+   - Root cause: model_hint mismatch or rollout policy selected a quantized variant without eval coverage.
+   - Fix: pin to prior model version, run targeted evals using the eval harness with representative prompt set, and schedule A/B rollout with canary checks on quality metrics. Use Redwood Optimize recommendations before switching variants.
+
+Operational playbook: incident steps (concise)
+1) Pager fires for service X fallback.rate > 1% sustained for 5m.
+2) Triage: inspect sidecar logs (aggregated) for 5m window; check circuit state and token errors.
+3) If token/auth issue: rotate secret and force restart; annotate incident.
+4) If sidecar overload: switch to soft-fallback mode (throttle to hosted 5% sample) and scale sidecar replicas.
+5) Post-incident: create a short incident note, update canonical fix above, and run a retro if > 30m user-impact.
+
+Observability: telemetry keys to export
+- span.sidecar.enqueue_ms: distribution
+- sidecar.batch.size: gauge
+- sidecar.request.latency.p50/p95/p99: histograms
+- sidecar.fallback.rate: ratio
+- sidecar.circuit.state: gauge (0=closed,1=half-open,2=open)
+
+Acceptance criteria for adopting sidecar pattern
+- SDK sidecar must have integration test coverage for: auth refresh, batch flush logic, retry/backoff, and fallback behavior.
+- Canary rollout shows no more than 10% relative increase in p95 latency and fallback.rate < 0.5%.
+- SRE runbook created and on-call engineers trained.
+
+Ownership and contacts
+- Primary owner: eng-developer-experience (pager: #dx-oncall)
+- Runbook author: Asha Patel
+- Escalation: Marcus Lee (Platform SRE)
+- Observability: Priya Nambiar
+
+References and links
+- SDK telemetry schema: /confluence/eng-developer-experience/docs-site/telemetry-schema-2025
+- Eval harness guide: /confluence/applied-ml-and-evals/eval-harness/README
+- Runtime observability patterns: /confluence/eng-serving-runtime/observability-standards/streaming-and-batching
+
+Appendix: configuration examples
+- Example minimal sidecar config (YAML)
+```yaml
+http:
+  listen: 127.0.0.1:12710
+batch:
+  max_size: 12
+  max_latency_ms: 30
+retry:
+  max_attempts: 2
+  backoff_ms: 100
+circuit:
+  trips: 6
+  cooldown_ms: 300000
+fallback:
+  endpoint: https://api.redwood.ai/v1/generate
+telemetry:
+  exporter: otlp
+  trace_headers: [traceparent, x-request-id]
+```
+
+If you have questions or want a hands-on walkthrough for your service, open a ticket with label `sdk-sidecar-request` or ping #dx-eng on Slack.

@@ -1,0 +1,148 @@
+Predictive prefetch and sticky session allocator — design
+
+Overview
+
+Purpose
+This design specifies an allocator and prefetch coordinator for ephemeral conversational sessions that: 1) reduces cold-start latency for in-flight sessions, 2) improves KV-prefix hit rate through predictive prefetching, and 3) provides tenant-aware stickiness to preserve low-latency affinity without compromising multi-tenant fairness.
+
+Scope
+- Applies to hosted and dedicated runtime paths for conversational and interactive workloads.
+- Affects runtime request router, session store, KV-prefetch cache, and the autoscaler / placement decision logic.
+- Does NOT change model execution kernels or lower-level GPU scheduling primitives.
+
+Goals
+- Reduce median first-token latency for resumed conversational sessions by 20–40% for workloads with >10% session reactivation.
+- Increase KV cache rehydration hit rate by 30% for typical conversation patterns (short bursts + user pauses).
+- Maintain tenant isolation and SLO fairness: no tenant should see >5% regression in p50 latency due to prefetching activity from another tenant.
+
+Non-goals
+- This design is not a full replacement for long-term embedding caching or vector-store strategies.
+- We will not attempt cross-tenant prompt content pre-warming for private deployments.
+
+Design summary (short)
+We introduce two cooperating components: the Sticky Session Allocator (SSA) and the Predictive Prefetch Coordinator (PPC). SSA assigns a soft affinity between session IDs and serving shards (or lanes) based on historical run-length, tenant policy, and locality. PPC monitors session lifecycle signals and model KV-access patterns to schedule prefetch jobs that warm the runtime KV cache before a scheduled request reaches the serving lane. Both components respect a tenant-level budget and global admission-control penalties to avoid destabilizing capacity.
+
+Architecture and components
+1) Sticky Session Allocator (SSA)\- Responsibility: maintain soft mappings session_id -> serving lane with TTL and decay.\- Inputs: session activity history, tenant policy (stickiness allowed/disabled), lane load metrics, placement scores.\- Outputs: affinity token assigned to requests, fallback policy for when the lane is unavailable.\- Behaviour: affinity tokens have weight (0..1) and expire after idle_period or max_ttl. We bias new requests with the token when route selection occurs.
+
+2) Predictive Prefetch Coordinator (PPC)\- Responsibility: create prefetch tasks to hydrate KV cache / prefix buffers for a session before expected resume.\- Inputs: session idle interval, prior sequence length distribution, model variant, per-tenant prefetch budget, time-series of request inter-arrival times.\- Outputs: prefetch jobs (small n-context forward passes or KV fetches), estimated cost, and result status (hydrated/failed).
+
+3) Admission & Budgeting Layer
+- Global governor that enforces: max_prefetch_concurrency, per-tenant_budget_tokens, and pref_overcommit_threshold.
+- Prefetch tasks consume budget tokens proportional to estimated token rehydration cost.
+
+Data flows
+1. On request end, SSA updates session metadata: last_active_ts, average_turn_length, preferred_lane.
+2. When a session exceeds idle_min_threshold, PPC evaluates reactivation probability using an exponential-decay predictor (see Predictor section).
+3. If probability > prefetch_threshold and tenant budget allows, PPC schedules a prefetch to run into the targeted lane.
+4. Prefetch results (success/failure, bytes warmed, KV hit probability) are written to session metadata for routing heuristics.
+
+Predictor model (heuristic + ML hybrid)
+- Baseline: Exponential decay + time-of-day buckets + last-turn-length feature. This is fast and transparent.
+- Optional: Lightweight logistic regression (server-side) trained on historical session traces to improve probability estimates for enterprise tenants who opt in.
+- Features used: idle_seconds, avg_turn_tokens, tenant_id, app_route, last_5_intervals_mean, day_of_week, hour_of_day.
+
+API contracts and route changes
+- New request header: X-Session-Affinity-Token: <token> (opaque string). Provided by SSA for clients that manage sessions.
+- New admin API: POST /admin/prefetch/{session_id} to trigger an ad-hoc prefetch (used by customer connectors).
+- Runtime routing changes: routing path will prefer lanes with matching affinity tokens unless lane load exceeds overload_threshold.
+
+Configuration and constraints (table)
+| Setting | Default | Purpose | Range / Notes |
+| max_prefetch_concurrency | "2000" | Global concurrency limit for prefetch tasks | integer >= 100 |
+| tenant_prefetch_budget_per_min | "10" | Tokens per tenant per minute | integer, adjustable per contract |
+| prefetch_probability_threshold | "0.65" | Min predicted resume probability to trigger prefetch | 0.5–0.95 |
+| ttl_affinity_seconds | "3600" | Default sticky TTL for SSA token | 60–86400 |
+| pref_overcommit_threshold | "1.2" | Allowed overcommit factor when capacity is idle | 1.0–2.0 |
+
+Example YAML config snippet
+server:
+  allocator:
+    ttl_affinity_seconds: 3600
+    max_affinities_per_lane: 5000
+  prefetch:
+    max_prefetch_concurrency: 2000
+    tenant_prefetch_budget_per_min: 10
+    prefetch_probability_threshold: 0.65
+
+Prefetch task sketch (pseudo)
+1. Reserve budget token.
+2. Select target lane = SSA.preferred_lane(session_id) or best_lane_by_cost().
+3. Execute warm-forward with small window of tokens or explicit KV fetch (implementation varies by model).
+4. Validate resulting KV size and write metadata: hydrated=true, hydrated_at=ts.
+5. Release budget token.
+
+Rollout plan and safety knobs
+Phase 0 (Canary):
+- Enable SSA affinity header passthrough only for internal dev tenants. No prefetching. Monitor routing churn and lane imbalance metrics for 2 weeks.
+Phase 1 (Prefetch pilot):
+- Enable PPC in simulated mode (decisions logged but not executed) for a subset of traffic to calibrate predictors.
+Phase 2 (Soft launch):
+- Enable real prefetch for 5% of production sessions. Enforce strict tenant budgets and global max_prefetch_concurrency=200. Observe p50/p95 latency, KV hit rate, and tail CPU/GPU utilization.
+Phase 3 (Scale):
+- Gradually scale to 25%, then 100% for tenants flagged as safe. Ramp budgets per-tenant after manual review.
+
+Safety knobs (run-time):
+- global_prefetch_pause (boolean): immediately pause new prefetch tasks.
+- tenant_quarantine (list): temporary block list for tenants causing overload.
+- emergency_eviction: if lane overload > 85% for 5m, evict prefetched context to free resources.
+
+Metrics and SLOs (recommended)
+- KPI: session_resume_first_token_latency_p50/p95 (goal: -20% p50 for resumed sessions).
+- KPI: kv_prefetch_hit_rate_by_session (goal: +30% from baseline).
+- Safety: prefetch_cpu_fraction, prefetch_gpu_fraction (should be < 5% under normal ops).
+- Alert: tenant_prefetch_budget_burn_rate > 2x baseline for 10m.
+
+Operational runbook (high level)
+1. Detect: pager alert fires for prefetch-related overload (CPU/GPU > threshold).
+2. Triage: identify lanes and tenant ids from prefetch metrics dashboard.
+3. Mitigate: toggle global_prefetch_pause=true and set tenant_quarantine for offending tenants.
+4. Recover: let system stabilize, analyze traces, then re-enable with reduced budgets.
+5. Postmortem: if outage, follow standard incident process and record regression metrics.
+
+Testing and validation plan
+- Unit tests for SSA weight decay and token issuance.
+- Integration test: simulated traffic with varied idle intervals to measure prefetch effectiveness.
+- Load test: measure global_prefetch_concurrency behaviour under synthetic spikes.
+- A/B experiment: route 50/50 sessions to prefetch-enabled vs baseline runtime and compare latency, cost, and cache hit metrics.
+
+Security and privacy considerations
+- Prefetching only uses session metadata and KV-index pointers; we do not include customer prompt content in cross-tenant prefetch tasks.
+- For private deployments, PPC is disabled unless explicitly allowed by customer config.
+- All prefetch audit logs are written to tenant-scoped retention buckets and accessible only to authorized roles.
+
+Cost and pricing implications
+- Prefetching will increase short-term token-equivalent compute. We propose adding a tiered "prefetch credit" SKU for Dedicated tenants that opt for aggressive prefetch budgets. Pricing guidance: base included budget (10 tokens/min), additional credits billed at measured token-equivalent cost.
+
+Open questions and trade-offs
+- Do we allow cross-tenant opportunistic prefetching when lane utilization is low? Tradeoff: better aggregate hit rate vs. tenant isolation concerns.
+- How to model complex multi-turn dialogue where prefetching a wrong prefix can increase cost without improving latency? Conservative thresholds and quick failure detection recommended.
+
+Ownership and next steps
+- Feature owner: Aisha Patel (serving runtime).
+- Implementation sprint plan: 3 sprints for SSA, 4 sprints for PPC, 2 sprints for dashboarding and safety knobs.
+- Next steps: prototype predictor in the lab, create simulated-trace runner, and submit an API contract PR for X-Session-Affinity-Token.
+
+Appendix: sample CLI and traces
+# Trigger an admin prefetch (dev-only)
+curl -X POST "https://api.internal.redwood.io/admin/prefetch/SESSION_1234" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"target_lane": "lane-east-1-a", "mode":"kv"}'
+
+Sample trace record (logged)
+- session_id: SESSION_1234
+- event: prefetch_scheduled
+- predictor_score: 0.72
+- target_lane: lane-east-1-a
+- budget_token_id: TB_9876
+- result: hydrated
+
+Related work and references
+- KV cache management docs — see eng-serving-runtime/runtime-architecture/kv-cache-management-2026-06-01
+- Session evacuation and eviction protocol spec — see product-docs/design-specs/session-evacuation-and-eviction-protocol-spec-2026-03-30
+- Session SLO dashboard (dashboards-and-alerts) for operational thresholds
+
+Document history
+- 2026-10-19: created by Aisha Patel (initial draft).
+- 2026-10-28: added predictor sketch and rollout plan after lab experiments.
+- 2026-11-02: updated budgets and conservative defaults following security review.

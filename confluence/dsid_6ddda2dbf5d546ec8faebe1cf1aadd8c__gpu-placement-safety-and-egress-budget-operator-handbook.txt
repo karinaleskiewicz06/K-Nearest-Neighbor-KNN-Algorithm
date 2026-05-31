@@ -1,0 +1,140 @@
+GPU placement safety and egress budget operator handbook
+
+Overview
+
+This handbook describes the `gpu-placement-safety-operator` (GPO): an operator and accompanying Terraform module and CI/CD policy used to ensure safe GPU allocation decisions while controlling tenant egress spend. The GPO is responsible for: placement validation, preflight admission checks, automated egress budgeting updates, and coordinating safe rollbacks when placement decisions cause degraded latency or exceed egress budgets.
+
+Intended audience
+- Infra engineers operating GPU fleets and multi-account networking
+- Terraform/IaC authors who provision placement operator resources
+- CI/CD engineers who must gate runtime changes
+- Oncall and SRE teams responding to placement or egress incidents
+
+Goals and success criteria
+- Prevent >95% of placement-related latency regressions reaching production (measured via synthetic probes).
+- Enforce per-tenant egress budgets automatically; flag and throttle tenants when monthly egress >= 90% of budget.
+- Achieve placement validation latency (admission path) < 120ms median and < 300ms 95th.
+- Ensure Terraform promotion workflow can roll back operator configuration in < 10 minutes.
+
+High-level architecture
+- gpu-placement-safety-operator (GPO): Kubernetes operator deployed in control-plane accounts. Watches Tenant CRs and PlacementRequests.
+- Placement-engine (service): stateless microservice called by the operator to calculate affinity, topology, egress-cost estimates.
+- Egress-accounting (sidecar/agent): collects per-request egress bytes and reports to the budgeter via Kafka topic `egress-usage.v1`.
+- IaC: `tf-gpo-module` — Terraform module that provisions the operator, CRDs, IAM roles (cross-account read only), and an SQS -> Kafka bridge for egress telemetry.
+- CI/CD: GitOps pipeline (Buildkite) with: unit tests -> integration test against a simulated placement testbed -> canary -> promote to prod clusters.
+
+Ownership and run-to-completion checklist
+- Owner: infra/gpu-fleet team
+- Primary oncall: infra-sre (rotation)
+- Escalation: product-platform -> infra leadership for capacity-impacting changes
+
+Runbook: common incidents
+1) Placement validation failures spike (>= 5% of requests failing admission for 10m)
+   1.1 Confirm placement-engine health: kubectl -n redwood get pods -l app=placement-engine 
+   1.2 Check placement-engine latency: /observability/services/placement-engine/dashboard (P95)
+   1.3 If placement-engine is overloaded, scale replica count by +2 and requeue blocked PlacementRequests: kubectl patch deployment placement-engine -p '{"spec":{"replicas":<current+2>}}'
+   1.4 If failures persist after 5 minutes, flip admission to "soft-fail" mode (operator config map): `gpo.admission.mode=soft` to route to legacy allocator and notify oncall.
+
+2) Tenant egress budget breach warning (>= 90% of monthly budget)
+   2.1 The budgeter dashboard will emit a ticket to /workbench with severity low. The operator will annotate tenant CR with `egress_status=warning` and attach `egress_estimate_url`.
+   2.2 Investigate top consumers: run `curl -s https://telemetry.internal/egress/top?tenant=TENANT_ID`
+   2.3 For transient spikes, apply temporary throttle policy via the operator: `kubectl apply -f throttle-policy.yaml` (example below).
+   2.4 For sustained overages, follow billing & cs escalation (see Related pages).
+
+Terraform/IaC contract (tf-gpo-module)
+- Module inputs (required): `control_plane_namespace`, `operator_image_tag`, `egress_kafka_topic`, `billing_account_id`
+- Module optional inputs: `soft_fail_timeout_seconds` (default: 30), `egress_warning_pct` (default: 90), `placement_probe_interval_s` (default: 60)
+- Outputs: `operator_deployment_name`, `operator_iam_role_arn`, `egress_topic_arn`
+
+Minimal example (HCL)
+```
+module "gpo" {
+  source = "git::ssh://git.internal/repo/infra/terraform//tf-gpo-module"
+  control_plane_namespace = "gpo-system"
+  operator_image_tag = "ghcr.io/redwood/placement-operator:v2025-03-01"
+  egress_kafka_topic = "egress-usage.v1"
+  billing_account_id = "acct-987654"
+}
+```
+
+Module policy notes
+- The module creates an IAM role with least-privilege KMS decrypt for billing keys and read-only access to cloud billing APIs. Avoid granting full billing write permissions in the module; separate billing workflows must own write capabilities.
+
+Operator configuration table (defaults shown)
+| parameter | purpose | default |
+|---|---|---|
+| admission.mode | admission behaviour (hard/soft) | hard |
+| soft_fail_timeout_seconds | how long to wait before falling back | 30 |
+| egress.warning_pct | percent of budget to trigger warning | 90 |
+| placement.probe_window_s | rolling window for placement probes | 300 |
+| throttle.max_rps | per-tenant throttle when over budget | 5 |
+
+CI/CD gating and tests
+1) Pre-merge pipeline (Buildkite): unit tests, static analysis (tfsec), and `kubeval` for CRDs.
+2) Integration stage: run acceptance harness against a simulated cluster (uses `kind` + replayed telemetry). Assert: placement admission success >= 99% for baseline traffic profile and egress accounting matches expected within 2%.
+3) Canary stage: deploy operator to `gpo-canary` control plane account with `operator_image_tag` and run synthetic probes (1000 requests over 15m). Metrics to check:
+   - placement.admit_rate >= 99.5%
+   - placement.latency_p95 < 300ms
+   - egress.report_latency_p95 < 5s
+4) Promotion: automated after canary metrics pass 2 consecutive runs. Manual approval required if any of the canary assertions fail.
+
+Throttle policy (example YAML)
+```
+apiVersion: gpo.redwood.ai/v1
+kind: ThrottlePolicy
+metadata:
+  name: tenant-throttle-quick
+spec:
+  tenantSelector:
+    matchLabels:
+      tier: standard
+  maxRPS: 5
+  windowSeconds: 60
+  reason: "auto-applied when tenant >= 90% budget"
+```
+
+Operational diagnostics checklist
+- Check `egress-usage.v1` lag in Kafka (topic partitions and consumer lag).
+- Validate agent (egress-accounting) health on sample nodes: `systemctl status redwood-egress-agent` or `kubectl logs -l app=egress-agent`
+- Confirm operator CRD status: `kubectl get placementrequests -o wide` and `kubectl describe placementrequest <id>`
+- Verify TF state lock presence to avoid concurrent promotions: `terraform workspace show` and check locking in remote backend.
+
+Automated rollback strategy
+- CI/CD will create a short-lived revert PR that sets `operator_image_tag` to previous stable digest and flips `admission.mode=soft` if canary alerts trigger.
+- If oncall triggers manual rollback, follow these steps:
+  1) Promote revert PR through the pipeline with priority flag.
+  2) Run `scripts/verify-rollback.sh` which runs 200 synthetic placement probes and confirms success > 99%.
+  3) Once verified, tag the revert as `hotfix` and notify stakeholders.
+
+SLOs, alerts and dashboards (concrete thresholds)
+- SLO: placement success rate >= 99.9% (30d window)
+- SLO: overall P95 admission latency < 160ms
+- Alert: placement.admit_rate < 99% for 5m -> page oncall (severity P2)
+- Alert: tenant.egress_usage_pct >= 95% for 10m -> notify billing and cs (severity P3)
+- Dashboard panels: placement success heatmap by region, top-10 tenants by egress, Kafka lag for egress topic, operator reconcile duration histogram
+
+Security & least privilege notes
+- Cross-account access is via an assume-role model; operator uses short-lived STS tokens.
+- Egress accounting agent only has permission to push to Kafka topic; billing read is via a separate IAM role bound to the `billing-reader` group.
+- Secrets: operator KMS keys must be rotated quarterly. See `/security-and-compliance/audit-logging/` for evidence requirements.
+
+Appendix: useful commands and scripts
+- Requeue stuck PlacementRequests: `kubectl get placementrequests -o json | jq '.items[] | select(.status.state=="Pending")'` then `kubectl annotate placementrequest <id> gpo.requeue=true`
+- Quick canary test (local): `scripts/local-canary.sh --image ghcr.io/redwood/placement-operator:canary`
+- Verify egress accounting mapping: `python tools/egress_analyzer.py --tenant TENANT_ID --window 24h`
+
+Related pages
+- /eng-infra/gpu-fleet-and-capacity/gpu-tenant-credit-buckets-and-granular-throttling-policy.json
+- /eng-infra/ci-cd-and-build/gpu-ci-eval-quarantine-and-ci-throttling-policy.json
+
+Revision history
+- 2024-11-02: First draft (Maya Chen)
+- 2025-01-15: Added Terraform contract and operator defaults (Rafael Ortiz)
+- 2025-03-12: Finalized CI/CD gating and rollback steps (Priya Nair)
+
+Contacts
+- Primary: infra/gpu-fleet (pager: #infra-oncall)
+- Module maintainer: maya.chen@redwood.ai
+
+Notes
+This handbook is intended to be the canonical reference for GPO operations. If you are updating modules or operator behaviour, add a short summary in the Revision history and notify the reviewer list.

@@ -1,0 +1,158 @@
+Input Sharding and Pipeline Affinity Playbook
+
+Overview
+
+Purpose:
+This playbook defines recommended patterns, operational controls, and validation steps for input sharding and pipeline affinity inside Redwood’s inference runtime. It covers why we shard inputs, how affinity should be expressed between sharded inputs and runtime pipeline stages (preprocessing, model shard placement, KV cache locality, postprocessing), and how to test and roll out changes with minimal risk to latency SLOs and unit cost.
+
+Audience:
+- Runtime engineers who implement serving pipelines
+- Infra/SRE teams tuning GPU pools and scheduler policies
+- Product engineers who need predictable latency/cost trade-offs for multi-turn chat and batch jobs
+
+When to use this playbook:
+- Large batched user requests where a single request can be split across model micro-batches (e.g., multi-document summarization across long context)
+- Multi-customer cohosting scenarios where tenant isolation and fairness require shard placement controls
+- Private deployments with constrained GPU memory where model sharding + request sharding is required
+
+Goals and invariants
+
+Primary goals:
+1) Preserve p95 and p99 tail latency SLOs while improving throughput by up to 2–5x for supported workloads.
+2) Ensure deterministic fallback behavior when affinity cannot be satisfied.
+3) Keep per-request unit cost predictable and auditable.
+
+Invariants (must hold for all approved sharding configs):
+- Atomicity: a request shard must have an explicit affinity label and a well-defined failure fallback (retry, reassemble-on-single-node, or degrade to smaller model variant).
+- Observable lineage: each shard inherits a correlation id and emits prompt-level telemetry (shard.id, shard.index, original.request.size.tokens).
+- Cache coherence: KV-prefetch decisions must respect shard boundaries to avoid cache thrashing across tenants.
+
+Definitions
+
+- Input shard: a fragment of an original request (e.g., chunked documents, user turns) that can be processed independently or with cross-shard coordination.
+- Pipeline affinity: a set of constraints or hints that pin a shard to a placement characteristic (GPU model variant, pre-warmed node, local KV segment).
+- Shard coordinator: runtime component that orchestrates shard assignment, gathers partial results, and performs final assembly.
+
+High-level patterns (recommended)
+
+1) Prefer horizontal sharding (split by document/turn) over token-level sharding unless model supports cross-shard KV streaming.
+2) Express affinity as a small declarative object on the request metadata:
+   - affinity: { "model_variant": "m1-quant", "kv_segment": "tenant-12-local", "priority": "interactive" }
+3) Pipeline stages must be idempotent for partial retries (preprocessing and postprocessing safe-retries).
+4) Limit cross-shard synchronization to the assembly stage. Avoid synchronous all-to-all during token generation.
+
+Example request metadata (JSON):
+
+{
+  "request_id": "r_20260118_abcd",
+  "shard_policy": "document-split",
+  "affinity": {
+    "model_variant": "redwood-llama-xf-quant8",
+    "kv_segment": "tenant-42-seg-7",
+    "preferred_pool": "dedicated-gpu-pool-4",
+    "priority": "interactive"
+  }
+}
+
+Configuration matrix (recommended defaults)
+
+| Workload class | Default shard policy | Default affinity | Max shards per request | Notes |
+|---------------|----------------------|------------------|------------------------|-------|
+| Interactive short (<=1024 tokens) | none | single-node | 1 | Avoid sharding to preserve latency |
+| Interactive long (1k–8k tokens) | document/turn split | same-GPU affinity | 2–4 | Keep p99 < 2x baseline |
+| Batch high-throughput | token micro-batch (when model supports) | model-variant only | 16 | Optimize for throughput; acceptable higher latency |
+| Embedded large files | file-chunk | kv-segment affinity | 8 | Prefer assembly outside hot path |
+
+Placement and scheduler hints
+
+Scheduler respects these affinity hints in descending priority order:
+1) reserved_pool (hard): must place in named pool, otherwise fail fast and return 503 with Retry-After when configured.
+2) model_variant (soft): prefer nodes with compatible variant; fallback to nearest compatible quantized variant.
+3) kv_segment (soft): prefer nodes with warmed KV; if not available, run prefetch and allow a delayed start no longer than 150ms.
+4) priority: used by admission controller for preemption and queuing.
+
+Fallback policies (required)
+
+Every sharding config must define one of the following fallback behaviors (explicitly):
+- fail_fast: return a structured error (code: SHARD_AFFINITY_UNAVAILABLE) + diagnostic fields.
+- best_effort: reassign shards to the best available nodes and mark response as degraded with a provenance flag.
+- consolidate: reassemble whole request on a single node (may increase latency but preserves correctness).
+
+Telemetry and SLO impact measurement
+
+Required telemetry fields (emit for every shard lifecycle event):
+- shard.id, shard.index, original.request_id, affinity.hints, assigned_node, scheduling_latency_ms, start_ts, end_ts, shard_outcome (success|fallback|retry|error), tokens_generated, bytes_sent.
+
+SLI surface to track change impact:
+- shard_scheduling_latency.p95 (target < 120ms for interactive-affinity requests)
+- request_assemble_latency.p99 (target < 200ms)
+- shard_failure_rate (target < 0.5% over 24h)
+- unit_cost_per_shard (tracked for billing reconciliation)
+
+Testing and validation
+
+1) Unit tests: validate shard coordinator merges and edge cases (missing shard, duplicate shard).
+2) Integration tests (stage): run synthetic workloads with the following profiles:
+   - interactive-long: 5k requests @ 10 RPS, measure p95/p99 latency and compare against baseline (no sharding).
+   - batch-surge: 200 concurrent batch jobs with 8 shards each. Verify cost-per-token benefits and that tail latency degrades gracefully.
+3) Chaos tests: simulate node evaporation (kill 20% of pool) while running sharded requests; expected behavior per fallback policy must be asserted.
+4) Perf tests: run end-to-end with real models and measure KV cache hit ratio delta.
+
+Rollout plan
+
+0) Design review and ADR (this playbook should be referenced by any ADR that changes sharding contract).
+1) Feature-flagged launch on a small dedicated pool used by internal customers (5% of traffic).
+2) Observe SLI window for 72 hours; require shard_failure_rate < 0.5% and no >10% increase in p99.
+3) Expand to 20% traffic with auto-rollback guard rails if request_assemble_latency.p99 exceeds 200ms.
+4) Full rollout to production pools and add telemetry to billing pipelines.
+
+Operational runbook (abridged)
+
+- Symptom: shard_scheduling_latency.p95 spiking >200ms
+  1) Check scheduler queue length and admission controller logs for preemption.
+  2) Validate node pool health (gpu_mem_usage > 90%?). Consider temporarily draining batch nodes to relieve contention.
+  3) If affinity hard failures observed, toggle fail_fast -> consolidate for the affected tenant for 10 minutes while investigating.
+
+- Symptom: increased shard_failure_rate after a model variant rollout
+  1) Rollback variant on pool using staged rollout mechanism.
+  2) Run offline similarity checks and verify kernel compatibility matrix.
+
+Security and privacy considerations
+
+- Shard metadata must not leak tenant identifiers in telemetry streams that may be accessible to cross-tenant logs. Use hashed tenant IDs when emitting to aggregated metrics systems and restrict full identifiers to audit logs with restricted retention.
+- When consolidating shards on a single node for private deployments, ensure KV eviction policies do not cause sensitive keys to be spilled to non-authorized nodes.
+
+Ownership and contributors
+
+- Runtime team: primary owners of implementation and automated tests (runtime-team@redwood.com)
+- SRE: ownership for rollout guard rails and alerting thresholds
+- Billing: validate unit cost telemetry and reconciliation
+
+References and related artifacts
+
+- shard-coordinator RFC (internal link) — design notes and sequence diagrams
+- kernel-selection and KV prefetch guidelines: see /confluence/eng-serving-runtime/runtime-architecture/sequence-length-aware-kernel-selection-guidelines-2026
+- telemetry schema: /confluence/architecture-and-standards/observability-standards/granular-metrics-taxonomy-and-dimension-catalog-2026
+
+Appendix: YAML example for a sharding policy config (runtime config map)
+
+```yaml
+shard_policies:
+  document_split:
+    max_shards: 4
+    affinity_defaults:
+      model_variant: redwood-llama-xf-quant8
+      kv_segment: local-hot
+    fallback: consolidate
+  token_microbatch:
+    max_shards: 16
+    affinity_defaults:
+      priority: batch
+    fallback: best_effort
+```
+
+Change log
+
+- 2025-11-02: Initial draft (Sofia Martinez)
+- 2025-12-12: Added scheduler priority ordering and YAML config examples (Arjun Rao)
+- 2026-01-18: Finalized rollout plan and SLI targets; published (Sofia Martinez)

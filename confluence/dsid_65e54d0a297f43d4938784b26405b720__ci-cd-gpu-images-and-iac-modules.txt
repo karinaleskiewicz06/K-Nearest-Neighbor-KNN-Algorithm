@@ -1,0 +1,181 @@
+CI/CD for GPU-Optimized Images and IaC Modules
+
+Overview
+
+This document describes Redwood's standard CI/CD patterns for building, testing, scanning, and publishing GPU-optimized container images plus the companion Terraform / IaC modules that provision GPU capacity and networking for inference clusters. It covers pipeline topology, gating tests (functional, perf, quantization), image signing and SBOM generation, module publishing, rollback processes, and runbook steps for common failures.
+
+Goals
+
+- Ensure reproducible, auditable GPU images with verified runtime characteristics (CUDA/cuDNN, kernel compatibility, quantization variant artifacts).
+- Keep build times and costs predictable: median pipeline time < 12 minutes for incremental builds; < 40 minutes for full image builds.
+- Prevent regressions in latency/cost by running lightweight perf checks as part of CI.
+- Automate safe rollout of new images to Hosted/Dedicated pools with canaries and automated fallback.
+
+Scope
+
+Included: Docker container images for inference runtime (Torch/Triton/TF), multi-variant artifacts (fp16, int8/quantized), Helm charts, Terraform modules for cluster/ASG, VPC and subnet modules, and pipeline templates.
+Excluded: Model training pipelines, third-party marketplace build processes.
+
+Pipeline architecture (recommended)
+
+1) Source push / PR triggers pipeline in CI system (we use Buildkite for infra-sensitive pipelines).
+2) Stages (parallel where safe):
+   - Lint & static analysis (Dockerfile, IaC linting: tflint, checkov)
+   - Unit tests (python unit tests, infra module unit tests via terratest)
+   - Build image variants (cache layer: base-image digest + buildkit)
+   - SBOM generation and image signing (syft + cosign)
+   - Vulnerability scan (trivy)
+   - Lightweight perf smoke against local emulation or small Dedicated dev pool (latency, memory, kv-cache warmup)
+   - Publish to internal registry (artifact tag: semantic + commit + build id)
+   - IaC module publish (registry and git tag)
+   - Release gating: QA approval or automatic canary rollout to 5% traffic
+
+Diagram (text)
+
+[PR] -> [Buildkite pipeline] -> parallel: [Lint, Unit tests] -> [Image builds -> SBOM/Sign -> Scan] -> [Perf smoke] -> [Publish registry + Tag IaC] -> [Canary deploy]
+
+Pipeline conventions and naming
+
+- Image tag: redwood/<service>:v{major}.{minor}.{patch}-{commit_sha_short}-{variant} e.g. redwood/inference-runtime:v2.4.1-ab12f3-int8
+- Terraform module versioning: semantic vMAJOR.MINOR.PATCH with module-test/CHANGELOG in module repo root.
+- Buildkite pipeline naming: infra-ci/<service>/<variant>
+- Secrets stored in Vault paths: secret/ci/buildkite/<service> and secret/ci/docker-creds/<registry>
+
+Preconditions & permissions
+
+- Service account for CI with minimal IAM: storage writer to registry bucket, ECR push (or GCR/ACR equivalent), KMS encrypt/decrypt only for signing keys, and Terraform state write access to the specific backend bucket.
+- Vault policy: ci-build can read signing key path and docker credentials; rotate keys quarterly.
+
+Example Buildkite YAML (snippet)
+
+steps:
+  - label: ":docker: build runtime int8"
+    commands:
+      - "./ci/build-image.sh --variant=int8 --tag=${BUILDKITE_COMMIT:0:7}"
+    agents:
+      - queue=ci-small
+    env:
+      - IMAGE_REGISTRY=registry.internal.redwood.com
+
+ci/build-image.sh (excerpts)
+
+#!/usr/bin/env bash
+set -euo pipefail
+VARIANT=$1
+TAG=$2
+# Use buildkit + cache-from to speed up repeated builds
+docker buildx build --platform linux/amd64,linux/arm64 \
+  --build-arg VARIANT=${VARIANT} \
+  --cache-from=type=registry,ref=${IMAGE_REGISTRY}/base:cache \
+  --tag ${IMAGE_REGISTRY}/${SERVICE}:${TAG}-${VARIANT} \
+  --push .
+
+SBOM + Signing + Scan sample commands
+
+syft ${IMAGE_REGISTRY}/${SERVICE}:${TAG}-${VARIANT} -o json > build/sbom.json
+cosign sign --key k8s://projects/redwood/secrets/signing-key ${IMAGE_REGISTRY}/${SERVICE}:${TAG}-${VARIANT}
+trivy image --exit-code 1 --severity CRITICAL,HIGH ${IMAGE_REGISTRY}/${SERVICE}:${TAG}-${VARIANT} || echo 'VULNERABILITY_FAIL'
+
+Gating tests (must pass before publish)
+
+- Lint and unit tests: exit on any failure.
+- Trivy vulnerability check: block if CRITICAL vulnerabilities found. For HIGH vulnerabilities, policy depends on whitelist and CVSS comments.
+- Perf smoke: must meet baseline threshold calculated from last successful release. Baseline stored in /infra/perf-baselines (internal). Failure triggers automatic rollback of publish step and notifies owners.
+
+Terraform / IaC module publishing flow
+
+1. Module PR -> tests (tflint, terratest) -> merge to main.
+2. CI runs module validation and increments module patch version (via semantic-release or manual tag).
+3. Publish module artifact to module-registry (internal) and update module CHANGELOG.
+4. Notify downstream stacks via automatic pull request with pinned version bump.
+
+IaC module requirements table
+
+| Field | Requirement | Rationale | Owner |
+| --- | --- | --- | --- |
+| module_name | prefix: rdw- | Identify Redwood modules in registry | infra-iac-team |
+| inputs | explicit, no implicit region defaults | Avoid accidental cross-region deployments | infra-iac-team |
+| outputs | standardized tagging outputs (service, env, owner) | For observability and cost allocation | platform-observability |
+| tests | terratest + tfsec | Prevent regressions | infra-iac-team |
+
+Canary rollout and rollback policy (images)
+
+- Canary phases: 5% -> 25% -> 60% -> 100% with 10–30 minute observation windows depending on traffic.
+- Automated health checks during canary: 200 OK rate, p95 latency within baseline +20%, error budget burn < 2% per window.
+- If any check fails, the pipeline triggers an automated rollback to the previous image and opens an incident in PagerDuty (see Runbook: Canary Failure).
+
+Runbooks (high-level)
+
+1) Build fails on buildkite (common causes: cache miss, base image change, low disk)
+   - Owner: infra-ci oncall
+   - Steps:
+     1. Inspect Buildkite logs and the buildkite-agent machine: tail /var/log/buildkite-agent.log
+     2. Check cache hit rate: registry API for cache layer digest mismatch. If cache miss, rebuild base-image and re-run.
+     3. If machine disk pressure: trigger ephemeral agent reprovisioning: aws ec2 reboot or delete instance in the ci-agent autoscaling group.
+     4. If base-image change detected, validate base digest and coordinate with base-image owner to cut a compatible patch.
+
+2) Image scan returns CRITICAL vulnerabilities
+   - Owner: security-engineering & infra-ci
+   - Steps:
+     1. Gate publish: image is not pushed to prod registry (pipeline should prevent).
+     2. Retrieve SBOM and vuln report: build/sbom.json and trivy output.
+     3. Triage: if fixable by package upgrade, patch Dockerfile and re-run. If requires upstream OS rebuild, escalate to security for policy decision.
+     4. Record incident and add CVE to vulnerability backlog with severity and ETA.
+
+3) Canary health check failed after rollout
+   - Owner: infra-sre + service owning the image
+   - Steps:
+     1. Abort further rollout. Trigger rollback to previous image tag via deployment controller.
+     2. Attach perf traces and logs (tracing link) to incident.
+     3. Run local repro steps against canary instances: reproduce request patterns used in health checks.
+     4. If root cause is infra (node kernel, NV driver), follow GPU fleet runbook (see related page).
+
+Operational metrics and SLOs for pipelines
+
+- Build success rate: >= 98% (weekly rolling).
+- Median incremental build time: <= 12 min.
+- Median full build time: <= 40 min.
+- Time-to-publish after merge (automated): <= 30 minutes for non-manual releases.
+- Image scanning block on CRITICAL vulnerabilities: 100%
+
+Secrets and signing keys management
+
+- Cosign keys stored in KMS-backed Vault path: secret/signing/ci, rotated quarterly.
+- SBOMs persisted alongside artifact metadata in the artifact registry for reproducibility.
+
+Owner & contact matrix
+
+- infra-ci team (primary): infra-ci@redwood.internal
+- infra-iac-team (modules): infra-iac@redwood.internal
+- security-engineering: security-eng@redwood.internal
+- SRE oncall: see rota in PagerDuty
+
+Onboarding checklist for a new service to adopt the pipeline
+
+1. Create service repo with Dockerfile following runtime base-image guidelines.
+2. Add pipeline.yaml using template (contrib/pipeline-templates/ci-image.yaml).
+3. Add module.tf referencing rdw-gpu-cluster module with explicit inputs.
+4. Run `./ci/local-smoke.sh` and push PR for infra review.
+
+Troubleshooting tips and FAQs
+
+Q: My perf smoke is flaky across runs.
+A: Use a fixed random seed, control concurrency, and warm KV cache before measuring. Capture the full p95 distribution for 50 runs instead of a single run.
+
+Q: How do I test int8/quantized runtime locally?
+A: Use the small dedicated dev-pool (namespace: rdw-dev-gpu-small) and limit traffic via k8s patch to avoid consuming production capacity.
+
+Appendix: Useful commands and links
+
+- Publish a module locally: `make module-publish MODULE=rdw-gpu-cluster VERSION=0.3.1`
+- Force-retry a failed Buildkite job: `buildkite-agent build retry <build-id>`
+- View SBOM for image: `curl -s https://artifact-registry.internal.redwood.com/sbom/<image-tag>.json`
+- Internal wiki links:
+  - GPU node sizing: /confluence/eng-infra/gpu-fleet-and-capacity/gpu-node-sizing-guidance
+  - Module publishing standards: /confluence/eng-infra/terraform-and-iac/module-publishing-standards
+
+Change log
+
+- 2024-01-15: Initial draft and approvals (Ana Gomez).
+- 2024-06-03: Added SBOM/signing flow and trivy policy (Marcus Lee).
+- 2024-11-02: Updated canary observation windows and perf gating thresholds (Sasha Patel).

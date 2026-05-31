@@ -1,0 +1,136 @@
+Runtime workload classifier and safety catalog
+
+Overview
+
+This document defines the runtime workload classifier used by the serving runtime, catalogs safety-related workload types, and provides operational guidance for classifier changes, profiling, and benchmark integration. The classifier is the central input to: scheduler profiles, kernel selection hints, KV cache policies, batching windows, and quality-of-service (QoS) safety gates.
+
+Scope
+- Applies to hosted, dedicated and private chains of the runtime orchestration layer.
+- Covers classifier taxonomy, schema for rules, rollout and canary testing, telemetry contracts, and runbook actions for misclassification incidents.
+- Does NOT define model-level safety filters (those live in product filter pipelines); this is focused on runtime routing and fidelity safety.
+
+Motivation
+- Workloads present radically different cost/latency/fidelity trade-offs. A small mismatch (e.g., treating streaming responses as short interactive) increases tail latency and kernel contention.
+- Explicitly declaring workload intent lets the scheduler / kernel mapper apply conservative or aggressive strategies while preserving SLOs and safety margins.
+
+Classifier design principles
+1. Deterministic, signal-first: classification must be derivable from request metadata and the first N tokens (N configurable); avoid reliance on model outputs.
+2. Minimal changes to call paths: low-latency decision. The classifier runs inline in the ingress path or in the pre-routing sidecar for Private deployments.
+3. Observable: emit classification events with version and feature flags to enable backfill analysis.
+4. Safe defaults: unknown/ambiguous requests map to the most conservative profile.
+
+Taxonomy (canonical classes)
+| class_key | description | primary SLO | batch_target | kernel_hint | kv_cache_hint | typical examples |
+|---|---|---:|---:|---|---|---|
+| interactive-short | Single-turn, latency-critical (<200ms token) | P50 10ms / P99 120ms | 1-4 | fast-attn, tensor-core | warm | chat replies, completions from short prompts |
+| streaming-long | Long streamed generations (>512 tokens expected) | sustained throughput  >=  token/sec target | 8-32 | streaming-optimized | strong-prefetch | audio transcription continuation, longform generation |
+| embeddings-bulk | Offline or batch embedding jobs | throughput cost target | 64-1024 | vector-batch-kernel | n/a | dataset embedding jobs, periodic reindexing |
+| rerank-latent | Short prompt, multi-candidate scoring | low-latency scoring | 4-16 | dense-matrix | cold | search reranking requests |
+| multimodal-sync | Image+text interactive | interactive SLO / extra memory | 1-2 | mixed-precision | strong | vision QA, OCR + prompt |
+| high-memory | Large context / long sequence buffers | P99 memory usage guard | 1-2 | memory-friendly | pin | document summarization w/ 100k tokens |
+| regulated-sensitive | Data flagged as regulated (PII/PHI) | additional audit logging + KMS | conservative latency targets | conservative-kernel | disabled (no cache) | medical notes, SSNs |
+| batch-notime | Best-effort, latency-insensitive background jobs | cost-minimize | 256+ | low-precision | disabled | nightly cleanup, offline scoring |
+
+Classifier schema
+- classifier_version: string (semver)
+- rules: ordered list evaluated top-to-bottom
+- rule: {id, predicates[], assign_class, confidence_threshold, metadata_hints}  # expressed as YAML/JSON in repo
+
+Example rule (YAML):
+```yaml
+classifier_version: "1.3.0"
+rules:
+  - id: "regulated-header"
+    predicates:
+      - header_exists: "X-Customer-Regulated"
+      - header_value: "true"
+    assign_class: "regulated-sensitive"
+    confidence_threshold: 0.95
+    metadata_hints:
+      kernel_hint: "conservative-kernel"
+      kv_cache: "disabled"
+  - id: "short-interactive-by-length"
+    predicates:
+      - estimated_tokens: "<64"
+      - content_type: "text"
+    assign_class: "interactive-short"
+    confidence_threshold: 0.8
+```
+
+Runtime implementation notes
+- Where: ingress proxy (hosted) or pre-routing sidecar (Private). The classifier is implemented as a small Go microservice (classifierd) with a 3ms median execution time under common rulesets.
+- Caching: classifier decisions are cached per-session id for 5 minutes by default.
+- Versioning: each decision emits header X-Runtime-Class:v=<version>|class=<class_key>. The header is read by downstream router and scheduler.
+
+Telemetry contract
+Emit the following events at INFO sampling 100% for canaries, 1% for production by default (configurable per tenant):
+- runtime.classify.request (fields: request_id, class_key, classifier_version, decision_latency_ms, source, rule_id)
+- runtime.classify.fallback (fields: request_id, fallback_reason, original_signals)
+- runtime.classify.change (fields: old_class, new_class, diff_reason)
+
+Profiling and benchmark integration
+- Unit: every classifier change must have a microbenchmark that measures classifier latency and memory under representative rulesets. Use the benchmark harness: bin/classifier-bench --rules tests/rules/synthetic-large.yaml --qps 500 --concurrency 128.
+- End-to-end: run standardized workload replays labelled with ground-truth: scripts/bench/run-replay --trace labelled-replay.json --compare baseline-release. Measure downstream P50/P95/P99 latency, kernel dispatches per second, and KV cache hit rate per-class.
+- Experimental: for any rule that changes kernel_hint or batch_target, run the "Kernel Hint Validation" protocol (see Checklist).
+
+Kernel Hint Validation checklist (numbered procedure)
+1. Add the rule to a staging ruleset (classifier_version X.Y.Z+staging).
+2. Deploy staging classifier to a small fraction (5%) of traffic or a dedicated shadow fleet.
+3. Run the Kernel Hint Validation benchmark for 30 minutes: scripts/bench/kernel-hint-validate --class NAME --duration 1800s.
+4. Compare baseline kernel utilization, tail latency, and throughput for the class. If P99 degrades >20% for the class or sibling classes, abort.
+5. If safe, proceed to 25% traffic for 2 hours, then gradual ramp with automated SLO gates.
+
+Operational runbook: misclassification incident
+Trigger: sudden spike in runtime.classify.fallback, or increase in P99 for a class with no config changes.
+Immediate steps:
+1. Pager: owning runtime oncall (page).
+2. Short-term mitigation: flip classifier to previous stable version (classifierd supports quick rollback: curl -XPOST http://classifier-control/reload?version=1.2.4).
+3. If rollback not available, apply an emergency whitelist rule that routes to conservative class:
+   - id: emergency-conservative
+     predicates: [] # match all
+     assign_class: interactive-short
+     confidence_threshold: 1.0
+4. Capture traces for 100% of a small sample of requests using trace-mode: curl -H "X-Debug-Trace:1" ... and upload to the runtime incident bucket.
+5. Post-incident: run a classification audit job to compute false-positive/false-negative rates using ground-truth replays.
+
+Change and release process (short bullets)
+- Author creates classifier rule PR in infra/classifier-rules repo. Include YAML, unit tests, and a microbenchmark.
+- Reviewer checklist: semantics, telemetry hooks, kernel_hint impact, caching implications.
+- Staging rollout -> Kernel Hint Validation -> Canary (5/25/50/100) with SLO gates.
+
+Security and privacy considerations
+- Regulated-sensitive class must add KMS envelope tag and disable KV caching; operators must not allow cached payloads for these classes.
+- All classification logs that include payload-derived signals must be redacted for tenants flagged with PII suppression.
+
+Operational metrics and dashboards (table-like)
+| metric | owner | alerting rule | baseline | notes |
+| runtime.classify.latency.p50 | runtime | > 50ms p50 | 3ms | track per-version |
+| runtime.classify.latency.p99 | runtime | > 200ms p99 | 30ms | investigate rule explosion |
+| runtime.classify.event.rate | runtime | drop >10% | variable | sudden drops indicate infra issues |
+| kvcache.hit.rate.by_class | infra/cache | <5% for interactive-short | target 70% | misclassification causes drops |
+
+Ownership and contacts
+- Primary owner: Runtime Orchestration (team: eng-serving-runtime/runtime-ops).
+- Secondary: Kernel Mapping (team: eng-serving-runtime/kernel-scheduler).
+- Oncall: see /confluence/eng-serving-runtime/team-wiki/serving-runtime-oncall-rapid-investigation-cheatsheet-2023.
+
+Appendix: small debugging CLI snippets
+- Validate current ruleset and version: curl -sS http://classifier-control/status | jq .
+- Force reload (for emergency rollback): curl -XPOST http://classifier-control/reload?version=1.2.4
+- Emit a self-test sample: bin/classifier-selftest --sample-file tests/samples/regression-suite.json
+
+Appendix: example golden trace (JSON)
+```json
+{
+  "request_id": "req-20260203-0001",
+  "classifier_version": "1.3.0",
+  "class_key": "interactive-short",
+  "decision_latency_ms": 2.9,
+  "rule_id": "short-interactive-by-length"
+}
+```
+
+Revision notes
+- 2025-11-12: initial draft (Maya Patel).
+- 2026-01-08: expanded telemetry contract and kernel hint validation (Jordan Li).
+- 2026-02-03: added emergency runbook steps and measurements for KV cache impacts (Aria Gomez).

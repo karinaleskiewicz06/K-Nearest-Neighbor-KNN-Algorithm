@@ -1,0 +1,158 @@
+Adaptive Tenant Scorecard and Auto-Buydown for Throttling
+
+Overview
+========
+This document describes the Adaptive Tenant Scorecard (ATS) — a lightweight, realtime heuristic that ranks tenants by operational risk — and the Auto-Buydown (AB) action that temporarily reduces a tenant's burst/priority during system stress. The goal is to protect platform SLOs while minimizing manual intervention and preserving customer experience for high-value tenants.
+
+Scope
+-----
+- Applies to multi-tenant inference pools managed by platform scheduler: service name: "redwood-infer-pool-v2".
+- Covers transient throttling (soft buydown) actions and automatic recovery.
+- Does NOT replace contractual hard throttles (billing/commit enforcement) or Dedicated/Private tenant controls.
+
+Motivation & goals
+------------------
+1. Avoid system-wide SLO degradation (target: 99.9% request success and p95 latency <= 450ms across public pools).
+2. Provide predictable, auditable decisions during surge events so SRE and Platform Ops can explain impact to customers.
+3. Minimize revenue impact by choosing poor-behavior tenants (high-cost, low-value, high-error) as candidates for buydown.
+4. Ensure safety: human-in-the-loop override, cooldown windows, and conservative thresholds.
+
+Ownership
+---------
+- Product owner: Priya Shah (Platform Reliability).
+- Engineering owner: Miguel Alvarez (Scheduler & Autoscaling team).
+- Oncall responder: platform-oncall rotation (see /confluence/eng-platform/oncall-rotation).
+
+Design summary
+--------------
+Adaptive Tenant Score (ATS) = weighted sum of normalized signals. When ATS > BUYDOWN_TRIGGER and system stress is detected, the Auto-Buydown controller will apply a temporary policy change to the tenant's queue slice.
+
+Signals and normalization
+-------------------------
+Each signal is normalized to a 0..1 range where 1 is worst. We compute a rolling 5m and 30m view — both are retained and combined for smoothing.
+
+Signals (weights shown are defaults):
+- sustained_token_rate_per_second (w=0.28): normalized by 99th-percentile historical peak for tenant class.
+- error_rate_5m (w=0.20): failed requests / total requests (5m).
+- tail_latency_score (w=0.18): p99 latency relative to target (p99 / 2000ms clipped).
+- cache_miss_ratio (w=0.12): KV prefix cache miss fraction for tenant.
+- SLO_violation_delta (w=0.12): percent points of SLO burn above baseline in last 5m.
+- recent_manual_flags (w=0.10): operator-supplied flag (0 or 1) multiplied by 1.0 (instant full weight).
+
+ATS formula (textual):
+ATS = sum(weights_i * normalized_signal_i) / sum(weights)
+
+Scoring thresholds (defaults)
+---------------------------
+- ATS < 0.25: green — no action.
+- 0.25 <= ATS < 0.45: watch — notify tenant owner, prepare mitigation.
+- 0.45 <= ATS < 0.70: soft-buydown candidate — throttle best-effort capacity by 20-40%.
+- ATS >= 0.70: hard-buydown candidate — apply aggressive limits, route to low-priority queue, or temporarily evict non-critical background work.
+
+Safety and eligibility filters
+----------------------------
+Do not consider a tenant for Auto-Buydown unless all of the following are true:
+- tenant not in Dedicated or Private mode.
+- no active enterprise SLA exception for platform-degraded events.
+- tenant has not been manually flagged with "protected_until" metadata.
+- tenant historical_commit_level == "low" OR (billing_tier == "free" and recent_support_tickets == 0).
+
+Operational actions (Auto-Buydown controller)
+--------------------------------------------
+When controller decides to act, it runs a deterministic action plan: 
+1) Mark candidate in audit_log with reason, ATS value, and selected policy.
+2) If ATS in soft range: reduce burst tokens by 25% and decrease priority score by 0.15 for 10 minutes.
+3) If ATS in hard range: move to low-priority queue, cap token rate to historical 10th percentile for 15 minutes, and enable prefix-caching overrides.
+4) Notify tenant owners and SRE oncall via Slack channel #platform-throttles and create incident draft (auto-populated template).
+5) Start cooldown window: controller prohibits further buydown to same tenant for 30 minutes after action ends.
+
+Configuration table (operator-editable values)
+----------------------------------------------
+| parameter_key | default_value | description | owner |
+| ATS_WEIGHTS | "token:0.28,error:0.20,tail:0.18,cache:0.12,slo:0.12,manual:0.10" | weights for each signal | Scheduler team |
+| BUYDOWN_TRIGGER | "0.45" | ATS threshold to consider buydown | Platform Reliability |
+| SOFT_BUYDOWN_DECAY_MIN | "10m" | duration of soft action | Scheduler team |
+| HARD_BUYDOWN_DECAY_MIN | "15m" | duration of hard action | Scheduler team |
+| COOLDOWN_WINDOW | "30m" | cooldown for same tenant | Platform Ops |
+| MAX_CONCURRENT_BUYDOWNS | "25" | max number of simultaneous buydowns per region | SRE |
+
+Decision workflow (step-by-step)
+--------------------------------
+1. Detection: telemetry pipeline emits region_stress signal when platform p95 > 600ms OR token_concurrency > 95th configured capacity.
+2. Candidate ranking: compute ATS for tenants in affected pools, sort descending.
+3. Pre-filter: apply safety and eligibility filters.
+4. Simulate impact: controller runs a fast simulation using historical 1h workload to estimate SLO lift. If estimated lift < 0.5% SLO improvement, skip action.
+5. Execute: apply action and create audit entries.
+6. Observe & iterate: monitor impact for 5m; if platform SLO improves, keep until decay window. Otherwise rollback immediately.
+
+Monitoring and dashboards
+-------------------------
+Primary dashboards (links are internal):
+- "ATS Leaderboard" — per-region table of top 200 ATS tenants with trend sparkline. (Metric: platform.tenant.ATS)
+- "Buydown Events" — timeline of recent buydown actions with before/after SLO deltas. (Metric: platform.buydown.events)
+- "Region Stress Monitor" — p50/p95/p99 and token concurrency. (Metric: platform.region.latency.*)
+
+Suggested alert rules
+---------------------
+- region-stress-warning: when region_p95_latency > 600ms for 3m -> notify #platform-ops (severity: P2).
+- buydown-activation-fail: when buydown_action_count increases but platform p95 does not decrease by at least 0.5% in 10m -> P1 paging to oncall.
+- buydown-surge: if > MAX_CONCURRENT_BUYDOWNS triggered in 5m -> P1 (possible controller misconfiguration).
+
+Runbook: If you are paged for a failed buydown or unexpected side-effects
+---------------------------------------------------------------------
+1. Acknowledge page and pull the last buydown event from audit_log (query: SELECT * FROM platform_audit WHERE op = 'buydown' ORDER BY ts DESC LIMIT 1).
+2. Inspect ATS components for the tenant: check token_rate, error_rate, tail_latency, cache_miss.
+3. If action caused regression for other tenants: rollback immediately via controller API: POST /admin/v1/buydown/rollback {tenant_id, event_id}.
+4. If platform SLO unaffected: escalate to Scheduler team, open a debugging playbook, and consider manual transient increases in capacity (regional spillover) as short-term measure.
+5. Document post-action analysis in incident tracker and tag related pages.
+
+Metrics to capture for each buydown event
+-----------------------------------------
+- event_id, tenant_id, ats_before, ats_after, action_type, start_ts, end_ts, rollback_flag, estimated_slo_improvement, actual_slo_delta_5m.
+
+Testing and rollout plan
+-----------------------
+Phase 0 (lab): implement controller in canary region, run synthetic surges via chaos harness for 2 weeks.
+Phase 1 (limited): enable ATS computation in US-west for low-commit tenants only, no automatic actions (alerts only) for 4 weeks.
+Phase 2 (soft): enable soft-buydown (no more than 5 concurrent) with extended observability for 6 weeks.
+Phase 3 (global): enable full policy with MAX_CONCURRENT_BUYDOWNS=25 and automated notifications.
+
+Retrospective cadence and KPIs
+------------------------------
+- Weekly review during rollout: count of buydown events, false positives, SLO improvement per event, customer escalations.
+- 90-day retrospective: analyze revenue impact vs SLO recovery, tune weights and thresholds.
+
+Operational considerations and known limitations
+----------------------------------------------
+- ATS relies on accurate tenant metadata; stale billing or "protected_until" flags may cause poor decisions. Ensure metadata sync job runs every 5 minutes.
+- Simulation uses historical data and may mispredict when tenant workload changes shape rapidly (e.g., model updates).
+- Avoid irreversible actions: Auto-Buydown never changes billing state or model versions.
+
+Appendix A: Example audit entry (JSON)
+-------------------------------------
+{  "event_id": "bd-20260211-9f3a",  "tenant_id": "tenant-8342",  "ats": "0.69",  "action": "soft-buydown",  "policy": "burst_reduction_25pct_priority_decrease_0.15",  "start_ts": "2026-02-11T14:23:10Z",  "end_ts": "2026-02-11T14:33:10Z",  "initiated_by": "auto-controller-v1",  "reason": "region_p95 720ms + ATS 0.69"}
+
+Appendix B: Frequently asked questions
+-------------------------------------
+Q: Will buydown affect dedicated tenants?
+A: No. Dedicated and Private tenants are excluded by eligibility filters.
+
+Q: Can sales request exceptions?
+A: Yes — add an SLA exception artifact to tenant metadata with expiration. This will mark tenant as "protected" until expiration.
+
+Related docs
+------------
+- Tenant eviction simulator playbook (simulation guidance)
+- Emergency model swap and token surge mitigation runbook
+
+Open action items
+-----------------
+- [ ] Build simulation endpoint (owner: Scheduler team) — due 2026-03-01.
+- [ ] Dashboard: ATS Leaderboard — owner: Observability team — due 2026-02-28.
+- [ ] Create customer communication template for buydown events — owner: Customer Success — due 2026-03-10.
+
+Revision history
+----------------
+- 2025-09-16: Draft created by Priya Shah.
+- 2025-11-02: Added simulation step and safety filters (Miguel Alvarez).
+- 2026-02-11: Finalized thresholds and rollout plan; published.

@@ -1,0 +1,345 @@
+How-to: Integrate Redwood Console with the Cost Model API (v1)
+
+## Purpose
+This page documents the recommended integration pattern for **Redwood Console** backend services calling the **Cost Model API (v1)**.
+
+Console uses the Cost Model API to power:
+- Cost breakdown tables (prefill vs decode, cache hit attribution, overhead)
+- Time-series dashboards (bounded, aggregated breakdowns)
+- Drill-down views for a request or small cohort
+
+The intent is that Console uses a **single canonical source** of cost semantics and breakdown taxonomy, rather than duplicating logic.
+
+## Audience
+- Console backend engineers and dashboard engineers
+- On-call engineers debugging cost discrepancies in Console
+
+## Quick start (TL;DR)
+1) Use the shared client library (preferred) with **schema version negotiation enabled**.
+2) Use **bounded queries** (time windows, group-by dimensions, and result limits).
+3) Add **multi-layer caching** in Console for hot dashboard paths (60s default TTL).
+4) When the Cost Model API is degraded, **fall back** to existing Console aggregates (feature-flagged) and surface a UI banner.
+5) Validate changes against **staging fixtures** and golden datasets before rollout.
+
+---
+
+## Prerequisites
+### Access + service identity
+- Console services must authenticate to Cost Model API using standard service-to-service auth (mTLS / workload identity as configured by Platform).
+- Ensure the calling service has the IAM permission:
+  - `costmodel.estimates.read` (for request-level estimate/breakdown)
+  - `costmodel.aggregates.read` (for time-window aggregates)
+
+If you get `403` errors in staging, file an access request with Platform Control Plane (tag Kaitlyn Nguyen).
+
+### Required context
+All calls must include tenant context. In Console, this should come from the authenticated user/session and be forwarded to the backend service.
+
+Console must supply:
+- `org_id` (required)
+- `project_id` (required)
+- `environment` (required; `prod|staging|dev`)
+
+Do not infer tenant context from URL parameters without auth validation.
+
+---
+
+## Preferred integration approach
+### Use the shared client library
+Console should not hand-roll HTTP calls except in emergency debugging tools.
+
+Supported clients:
+- **Go** (Console aggregator services): `go.redwood.ai/costmodel/client`
+- **TypeScript/Node** (if applicable): `@redwood-inference/cost-model-client`
+
+Client features you should rely on:
+- Timeouts + retries (idempotent requests only)
+- Version negotiation (`schema_version` pinning + fallback)
+- Standard error mapping (4xx vs 5xx vs policy guardrails)
+- Request bounding helpers (max ranges, max group-by)
+
+---
+
+## Endpoints Console typically uses
+Console primarily uses aggregated breakdown endpoints for dashboards, plus request-level breakdown for drill-down.
+
+### 1) Aggregate breakdown (dashboards)
+Use this for time-series charts and tables.
+
+Conceptual operation: “Give me cost breakdown for org/project over a bounded time window, optionally grouped by a small set of dimensions.”
+
+Common groupings:
+- `model_id`
+- `route`
+- `deployment_mode` (hosted/dedicated/private)
+- `region`
+
+Hard rules for Console:
+- Prefer **one aggregate request** per widget rather than N small requests.
+- Keep `group_by` small (0–2 dimensions). More than that will amplify cardinality.
+
+### 2) Request breakdown (drill-down)
+Use this for request detail pages (or small cohorts).
+
+Hard rules for Console:
+- Batch request IDs (if the API supports it) rather than calling per-request in a loop.
+- Avoid powering infinite-scroll UIs by repeatedly calling request-level endpoints. Prefer aggregate endpoints and sampled drill-down.
+
+---
+
+## Example usage (Go)
+The exact package names may change; prefer whatever is vendored in the monorepo under `internal/clients/costmodel`.
+
+```go
+import (
+  "context"
+  "time"
+
+  costmodel "go.redwood.ai/costmodel/client"
+)
+
+func FetchRouteCostBreakdown(ctx context.Context, orgID, projectID string, start, end time.Time) (*costmodel.AggregateBreakdownResponse, error) {
+  c := costmodel.NewClient(costmodel.Config{
+    BaseURL:               "https://cost-model-api.service.consul",
+    DefaultSchemaVersion:  "cost-model/v1",
+    Timeout:              750 * time.Millisecond,
+    Retries:              2,
+  })
+
+  req := &costmodel.AggregateBreakdownRequest{
+    OrgID:        orgID,
+    ProjectID:    projectID,
+    Environment:  "prod",
+    TimeStart:    start,
+    TimeEnd:      end,
+    Granularity:  "5m", // dashboards: 1m/5m/1h only
+    GroupBy:      []string{"route"},
+    Metrics:      []string{"total_cost_usd", "prefill_cost_usd", "decode_cost_usd", "overhead_cost_usd"},
+    MaxGroups:    200,  // guardrail: bound response size
+    MaxSeries:    1000, // guardrail for time-series points
+  }
+
+  // Client negotiates a compatible schema version if server rejects the pinned version.
+  resp, err := c.AggregateBreakdown(ctx, req)
+  if err != nil {
+    return nil, err
+  }
+  return resp, nil
+}
+```
+
+Notes:
+- Console should treat the Cost Model API as an internal dependency with strict timeouts. Do not allow slow cost computation to cascade into overall page latency.
+- Prefer `Granularity=5m` for most dashboard widgets; use `1m` only for short windows.
+
+---
+
+## Caching guidance (Console)
+Cost Model API is designed to be fast, but dashboard workloads are spiky and repetitive. Console should cache aggressively.
+
+### What to cache
+Cache the **entire Cost Model API response** for a given query.
+
+Cache key should include (at minimum):
+- `org_id`, `project_id`, `environment`
+- endpoint name + normalized query params
+- `schema_version` actually used (after negotiation)
+- time range + granularity
+- `group_by` and `filters`
+
+### Recommended TTLs
+- Dashboard aggregate breakdown: **60 seconds** default TTL
+- High-traffic landing pages: **30 seconds** if freshness concerns
+- Drill-down by request_id: **5 minutes** (request costs don’t change unless backfilled; see caveat below)
+
+### Cache layers
+- L1: in-process LRU (fast path; helps thundering herd within a single pod)
+- L2: shared Redis cache for Console backend (recommended for dashboards)
+
+### Backfill / late telemetry caveat
+Some cost inputs can be corrected by backfills (e.g., telemetry lag, late-arriving KV cache stats). For Console UI correctness:
+- Prefer a small “data freshness” indicator on cost widgets.
+- Do not cache aggregate responses longer than 5 minutes.
+- If a user requests “Last 24h”, compute from **rolling cached chunks** (e.g., 5m buckets), not a single massive response.
+
+### Thundering herd prevention
+Use singleflight / request coalescing keyed by the cache key to ensure only one in-flight request per unique query.
+
+---
+
+## Bounds, pagination, and cardinality rules
+Cost queries are naturally high-cardinality. The API enforces policy guardrails; Console should stay well within them.
+
+### Time windows
+Guidelines for dashboards:
+- Default: max window **24 hours** per widget
+- Deep history: use pre-aggregated pipelines (Analytics) or request coarser granularity (1h)
+
+If you need >24h at 5m granularity, discuss with Telemetry & Analytics (Logan Wright / Mei Lin) because this is usually a product/design smell.
+
+### Group-by limits
+- Recommended: 0–2 group-by dimensions
+- Avoid: `group_by=[route, model_id, region]` unless strictly bounded with strong filters
+
+### Result limits
+Set explicit bounds on response sizes:
+- `max_groups` (e.g., 200)
+- `max_series` (e.g., 1000)
+- Prefer “Top N by total_cost_usd” semantics when available
+
+### Pagination
+If an endpoint returns `next_page_token`:
+- Always implement pagination loops with a hard cap (e.g., max 5 pages)
+- Surface partial results and a warning rather than looping unbounded
+
+Pseudo-pattern:
+1) Request page 1
+2) While token != empty AND pages < maxPages: request next page
+3) If maxPages hit: stop and log `costmodel.pagination_truncated=1`
+
+---
+
+## Error handling + fallback behavior
+Console must not become unavailable if Cost Model API is degraded.
+
+### Recommended timeout/retry policy
+- Timeout: 500–750ms for dashboard paths; 1–2s for drill-down
+- Retries: at most 1–2 retries for safe/idempotent reads
+- Use jittered exponential backoff; do not retry `4xx`
+
+### Common error classes
+- `400/422` Invalid request bounds or unsupported fields: fix Console query construction; do not retry.
+- `429` Rate limited: rely on caching; reduce widget fanout; consider adding server-side batching.
+- `503/504` Temporary outage/overload: fail fast and use fallback.
+
+### Fallback behavior (required)
+All Console surfaces using cost-model must support:
+- Feature flag: `console.cost_model_api.enabled` (per environment)
+- Feature flag: `console.cost_model_api.fallback_to_legacy` (default ON during rollout)
+
+When fallback triggers:
+- Use legacy Console aggregation logic (existing pipeline) for that widget/page
+- Emit metrics:
+  - `console.costmodel.fallback.count`
+  - `console.costmodel.fallback.reason` (timeout|5xx|rate_limit|schema)
+- UI: show a non-blocking banner “Cost breakdown temporarily using legacy estimator; values may differ from invoice.”
+
+---
+
+## Testing against staging fixtures
+Console changes must be validated against known-good datasets before production rollout.
+
+### Recommended test types
+1) **Contract tests (schema + semantics)**
+- Ensure Console can parse responses for `cost-model/v1`
+- Ensure unknown fields are ignored safely
+
+2) **Golden fixtures (deterministic outputs)**
+- Use fixture datasets produced by the validation harness
+- Snapshot a small set of queries that match Console widgets
+
+3) **Backtesting (drift checks)**
+- Compare aggregate outputs vs observed spend attribution (within defined thresholds)
+
+### How to run locally (typical)
+Set env vars (names may vary; follow monorepo conventions):
+- `COST_MODEL_BASE_URL=https://cost-model-api.staging.redwood.internal`
+- `COST_MODEL_SCHEMA_VERSION=cost-model/v1`
+- `COST_MODEL_TIMEOUT_MS=750`
+
+Run Console backend tests with recorded fixtures:
+```bash
+# Pull latest staging fixtures used by validation harness
+rw costmodel fixtures pull --dataset console_breakdown_v1 --out ./testdata/costmodel
+
+# Run Console contract + golden tests
+go test ./... -run TestCostModel -update-golden=false
+```
+
+### Staging sanity checklist (before enabling the flag)
+For each of the main Console cost views:
+- Load time window: Last 1h, 24h
+- Group-by: route, model_id
+- Validate that:
+  - totals are non-negative
+  - prefill + decode + overhead == total (within rounding tolerance)
+  - cache attribution fields are present when cache is enabled
+  - p95 API latency stays within budget during normal load
+
+---
+
+## Observability (what Console should emit)
+When calling Cost Model API, emit client-side metrics to correlate widget regressions with API behavior.
+
+Required metrics/tags:
+- `console.costmodel.client.latency_ms` (p50/p95)
+- `console.costmodel.client.status_code`
+- `console.costmodel.client.endpoint` (aggregate|request)
+- `console.costmodel.client.schema_version_used`
+- `console.costmodel.client.cache_hit` (l1|l2|miss)
+- `console.costmodel.client.query_cardinality_estimate` (best-effort)
+
+Logging:
+- Log full request bounds (time window, group_by, limits), but **do not** log customer prompts or raw request payloads that may contain sensitive text.
+
+---
+
+## Troubleshooting
+### “Console cost breakdown does not match invoice”
+This is expected during rollout windows if:
+- Console is still using legacy fallback for part of traffic
+- Telemetry lag/backfills changed cost attribution after the fact
+- Invoice includes intentional billing-specific adjustments (taxes, credits, rounding rules) that are out of scope for cost model primitives
+
+Actions:
+1) Check if fallback is active (`console.costmodel.fallback.count`)
+2) Check Cost Model API drift dashboard (SRE-owned)
+3) Confirm the widget is using the correct time window + granularity
+4) If mismatch persists, open a thread with Finance (Laura Bennett / Rishi Malhotra) and include:
+   - org_id/project_id
+   - time range
+   - schema version used
+   - breakdown totals
+
+### “Latency spike on cost-model endpoint affects Console page load”
+Actions:
+- Confirm Console timeouts are enforced (do not wait >750ms on dashboard paths)
+- Verify caching is functioning (L2 hit rate)
+- Reduce fanout: consolidate multiple widget queries into one aggregate query where possible
+- If persistent, file an incident and include:
+  - endpoint, group_by, time range, max_groups/max_series
+  - request volume and concurrency
+
+---
+
+## Ownership + support
+- Cost Model API service owner: Platform Control Plane (Ethan Park)
+- Telemetry inputs/data quality: Telemetry & Analytics (Logan Wright)
+- Console integration owner: Console Backend (Chloe Martin / Jada Williams)
+- SLO/on-call: SRE (Rafael Mendes)
+
+For changes to required fields, open a PR against the versioned schema package and tag:
+- `@platform-control-plane`
+- `@console-backend`
+- `@telemetry-analytics`
+
+---
+
+## Appendix: Recommended widget patterns
+### Pattern A: Top routes by cost (Last 24h)
+- One aggregate query
+- `group_by=[route]`
+- `max_groups=50`
+- `granularity=1h`
+- Cache TTL: 60s
+
+### Pattern B: Model cost split (Last 1h)
+- One aggregate query
+- `group_by=[model_id]`
+- `granularity=5m`
+- Cache TTL: 30–60s
+
+### Pattern C: Drill-down (single request)
+- One request breakdown query
+- Cache TTL: 5m
+- UI: show schema version + “data freshness” timestamp

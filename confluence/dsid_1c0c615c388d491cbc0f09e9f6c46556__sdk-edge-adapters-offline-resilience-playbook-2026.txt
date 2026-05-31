@@ -1,0 +1,182 @@
+SDK edge adapters and offline resilience playbook
+
+Overview
+
+This playbook describes recommended SDK adapter patterns and operational guidance for building resilient client integrations that tolerate intermittent connectivity, operate in offline-first contexts, and degrade gracefully while preserving telemetry and cost signals. It complements runtime-side patterns (redwood-runtime and redwood-proxy) by focusing on client-side components used by product teams and integrators.
+
+Scope and audience
+
+- Intended for SDK engineers, integrators, and platform engineers who embed Redwood SDKs in web/mobile/edge clients.
+- Covers adapter patterns (caching, queuing, network fallbacks), configuration templates, tests, rollout guidance, and triage/playbook for common failure modes.
+- Not a replacement for server-side SLOs and capacity playbooks; see runtime and SRE docs for server-side controls.
+
+TL;DR recommendations
+
+1) Provide a small, well-documented adapter surface on each SDK so integrators can opt into offline/resilient behavior. Default: disabled for hosted-critical paths; opt-in for edge/embedded use.
+2) Implement three composable adapters: cache-adapter, queue-adapter, and network-adapter. Keep them pluggable and testable.
+3) Preserve observability: emit retry/drop events and sampled request bodies to the local telemetry buffer with strict PII filters.
+4) Use deterministic backoff and jitter policies; avoid unbounded retries that cause request storms on reconnection.
+
+Adapter reference patterns
+
+1) Cache-adapter (prefix/prompt caching)
+- Purpose: return cached responses for stable prompt templates or previously evaluated prefixes when network unavailable or to reduce token usage.
+- Behavior: TTL-based entries, optional fuzzy-match for near-identical prompts, KV cache pluggable to local storage (IndexedDB, SQLite, platform-backed).
+- Deterministic keys: hash(prompt_template + canonicalized_inputs + model_id + max_tokens + quantization_profile).
+
+2) Queue-adapter (local enqueue & durable delivery)
+- Purpose: accept requests when offline and deliver when connectivity restored. Support ordered and idempotent delivery.
+- Persistent store: SQLite on mobile/desktop, local files on embedded Linux, or IndexedDB on web.
+- Delivery modes: background-push (preferred) and foreground-drain (fallback).
+
+3) Network-adapter (multi-route fallback + preflight)
+- Purpose: select best endpoint with graceful fallbacks (region, dedicated vs hosted, edge proxy).
+- Preflight: light HEAD/TCP probe to chosen endpoint and measure latency; switch to alternate endpoints on sustained failures.
+- Fallback policy config: prefer dedicated endpoints within 100ms baseline, otherwise route to hosted with small token-rate limits.
+
+Example architecture diagram (textual)
+
+Client app -> SDK core -> [cache-adapter] -> [queue-adapter] -> [network-adapter] -> redwood-proxy -> redwood-runtime
+
+Configuration schema (YAML example)
+
+```
+# sdk-resilience-config.yaml
+adapters:
+  cache:
+    enabled: true
+    backend: "indexeddb"
+    ttl_seconds: 86400
+    fuzzy_match: false
+  queue:
+    enabled: true
+    backend: "sqlite"
+    max_queue_items: 500
+    delivery_mode: "background-push"
+  network:
+    probes_per_endpoint: 3
+    preflight_interval_seconds: 30
+    failover_threshold: 0.2   # fraction of failed probes
+retry_policy:
+  max_attempts: 5
+  base_backoff_ms: 300
+  max_backoff_ms: 10000
+  jitter: 0.2
+telemetry:
+  sample_rate: 0.02
+  local_buffer_size: 1000
+  pii_filters: ["email", "ssn"]
+```
+
+JavaScript adapter usage (example)
+
+```
+import { RedwoodSDK, SQLiteQueueAdapter, IndexedDBCacheAdapter } from '@redwood/sdk';
+
+const sdk = new RedwoodSDK({
+  networkAdapter: { endpoints: ["https://us1.redwood.ai", "https://eu1.redwood.ai"], preflight: true },
+  cacheAdapter: new IndexedDBCacheAdapter({ ttlSeconds: 86400 }),
+  queueAdapter: new SQLiteQueueAdapter({ maxItems: 200 })
+});
+
+// Send a request that will be queued if offline
+const resp = await sdk.generate({ model: 'gptx-small', prompt: 'Summarize Q1 results' });
+```
+
+Python example (background delivery)
+
+```
+from redwood import RedwoodClient
+from redwood.adapters import FileQueueAdapter, MemoryCacheAdapter
+
+cfg = {
+  'queue': FileQueueAdapter('/var/tmp/rw_queue.db'),
+  'cache': MemoryCacheAdapter(ttl_seconds=3600),
+  'network': { 'endpoints': ['https://us1.redwood.ai'] }
+}
+client = RedwoodClient(config=cfg)
+
+# enqueue; returns a request id
+req_id = client.generate_async('gptx-small', 'Draft an email subject')
+```
+
+Operational controls and telemetry
+
+Required telemetry events (all adapters must emit):
+- adapter.queue.enqueued (tags: adapter, queue_length, request_size_bytes)
+- adapter.queue.sent (tags: adapter, request_age_seconds, success)
+- adapter.cache.hit/miss (tags: adapter, key_hash)
+- adapter.network.probe (tags: endpoint, latency_ms, success)
+- adapter.retry.attempt (tags: attempt, backoff_ms)
+- adapter.drop (tags: reason, last_error_code)
+
+SLOs and thresholds for SDK behavior (recommended):
+- Max local queue age: 24h (requests older than this should be expired and emitted as adapter.drop with reason=stale).
+- Queue persistence success: >= 99.5% writes under normal device conditions.
+- Telemetry delivery: best-effort; SDK must batch and backoff to avoid CPU/network spikes.
+
+Testing and validation checklist
+
+1) Unit tests for adapter logic (cache key determinism, queue ordering, idempotency).
+2) Integration tests that simulate offline and reconnection windows at multiple latencies. Include tests for partial failure of endpoints and prioritized failover.
+3) End-to-end contract tests that validate telemetry events are emitted and PII filters applied.
+4) Chaos test: simulate storage full, permission errors, and abrupt process termination to verify no data corruption and safe expiration.
+
+Rollout and migration guidance
+
+1) Feature gate: release adapters behind an opt-in feature flag in SDK minor releases.
+2) Canary: enable adapters for 1–2 customers or internal beta for 2 weeks, monitor telemetry (adapter.queue.sent/adapter.drop) and device metrics (disk usage, CPU).
+3) Gradual rollout: 10% -> 50% -> 100% over 3–4 weeks with automated rollback on adapter.drop spike > 2x baseline.
+4) Migration path: if switching cache backends (e.g., memory -> sqlite), provide a transition mode that reads fallback from old backend for 7 days and emits migration_summary telemetry.
+
+Troubleshooting matrix
+
+| Symptom | Likely cause | Diagnostic step | Remediation |
+|---|---|---|---|
+| Requests never leave client queue | Persistent connectivity failure OR malformed endpoint config | Inspect local queue length, run preflight probe: `rwctl probe endpoint` | Surface user-facing status, allow manual drain, advise reconnect or switch endpoint |
+| Large number of adapter.drop with reason=quota | Endpoint rate limit or server-side quota | Check adapter.network.probe success and server 429 responses | Backoff, offer degrade mode (local-only responses), and request quota increase |
+| Telemetry missing from device | Telemetry buffer full or PII filter blocking | Check local telemetry buffer size and sample_rate | Increase local_buffer_size or reduce sample_rate temporarily; ensure filters are correct |
+| Data corruption after crash | Unhandled write concurrency in queue backend | Run queue integrity check `rwctl queue-check /path` | Fix adapter to use safe transactional writes; document in release notes |
+
+CLI troubleshooting helpers (examples)
+
+- Probe endpoints: `rwctl probe --endpoint https://us1.redwood.ai --count 5`
+- Inspect local queue: `rwctl queue-list --db /path/to/queue.db --limit 50`
+- Drain queue manually: `rwctl queue-drain --db /path/to/queue.db --target https://us1.redwood.ai`
+- Telemetry buffer dump (sanitized): `rwctl telemetry-dump --sanitized --limit 200`
+
+Security and privacy guardrails
+
+- PII: local adapters must apply a PII filter before storing any request payload. PII filters are configured centrally; SDKs must support dynamic filter updates pulled from a redwood-policy endpoint.
+- Encryption: persistent adapter storage must be encrypted at rest (platform mechanism or library-level encryption). For web (IndexedDB) use WebCrypto-based encryption shim.
+- Consent: mobile/embedded SDKs must respect user privacy settings (opt-out disables telemetry sampling and local persistence).
+
+Owner and escalation
+
+- Primary owner: eng-dx/sdk-team (contact: aisha.thompson@redwood.com)
+- Secondary: eng-platform/networking (contact: marcus.li@redwood.com)
+- Oncall escalation: if adapter.drop spikes or queue saturation impacts customer SLA, page eng-sre oncall per the oncall runbook.
+
+Appendix: quick reference snippets
+
+- Deterministic cache key (pseudo): `sha256(model_id + '::' + normalize(prompt) + '::' + params)`
+- Recommended backoff sequence: 300ms, 600ms, 1200ms, 2400ms, 4800ms (+jitter)
+
+FAQ
+
+Q: Should adapters be enabled by default?
+A: No. Default should be safe (no local persistence) for most production hosted customers. Enable adapters by configuration and clearly document behaviour.
+
+Q: How do we avoid double-delivery on reconnection?
+A: Use idempotency keys (client generated UUID per logical request) and server-side idempotency support where possible. Queue adapter should store idempotency key with the entry.
+
+Related pages
+
+- SDK observability cookbook: eng-developer-experience/api-examples/sdk-observability-telemetry-cookbook-2026
+- Local debug sandbox: eng-developer-experience/quickstarts-and-templates/local-debug-sandbox-sdk-quickstart-2025
+
+Change log
+
+- 2025-11-10: initial draft authored by Aisha Thompson.
+- 2025-12-02: added telemetry event list and rollout guidance (reviewers: Marcus Li).
+- 2026-01-12: hardened troubleshooting matrix and added CLI helpers; marked published.

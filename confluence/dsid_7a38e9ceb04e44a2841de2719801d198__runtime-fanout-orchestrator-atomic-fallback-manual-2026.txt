@@ -1,0 +1,151 @@
+Runtime fanout-orchestrator and atomic-fallback playbook
+
+Overview:
+
+This playbook describes the design and operational runbook for the Runtime Fanout-Orchestrator (internal service name: fanout-orch) and its atomic-fallback mechanism. The document covers architecture patterns, kernel-scheduler interactions, profiling checks, benchmark protocol for validation, and step-by-step remediation for the most likely failure modes.
+
+Goals:
+- Provide a low-latency, cost-aware fanout path for multi-model and multi-output requests while preserving per-request SLOs.
+- Define an atomic fallback policy that preserves correctness (no partial outputs), minimizes extra cost, and avoids thundering replays.
+- Give oncall and SRE clear procedures for triage and recovery, plus a repeatable benchmark/profiling checklist for changes.
+
+Scope and non-goals:
+- Scope: fanout-orch service, kernel-adapter, slot-coordinator, kvcache-proxy, and associated scheduler hooks.
+- Non-goals: model training, client SDK behavior, and external network provider faults (handled by infra-oncall).
+
+Architecture summary (text diagram):
+
+[fanfout-orch] ---> [slot-coordinator] ---> [kernel-adapter] ---> GPU worker shards
+                          |\
+                          +--> [kvcache-proxy] -- shared cache cluster
+                          +--> [degrader] -- fidelity budgets & cost controller
+
+Notes: fanout-orch accepts a single logical request which may produce N sub-requests (model variants, reranker + generator, multimodal decoders). The slot-coordinator is the single source of truth for per-request slot reservation, credits, and admission policy. Kernel-adapter transforms sub-requests into kernel invocation plans and negotiates prefetch hints with kvcache-proxy.
+
+Core components and responsibilities:
+- fanout-orch (service): request slicing, sub-request dependency graph construction, aggregate response reassembly, TTL tracking. Owner: inference-fanout team.
+- slot-coordinator (service): admission control, per-tenant slot accounting, priority enforcement, and issuing kernel tickets. Owner: runtime-scheduler team.
+- kernel-adapter (library + sidecar): kernel hint generation, dispatch batching hints, and kernel-variant selection. Owner: runtime-kernel team.
+- kvcache-proxy (service): prefix/KV caching with consistency window; provides warmup endpoints and prefetch suggestions. Owner: kvcache team.
+- degrader (component inside slot-coordinator): applies fidelity policies, quantization fallbacks, and per-request cost cap. Owner: cost-control team.
+
+SLOs and operational thresholds (customer-visible and internal):
+- Customer tail latency P99 (end-to-end): 300ms for 512-token generator requests (hosted tier).
+- Internal kernel ticket wait-time SLO (slot-coordinator): 20ms P95, 100ms P99. Alert if P99 > 120ms for 5m.
+- Fanout reassembly time (fanout-orch): P99 < 40ms for up to 8 sub-requests.
+- KVCache hit-rate target for warm requests: >= 85% for 30-day production traffic; alert if < 70% for 10m.
+
+Atomic fallback concept and decision matrix:
+- Definition: An atomic fallback is a single coordinated action that replaces an intended multi-path execution (e.g., multi-model fanout) with a single, lower-fidelity path (e.g., fallback model variant) such that the original request is either fully served or fully failed — no partial outputs returned.
+- When to trigger fallback automatically:
+  1) slot-coordinator detects a blocked kernel ticket for > 250ms and fallback budget is available.
+  2) KVCache warmup failed for critical prefix and remaining latency budget < 60ms.
+  3) Degrader computes that continuing fanout would exceed per-request cost cap by > 20%.
+- Fallback selection priority list (highest to lowest):
+  a) Compatible model variant same family (quantized or smaller size).
+  b) Single-step reranker+small-generator combo.
+  c) Graceful failure with structured error explaining limitation.
+
+Failure modes and example symptoms:
+- Mode A: Kernel queue saturation on particular shard
+  Symptoms: kernel ticket wait-time P99 rising, throttled dispatch rate, kernel-adapter retries increasing, GPU utilization pinned at 95% with high compute queuing.
+- Mode B: KVCache partition skew or eviction storm
+  Symptoms: sudden drop in KVCache hit-rate, spike in upstream model cold-starts, warmup failure logs.
+- Mode C: Fanout-orch reassembly deadlock
+  Symptoms: fanout-orch goroutines waiting on missing sub-responses, cluster-wide request lag at P99, error indicating missing correlation id.
+
+Runbook: immediate triage and remediation (oncall/SRE)
+1) Detect and classify (5 minutes)
+   - Check dashboards: slot-coordinator ticket wait-time, fanout-orch reassembly latency, KVCache hit-rate.
+   - Run quick queries: `SELECT count(*) FROM tracing.events WHERE service='fanout-orch' AND span='reassembly' AND duration>100`
+2) If Mode A (kernel saturation):
+   a) Apply emergency admission control: `POST /slot-coordinator/v1/emergency-policy` with body { "mode": "restrict-fanout", "max_subrequests": 2 }
+   b) Trigger selective fallback for heavy tenants: add `fallback:true` tag via `/fanout-orch/v1/tags/update` for tenant ids causing > 20% of queued tickets.
+   c) If sustained > 30m, escalate to infra-oncall for capacity add or hot-patch kernel flattening.
+3) If Mode B (KVCache eviction storm):
+   a) Run `kvcache-proxy diagnostics warmup --prefix <affected-prefix>` and collect `evict_histogram` and `warmup_latency` logs.
+   b) Temporarily increase cache retention policy for affected partition: `PATCH /kvcache-config { "eviction_window_ms": 600000 }` (owner approval required).
+   c) If data loss suspected, enable controlled shadow-warmup from shadow-cluster for 15m.
+4) If Mode C (reassembly deadlock):
+   a) Use diagnostic endpoint: `GET /fanout-orch/debug/blocked-requests` to list stuck correlation ids.
+   b) For each stuck id, trigger a controlled abort and reissue using fallback policy: `POST /fanout-orch/admin/reissue?correlation_id=...&fallback=atomic`
+   c) Schedule a post-incident test to replay 1,000 affected traces with the synthetic harness (see Benchmarking protocol below).
+
+Profiling checklist (pre-change and post-change):
+- Pre-change: capture 10k real traffic traces sampled at 0.1% but stratified across load buckets; collect kernel traces, kvcache span annotations, and fanout-orch reassembly traces.
+- Microsampling: run a 5-minute microtrace with experimental kernel variant to validate kernel latency distribution.
+- Post-change: run 10-minute shadow workload at 20% of peak with traffic mirroring and collect:
+  * kernel ticket latency distribution (P50/P95/P99)
+  * slot-coordinator admission logs (accepted/rejected counts)
+  * fanout reassembly error/incomplete counters
+  * total E2E latency slice for affected requests
+
+Benchmarking protocol (validation harness steps):
+1) Define workload: produce a corpus of 50k requests representative of production fanout shapes (1..8 subrequests, mixed model families, 5–20 tokens prompt variance).
+2) Run sequence:
+   a) Baseline run: A/B run against current stable runtime for 30 minutes at 0.3x peak QPS.
+   b) Candidate run: Deploy changes to canary pool and run the same corpus with the following noise injection: 5% cold model starts, 2% simulated kvcache misses.
+3) Metrics to collect: per-token cost, E2E latency quantiles, kernel-ticket wait-time, dispatch-retry-rate, reassembly incompletes.
+4) Pass criteria (example):
+   - P99 E2E latency regression < 5%
+   - kernel-ticket P99 not worse by > 10ms
+   - reassembly incompletes <= baseline + 0.05%
+   - cost per request change <= +3% (or documented product approval)
+
+Risk controls and rollout steps:
+1) Unit tests and integration tests including synthetic delay injection on kvcache and kernel-adapter branching.
+2) Canary rollout to 5% of nodes with shadow traffic mirroring. If any of these alerts breach:
+   - slot-coordinator ticket wait-time P99 > 60ms for 5m OR
+   - reassembly incompletes > threshold, then rollback automatically.
+3) Gradual ramp: 5% -> 25% -> 50% -> 100% with 30-minute steady-state gates.
+
+Example configuration table (values are suggested defaults):
+
+SERVICE CONFIG | KEY | DEFAULT | DESCRIPTION
+--- | --- | --- | ---
+fanout-orch.max_subrequests | max_subrequests | "8" | Maximum parallel subrequests per logical request.
+slot-coordinator.ticket_wait_slo_ms | ticket_wait_slo_ms | "20" | Target P95 ticket wait in ms.
+degrader.fallback_budget_per_min | fallback_budget_per_min | "200" | Max number of automatic fallbacks per minute across cluster.
+kvcache.eviction_window_ms | eviction_window_ms | "300000" | Minimum time before hot prefix eviction.
+
+Example kernel hint JSON (sent from kernel-adapter):
+{ "request_id": "req-1234", "priority": "high", "seq_length": 64, "kernel_variant": "attn-opt-v2", "prefetch_prefixes": ["user:abcd", "prompt:xyz"] }
+
+Operational notes and telemetry ownership:
+- slot-coordinator metrics: `slot.tickets.wait_ms`, `slot.tickets.granted`, `slot.rejects.count` (runtime-scheduler team).
+- fanout-orch metrics: `fanout.reassembly.latency_ms`, `fanout.subrequest.count`, `fanout.fallback.count` (inference-fanout team).
+- kvcache-proxy metrics: `kvcache.hit_rate`, `kvcache.evictions`, `kvcache.warmup_latency_ms` (kvcache team).
+
+Post-incident verification and retrospective checklist:
+- Reconstruct 1,000 affected traces and run them through the synthetic replay harness; record improvements and remaining regressions.
+- Add targeted microbench to our benchmarking suite for this exact fanout shape.
+- Author a short blameless postmortem with timeline, causes, fixes, and owners within 3 working days.
+
+Appendix A: quick CLI snippets
+- Emergency restrict fanout:
+  curl -X POST "https://slot-coordinator.internal/v1/emergency-policy" -H "Authorization: Bearer $ADMIN_TOKEN" -d '{"mode":"restrict-fanout","max_subrequests":2}'
+- List stuck fanout reassemblies:
+  curl -s "https://fanout-orch.internal/debug/blocked-requests" | jq .
+- Collect kvcache warmup histogram:
+  kvcachectl diagnostics --service kvcache-proxy --dump warmup_histogram > warmup.json
+
+Appendix B: Related test harnesses and workloads
+- Fanout shape corpus: `bench/fanout_shapes/2026-11` (see internal artifact store).
+- Kernel microprobe harness: `runtime/bench/microprobe` (owner: runtime-kernel).
+
+Owners and escalation paths:
+- Primary owner: inference-fanout (oncall: inference-fanout@pagerduty).
+- Secondary: runtime-scheduler (oncall: runtime-scheduler@pagerduty).
+- Infra escalation: infra-oncall@pagerduty.
+
+Change log (summary):
+- 2025-11-12: Document created by Asha Mehta (design and owner roster).
+- 2026-01-10: Added concrete SLO thresholds and emergency commands after canary test.
+- 2026-02-03: Finalized benchmark pass criteria and reviewer signoffs.
+
+References:
+- Runtime decision graph and observed behaviour catalog (internal link)
+- Runtime deployment circuit-breakers playbook (internal link)
+- Kernel-adapter API contract (runtime-kernel team repo)
+
+If you are implementing changes described here, follow the profiling checklist and run the benchmarking protocol before requesting a full rollout gate review. For questions, ping the owners or post on #runtime-fanout on Slack.

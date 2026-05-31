@@ -1,0 +1,157 @@
+Heterogeneous GPU Pool Integration Playbook
+
+Summary
+This playbook describes recommended patterns and step-by-step procedures for integrating heterogeneous GPU pools (different GPU types, instance families, and cloud providers) into Redwood's inference capacity plane. It covers Terraform/IaC patterns, CI/CD image and image promotion practices, autoscaler integration, networking considerations, and runbook actions for capacity incidents. The goal is predictable latency, controlled cost, and safe rollout paths for new pool types.
+
+Scope and audience
+- Scope: infra owners, platform SREs, and infra engineers implementing or onboarding new GPU pool types (on-prem, AWS, GCP, and partner clouds).
+- Audience: engineers building capacity IaC modules, CI/CD pipelines, and oncall responders for GPU capacity incidents.
+
+Goals
+- Provide a reusable Terraform pattern for multi-cloud GPU pools.
+- Ensure safe CI/CD promotion for GPU runtime images.
+- Define autoscaler integration points and SLO-aware thresholds.
+- Give a clear runbook for capacity-related incidents (scale-up, spot-preemption, network egress saturation).
+
+Key concepts and components
+- gpu-allocator: service that maps tenant demand to pool capabilities.
+- infer-scheduler: request router that chooses target pool based on routing policy (latency, cost, region, model compatibility).
+- spot-fallback-autoscaler: service that manages preemptible/spot fallback rules.
+- runtime-image-registry: container registry for signed GPU runtime images (immutable tags).
+
+Prerequisites
+1) Terraform modules for target cloud exist (see Naming & Outputs below).
+2) Signed runtime image build in registry (sha256 digest).
+3) Network egress path validated (VPC route or private link) and firewall rules applied.
+4) Capacity owner and oncall rotation defined in PagerDuty.
+
+Naming & outputs (IaC pattern)
+- Module naming convention: modules/gpu_pool/{provider}/{flavor} (e.g. modules/gpu_pool/aws/a10xlarge, modules/gpu_pool/gcp/a100-80gb).
+- Required outputs from module: pool_id, region, vpc_subnet_ids (comma-separated), egress_nat_gateway, instance_role_arn (or service_account_email).
+- Optional outputs: snipe_node_group_name, taint_key (for workload isolation).
+
+Example Terraform pattern (high level)
+- Compose a root module that assembles provider-specific modules and exposes a unified map to the allocator service. Example snippet: 
+
+terraform {
+  required_version = ">= 1.4"
+}
+
+module "gpu_pool_aws_a10" {
+  source       = "../modules/gpu_pool/aws/a10xlarge"
+  region       = var.aws_region
+  desired_min  = 2
+  desired_max  = 40
+  tenant_tags  = var.tenant_tags
+}
+
+output "pools_map" {
+  value = {
+    aws_a10 = module.gpu_pool_aws_a10.pool_id
+  }
+}
+
+Best practices: keep cloud-specific footguns in module boundary; only pass high-level capacity policies from root. Use remote state per environment and per-account to avoid cross-account shock on apply.
+
+CI/CD and image promotion for GPU runtimes
+- Build pipeline responsibilities:
+  - Build image pinned to base driver version (NVIDIA driver + CUDA) and test smoke startup on a small instance type with one model.
+  - Run hardware-aware integration tests (memory, nvlink, multi-process).
+  - Sign image artifact and publish immutable tag: runtime:v1.12-20251001+sha256:<digest>
+
+- Promotion flow: canary -> staged -> global. Use feature flags for new runtime behavior. Promotion steps:
+  1) Deploy to playground pool with <5 nodes.
+  2) Run synthetic eval harness (latency p50/p95, tokens/s, memory).
+  3) Monitor real traffic via canary route (5% traffic) for 24 hours.
+  4) If SLOs hold and no regression alerts, promote to staged (regional) then to global.
+
+Sample CI YAML (GitLab/GitHub Actions style):
+
+name: build-runtime-image
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build --build-arg CUDA_VERSION=12.1 -t ${{ secrets.REGISTRY }}/runtime:${{ github.sha }} .
+      - name: Push and sign
+        run: |
+          docker push ${{ secrets.REGISTRY }}/runtime:${{ github.sha }}
+          echo ${{ secrets.SIGN_KEY }} | cosign sign --key - ${{ secrets.REGISTRY }}/runtime:${{ github.sha }}
+
+Autoscaler integration patterns
+- Autoscaler contract with gpu-allocator:
+  - Inputs: pool_id, desired_min, desired_max, safe_padding_percentage (default 10%), scaling_cooldown_seconds.
+  - Behavior: prefer non-preemptible capacity; scale to preemptible only if forecasted demand > 80% of non-preemptible capacity.
+
+- Safe thresholds recommended (tune per workload):
+  - scale_up_trigger: 75% average GPU utilization over 3min window OR queue depth > 30 across pool.
+  - scale_down_trigger: average GPU utilization < 30% over 10min and no queued requests.
+  - preemptible_engagement_point: when non-preemptible headroom < 20% and forecasted demand for next 30min > 50%.
+
+Network and egress considerations
+- Ensure VPC native routing for inter-region inference traffic where possible.
+- Validate MTU (especially for NVLink/GPUDirect setups in on-prem racks).
+- Egress shaping requirements for multi-tenant pools: enforce per-tenant QOS token bucket at the NAT or egress gateway. Example iptables tc recipe (conceptual):
+
+# classful qdisc
+# tc qdisc add dev eth0 root handle 1: htb default 10
+# tc class add dev eth0 parent 1: classid 1:1 htb rate 1gbit
+
+Runbook: sudden capacity shortage (common symptoms: queued requests increasing, p95 latency spikes, allocate-fail events)
+1) Page the GPU-capacity oncall.
+2) Check allocator dashboard: current_pools, queued_requests, per-pool_utilization. Command examples: 
+   - kubectl -n infra get pods -l app=gpu-allocator -o wide
+   - curl -sS https://allocator.internal/v1/metrics?pools=true | jq
+3) Validate if preemptible pools are healthy and not fractured:
+   - aws autoscaling describe-auto-scaling-groups --region $REGION --names $ASG_NAME
+4) If immediate headroom needed:
+   - Increase desired capacity on root Terraform variable file and trigger a module apply for targeted pool (only with approval from capacity owner). Example: terraform apply -var 'desired_max=60' -target=module.gpu_pool_aws_a10
+   - Alternatively toggle temporary overflow routing in infer-scheduler: set route rule to send 10% of traffic to a lower-cost compatible model variant.
+5) If preemption causing failures: engage spot-fallback-autoscaler to shift queued work to non-preemptible pools: PATCH /autoscaler/api/v1/eviction-policy {"force_nonpreemptible": true}
+6) After stabilization, open an incident with summary and attach traces.
+
+Post-incident checklist
+- Timeline of events and detection.
+- Root cause analysis (misforecast, runaway eval job, bad rollout of expensive runtime).
+- Capacity delta: nodes added/removed.
+- Action items: max_limit increase, scheduler rule change, add synthetic probe.
+
+SLOs and capacity SLAs (example baseline)
+- p50 latency SLO (intra-pool): < 120ms for 4k token inference.
+- p95 latency SLO (intra-pool): < 500ms.
+- Availability: 99.9% per-region for non-preemptible inference pools.
+- Queuing time SLO: 99% requests start execution within 200ms of enqueue when capacity available.
+
+Ownership and escalation
+- Pool creation: infra-gpu-team (oncall: @gpu-infra-rotation).
+- Runtime image builds: infra-ci-team.
+- Network egress/QoS: cloud-networking-team.
+- Escalation path: capacity oncall -> infra lead -> platform SRE manager.
+
+Safety & change windows
+- Non-emergency scaling changes during business hours (09:00–18:00 local region).
+- Runtime upgrades require staged canary and 24h observation before global promotion.
+- Any change to taints/labels must be coordinated with platform and ML-systems teams to avoid silent placement failures.
+
+Appendix: useful commands and snippets
+- Check pool utilization (example CLI):
+  curl -sS https://allocator.internal/v1/pools/metrics | jq '.pools[] | {id: .id, util: .gpu_util, queued: .queue_len}'
+
+- Example terraform workspace flow for safe apply:
+  1) terraform workspace select env-prod || terraform workspace new env-prod
+  2) terraform plan -var-file=env-prod.tfvars -out plan.tfout
+  3) terraform apply plan.tfout
+
+- Quick revert: set runtime image tag back to last-known-good tag in the infer-scheduler configmap and restart rollout (kubectl rollout restart deployment/infer-scheduler).
+
+References and related pages
+- See also: gpu-fleet-scaling-metrics-and-oncall-runbook (capacity metrics), gpu-provisioning-immutable-state-and-disaster-recovery (IaC patterns), cross-account-gpu-vpc-modules-and-network-runbook (networking patterns).
+
+Last updated notes
+- 2025-10-05: Added preemptible_engagement_point guidance and sample Terraform pattern.
+- 2025-03-01: Introduced CI/CD promotion flow and signing guidance.
+
+If you find gaps in this playbook or want a new provider example added (Azure, OCI), open a PR against eng-infra team-wiki and assign @Samira Patel for review.

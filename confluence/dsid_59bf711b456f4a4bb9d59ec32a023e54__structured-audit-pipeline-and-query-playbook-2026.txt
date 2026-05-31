@@ -1,0 +1,159 @@
+Structured Audit Pipeline, Retention Tiers, and Forensic Query Playbook
+
+Summary
+This playbook documents Redwood's structured audit logging pipeline, storage/retention tiers, standard forensic query recipes, and the compliance evidence packaging workflow. It is intended for security engineers, SRE oncall, and compliance officers supporting auditor requests or incident response.
+
+Goals and scope
+- Ensure tamper-evident collection, durable storage, and searchable indexing of high-value audit events (authn/authz, model access, admin console actions, private deployment changes).
+- Define retention tiers and automated lifecycle rules for evidence preservation and legal holds.
+- Provide repeatable query and export steps for investigations and third-party audits.
+- Integrate RBAC context into logs to enable attribute-based queries (principal id, role, team, session id).
+
+Audit pipeline architecture (high level)
+1) Producers: application services, identity providers (Okta), control plane services, dedicated gateways, and Private deployment agents emit structured JSON events. All producers must include the canonical audit schema (see "Audit event schema" section).
+2) Transport: events are forwarded over protobuf/gRPC to the ingest tier using Vector (agent) with TLS + mutual auth. For Private customers, the agent writes to an encrypted S3-compatible endpoint.
+3) Stream & index: Kafka topic redwood.audit → stream processors (ksql/Beam) for enrichment (ip->region, role lookup, risk tags) → sink to two stores: cold object storage (S3, GCS) and hot index (Elastic Cloud cluster for hosted; self-hosted OpenSearch for Private).
+4) Long-term storage: raw event bundles (gzip + zstd) stored in encrypted buckets with manifest files signed by KMS. Hot index stores parsed fields for 90 days.
+5) Access & query: Security Console (Logs UI) backed by Elastic/OpenSearch and a CLI tool (redwood-audit-cli) that can run saved queries and export canonical evidence packages.
+
+Audit event schema (required fields)
+- timestamp (ISO8601 UTC)
+- event_type (enum: authn, authz, admin_action, model_inference, data_access, config_change, system_alert)
+- principal_id (string) — unique user/service id
+- principal_role (string) — RBAC role at time of event
+- session_id (string) — optional, preferred for web/tunnel sessions
+- resource (string) — resource path (e.g., /models/model-123, console/teams/45)
+- action (string) — verb (read, write, update, delete, create, approve, assume_role)
+- outcome (string) — success|failure|denied|timeout
+- request_id (string) — correlator across services
+- src_ip (CIDR) — client IP (if available)
+- metadata (map) — free-form key/value (use sparingly)
+- signature (base64) — HMAC or KMS-signed digest for tamper evidence
+Note: metadata keys must be snake_case and <= 32 chars. Producers that cannot sign inline must forward to an ingest signing service.
+
+Retention tiers and lifecycle
+- Hot index: 90 days (searchable, low-latency queries).
+- Warm archive: 1 year (compressed, indexed by key fields for range queries).
+- Cold archive: 7 years (raw compressed bundles, stored with SHA256 manifest and KMS envelope encryption).
+- Legal hold / Incident preserve: indefinite until release; objects moved into an immutable retention vault (S3 Object Lock or equivalent) and flagged in manifest.
+- Minimum retention for PII-containing events: 3 years unless otherwise required by contract or law.
+Policy for cross-region residency: data generated in EU region is first stored in EU buckets. If cross-region replication is required for durability, copy retains same residency tag and encryption keys per customer contract.
+
+Encryption, integrity, and tamper evidence
+- All transit uses TLS 1.3. Agents authenticate using mTLS certificates rotated every 90 days.
+- At ingest, each raw bundle is signed with KMS asymmetric key (kms-audit-signer). Manifests include: bucket path, start_ts, end_ts, record_count, sha256_of_bundle, kms_key_id, signature_base64.
+- Hot index rows include a verification_token (HMAC-SHA256) computed from request_id + timestamp + ingest_key. Periodic jobs verify index rows against cold bundles and emit discrepancy alerts to the security channel.
+
+RBAC integration and provenance
+- Audit events MUST include principal_role and principal_team. The enrichment step resolves principal_id → current roles via the RBAC service (rbac-service) and stamps the event with resolved_role and role_version.
+- When a subject performs an action via an assumed_role (assume_role action), the event MUST include assume_chain: [origin_principal, assumed_role, duration_seconds]. This enables tracing of escalations.
+
+Standard forensic queries (recipes)
+1) Compromised API key suspected
+   Steps:
+   - Query hot index: action=model_inference AND principal_id=unknown AND timestamp>=<incident_start-48h>
+   - Identify request_id(s) with high token usage; export matching raw bundles from cold archive for the 24h range.
+   - Cross-reference request_id with network flow logs (see "Network correlation" below).
+   Example OpenSearch DSL: {"query": {"bool": {"must": [{"term": {"action": "model_inference"}}, {"range": {"timestamp": {"gte": "now-48h"}}}]}}}
+
+2) Detect unauthorized console privilege escalation
+   Steps:
+   - Query: event_type=admin_action AND resource:console/* AND action:assume_role AND outcome:success
+   - Filter by role_version change within the last 7 days.
+   - Export evidence package: index hits + signed manifests + related Okta logs.
+
+3) Data exfiltration suspicion (large download)
+   Steps:
+   - Query: action=data_access AND outcome=success AND bytes_transferred:>10000000
+   - Join with src_ip and GeoIP to detect unusual destinations.
+
+Network correlation
+- Network flow logs (VPC flow logs, gateway logs) are stored in the netflow-YYYY/MM prefix. Use the redwood-audit-cli --attach-netflow flag to produce combined timelines.
+
+Evidence packaging and chain-of-custody (auditor-ready)
+Required artifacts for an evidence package:
+1) Signed manifest(s) for all raw bundles covering the time range.
+2) Export of hot index documents (NDJSON) for the matched queries with verification_token present.
+3) KMS signing statement: kms-audit-signer public key fingerprint and signature timestamp.
+4) RBAC snapshot: exported roles and memberships (CSV) for the timeframe with role_version.
+5) Hashes: SHA256 for all files in the bundle plus a top-level manifest.json with combined hash and signature.
+6) Chain-of-custody log: name of exporter, S3 path where artifacts were staged, and approval ticket id.
+Packaging steps (short):
+1) Create incident-preserve flag in the retention vault (redwood-console or redwood-audit-cli preserve --incident INCIDENT_ID --range START..END).
+2) Generate manifests and export hot index NDJSON (cli: redwood-audit-cli export --query "..." --format ndjson --out /tmp/incident-123/ndjson).
+3) Stage bundles to an immutable S3 bucket with object-lock set to GOVERNANCE mode.
+4) Generate top-level manifest and sign with kms-audit-signer.
+5) Upload package and create a compliance ticket (ticket system id in metadata).
+
+Operational runbook (incident responder checklist)
+1) Triage: confirm scope, assign investigator, create incident id.
+2) Lock preservation: execute preserve command, set legal hold if required.
+3) Quick-query: run hot index queries to identify leads.
+4) Deep-dive: pull cold bundles and run offline scans (malware, exfil pattern detection).
+5) Evidence handoff: prepare audited package, collect approver signatures.
+6) Release: remove legal hold only with written approval from Compliance + Legal.
+
+SLOs and monitoring
+- Ingest latency: 99th percentile < 15s from producer to hot index (monitored per-service).
+- Bundle durability: 99.999999999% (S3 SLA).
+- Manifest signing latency: < 60s per bundle.
+- Discrepancy detection job: runs every 6 hours, alerts to #security-ops when mismatch rate > 0.01%.
+
+Access controls and approvals
+- Only members of group security-audit-admins may run preserve/immutable operations. Approvals required: two approvers for legal holds > 30 days (Compliance team + Legal).
+- Export of evidence packages to external auditors requires ELA (external release approval) ticket and data transfer request. Customer-related packages require customer SLA/contract check and customer security contact notification.
+
+Vendor and deployment notes (hosted vs private)
+- Hosted: logs are indexed in Elastic Cloud clusters managed by Platform; RBAC enrichment uses internal rbac-service. Encryption keys: redwood-kms-global.
+- Private: agents write to customer-managed storage; manifest signing is performed by the customer's KMS or by a delegated signing proxy when allowed by contract. Private deployments may opt out of Elastic/OpenSearch indexing; in that case, redwood-audit-cli performs offline indexing for queries.
+
+Investigative scripts and example commands
+- Quick export: redwood-audit-cli export --query "action=data_access AND outcome=success AND principal_id:john.doe@redwood.com" --range "2026-02-10T00:00:00Z/2026-02-12T00:00:00Z" --out /tmp/jdoe-export.ndjson
+- Preserve range: redwood-audit-cli preserve --incident IR-2026-112 --range "2026-02-10T00:00:00Z/2026-02-12T00:00:00Z" --retain-until 2030-02-12
+- Verify manifest: redwood-audit-cli verify-manifest --manifest s3://redwood-audit-raw/2026/02/bundle-20260212-0001.manifest.json
+
+Compliance evidence workflow (audits and requests)
+1) Intake: Compliance receives evidence request with scope and timeframe. Create compliance request CR-#### and assign owner.
+2) Risk review: determine if any PII or regulated data included. If yes, obtain Legal approval before export.
+3) Execute preserve and export steps.
+4) Prepare cover letter and chain-of-custody documents.
+5) Deliver package via approved channel (SCP to auditor endpoint, cloud share with ELA, or air-gapped media for high-sensitivity audits).
+6) Record delivery and expiry; set reminder for retention release or extended hold.
+
+Exceptions and risk handling
+- Risk exception process: any deviation from baseline retention or manifest signing requires an approved Risk Exception (use risk-exception-template). Exceptions must include mitigation steps, compensating controls, and expiration date.
+- Temporary reduced retention (e.g., 45 days hot index instead of 90) is permitted only with Exec approval and compensating continuous cold-archive replication.
+
+Ownership and contacts
+- Policy owner: Head of Security — Soren Patel (soren.patel@redwood.com)
+- Evidence ops (day-to-day): Marcus Li (marcus.li@redwood.com)
+- RBAC service owner: Nina Ortega (nina.ortega@redwood.com)
+- Oncall escalation: pager +1-555-0101 (security-ops rota)
+
+Appendices
+A) Example manifest JSON (illustrative)
+{
+  "bundle_path": "s3://redwood-audit-raw/2026/02/bundle-20260212-0001.gz",
+  "start_ts": "2026-02-12T00:00:00Z",
+  "end_ts": "2026-02-12T01:00:00Z",
+  "record_count": "124523",
+  "sha256": "<hex>",
+  "kms_key_id": "projects/redwood/keys/kms-audit-signer",
+  "signature": "<base64>"
+}
+
+B) Quick glossary
+- preserve: operation that sets object-lock and prevents lifecycle deletion for a time range.
+- manifest: signed metadata describing a raw bundle.
+- redwood-audit-cli: internal tool that queries the hot index, exports NDJSON, and stages archives.
+
+C) Compliance checklist (pre-audit)
+- Verify all manifests for the audit period exist and signatures verify.
+- Confirm RBAC snapshot for the period.
+- Confirm legal holds and export approvals where required.
+- Run discrepancy job and ensure 0 mismatches or document mitigation.
+
+Document history
+- 2025-11-12: Created by Aisha Kapoor.
+- 2026-01-08: Added legal-hold guidance and packaging checklist (reviewers Marcus Li, Nina Ortega).
+- 2026-02-15: Updated commands and retention tiers; clarified private deployment signing behavior (reviewer Soren Patel).

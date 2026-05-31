@@ -1,0 +1,231 @@
+ADR-047: Dedicated Autoscaling Bounds — Precedence and Safety Invariants
+
+## Summary
+This ADR defines the **authoritative semantics** for customer-configurable autoscaling bounds (min/max) for **Redwood Dedicated** deployments, including:
+- Precedence between customer bounds and platform defaults
+- Conflict resolution between **predictive** and **reactive** scaling signals
+- Safety invariants for scale-down (and scale-up) behavior
+- Deterministic evaluation requirements for auditability
+
+The goal is to provide enterprise-grade, contract-aligned guardrails that are **hard enforced**, **observable**, and **operationally safe**.
+
+---
+
+## Status
+**Accepted** (implemented behind feature flags; required for GA).
+
+---
+
+## Context
+Redwood Dedicated historically relies on platform-driven autoscaling (reactive metrics + operator overrides). Enterprise customers require:
+- A **hard maximum** to prevent unexpected spend and enforce contractual ceilings.
+- A **hard minimum** to ensure baseline capacity and avoid cold-start latency.
+- Optional **predictive scaling** to pre-warm capacity ahead of known ramps, without sacrificing reliability.
+
+This introduces several ambiguous cases that must be explicitly defined:
+- What happens when the platform “wants” to scale outside customer bounds?
+- What if predictive suggests scaling down but reactive signals indicate saturation?
+- What if the fleet cannot provision the customer minimum due to a region capacity shortage?
+- How do we avoid oscillation and unsafe scale-to-zero outcomes?
+
+This ADR clarifies these semantics and the precedence ordering to enable consistent implementation in the autoscaler loop, the control plane policy evaluator, Console UX, and on-call procedures.
+
+---
+
+## Decision
+### D1. Customer bounds are **hard constraints** on desired capacity
+For a Dedicated deployment with customer bounds:
+- Autoscaler MUST NOT set desired replicas below `min_replicas`.
+- Autoscaler MUST NOT set desired replicas above `max_replicas`.
+- Bounds apply regardless of the source of desired capacity (reactive, predictive, operator, or platform defaults).
+
+**Canonical clamp:**
+`bounded_desired = clamp(requested_desired, min_replicas, max_replicas)`
+
+Where:
+- `requested_desired` is the desired replica count computed prior to bounds enforcement.
+- `bounded_desired` is the desired replica count after applying hard bounds.
+
+### D2. Precedence order for computing requested_desired
+The autoscaler computes `requested_desired` using the following precedence and arbitration rules:
+
+1) **Hard safety overrides (scale-up only)**
+   - If reactive overload signals exceed critical thresholds (e.g., sustained queue growth / saturation), autoscaler may request an *immediate* scale-up (subject to `max_replicas`).
+
+2) **Predictive desired (if enabled and valid)**
+   - If predictive mode is enabled and the forecast is “valid” (fresh, confidence >= minimum, model coverage OK), compute a predictive desired target.
+
+3) **Reactive desired (always available)**
+   - Compute reactive desired from observed metrics (queue depth, utilization/saturation, latency signals) using the standard control loop.
+
+4) **Arbitration between predictive and reactive**
+   - Requested desired is the **max()** of predictive and reactive desired for scale-up decisions.
+   - For scale-down decisions, requested desired is the **min()** of predictive and reactive desired, *subject to scale-down safety rules in D4*.
+
+Rationale: predictive is intended to avoid under-provisioning during ramps, but reactive must still prevent overload if predictions are wrong. For scale-down, we are conservative to prevent churn and under-provisioning.
+
+### D3. Platform defaults do not override explicit customer bounds
+Platform defaults (e.g., recommended min, recommended max, default cooldowns) are used only when the customer has not set an explicit value.
+
+Effective policy fields:
+- If customer specifies `min_replicas`, it replaces the platform default min.
+- If customer specifies `max_replicas`, it replaces the platform default max.
+- If a field is unset, platform default applies.
+
+Console MUST display both:
+- Customer-configured values (explicit)
+- Platform recommended range (informational only)
+
+### D4. Scale-down safety invariants
+Scale-down MUST be more conservative than scale-up.
+
+Required invariants:
+- Never scale down below `min_replicas`.
+- Never scale down if the deployment is in an overload condition (reactive critical signals active).
+- Never scale down more than `max_scale_down_step` per control interval.
+- Enforce cooldowns and dampening (see D5).
+
+Additionally:
+- If predictive returns null/unknown, it MUST NOT contribute to scale-down (treat as “no opinion”).
+- If predictive is stale or confidence is below threshold, predictive MUST be ignored (fallback to reactive).
+
+### D5. Anti-oscillation guardrails are mandatory
+To prevent oscillation caused by noisy signals or forecast error:
+- Enforce separate cooldown windows for scale-up and scale-down (e.g., 60s up, 300s down; exact values may vary by tier but MUST be non-zero).
+- Apply smoothing/dampening to reactive signals (e.g., EWMA) and require sustained conditions for scale-down.
+- Require minimum step sizing (avoid 1-replica flapping) unless in critical overload.
+
+### D6. Shortage behavior when minimum cannot be met
+If the fleet cannot provision `min_replicas` due to region capacity shortage:
+- Autoscaler MUST continue to *request* at least `min_replicas`.
+- System MUST surface a degraded state: `min_unmet` (with reason code: `REGION_SHORTAGE`, `QUOTA`, `PLACEMENT_FAILURE`, etc.).
+- SRE alerts MUST trigger based on `min_unmet` duration and customer impact.
+- Smart routing MAY use bounded-state signals for graceful degradation (e.g., fallback to compatible model/region per customer policy), but MUST NOT violate customer bounds within the Dedicated deployment.
+
+### D7. Deterministic evaluation + auditability is required
+For every autoscaler decision cycle (or at minimum every effective change), the system MUST record:
+- `requested_desired`
+- `bounded_desired`
+- Active bounds (`min_replicas`, `max_replicas`)
+- Signal inputs and reason codes (predictive_valid, reactive_overload, cooldown_blocked, min_unmet, max_hit)
+- Whether the decision resulted in a scale event
+
+These records must be queryable for enterprise support and compliance review.
+
+---
+
+## Definitions
+- **Replicas:** number of serving instances backing a Dedicated deployment (GPU-backed workers).
+- **Requested desired:** desired replica count before bounds enforcement.
+- **Bounded desired:** desired replica count after hard clamp to [min, max].
+- **Reactive signals:** real-time metrics (queue depth, saturation/utilization, latency, error rate) feeding the autoscaler control loop.
+- **Predictive signals:** forecasted demand (time-of-day patterns, scheduled events, historical trends) producing a target capacity ahead of observed load.
+- **Overload condition:** sustained indicators that the system is under-provisioned (e.g., queue growth + saturation + latency regression).
+
+---
+
+## Precedence and conflict resolution (normative)
+### Capacity computation sequence
+1. Load effective scaling policy (post-validation).
+2. Compute `reactive_desired`.
+3. If predictive enabled and forecast valid, compute `predictive_desired`.
+4. Compute `requested_desired`:
+   - If overload critical: `requested_desired = max(reactive_desired, predictive_desired_if_any)` with overload step-up allowed.
+   - Else:
+     - For upward moves: `requested_desired = max(reactive_desired, predictive_desired_if_any)`
+     - For downward moves: `requested_desired = min(reactive_desired, predictive_desired_if_any)` but blocked by scale-down safety rules.
+5. Apply clamp to produce `bounded_desired`.
+6. Apply cooldowns / dampening gates.
+7. Emit decision record + metrics.
+
+### Bounds enforcement is always last
+Bounds are applied after we compute requested desired, but before we actuate scaling.
+
+This ensures:
+- Audit logs can show when the system *wanted* to scale beyond a bound.
+- Metrics can track bound-hit rates.
+
+---
+
+## Safety invariants (must-hold)
+The following are invariants the autoscaler MUST enforce:
+1) **Never exceed max:** `bounded_desired <= max_replicas` at all times.
+2) **Never drop below min:** `bounded_desired >= min_replicas` at all times.
+3) **No scale-to-zero when bounds enabled:** if `min_replicas >= 1`, scale-to-zero is forbidden.
+4) **No unsafe scale-down during overload:** scale-down is blocked when reactive overload signals are active.
+5) **Deterministic decisions:** given the same policy + inputs at time T, evaluator yields the same requested/bounded desired and reason codes.
+6) **Fallback correctness:** if predictive is unavailable/stale/invalid, behavior equals reactive mode (still respecting bounds).
+
+---
+
+## Observability requirements (decision-linked)
+The following telemetry MUST be emitted:
+- Gauge: desired replicas (requested vs bounded)
+- Counter: bound hit events (`max_hit`, `min_hit`)
+- Gauge: forecast freshness and confidence
+- Gauge/counter: prediction error (forecast vs realized)
+- Counter: decision reason codes (cooldown_blocked, overload_override, predictive_invalid, etc.)
+- Gauge: `min_unmet` and associated reason
+
+Metric naming and label limits MUST follow the observability standard referenced in related pages (avoid unbounded cardinality).
+
+---
+
+## Alternatives considered
+### A1. Soft bounds (warnings only)
+Rejected. Customer requirement is contractual guardrails; soft bounds do not meet budget-capping and baseline guarantees.
+
+### A2. Predictive overrides reactive (prediction wins)
+Rejected. Reactive metrics are required to prevent overload when predictions are wrong; predictive must not force scale-down into saturation.
+
+### A3. Clamp first, then compute predictive/reactive
+Rejected. Clamping early hides the platform’s “requested desired” intent and reduces auditability (cannot reason about why latency regressed while max-bound was hit).
+
+### A4. Scale-up uses max(predictive, reactive), scale-down uses reactive only
+Not selected as the default. We allow predictive input into scale-down only when it is valid and scale-down safety gates pass; however, the net effect is still conservative due to cooldown and overload blocks.
+
+---
+
+## Consequences
+### Positive
+- Customers get deterministic, enforceable behavior aligned with contracts.
+- Support and SRE can quickly diagnose “we hit max” vs “prediction stale” vs “region shortage.”
+- Predictive scaling can improve p95 latency during known ramps while maintaining safety.
+
+### Tradeoffs / risks
+- Customers can misconfigure bounds (e.g., min too high), increasing shortage risk.
+- Hard max may cap performance during unexpected spikes (intentional by contract); requires clear UX and CS guidance.
+- Conservative scale-down may increase cost slightly vs aggressive reactive downscaling.
+
+---
+
+## Rollout and compatibility notes
+- Existing Dedicated deployments retain current behavior until the feature flag is enabled.
+- On enablement, defaults must preserve behavior unless customer explicitly sets bounds.
+- During pilot, require SRE readiness review and alert tuning before expanding to additional accounts.
+
+---
+
+## Open questions (tracked outside ADR)
+- Exact default cooldowns and step sizes per model family / GPU type (performance tuning doc).
+- Whether max should be expressed in replicas, GPUs, or both (schema evolution).
+- Smart routing policy interactions during `min_unmet` and `max_hit` states (routing ADR).
+
+---
+
+## Appendix: Reason codes (initial set)
+Autoscaler decision records SHOULD include one or more of:
+- `PREDICTIVE_VALID`
+- `PREDICTIVE_INVALID_STALE`
+- `PREDICTIVE_INVALID_LOW_CONFIDENCE`
+- `REACTIVE_OVERLOAD_CRITICAL`
+- `SCALE_UP`
+- `SCALE_DOWN`
+- `COOLDOWN_BLOCKED_UP`
+- `COOLDOWN_BLOCKED_DOWN`
+- `MAX_BOUND_HIT`
+- `MIN_BOUND_HIT`
+- `MIN_UNMET_REGION_SHORTAGE`
+- `MIN_UNMET_PLACEMENT_FAILURE`
+
+(Reason code list is extensible but must remain stable enough for dashboards and runbooks.)

@@ -1,0 +1,202 @@
+Fractional GPU multiplexing and cost-smoothing playbook
+
+Summary
+-------
+This playbook describes Redwood's recommended patterns for safely multiplexing workloads on fractional GPU capacity (software MPS, containerized vGPU partitioning, and process-level multiplexing), and the infrastructure and CI/CD changes needed to enable predictable cost smoothing across spot and reserved pools. It covers scheduling policies, Terraform module patterns, metrics and dashboards, common failure modes and runbook steps, and an example CI/CD gate for deploying multiplexing-enabled runtime images.
+
+Why this exists
+----------------
+- We often have underutilized GPU memory/compute across many short-lived requests (inference minibatches, small eval runs).
+- Fractional multiplexing increases utilization and reduces per-token cost without increasing committed capacity.
+- Multiplexing adds noisy-neighbor and tail-latency risks; this doc prescribes guardrails to preserve SLOs.
+
+Scope and audience
+------------------
+Audience: infra engineers, runtime engineers, SREs, and platform/product teams evaluating cost/reliability tradeoffs.
+Scope: multi-region GPU pools for Redwood Dedicated & Redwood Private. This is infrastructure-level guidance; model-level adapters and application-level latency budgets should be defined in product docs.
+
+High-level pattern overview
+---------------------------
+1) Fractional models supported
+   - NVIDIA MPS (Multi-Process Service) for CUDA workloads when kernel and driver support is acceptable.
+   - Container-level soft partitions: cgroups + GPU-scheduling daemon that enforces per-container SM fraction (best-effort).
+   - Inference multiplexer (process-level): single GPU process that demultiplexes many token-generation requests using batching within the runtime.
+2) When to use which pattern
+   - MPS: low-overhead sharing for homogeneous, latency-tolerant workloads where driver/kernel compatibility is confirmed.
+   - Container partitioning: when tenant isolation and cgroup accounting are required but strict per-tenant memory isolation is not.
+   - Inference multiplexer: preferred for production LLM inference where latency SLOs can be met and batching/caching gives the largest cost benefit.
+
+SLOs and safety thresholds
+--------------------------
+- Typical SLOs to preserve when enabling multiplexing:
+  - 95th percentile request latency must not regress > 15% relative to baseline single-tenant runs.
+  - Token-generation tail latency (99th) must remain within configured per-route thresholds (example: <= 2.5s for chat-small workloads).
+  - Throughput per-GPU should increase by >= 1.6x in steady-state to justify operational complexity.
+- Safety limits (initial rollout):
+  - Start with max 4 concurrent tenants per physical GPU or equivalent SM-share <= 25%.
+  - Enforce per-container/tenant memory cap at 80% of per-tenant peak expected working set to avoid OOM cascade.
+  - CPU quotas: ensure host CPU isn't oversubscribed when multiplexing (host CPU <= 70% during steady-state).
+
+Terraform/IaC patterns (example snippet)
+---------------------------------------
+- Provide a small reusable module that provisions: GCE/EC2 instances with GPU partitioning tags, a node-label for "gpu-fractional-enabled", and an autoscaling group policy that keeps a small buffer of dedicated single-tenant GPUs for high-priority workloads.
+- Example (representative) Terraform fragment for AWS autoscaling group + tagging (redacted for clarity):
+
+```hcl
+module "gpu_fractional_node_group" {
+  source = "git::ssh://git@github.com/redwood/iac-modules.git//aws/gpu-fractional-node-group?ref=v1.2.0"
+
+  name_prefix           = "gpu-fractional-${var.region}"
+  instance_type         = "p4d.24xlarge"
+  gpu_fraction_policy   = { max_tenants_per_gpu = 4, enable_mps = true }
+  node_labels           = { "gpu-fractional-enabled" = "true" }
+  taints                = ["gpu=fractional:NoSchedule"]
+  spot_fallback_groups  = var.spot_fallback_groups
+}
+```
+
+- Module responsibilities:
+  - Emit node pool labels and taints.
+  - Create IAM role and startup script that installs the multiplexing runtime (private package repository).
+  - Set lifecycle policies: scale-down protection for nodes running > 1 tenant longer than 10m.
+
+CI/CD and image rollout gating
+------------------------------
+- Deploy multiplexing runtime as a separate image stream with stability gates: canary -> regional rollout -> global.
+- Example GitHub Actions deployment gate (simplified):
+
+```yaml
+name: deploy-multiplex-runtime
+on: workflow_dispatch
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Build image
+        run: |
+          docker build -t ghcr.io/redwood/multiplex-runtime:${{ github.sha }} .
+      - name: Push image
+        run: |
+          docker push ghcr.io/redwood/multiplex-runtime:${{ github.sha }}
+  canary-deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy canary to us-west-2
+        run: |
+          ./scripts/deploy-canary.sh --image ghcr.io/redwood/multiplex-runtime:${{ github.sha }} --pool gpu-fractional-canary
+      - name: Wait for metrics
+        run: |
+          ./scripts/wait-for-canary-slo.sh --slo 95p_latency:1.15 --duration 30m
+      - name: Promote
+        if: success()
+        run: ./scripts/promote-canary.sh --to regional
+```
+
+- Gate rules (minimum):
+  - Canary must not exceed SLO regressions > 15% at 95th during a 30-minute smoke window.
+  - No increase in OOM events or GPU driver crash rate.
+
+Metric and dashboard guidance
+----------------------------
+- Instrumentation (prometheus metrics to emit from runtime node agent):
+  - gpu_multiplex_total_tenants (gauge by node)
+  - gpu_multiplex_active_batches (gauge)
+  - gpu_multiplex_token_throughput_per_gpu (counter/sec)
+  - gpu_multiplex_tail_latency_ms (histogram 50/95/99)
+  - gpu_multiplex_noisy_neighbor_evictions (counter)
+  - host_cpu_utilization_percent (gauge)
+  - host_memory_available_bytes (gauge)
+- Suggested Grafana panels:
+  1. Tenants per GPU heatmap by zone/instance-type.
+  2. 95/99 latency over time with deployment overlays.
+  3. Token throughput per GPU with scale actions annotated.
+  4. Noisy-neighbor eviction rate and OOM cascade warnings.
+  5. Spot-preemption events vs. node-pool size.
+
+Admission and scheduling policies
+--------------------------------
+- Admission controller (K8s or custom):
+  - Deny if node host_cpu_utilization_percent > 80%.
+  - Prefer nodes with identical driver/kernel patch level.
+  - Enforce tenant affinity: collocate compatible models (e.g., similar sequence length distributions) to reduce memory fragmentation.
+- Scheduler knobs recommended:
+  - max_tenants_per_gpu = 4 (initial); configurable per instance-type.
+  - tenant_priority: { realtime: 100, standard: 50, best_effort: 10 }
+  - preemption_policy: preempt best_effort first, then standard.
+
+Runbook: noisy neighbor and tail latency spike
+--------------------------------------------
+1) Detect
+   - Alert: gpu_multiplex_tail_latency_ms:rate50m > baseline*1.2 AND noisy_neighbor_evictions > 5 in 5m.
+2) Initial mitigation (automated)
+   - Temporarily reduce admission controller max_tenants_per_gpu by 1 in the affected AZ/ASG.
+   - Signal autoscaler to add single-tenant capacity: tag filter "gpu-single-tenant-reserve" (scale +2 nodes).
+3) Human runbook steps:
+   - Owner: oncall-infra (pager) escalate to runtime-owner if not resolved in 5m.
+   - Identify offending tenant(s): use node-agent logs and `nvidia-smi dmon` traces.
+   - If a single tenant is causing OOM or excessive SM use, cordon and drain the pod (kubectl cordon/drain with grace period) and restart on single-tenant reserve.
+   - If issue is systemic, rollback newest multiplex-runtime image to previous stable tag.
+4) Post-incident
+   - Create a short incident note: cause, actions, duration, customers impacted.
+   - Update admission thresholds if repeat issues occur.
+
+Common failure modes and remediation table
+----------------------------------------
+| Symptom | Likely cause | Immediate remediation | Owner |
+|---|---|---|---|
+| Frequent OOMs on multiplexed pods | Memory caps too permissive for peak model working set | Reduce per-tenant memory cap by 10%, cordon node, move pods to single-tenant pool | runtime-team |
+| Driver crashes after multiplexer upgrade | Incompatible driver/kernel | Roll back node image and multiplex runtime, open infra-issue | infra-image-team |
+| Tail latency spikes during bursts | Unbalanced tenant mix or CPU contention | Reduce admission, increase single-tenant reserve, enforce CPU quotas | sres |
+| High eviction counts on spot nodes | Spot preemption + no eviction buffer | Reconfigure ASG/AS pools to keep 2 spare capacity nodes in region | capacity-planning |
+
+Operational cost smoothing and budgeting
+---------------------------------------
+- Commitments (Dedicated): maintain a split of reserved single-tenant capacity equal to 20% of peak demand for critical customers; allow remainder to be fractional-multiplexed.
+- Spot policy: do not place critical workloads on multiplexed spot nodes. Use multiplexing primarily on spot-backed pools for batch/low-priority inference.
+- Finance reporting: add a report column for "fractional-utilization uplift" (tokens served per GPU relative to single-tenant baseline).
+
+Deployment checklist (pre-rollout)
+----------------------------------
+1) Compatibility matrix validated: driver, CUDA, container runtime, and OS kernel versions.
+2) Terraform module deployed to staging with node-labels and taints applied.
+3) Canary image deployed to smaller pool for 48–72 hours under synthetic traffic.
+4) CI/CD gate metrics scripted and smoke-run automated.
+5) Dashboards and alerts configured with runbook links.
+6) Billing metric hooks enabled for cost-per-token comparison.
+7) Team training: runbook walkthrough and oncall tabletop.
+
+Ownership and contacts
+----------------------
+- Primary owner: runtime-infra (team alias: runtime-infra@redwood.com)
+- Capacity planning and cost: infra-capacity@redwood.com
+- SRE escalation: oncall-infra@sre.redwood.com
+- Security review required for Private deployments: security@redwood.com
+
+Related pages
+-------------
+- See also: gpu-fleet-scaling-metrics-and-oncall-runbook (capacity baselines)
+- See also: gpu-thermal-and-power-management-guidelines (hardware constraints)
+- Terraform module reference: iac-modules/aws/gpu-fractional-node-group (internal repo)
+
+Appendix: diagnostic commands
+----------------------------
+- Node-level quick checks:
+  - nvidia-smi topo -m
+  - nvidia-smi dmon -s u
+  - sudo journalctl -u multiplex-runtime -n 200
+- Kubernetes: find nodes running fractional workloads:
+  - kubectl get nodes -l gpu-fractional-enabled=true -o wide
+  - kubectl top pod --containers --namespace=ml-inference | sort -k3 -n -r | head
+- Quick cordon/drain pattern:
+  - kubectl cordon <node>
+  - kubectl drain <node> --ignore-daemonsets --delete-emptydir-data --force --grace-period=30
+
+Revision history
+----------------
+- 2024-05-10: Draft created by Aisha Patel.
+- 2024-07-02: Added Terraform module pattern and initial runbook steps (reviewed by Marco Nguyen).
+- 2024-11-18: Added CI/CD gate examples and admission controller knobs after canary results.
+- 2025-02-12: Published with finalized SLO thresholds and alerting playbook (reviewed by Daniel Kim, Zoe Martinez).
+

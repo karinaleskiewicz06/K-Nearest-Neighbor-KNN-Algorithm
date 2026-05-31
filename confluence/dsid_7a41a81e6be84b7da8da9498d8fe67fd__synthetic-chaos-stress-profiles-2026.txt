@@ -1,0 +1,189 @@
+synthetic-chaos-stress-profiles-2026
+
+Overview
+
+This page defines a set of synthetic stress profiles and a small chaos-harness used by SRE and Runtime teams to validate kernel scheduling, KV cache behavior, batching heuristics, and degradation/fallback policies under controlled but realistic failure modes. These profiles are used for:
+
+- Pre-release performance gating (release branch + canary)
+- Continuous nightly regression checks
+- Capacity and autoscaling validation for Dedicated clusters
+- On‑prem validation for Private deployments prior to customer handover
+
+Goals
+
+1. Provide reproducible workload definitions that exercise the hot paths across the serving runtime (attention kernels, kv-cache, batching, preemption).
+2. Surface regressions in tail latency, correctness (token drift), and error modes introduced by kernel changes or scheduler refactors.
+3. Validate fallback and graceful degradation policies (model variant fallback, region fallback).
+4. Give a standardized triage playbook and pass/fail criteria tied to SLOs.
+
+Scope and Exclusions
+
+- Scope: inference path (token generation / chat), scheduler interactions, cache eviction under pressure, batching/packing, network backpressure.
+- Exclusions: training workloads, model conversion artifacts, client-side SDK correctness.
+
+Ownership
+
+- Primary: eng-serving-runtime / Runtime QE (runtime-qe@redwood.com)
+- Secondary: eng-sre (sre-runtime@redwood.com)
+- Review cadence: Quarterly or on any scheduler/runtime release
+
+Definition: Stress Profile Concept
+
+Each stress profile is a small YAML spec interpreted by benchctl (internal harness). Required fields: id, description, tenant_mix, sequence_length_dist, qps_pattern, latency_target, duration, fault_injection. Optional: kernel_expectations.
+
+Example profile (encoder-heavy burst):
+
+---
+# file: profiles/encoder-heavy-burst.yaml
+id: encoder-heavy-burst
+description: Short-lived burst of high-qps small-sequence encoder generation to stress kernel queueing and batching.
+tenant_mix: ["plat_internal": 0.6, "external_vip": 0.4]
+sequence_length_dist: {mean: 16, p95: 48}
+qps_pattern: {type: burst, peak_qps: 4200, warmup: 10s, cooldown: 30s}
+duration: 5m
+latency_target: {p50_ms: 5, p95_ms: 18, p99_ms: 45}
+fault_injection: {drop_gpu_cards: none, simulate_network_spike: 0}
+kernel_expectations: ["kernel_queue_depth >= 128 at peak", "batcher_pack_rate >= 90%"]
+---
+
+In the harness this becomes a single benchctl run:
+
+$ benchctl run --profile profiles/encoder-heavy-burst.yaml --target cluster://staging-gpu-pool --output results/encoder-burst-2026-03-01.json
+
+Key Stress Profiles (canonical list)
+
+- kvcache-eviction-surge: simulate many long-context requests causing KV-cache churn and eviction storms. Useful to surface cache-serialization/lock contention.
+- longcontext-steady: continuous long sequence generation (avg 4096 tokens) to exercise backend memory pressure and attention kernel breakpoints.
+- mixed-tenant-thundering-herd: many small tenants with spiky arrivals to validate priority accounting and kernel-credit throttling.
+- encoder-heavy-burst: short, high qps encoder-style workloads that produce large batching opportunities but stress kernel queueing (example above).
+- ablate-batcher: toggle batcher parameters (max_latency_ms, max_tokens) across runs to measure cost/latency tradeoffs.
+- graceful-degrade-path: incrementally reduce preferred model capacity and validate automatic fallback to lower-cost quantized variants without correctness regressions.
+
+Pass/Fail Criteria and SLOs
+
+Pass conditions are evaluated per-run and are used by CI gating and nightly regression alerts. Each profile tie to an action level:
+
+- Green: all SLOs met and no increase in token-error or hallucination metrics beyond historical baseline
+- Amber: specific SLO breach but within tolerable rollback policy (e.g., p99 up to 1.5x baseline) -> alert + triage
+- Red: major degradation (p99 > 2x or error_rate > 0.2%) -> block merge and trigger incident process
+
+Default SLO thresholds (adjust per workload):
+
+- p50 latency <= profile.latency_target.p50_ms
+- p95 latency <= profile.latency_target.p95_ms
+- p99 latency <= profile.latency_target.p99_ms
+- request_error_rate <= 0.1%
+- token_drift (from golden prompts) <= 1% relative token mismatch
+
+Telemetry and Metrics to Collect
+
+Collect these during every run:
+
+- infra: GPU utilization per-card, memory_used, PCIe retransmits, host-side CPU stall time
+- runtime: per-kernel exec_time histogram, kernel_queue_depth, batch_size_distribution, batch_pack_rate, kvcache_eviction_rate, kvcache_lock_wait_ms
+- api-level: request_latency histogram, error_codes, response_token_counts, token_drift_against_golden
+- orchestration: container_restart_count, preemptions, model_variant_fallbacks
+
+Suggested Prometheus metrics and dashboards (names):
+
+- runtime_kernel_latency_ms_bucket{kernel}
+- runtime_kernel_queue_depth_gauge
+- runtime_batch_pack_ratio
+- runtime_kvcache_evictions_total
+
+Profiling Playbook (when a run fails)
+
+1. Identify failing profile and time window. Pull benchctl artifact JSON and stored logs.
+2. Check orchestration events (kube events, preemptions). If containers restarted or OOMKilled, escalate to eng-infra.
+3. Correlate p99 spikes with kernel_latency histograms. If a single kernel shows a long tail, tag suspect kernel.
+4. Enable sampling profiler run (trace-level) for 60s on the affected node group:
+
+$ benchctl profile --node-group staging-gpu-pool --sample-duration 60s --output traces/trace-$(date +%s).json
+
+5. If kvcache_eviction_rate > 10/min during failure, run the cache inspection script to dump kvcache shards and eviction logs:
+
+$ benchctl kvcache-dump --node node-12 --shard 3 --out kvdump.json
+
+6. If batch_pack_ratio drops below expected threshold, validate the request packing logs and the per-tenant sequence_length_dist used by the harness.
+
+Runbook: Immediate Mitigations During Incidents
+
+- Scaling: Temporarily scale Dedicated pool by +20% capacity (if autoscaling not reacting)
+- Routing: Route high-priority tenants to a warm reserve pool (route policy: limit concurrency to 50% of default)
+- Kernel gate: If a new kernel change is suspected, rollback kernel binary on canaries via the artifact manager and re-run the failing profile.
+- Fallback: Toggle model_variant_fallback to allowed for the route to shift traffic to quantized variant.
+
+Example commands (ops):
+
+$ rctl cluster scale staging-gpu-pool --delta 10
+$ rctl route update --route high-priority --capacity 50%
+$ rctl artifact rollback --service runtime-kernel --to-revision v2026-02-22
+
+Integration with Release Process
+
+- New runtime/kernel code: required to run the full canonical profile set as part of pre-merge CI. Any Red/Amber outcome must be explained in a pre-merge checklist.
+- Canary: deploy to a canary cluster and run only the high-sensitivity profiles (kvcache-eviction-surge, longcontext-steady).
+- Automated gating: CI jobs will annotate PRs with benchctl artifacts and link to the profile run result.
+
+Known Issues and Workarounds (as of 2026-03-01)
+
+- Issue: kernel_credit accounting may under-report when mixed-tenant-thundering-herd runs with priority inversion.
+  Workaround: temporarily increase per-tenant minimum credits and re-run the profile.
+- Issue: Rare token drift observed for graceful-degrade-path when fallback quantized models differ in BOS tokenization.
+  Workaround: add normalization step comparing token ids and run token-drift acceptance test in harness.
+- Issue: benchctl sampling profiler may miss short-lived micro spikes due to 1s sampling resolution.
+  Workaround: increase sample-duration to 120s or enable high-res tracer in suspected runs.
+
+Gallery: Example results snippet (benchctl output)
+
+{
+  "profile_id": "kvcache-eviction-surge",
+  "p99_ms": "132",
+  "error_rate": "0.03%",
+  "kvcache_evictions_per_min": "16",
+  "kernel_outliers": ["attention_forward_v3", "kv_sync"]
+}
+
+Regression Triage Template
+
+1. Summary: short description of observed failure and impacted SLOs.
+2. Artifacts: benchctl run JSON, traces, node metrics, orchestration events.
+3. Hypothesis: one-liner suspected cause.
+4. Action taken: rollback/scale/toggle fallback, and result.
+5. Root cause analysis: completed within 72 hours for red-level regressions.
+6. Postmortem and mitigations: documented and assigned.
+
+Automation and CI Examples
+
+- GitHub Action snippet to run the canonical profiles on every kernel PR:
+
+name: runtime-benchmark-check
+on: pull_request
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Run benchctl canonical set
+        run: |
+          benchctl run-set --set canonical --target cluster://ci-gpu-small --out artifacts/${{ github.sha }}.json || exit 1
+
+Next Steps and Roadmap
+
+- Expand the canonical set with a dedicated latency-sensitivity profile for each new kernel (ETA Q2 2026).
+- Add synthetic network partition scenarios to the harness (ETA Q3 2026).
+- Integrate benchctl outputs into the Runtime Console for per-PR visual diffs (ETA Q3 2026).
+
+References
+
+- /confluence/eng-serving-runtime/profiling-playbook/runtime-profiling-playbook-guidelines-2025
+- /confluence/eng-serving-runtime/benchmarking-and-perf-suite/throughput-latency-workload-catalog-2026
+- /confluence/eng-serving-runtime/runbooks/runtime-fallback-and-degradation-playbook-2026
+
+Appendix: Benchctl workload spec quick reference
+
+Fields (string): id, description, duration, target_cluster
+Fields (numeric): peak_qps, mean_sequence_length, p95_sequence_length
+Fields (enums): qps_pattern (steady|burst|sine), fault_injection (none|network_spike|card_drop), validation (none|golden_token_set)
+
+End of document

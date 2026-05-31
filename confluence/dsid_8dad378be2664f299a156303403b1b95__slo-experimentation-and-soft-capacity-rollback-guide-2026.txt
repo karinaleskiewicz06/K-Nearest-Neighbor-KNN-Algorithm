@@ -1,0 +1,150 @@
+SLO experimentation and soft-capacity rollback guide
+
+Summary
+This runbook describes a controlled process for A/B-style SLO experiments (soft change to SLO thresholds or traffic allocation) combined with a low-friction "soft-capacity" rollback path. It is intended for service owners and SREs running capacity-constrained inference services (examples: inference-gateway, emb-encoder, realtime-chat). The goal is to let product/ML teams experiment with more aggressive throughput or model variants while preserving customer-facing SLOs and ensuring quick, observable rollback when risk signals appear.
+
+Why this exists
+- SLOs must be both guardrails and learning mechanisms; safe experiments accelerate cost/perf optimization.
+- Traditional hard cutovers are too risky for multi-tenant LLM inference.
+- Soft-capacity rollback provides an intermediate safety layer (capacity and routing controls that can be quickly tightened without code deploy).
+
+Audience and ownership
+- Primary: service owners (Product/ML + SRE oncall)
+- Secondary: Platform/Infra owners who operate autoscalers and regional routing
+- Ownership: service owner owns experiment plan; SRE owns observability triggers and rollback authority
+
+Applicability
+- Use for: model variant rollouts, quantization profile changes, trial autoscale policy relaxations, tenant burst tests
+- Do NOT use for: security fixes, data residency changes, or experiments that alter persisted user data semantics
+
+Experiment pre-flight checklist (must pass before enabling any soft experiment)
+1) Rollout plan and hypothesis (one paragraph): what will change; expected SLO impact; success metrics.
+2) Runbook fill: link to this doc and the service runbook.
+3) Stakeholder sign-offs: product, SRE, infra (email or Slack thread).
+4) Canary window defined: start_time, duration, target tenant(s), traffic fraction.
+5) Telemetry readiness verified: Prometheus metrics, synthetic canary, distributed tracing, and cost meter.
+6) Backstop capacity knobs identified and tested in staging.
+
+Example experiment metadata (table)
+| field | example |
+|---|---|
+| service | inference-gateway |
+| owner | inference-team@redwood.com |
+| change | move model-v2 quantized -> INT8; reduce per-request memory fingerprinting |
+| canary tenants | tenant-demo, tenant-qa |
+| fraction | 5% traffic for 2 hours |
+| expected delta | p95 latency +10ms, token cost -22% |
+| abort criteria | >1.0% additional 5m error rate or p99 latency +100ms |
+
+Instrumentation & telemetry (required)
+- Metrics (Prometheus):
+  - infra_slo_success_rate{service=~"inference-.*",slo="availability"}  // aggregate success rate used for SLO calculation
+  - request_latency_seconds_bucket{le="0.2",service="inference-gateway"}  // compute p95/p99
+  - inference_model_error_total{model_variant!=""}  // model inference errors (invalid outputs / OOMs)
+- Synthetic canary: round-trip against a deterministic prompt every 30s; compare tokens/latency/semantic sanity score
+- Trace sampling: 100% for canary tenants, 1% for global baseline during experiment
+- Cost telemetry: per-request token cost exported to billing pipeline for trial accounting
+
+PromQL snippets (copy/paste)
+- 5m rolling SLO burn (invocation success rate for last 5m):
+  
+  (sum(rate(infra_slo_success_rate{service="inference-gateway",slo="availability"}[5m])) / sum(rate(infra_slo_total{service="inference-gateway",slo="availability"}[5m]))) * 100
+
+- Canary p95 latency (60m window):
+  histogram_quantile(0.95, sum(rate(request_latency_seconds_bucket{service="inference-gateway",tenant=~"tenant-demo|tenant-qa"}[5m])) by (le))
+
+Risk signals and thresholds (triggers that must be monitored)
+- Immediate abort (hard rollback):
+  - SLO success rate for service drops by >1.0 percentage point relative to baseline over a 5m window (e.g., from 99.95% -> 98.95%)
+  - p99 latency increases by >150ms sustained for 10m
+  - Model error rate (inference_model_error_total) increases >300% relative to baseline over 10m
+  - Autoscaler thrash: >3 scale events/min sustained for 5m
+- Soft rollback (throttle/reroute first, full rollback if unresolved):
+  - SLO burn rate accelerating: burn_rate_5m > 2x burn_rate_1h
+  - Tenant complaint: exception to automated signal; verified by SRE via tracing
+
+Decision matrix (operator quick reference)
+1) Minor blip (single spike <10m, resolves): continue monitoring, document in experiment log.
+2) Risk threshold met (one Immediate abort criterion): initiate hard rollback procedure (Section: Hard rollback).
+3) Burn acceleration without immediate abort: perform soft rollback: throttle experiment fraction by 50% and enable regional fallback pool. If risk not reduced in 10m → hard rollback.
+
+Soft rollback procedure (fast, non-deploy)
+1) Oncall SRE posts to #sre-experiments with subject: "Soft-rollback: <service> <experiment-id>" and tags stakeholders.
+2) Reduce canary traffic fraction via router API:
+   - Example HTTP request (gateway-router):
+     curl -X POST -H 'Authorization: Bearer $ROUTER_TOKEN' \
+       https://router.internal.redwood/api/v1/experiment/scale \
+       -d '{"experiment_id":"exp-2026-42","fraction":0.025}'
+3) Activate regional fallback pool (reserve nodes):
+   - kubectl scale deployment/fallback-pool -n inference --replicas=6
+4) Increase synthetic cadence from 30s -> 10s for more frequent sampling (via canary-config map).
+5) Monitor 5m SLO burn and p99 for 10 minutes. If stable, keep reduced fraction and open a postmortem to investigate.
+
+Hard rollback procedure (when immediate abort criteria met)
+1) Announce incident on #sre-major with context and action: "Hard rollback initiated for <service> <experiment-id>".
+2) Execute rollback knobs (order matters; aim for minimal customer impact):
+   a) Re-route all canary tenants to stable model variant: router API set mapping: model-v1 for tenants [tenant-demo, tenant-qa, buyer-prod-test]
+   b) Revert autoscaler policy to conservative profile: POST /infra/autoscaler/policies/inference-gateway/revert
+   c) Disable model-v2 in model-catalog: curl -X PATCH ... {"enabled":false} (internal model registry API)
+3) Confirm rollback success by verifying:
+   - infra_slo_success_rate recovers to within 0.1 percentage points of baseline within 15m
+   - p99 latency drops to baseline within 20m
+4) Close the incident channel only after stability validated for 30m; open a follow-up incident review.
+
+Post-experiment analysis (15–30 day lens)
+- Required artifacts: experiment hypothesis, telemetry snapshot, decision timeline (who did what and why), cost delta analysis, and remediation actions.
+- Metrics to collect: SLO burn windows (5m/1h/24h), cost-per-1000-requests, model error taxonomy, scaling events timeline, tenant impact list.
+- Deliverable: one-page findings + recommended next steps (roll forward, rollback permanently, or iterate).
+
+Operational tooling checklist (automation candidates)
+- Router API feature: fine-grained fractional routing by tenant and region (must support sub-1% fractions).
+- Canary config templating: change cadence, buckets, and synthetic test definitions via GitOps (kustomize overlay).
+- SLO burn automated alert with suggested action buttons (soft rollback, throttle 50%, hard rollback).
+- Chaos simulation harness to replay production canary traces in staging against proposed changes.
+
+Example kustomize overlay snippet (canary fraction):
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: experiment-config
+data:
+  experiment-id: "exp-2026-42"
+  fraction: "0.05"
+  canary-tenants: "tenant-demo,tenant-qa"
+
+Rollback bake plan (to reduce operator risk)
+- Always keep a small, warm fallback fleet (10% of max capacity) in each region for rapid absorption.
+- Maintain an autoscaler conservative baseline profile that can be re-applied via API in <60s.
+- Circulate and rehearse this guide in quarterly chaos drills.
+
+Communication and SLO governance
+- SRE has veto authority for experiment continuation if any Immediate abort criterion is met.
+- Product/ML may request an exception only with written justification and an expanded rollback runway.
+- All experiments must be logged in the SLO Experiment Registry (simple CSV stored in /shared/slo-experiments with columns: id, service, owner, start, end, status, notes).
+
+Incident review template for experiments
+- Title: Experiment <id> — <service> — <date>
+- Summary of actions taken (timeline format)
+- Telemetry evidence (links to Grafana dashboards + PromQL used)
+- Root cause hypothesis and detection gap analysis
+- Remediation and detection improvements (owner + due date)
+- Lessons learned and next steps (iterate / roll-forward / abandon)
+
+Training and drills
+- Quarterly table-top involving SRE, product, infra to play through rollback scenarios for at least two critical services.
+- Annual live drill: run a benign experiment in staging mirroring production traffic profile and practice soft/hard rollback flows.
+
+Appendix: quick commands and links
+- Router API: https://router.internal.redwood/docs#experiment-scale
+- Model registry: https://models.internal.redwood/dashboard
+- Sample PromQL dashboard: https://grafana.internal.redwood/d/inference/slo-experiment-playback
+- SLO Experiment Registry CSV path: s3://redwood-docs/slo-experiments/registry.csv
+
+Revision history
+- 2026-01-12: Draft created by Leah Chen
+- 2026-02-05: Added PromQL snippets and decision matrix (review: Arjun Patel)
+- 2026-03-02: Incorporated automation checklist and updated thresholds after runway drill (review: Marisol Gomez)
+
+Contact
+- Primary contact: Leah Chen (leah@redwood.com)
+- Oncall channel: #sre-oncall

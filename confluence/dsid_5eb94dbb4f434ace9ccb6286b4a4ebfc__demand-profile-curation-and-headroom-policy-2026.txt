@@ -1,0 +1,205 @@
+demand-profile-curation-and-headroom-policy
+
+Overview
+--------
+This playbook defines how Redwood Inference curates demand profiles, computes operational headroom, and ties those calculations back to SLOs and error budget triggers. It provides deterministic formulas, configuration examples, monitoring dashboards, and an incident/runbook attachment so SREs and platform owners can make repeatable provisioning and throttling decisions.
+
+Why this exists
+---------------
+- To avoid ad hoc capacity decisions during incidents.
+- To ensure SLO commitments (latency and availability) map to concrete capacity signals.
+- To provide a repeatable, audit-friendly method for determining reserved headroom for inference workloads across hosted, dedicated, and private deployments.
+
+Scope
+-----
+Applies to all Redwood production inference services including: inference-gateway, chat-router, embedder, reranker. Not intended for internal batch-only jobs (see "batch-capacity-guide").
+
+Goals
+-----
+1. Provide a defensible headroom formula that scales with observed demand variance.
+2. Standardize demand profiling windows used for provisioning and autoscaler tuning.
+3. Define automated triggers that convert error budget burn into capacity or admission-control actions.
+4. Document a verification checklist for rollouts and emergency changes.
+
+Key concepts and definitions
+---------------------------
+- Demand profile: distribution of request arrival rates and token-per-request distributions over time windows (1m/5m/1h/24h).
+- Baseline capacity: capacity required to meet nominal load at target SLO with configured batching/kv-cache assumptions.
+- Headroom: additional capacity reserved to absorb short-term surges and variance without SLO violations.
+- Safety multiplier (alpha): scalar used on statistical variance to translate observed variability into additional headroom.
+- Admission control: system that enforces per-tenant or per-route limits to preserve SLOs during shortage.
+
+Demand profiling: telemetry and methodology
+----------------------------------------
+1) Signals to collect (per route/service):
+   - requests_per_minute (rpm) (1s, 1m, 5m aggregates)
+   - tokens_per_request (TPR) distributions (p50/p90/p99)
+   - p50/p95/p99 latency (server-side, excluding client/network)
+   - kv-cache hit ratio and hit-latency
+   - CPU/GPU utilization by serving pool
+   - queue_length and batching latency contribution
+
+2) Windows and aggregation rules:
+   - Short-term reactive window: 1m and 5m (used for autoscaler and emergency admission control)
+   - Tactical window: 1h (used for intraday headroom adjustments and next-hour reservations)
+   - Strategic window: 24h (used for daily provisioning and capacity planning)
+   - Use exponential-weighted moving average (EWMA) with alpha=0.2 on the 1m series to smooth noise for short-term decisions.
+
+3) Example PromQL snippets (observability team):
+
+- requests_per_minute: rate(http_requests_total{route="/v1/generate"}[1m]) * 60
+- p95_latency: histogram_quantile(0.95, sum(rate(request_latency_bucket[5m])) by (le))
+
+Headroom formula and rationale
+----------------------------
+We use a hybrid statistical + rule-based headroom policy:
+
+Headroom_units = base_units + ceil(alpha * sigma_demand)
+
+Where:
+- base_units = capacity required to serve median (p50) demand at target SLO given current batching and cache profile.
+- sigma_demand = standard deviation of demand in the tactical window (1h) computed on minute-level samples.
+- alpha = safety multiplier, default = 3 for mixed-tenant traffic, 2 for high-confidence single-customer dedicated pools.
+
+Interpretation: sigma captures typical short bursts; multiplying by alpha covers tail probability (approx 99.7% if demand is Gaussian and alpha=3). We then ceil to whole GPU slots or shard-units as appropriate.
+
+Sizing rules and heuristics
+-------------------------
+- Convert capacity units to the smallest allocatable chunk: GPU-slot (e.g., aT4/rtx-a5000 slice) or model-worker shard. Round up to nearest allocatable unit.
+- When using quantized models, reduce base_units by model_efficiency_delta (observed token/sec improvement), but do not reduce alpha (variance remains).
+- If KV-cache hit ratio > 85% and cache latency < 5ms, reduce base_units by up to 20% (add a recorded rationale).
+- For cold-started private deployments, add a fixed bootstrap headroom of +1 GPU-slot for the first 24h after deployment.
+
+Admission control and throttling policies
+---------------------------------------
+Admission-control decisions map to error budget burn and headroom exhaustion:
+
+Triggers (ordered):
+1. If p95 latency > SLO_p95 + 25% OR available_headroom < 0.2 * base_units for >5m => escalate to oncall and begin throttling non-critical routes (see ordered list below).
+2. If error_budget_burn_rate (30m) > 2x expected and sustained => enable token-priority-based shedding for low-priority tenants.
+3. If queue_length exceeds threshold for >2m => shed requests using oldest-first policy with immediate 429 to caller including JSON Retry-After and error_budget_state.
+
+Ordered shedding list (default):
+   a) Background embedding-batch routes (non-interactive)
+   b) Low-tier API keys (pre-configured per-account in tenant-config)
+   c) Non-critical retries and long-run reranks > 3 attempts
+
+Throttle implementation notes:
+- Use per-tenant token buckets persisted in redis (leaky-bucket implementation) with refill tied to tenant plan and weight.
+- Emit events to telemetry: admission_control.decisions{reason, tenant, route, dropped_count}.
+
+Error budget integration (SLO -> action)
+--------------------------------------
+- Define SLOs per route (e.g., chat-router p95 latency < 250ms, availability 99.9% monthly).
+- Compute rolling error budget consumption using 30d sliding window and 6h short-window for fast response.
+- Map burn-rate tiers to actions:
+   * Low burn (0–0.5x expected): monitor, alert to pulse channel only.
+   * Medium burn (0.5–1.5x expected): automated canary rollback for recent deploys; pre-scale headroom by +ceil(0.1 * base_units).
+   * High burn (>1.5x expected): enable admission control and page oncall; consider emergency capacity allocation from reserves or cloud-bursting.
+
+Runbook: responding to headroom exhaustion
+----------------------------------------
+1. Detection: alert "headroom.low" fires when available_headroom_percent < 15% for >3m. Pager goes to SRE oncall.
+2. Triage steps (first 10 minutes):
+   1) Check recent deploys (git tag and rollout window). If <15m since deploy, roll back canary or pause rollout.
+   2) Inspect traffic spike origin: tenant_id, route, geo. Use telemetry filter `origin=tenant:<id>` and p95, rpm.
+   3) Confirm model or cache regressions: compare kv-cache hit ratio and model token/sec to last hour baseline.
+3. Immediate mitigations (10–30 minutes):
+   - Activate admission-control policy for non-critical routes as per ordered shedding.
+   - If autoscaler exists and cluster quotas permit, request emergency scale with annotation `emergency: headroom` to prioritize allocation.
+   - If using multi-region, shift low-latency traffic to less-loaded region per routing policy (apply only for stateless routes).
+4. Remediation (30–90 minutes):
+   - If root cause is degraded model (inference slowdown), revert to previous model version with verified perf profile.
+   - If cause is a tenant spike, negotiate temporary capacity grant and enable soft quota on tenant.
+5. Post-incident: record the incident ID, yield updated demand profile, and update base_units for next-day provisioning if spike permanently increases median demand.
+
+Verification checklist before changing headroom parameters
+---------------------------------------------------------
+- [ ] Synthetic canary passing: p95 latency within SLO for 30m under pre-roll traffic.
+- [ ] Telemetry dashboards configured for the change (availability, headroom, queue_length).
+- [ ] Runbook owned and oncall informed with rollback knobs.
+- [ ] Config change reviewed by capacity team and recorded in change log.
+
+Example autoscaler config (K8s-style snippet)
+--------------------------------------------
+```yaml
+apiVersion: autoscaling/v2beta2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: inference-worker-hpa
+  annotations:
+    capacity.redwood/intent: "headroom-adjustable"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: inference-worker
+  minReplicas: 2
+  maxReplicas: 40
+  metrics:
+  - type: Pods
+    pods:
+      metric:
+        name: rps_per_pod
+      target:
+        type: AverageValue
+        averageValue: "50"
+```
+Note: translate pod replicas to GPU-slot allocation when using GPU-scheduler (see mapping table below).
+
+Capacity allocation mapping (example table)
+-----------------------------------------
+Unit | Representative resource | Notes
+-----|-------------------------|------
+1 gpu-slot | 1 x a5000-slice | smallest allocatable GPU-shard in multi-tenant pool
+1 pod | 0.25 gpu-slot | when using small worker image; measured token/sec = 120
+1 shard | 2 gpu-slots | heavy model (redwood-large)
+
+Operational telemetry and dashboards
+----------------------------------
+- Core dashboards (per service):
+  - Headroom summary: available_headroom_percent, base_units, allocated_units
+  - Demand profile: rpm p50/p95/p99, TPR p50/p95/p99
+  - Error budget dashboard: burn rate (6h/30d), contributors by route/tenant
+  - Queue and batching latency waterfall
+- Essential alerts:
+  - headroom.low (available_headroom_percent < 15% for >3m)
+  - p95 latency > SLO_p95 + 25% (5m)
+  - sustained_error_budget_burn.high (>1.5x expected over 30m)
+
+Ownership and processes
+----------------------
+- Capacity owner: eng-sre/capacity (primary) — responsible for weekly headroom reviews and running the "demand-curation" pipeline.
+- Service owners: each product team owns route SLO definitions and test prompts for canaries.
+- Change approvals: any headroom reduction > 20% requires capacity-owner and product-owner sign-off and a 48-hour dry-run period.
+
+Rollouts and experiments
+-----------------------
+- A/B experiments for headroom sizing should use the capacity-sandbox with mirrored telemetry; run at most one sizing experiment per week per service.
+- Track experiment metrics for 72h and require no SLO regressions and no increase in error budget burn before promoting experiment.
+
+Post-incident evidence collection and update cadence
+--------------------------------------------------
+- For any headroom-related incident, collect minute-resolution telemetry for +/- 6h around the incident window. Attach to incident review with annotated demand-profile plots.
+- Weekly: capacity-owner runs a scheduled job that outputs per-route demand-profile summary and headroom recommendation.
+- Quarterly: review default alpha values and empirically re-calibrate using spike history.
+
+Appendix: quick commands and queries
+-----------------------------------
+- Get current headroom for service (CLI):
+  redwoodctl capacity headroom get --service inference-gateway --window 1h
+- Temporarily enable admission control for route:
+  redwoodctl admission enable --route /v1/embed --policy low-priority-shed --reason "emergency headroom"
+- PromQL: available_headroom_percent:
+  (sum(cluster_available_gpu_slots) - sum(service_allocated_gpu_slots)) / sum(cluster_total_gpu_slots) * 100
+
+Related artifacts
+-----------------
+- capacity-onboarding-checklist-for-new-model-tenants-2026 (service onboarding)
+- slo-portfolio-hedging-toolkit-2026 (operational tooling)
+
+Document history
+----------------
+- 2026-02-15: Draft created by Aisha Patel.
+- 2026-02-22: Incorporated reviewer feedback on admission-control ordering.
+- 2026-03-02: Published with updated autoscaler examples and verification checklist.

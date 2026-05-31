@@ -1,0 +1,366 @@
+Workload-aware batching defaults (Fast / Standard / Cost-efficient) — design
+
+## Overview
+This document defines Redwood Runtime’s “workload-aware batching defaults”: three customer-facing latency SLO tiers (Fast / Standard / Cost-efficient) implemented as tiered batching profiles selected automatically by the runtime based on workload signals and policy configuration.
+
+The primary goal is to reduce cost per 1K tokens via safer batching defaults while preserving predictable tail latency (especially for streaming) and avoiding starvation under mixed workloads.
+
+This is the primary design doc for:
+- Tier definitions and the contract we uphold for each tier (in runtime terms).
+- Scheduler knob mapping (continuous batching heuristics, queueing, prefill/decode balancing, admission control).
+- Workload signals (length buckets, streaming flag, concurrency, overload signals) and selection logic.
+- Override hierarchy (customer override > route/model policy > tier default) and explainability (reason codes).
+- Rollout and rollback plan for Hosted and Dedicated.
+
+## Background and decision summary
+We will ship three tiered defaults rather than per-tenant real-time autotuning (see ADR-023). The tiers give customers a stable mental model and enable us to publish and validate recommended profiles per model family + hardware class.
+
+Key principles:
+1) Tail latency is a first-class constraint (Fast tier must protect p99 and streaming “time-to-first-token”).
+2) Defaults must be explainable (operators can see the effective tier/profile and why it was selected).
+3) Behavior under overload must be safe and predictable (backpressure, load shedding, and bounded queues).
+4) Profiles must work under mixed workloads (avoid starving long prompts, avoid “short prompts dominate forever”).
+
+## Goals / non-goals
+### Goals
+- Provide 3 tiers with validated scheduler knob sets that meet tier SLO targets under the benchmark methodology.
+- Make tier selection workload-aware using a small set of robust signals (prompt length distribution, streaming vs non-streaming, concurrency and queue pressure).
+- Add observability for tier effectiveness (latency, queue depth, batch size distribution, cache hit rate) and profile selection reason codes.
+- Support overrides for enterprise/Dedicated and safe rollback via feature flags and kill switches.
+
+### Non-goals (initial release)
+- Fully automatic per-tenant tuning in real time.
+- Introducing new cross-region routing decisions beyond existing smart routing policies.
+- Changing model quality behavior (we will add guardrails/evals to ensure no meaningful quality regression).
+
+## Definitions
+### Key terms
+- **Prefill**: processing the prompt/context portion of a request (often compute-heavy and variable length).
+- **Decode**: token-by-token generation (typically more latency sensitive for streaming).
+- **Continuous batching**: dynamically packing multiple requests into GPU execution steps over time.
+- **Wait budget**: maximum queue time a request may spend waiting to be batched.
+- **Batch tokens**: the total tokens processed in a single execution step (prefill tokens + decode tokens).
+
+### Tier contract (runtime interpretation)
+The SLO targets are defined formally in the SRE SLO tier doc. Runtime’s contract is:
+- **Fast**: prioritize tail latency and streaming responsiveness over throughput. Use tight wait budgets, stronger admission control, and conservative max batch sizes.
+- **Standard**: balanced default; moderate batching with bounded tail latency.
+- **Cost-efficient**: maximize throughput and $/token improvements while staying within published latency bounds; more aggressive batching and larger batch token limits, with guardrails to prevent queue blowups.
+
+Important: These tiers are **defaults** (not guarantees) and are enforced via best-effort scheduling plus overload protections.
+
+## High-level architecture
+### Components
+- **Scheduler (Runtime)**: implements queue admission, request classification, batching, and prefill/decode interleaving.
+- **Policy engine (Control plane)**: resolves tier selection configuration at route/model/tenant level.
+- **Telemetry pipeline**: emits per-tier metrics and reason codes with cardinality controls.
+
+### Data flow (simplified)
+1) Request arrives with attributes (model, route, region, streaming flag, prompt length, max output tokens).
+2) Policy engine resolves an *effective tier* (and optional profile override) based on precedence rules.
+3) Scheduler tags request with a tier, selects a batching profile (possibly adjusted by workload signals), and applies admission control.
+4) Runtime executes continuous batching; telemetry records latency/cost/queue metrics, plus selection reason codes.
+
+## Workload signals
+We use a small set of signals that are low-cardinality, stable, and available at request time.
+
+### Request-time signals
+- **streaming** (boolean): whether the request is streaming tokens.
+- **prompt_length_bucket**: bucketed prompt tokens (derived from tokenizer estimate or actual token count once computed).
+  - Buckets (initial): 0–256, 257–1k, 1k–4k, 4k–8k, 8k+.
+- **max_output_bucket** (optional, coarse): <=256, 257–1k, >1k.
+- **model_family / engine_compat_class**: derived from model catalog metadata (e.g., Llama-style decoder-only; MoE constraints; attention kernel compatibility).
+
+### Runtime signals
+- **concurrency_estimate**: rolling EWMA of in-flight requests per model shard.
+- **queue_depth** and **queue_wait_ms**: per-tier queues (bounded) and current tail of wait.
+- **kv_cache_pressure**: derived from cache occupancy and eviction rate.
+- **overload_mode**: boolean state computed from admission control triggers (see Overload section).
+
+### Signals explicitly NOT used (v1)
+- Tenant identifier (to avoid high-cardinality coupling and fairness issues).
+- Prompt content (privacy + complexity).
+- Fine-grained per-user/client metrics.
+
+## Tier selection logic
+Tier selection happens in two layers: (1) control-plane policy (configured tier), and (2) scheduler-level workload-aware adjustments (within the tier).
+
+### Layer 1: Effective tier from policy engine
+Input sources:
+- Request header/SDK parameter (optional; only allowed if enabled for the route).
+- Route policy (Hosted API and Dedicated).
+- Tenant/cluster override (Dedicated), plus model constraints.
+
+Output:
+- effective_tier: fast | standard | cost_efficient
+- effective_profile_id: optional explicit profile override
+
+### Layer 2: Workload-aware adjustments (within tier)
+We do not “upgrade/downgrade” tiers automatically in v1. Instead, we adjust a small set of knobs inside the selected tier based on workload shape and overload.
+
+Adjustments include:
+- Lowering max_wait_ms for streaming-heavy traffic in Standard tier.
+- Tightening max_batch_tokens for very long prompt buckets to prevent head-of-line blocking.
+- Enabling stricter admission control earlier if queue_wait_ms trends upward in Fast tier.
+
+### Selection pseudo-code (conceptual)
+```
+// resolved by policy engine
+tier = resolve_effective_tier(request)
+profile = base_profile_for(tier, model_family, hw_class)
+
+// scheduler-level adjustments
+if request.streaming:
+  profile.max_wait_ms = min(profile.max_wait_ms, STREAMING_WAIT_CAP_MS[tier])
+
+if request.prompt_length_bucket in {4k-8k, 8k+}:
+  profile.max_batch_tokens = min(profile.max_batch_tokens, LONG_PROMPT_BATCH_CAP[tier])
+  profile.prefill_max_concurrency = min(profile.prefill_max_concurrency, LONG_PROMPT_PREFILL_CAP[tier])
+
+if overload_mode_active(tier):
+  profile = apply_overload_policy(profile, tier)
+
+emit_reason_codes(...)
+return profile
+```
+
+## Scheduler knob mapping
+This section defines the knobs that constitute a “batching profile”. Names are aligned with runtime config schema (ENG-18422 / PR-28431), but the table below is the *behavioral* contract.
+
+### Profile knobs (v1)
+| Knob | Description | Why it matters |
+|---|---|---|
+| max_wait_ms | Maximum queue time before forcing dispatch | Direct tail latency control; primary lever for Fast |
+| max_batch_tokens | Upper bound on total tokens per step (prefill+decode) | Throughput vs tail latency; bounds worst-case step time |
+| max_batch_requests | Upper bound on number of requests in a batch | Prevents pathological micro-requests from overpacking |
+| prefill_decode_ratio_target | Target GPU time split between prefill and decode | Avoids decode starvation (streaming) or prefill backlog |
+| prefill_max_concurrency | Max concurrent prefills admitted per shard | Prevents long prompts from dominating compute |
+| decode_max_concurrency | Max concurrent decodes admitted per shard | Controls streaming smoothness, TTFT, and p99 |
+| queue_max_depth | Bounded queue size per tier | Prevents unbounded latency growth; enables backpressure |
+| admission_max_queue_wait_ms | Threshold to start rejecting/throttling | Predictable degradation under overload |
+| anti_starvation_quantum_ms | Ensures long/slow requests make progress | Prevents starvation under mixed length buckets |
+| enable_prefix_cache_preferential | Prioritize requests with cache hits (bounded) | Improves $/token without harming fairness |
+
+Notes:
+- We keep the knob surface area intentionally small. Internally there may be additional parameters (e.g., kernel dispatch granularity), but those are not exposed as profile-level knobs.
+- Profiles are parameterized by model family + hardware class where necessary.
+
+### Baseline tier profiles (initial targets)
+Values below are *initial targets* for top model families and are finalized by the benchmark suite. Publishable values live in the profile matrix doc / spreadsheet; this design doc defines the intended relationships.
+
+| Tier | Intent | max_wait_ms | max_batch_tokens | Admission control | Prefill/decode balancing |
+|---|---|---:|---:|---|---|
+| Fast | Protect p99 / streaming | 1–3ms (streaming cap 1–2ms) | Conservative | Early + strict | Decode-biased when streaming |
+| Standard | Balanced | 3–8ms (streaming cap 3–5ms) | Moderate | Moderate | Adaptive |
+| Cost-efficient | Optimize throughput | 8–20ms (streaming cap 5–8ms) | Aggressive (bounded) | Later, but stronger overload guardrails | Prefill-biased unless streaming |
+
+### Streaming considerations
+Streaming is treated as a high-priority latency mode:
+- **Time-to-first-token (TTFT)** is strongly correlated with prefill queueing + prefill step time.
+- **Inter-token latency** is sensitive to decode scheduling and decode concurrency.
+
+Rules:
+1) For streaming requests, apply a stricter wait cap regardless of tier.
+2) When the decode queue for streaming requests is non-empty, enforce a minimum decode service share (prefill_decode_ratio_target shifts toward decode).
+3) Avoid batching streaming decode into overly large steps that produce “bursty” token emission.
+
+## Queues, fairness, and starvation prevention
+We maintain per-tier logical queues, but fairness is enforced globally per shard.
+
+### Fairness design
+- Requests are tagged with tier and length bucket.
+- Scheduler uses weighted fair queuing between:
+  - tier queues (Fast > Standard > Cost-efficient weights)
+  - within each tier: length buckets with anti-starvation guarantees
+
+### Anti-starvation mechanism
+We use a quantum-based mechanism:
+- Each length bucket accumulates deficit credits over time.
+- Even if short prompts dominate arrivals, long prompt buckets will eventually accumulate enough credit to be scheduled.
+- anti_starvation_quantum_ms is tier-dependent (Fast smallest, Cost-efficient largest).
+
+### Head-of-line blocking mitigation
+- Large-prefill requests (8k+) are limited via prefill_max_concurrency.
+- long prompts may trigger a lower max_batch_tokens cap to bound step time.
+
+## Overload behavior (safe degradation)
+Overload behavior must be predictable and reversible.
+
+### Overload detection
+We enter overload_mode per tier when any of the following conditions persist for a rolling window (e.g., 5–15s):
+- queue_wait_ms p95 > admission_max_queue_wait_ms (tier-specific)
+- queue_depth approaches queue_max_depth
+- repeated cache eviction spikes correlate with degraded latency (kv_cache_pressure high)
+
+### Overload actions (ordered)
+1) **Backpressure**: return 429/503 with Retry-After (Hosted) or propagate backpressure upstream (Dedicated), respecting existing policies.
+2) **Tighten wait budgets**: reduce max_wait_ms (especially for Fast/streaming) to prevent latency spirals.
+3) **Clamp batch size**: reduce max_batch_tokens to keep step time bounded.
+4) **Shed lowest-priority**: Cost-efficient tier is first to shed; Standard next; Fast last (but still bounded—no infinite queues).
+
+### What we do NOT do in overload (v1)
+- Automatically switch a request’s tier.
+- Increase max_wait_ms to create larger batches (this tends to worsen tail latency and customer-perceived “hangs”).
+
+## Model family + hardware class specialization
+Some parameters must vary by model family / hardware class due to kernel characteristics and memory behavior.
+
+### Classification (v1)
+- model_family: e.g., llama_decoder_only, qwen_decoder_only, moe_decoder_only
+- hw_class: e.g., H100_80GB, A100_80GB, L40S_48GB (examples)
+
+### Constraints handled in profile selection
+- **max_batch_tokens** must not exceed memory-safe limits for long context + kv cache.
+- Some quantization variants may change optimal batch token limits and prefill/decode timing.
+
+When a requested tier is incompatible with the model/hardware constraints:
+- We keep the tier but clamp the profile values and emit a reason code (e.g., MODEL_CONSTRAINT_CLAMP).
+
+## Override hierarchy and config surface
+### Precedence rules
+Effective tier/profile is resolved using the following precedence:
+1) **Dedicated tenant/cluster override** (if present and valid)
+2) **Route policy tier** (Hosted API route / Dedicated route)
+3) **Request-level tier hint** (only if allowed by route policy; otherwise ignored)
+4) **System default tier** (Standard)
+5) **Model constraint clamps** (applies after tier selection)
+
+This matches the requirement: customer override > route policy > tier default.
+
+### Config examples (conceptual)
+**Route policy (Hosted):**
+- `route.batching_tier = "standard"`
+- `route.allow_request_tier_override = false`
+
+**Dedicated override:**
+- `tenant_override.batching_tier = "fast"`
+- `tenant_override.max_wait_ms = 2` (optional explicit knob override; allowed for Dedicated per contract)
+
+### Guardrails on overrides
+- Overrides are validated against min/max safe bounds.
+- Any clamp or rejection produces reason codes and is surfaced in Console.
+
+## Reason codes and explainability
+We emit structured reason codes for “why this profile was selected”, with cardinality controls.
+
+### Required reason codes (v1)
+- TIER_DEFAULT: selected default profile for tier
+- ROUTE_POLICY: tier chosen due to route policy
+- DEDICATED_OVERRIDE: tier/profile chosen due to tenant/cluster override
+- REQUEST_HINT_ACCEPTED: request-level tier hint accepted
+- REQUEST_HINT_IGNORED: request-level hint ignored (not permitted)
+- MODEL_CONSTRAINT_CLAMP: clamped due to model/hardware safety bounds
+- OVERLOAD_MODE: overload policy applied
+- STREAMING_WAIT_CAP: streaming-specific wait cap applied
+- LONG_PROMPT_CAP: long prompt bucket caps applied
+
+### Telemetry shape
+- Metrics: low-cardinality labels {tier, model_family, region, hw_class} (no tenant label).
+- Traces: structured event `batching_profile_selected` with reason codes and effective knobs (sampled).
+
+## Observability requirements (summary)
+Full dashboard/alert details live in the observability spec; runtime must expose the following:
+
+### Core metrics (per tier/model_family/region)
+- Request latency: p50/p95/p99 end-to-end
+- TTFT (streaming): p50/p95/p99
+- Inter-token latency (streaming): p50/p95/p99
+- Queue wait time and queue depth
+- Batch size distribution (requests per batch, tokens per batch)
+- Prefill time and decode time distributions
+- Cache hit rate and kv cache eviction rate
+- Rejection / backpressure rate and reasons
+
+### Regression detection
+- Canary gates: Fast tier p99 and Standard tier p95 must not regress beyond thresholds (see perf canary PR-489 alignment).
+- Alerts: page only for Fast tier p99 sustained regressions + error budget burn; ticket for Standard/Cost-efficient regressions.
+
+## Benchmarking and validation plan
+We validate tier profiles using the published benchmark methodology.
+
+### Workload scenarios (minimum set)
+- Mixed prompt lengths (short chat + medium summarization + long context)
+- Streaming vs non-streaming mixes
+- Concurrency ramps (low → saturation → overload)
+- Regional variance (at least 2 major regions in canary)
+
+### Pass/fail gates
+- Tier SLO metrics within bounds for representative model families.
+- No starvation observed (bounded max queue wait for long prompts under mixed arrivals).
+- Overload mode engages and sheds load rather than allowing unbounded latency.
+- Telemetry cardinality stays within budget (post-PR-28544 constraints).
+
+## Rollout plan
+Rollout is staged with feature flags and rapid rollback.
+
+### Release vehicle
+- Runtime v1.22 includes tiered defaults behind a feature flag.
+
+### Stages
+1) **Internal canary**
+   - Enable for Redwood internal traffic and perf test harness.
+   - Validate dashboards, reason codes, and perf gates.
+
+2) **Hosted API subset**
+   - Enable for a small % of routes/models in one region.
+   - Monitor Fast tier p99, streaming TTFT, and rejection rates.
+
+3) **Dedicated opt-in**
+   - Allow opt-in per cluster/tenant; document override precedence.
+   - Ensure Dedicated override behavior matches product requirements.
+
+4) **Broader default**
+   - Expand to additional models/regions.
+   - Make Standard tier the default when no tier is specified.
+
+### Launch criteria (minimum)
+- Perf canary pass rates green for top models.
+- No sustained error budget burn attributable to tiered defaults.
+- Observability dashboards available + on-call playbook updated.
+- Public docs and SDK support merged (Python/TS parameter support).
+
+## Rollback plan
+Rollback must be immediate and low-risk.
+
+### Mechanisms
+- Global kill switch disables tiered defaults and returns to legacy batching behavior.
+- Per-route override can pin legacy behavior for specific customers during investigation.
+- Dedicated: per-tenant override can disable tiering or set conservative tier.
+
+### Rollback triggers (examples)
+- Fast tier p99 regression > threshold for >N minutes in >=1 region.
+- Streaming TTFT regression sustained and correlated with tiering enablement.
+- Telemetry cost blow-up due to unexpected label cardinality.
+- Elevated 429/503 rates outside expected overload windows.
+
+### Rollback procedure (operator checklist)
+1) Flip global kill switch.
+2) Confirm latency and rejection metrics recover on dashboards.
+3) Post update in #eng-runtime and #eng-sre with time window and suspected cause.
+4) If customer-facing, coordinate status page comms per SRE playbook.
+5) Create incident ticket if thresholds met; attach reason-code distribution and queue metrics.
+
+## Risks and mitigations
+| Risk | Impact | Mitigation |
+|---|---|---|
+| Fast tier p99 regression due to mixed workload batching | Customer-visible latency spikes | Tight wait cap; decode service share; perf canary gate; staged rollout |
+| Starvation of long prompts | Timeouts / perceived hangs | Anti-starvation deficit scheduling; prefill concurrency caps |
+| Queue blowup in cost-efficient tier | Unbounded latency, high rejection | Bounded queues; early overload detection; load shedding priority |
+| Metric cardinality blowup | High telemetry cost | Strict label set; sampled tracing; explicit cardinality controls |
+| Override precedence confusion (Dedicated) | Support burden / misconfig | Console shows “effective tier/profile” + reason codes; docs + examples |
+
+## Open questions
+1) Should request-level tier hints be allowed for Hosted API by default, or only opt-in per route?
+2) Do we need a distinct “streaming-fast” sub-profile, or is streaming wait cap + decode share sufficient?
+3) For extremely long contexts (>=16k), do we force additional clamps beyond the long prompt bucket caps?
+
+## Appendix A: Suggested effective-tier UX copy (for Console)
+- Effective tier: Fast / Standard / Cost-efficient
+- Effective profile: `<tier>-<model_family>-<hw_class>-vN`
+- “Why”: show ordered reason codes and any clamps applied.
+
+## Appendix B: Change log
+- 2026-01-14: Initial draft created.
+- 2026-02-03: Added override precedence rules and Dedicated requirements.
+- 2026-02-18: Added overload behavior and rollback triggers aligned with SRE feedback.
+- 2026-02-26: Updated reason codes list and tightened streaming-specific rules.

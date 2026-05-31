@@ -1,0 +1,149 @@
+GPU Egress & KMS Shielding: Rotation and Emergency Runbook
+
+Summary
+------
+This document describes the recommended architecture, Terraform patterns, CI/CD controls, monitoring, and an operational runbook for protecting GPU tenant network egress using an egress-shielding pattern combined with customer-tenant KMS key rotation. The goal is to: (1) prevent accidental or malicious egress from GPU tenants to disallowed destinations, (2) keep encryption key rotation predictable and auditable, and (3) provide a clear emergency rollback and mitigation workflow for failures during scheduled rotations or sudden egress spikes.
+
+Scope and audience
+------------------
+- Audience: infra engineers, SREs, private-deployments delivery engineers, and security engineers maintaining GPU fleets in multi-account setups.
+- Scope: multi-account AWS/GCP deployments where GPU compute nodes run inference workloads and must egress through proxy/egress-gateway services. Includes Terraform modules, CI gates, alerting rules, and oncall runbook. Does NOT cover application-level encryption key usage (see data-protection-policy).
+
+Owners and contacts
+-------------------
+- Primary owner: infra-networking (team slack: #infra-networking)
+- Runbook pager: eng-sre oncall (pager duty)
+- Backup contact: Marisol Vega (marisol@redwood.ai)
+
+High-level design
+------------------
+1) Egress shield framework: all GPU tenant traffic exits via a controlled egress-gateway (proxy or NAT) in a dedicated network account. Egress gateways are fronted by strict allowlists and TLS inspection where required.
+2) KMS usage: tenant secrets (e.g., service-account creds used by egress-gateway) are encrypted with a tenant-specific KMS key which is stored in the control account. Periodic rotation of that key requires coordinated rollout of the egress-gateway config and secrets.
+3) Terraform modules: we use three composable modules: network-egress-gateway, kms-key-vault, and role-binder. Each module exposes idempotent rotation helpers and drift detection policies.
+
+Topology (text diagram)
+----------------------
+GPU Tenant Account A ---- VPC Peering / PrivateLink ----> Egress Account (shared) ----> Internet
+                            |
+                            +---> Transit VPC / NAT Gateway (session tracking + proxy)
+
+Security controls and guardrails
+-------------------------------
+- Egress allowlist enforced via egress-gateway, deny-by-default policy in network ACLs.
+- KMS keys are customer-managed, rotate on schedule (default 30 days), and are disabled for 24h before deletion.
+- Terraform policy checks (opa/gatekeeper) to block direct public route creation in GPU accounts.
+- CI/CD: changes to terraform module inputs that touch egress allowlists or KMS rotation schedules require two approvers and a canary promotion.
+
+SLOs and alerts
+---------------
+- Egress gateway availability SLO: 99.95% monthly.
+- Key rotation orchestration success rate: 99% of rotations complete without rollback.
+- Alerts (examples):
+  - egress-shield:high-error-rate -> p0 when > 5% request error rate for 5m or > 10% for 1m.
+  - kms-rotation:failed-step -> p1 when orchestrator reports FAILED status for any tenant rotation.
+  - egress:unexpected-destination -> p0 on > 10 connections/min to destinations outside approved ranges.
+
+Terraform pattern (example)
+--------------------------
+Use the following pattern inside the central control account. The snippet below is illustrative:
+
+```hcl
+module "gpu_egress_gateway" {
+  source = "git::ssh://git@repo.redwood.ai/infra-modules/egress-gateway.git?ref=v2.1.0"
+
+  region               = var.region
+  tenant_tag           = local.tenant_tag
+  allowed_destinations = var.allowed_destinations
+  kms_key_id           = module.kms.key_id
+  session_logging      = true
+}
+
+module "kms" {
+  source = "git::ssh://git@repo.redwood.ai/infra-modules/kms-key-vault.git"
+  key_alias = "alias/gpu-tenant-${local.tenant_tag}"
+  rotation  = { enabled = true, period_days = 30 }
+}
+```
+
+CI/CD controls and test matrix
+------------------------------
+- Terraform PR checks: unit plan, policy-as-code (OPA), and a simulated "egress acceptance" test that runs a local harness to verify allowlist behavior.
+- Promotion pipeline: developer -> staging-canary (single tenant) -> staged-wave (10% of tenants) -> global. Each promotion step requires a smoke test for connectivity and telemetry.
+- Canary smoke tests:
+  1. connectivity to whitelisted destination (should succeed)
+  2. attempt to connect to blacklisted destination (should be blocked, >95% blocked)
+  3. verification of successful KMS decrypt of a signed token by egress-gateway
+
+Operational runbook: scheduled KMS rotation
+-----------------------------------------
+Pre-rotation (STAKEHOLDERS: infra-networking, eng-sre)
+1) Create rotation PR with explicit canary targets and window.
+2) Ensure monitoring dashboards are green: egress errors < 0.5%, gateway latency < 50ms P95.
+3) Notify oncall and downstream teams via #infra-changes and sentry release notes.
+
+Canary (single-tenant)
+1) Apply terraform for canary tenant in a maintenance window (recommended 02:00-04:00 UTC).
+2) Wait 5 minutes, run the canary smoke tests (connectivity and decrypt).
+3) If tests pass, promote to staged-wave. If tests fail, follow rollback below.
+
+Staged-wave (10% tenants)
+1) Increase scope in waves with 10 minute observation windows between waves.
+2) Run automated traffic replay for known prompt sets to ensure no degradation in throughput or increased TLS failures.
+3) If failures trend > 1% over baseline, stop rollout and escalate.
+
+Global rollout
+1) Execute terraform apply for remaining tenants with parallelism limited to 20 at a time.
+2) Monitor key metrics for 30 minutes post-wave before continuing.
+
+Rollback procedure (KMS rotation failure)
+---------------------------------------
+1) If canary fails, immediately run: terraform apply -target=module.gpu_egress_gateway -var='kms_key_id=${previous_key_id}' to revert the canary gateway to previous key.
+2) Mark the rotation key as disabled and open a security incident if there is evidence of misuse.
+3) Re-run the rotation after addressing root cause and notify impacted tenants.
+
+Emergency mitigation: sudden egress spike to unexpected destinations
+------------------------------------------------------------------
+1) Pager triggers to SRE: identify originating tenant account and request trace from egress-gateway logs (session id/TCP fingerprint).
+2) If malicious or accidental, move offending tenant to a quarantined VPC (terraform target) that forces all outbound traffic through a blackhole route.
+3) Rotate tenant service credentials and disable the tenant-specific KMS key until verified.
+4) Conduct forensic capture: interface packet captures (up to sampling policy), proxy logs, and application request traces.
+
+Troubleshooting checklist
+-------------------------
+- Check egress-gateway logs for 403/502/5xx patterns.
+- Verify KMS permissions: resource policy allows decrypt for the gateway role.
+- Confirm route tables and security groups in the control egress account are intact.
+- Confirm terraform plan expected change (avoid unintended public route creation).
+
+Telemetry and dashboards (minimum)
+---------------------------------
+- Dashboard: Egress Gateway Health
+  - P50/P95/P99 latency, request rate, error rates, active connections by tenant.
+- Dashboard: KMS Rotation Orchestration
+  - last_rotation, next_rotation, per-tenant rotation status, failed_steps.
+- Alert: Unexpected-Destination-Heatmap (top 10 external hosts by connection count)
+
+Post-incident actions and RCA template
+-------------------------------------
+- Open an incident ticket and assign owner within 1 hour.
+- Collect: terraform plan/applies, rotation run logs, gateway telemetry, and IAM/KMS audit logs.
+- Runbook follow-up: implement at least one remediation item before closing incident (e.g., add OPA policy test, extend canary window).
+
+Appendix: small checklist for engineers implementing the modules
+--------------------------------------------------------------
+- Ensure module version pinning: module.egress-gateway ref should be pinned to an immutable tag.
+- Export module outputs: gateway_dns, gateway_role_arn, kms_key_id for downstream automation.
+- Test locally with the egress simulator harness prior to PR.
+
+References and related pages
+---------------------------
+- See: network-egress-gateway module README (internal repo).
+- See: policy-as-code-gpu-tenant-guardrails (OPA ruleset).
+- See: infra-sre/incident-handling for generic incident lifecycle.
+
+Changelog
+---------
+- 2025-09-30: Initial draft by Marisol Vega.
+- 2025-11-12: Added CI canary smoke tests and telemetry thresholds (review feedback).
+- 2026-02-18: Added emergency quarantine steps and rollback commands (postmortem 2026-02-10).
+

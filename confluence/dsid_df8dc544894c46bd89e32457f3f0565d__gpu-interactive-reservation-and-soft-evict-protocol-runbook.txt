@@ -1,0 +1,147 @@
+Interactive reservation and soft-evict protocol for GPU inference
+
+Overview:
+
+This runbook defines the "interactive reservation" and "soft-evict" protocol we use to support low-latency, interactive LLM inference on Redwood's multi-tenant GPU fleet. It combines an operational policy, Terraform/IaC patterns, CI/CD rollout steps, and on-call procedures so teams can safely enable prioritized interactive sessions without jeopardizing batch workloads or overall capacity SLOs.
+
+Goals:
+- Guarantee p99 latency budget for interactive sessions (default 200ms per-token on A100-class nodes) while preserving overall capacity utilization >= 70%.
+- Allow bounded, time-limited reservations that can be softly evicted (spill to cheaper or lower-priority pools) before hard preemption.
+- Provide a tested Terraform module and CI/CD lifecycle for enabling reservation policies and the associated routing rules.
+
+Scope and applicability:
+- Applies to hosted and dedicated fleets managed by the GPU allocator service (gpu-allocator-operator).
+- Does NOT replace the tenant-level fairshare allocator; it is a supplementary policy layer for latency-sensitive routes (e.g., /v1/generate?priority=interactive).
+
+Key concepts:
+- Reservation: short-lived (default 10–60s) slot allocation attached to a session token. Not a full node claim; instead, it's a weighted quota on the allocator.
+- Soft-evict: preference-based degradation where we try to re-route or migrate in-flight sessions to an alternate compatible pool, using KV cache serialization where possible, before issuing a hard preempt.
+- Eviction budget: a per-region, per-tenant counter that limits how often a tenant can be soft-evicted in a sliding window (default: 5 evictions / 10m).
+
+Operational policy (high-level):
+1) Reservation request flow:
+   - Client requests an interactive reservation via API header X-Redwood-Session: interactive and the route sets priority=interactive.
+   - The fronting router checks the policy store for feature flag and per-tenant quota; if allowed, the router issues a reservation token (session_id) with TTL and preferred pool attributes (gpu_class, seq_len_hint, quantization_profile).
+   - Reservation tokens are short-lived and cost-accounted as 'interactive-resv' in billing.
+
+2) Admission control and placement:
+   - The allocator evaluates the reservation token against active capacity and reserves a weighted slot in the warm-pool. Reservation weight depends on route SLO and model (table below).
+   - If warm-pool cannot satisfy the reservation, allocator attempts one of the following, in order: (a) prefix cache affinity pin on a compatible node, (b) burst to heterogeneous warm buffer, (c) route to dedicated-interactive fallback pool (higher cost), (d) return soft-fail with suggested retry-backoff.
+
+3) Eviction model:
+   - Soft-evict path: first attempt to migrate session to fallback pool using KV checkpointing. Migration must keep token-level latency under p95 target (default 120ms extra).
+   - Hard preempt path: allowed only when migration fails or when safety signals (urgent capacity reclaim) exist; hard preempt triggers immediate session termination with a structured error and guaranteed cache eviction to avoid corruption.
+
+Sizing guidelines and default weights (config table):
+| model_class | seq_len_hint | reservation_weight | target_p99_per_token | preferred_pool |
+|-------------|--------------|--------------------:|---------------------:|----------------|
+| small (e.g., LLaMA-7B) | <=512 | 1 | 120ms | warm-small |
+| medium (e.g., LLaMA-13B) | <=1024 | 2 | 160ms | warm-medium |
+| large (e.g., 70B+) | >1024 | 4 | 200ms | warm-large |
+
+Terraform / IaC patterns:
+- We maintain a dedicated module: modules/gpu_interactive_reservation which encapsulates:
+  - FeatureFlag (launchdarkly) resource toggles for region and tenant groups.
+  - allocator_policy (custom CRD) definitions as YAML manifests to apply via the operator.
+  - IAM bindings and network egress tags required for fallback pool flow.
+
+Example module usage (pseudo-HCL):
+
+module "interactive_resv_us_west" {
+  source = "git::ssh://git.redwood/repo.git//modules/gpu_interactive_reservation"
+  region = "us-west-2"
+  allocator_policy_name = "interactive-low-latency-v1"
+  eviction_budget = 5
+  warm_pool_prefix = "warm-interactive"
+}
+
+Terraform notes and constraints:
+- allocator_policy CRD contains an immutable policy_hash field that must change when any behavioral param changes; CI will block promotion if the hash doesn't match expected.
+- Module outputs: policy_manifest_path, feature_flag_key, iam_role_arn. Use these outputs in downstream service modules.
+
+CI/CD integration and promotion checklist:
+1. Author change in a feature branch under infra/gpu-policies.
+2. Unit tests: terraform fmt + validate + custom linter that verifies policy thresholds against a known-safe baseline.
+3. Integration test in ephemeral sandbox cluster:
+   - Create a sandbox reservation and assert p50/p95 latency under synthetic 50 concurrent interactive sessions.
+   - Simulate a warm-pool shortage and verify migration path completes within migration latency budget.
+4. Canary promotion: apply policy to canary region (default us-west-2-canary) using CD pipeline. Monitor: allocator_evictions, reservation_success_rate, migration_latency_histogram.
+5. Full rollout: staged by region, 24h observation per region before next stage.
+
+Meters, alerts, and dashboards:
+- Required metrics to emit from allocator and runtime:
+  - interactive_reservation_attempts_total (by region, tenant_id)
+  - interactive_reservation_success_total (labels: model_class, pool)
+  - interactive_soft_evictions_total (labels: reason, tenant_id)
+  - migration_latency_seconds_bucket
+  - reservation_weight_utilization (per-pool gauge)
+- Alerting rules (examples):
+  - P0: reservation_success_rate < 85% sustained 5m for a region -> Pager (oncall infra)
+  - P1: soft_evictions per tenant > eviction_budget within 10m -> Slack to tenant-success + infra (automated rate-limiter in allocator)
+  - P1: migration_latency p99 > 400ms for 10m -> Channel ops, investigate kernel/IO hotspots
+
+On-call runbook (step-by-step):
+1. Pager fires: reservation_success_rate < 85% in region X.
+2. Check allocator dashboard: top 5 failure reasons (labels).
+3. If failures are due to warm-pool exhaustion:
+   - Evaluate warm-pool scaling: runbook snippet:
+     - Scale warm-pool by 20% via terraform variable override in the allocator module.
+     - Trigger CD pipeline to apply.
+     - If CD not available, use operator CLI to increase pool target:
+       kubectl apply -f /manifests/allocator/warm-pool-scale-increase-20.yaml
+4. If failures are due to IAM/network tagging (e.g., fallback pools missing egress tags), revert last IaC change or run the quick-fix snippet below.
+5. If soft-eviction spike for a single tenant, check tenant's eviction_budget; consider temporary uplift or throttling.
+6. If migration_latency spike observed, check node-level metrics (cuda_busy, nvlink_errors, host_io_wait). Consider rolling nodes with kernel patch or kernel-level patchback.
+7. Escalate to runtime team if the issue persists after 30m.
+
+Quick-fix Terraform snippet (applies fallback egress tag):
+
+resource "aws_ec2_tag" "fallback_pool_egress" {
+  for_each = toset(var.fallback_pool_instance_ids)
+  key      = "redwood:egress-path"
+  value    = "interactive-fallback"
+}
+
+Migration and data integrity considerations:
+- KV cache checkpoint format must be backward compatible for the two most recent runtime releases. Tests will run in CI to ensure checkpoint serialization/deserialization across versions.
+- Migration rollback: if destination node fails to accept a checkpoint, the allocator must attempt a second target within 5s; if both fail, mark reservation as failed and surface a structured error to the client with retry-after header.
+
+Testing matrix (automated):
+- Unit: policy hash/immutability tests, IaC linting.
+- Integration: end-to-end reservation lifecycle in sandbox for each model_class.
+- Chaos: inject simulated node loss during migration to verify soft-evict fallback completes gracefully.
+
+Rollout playbook (detailed):
+1. Feature branch -> PR with policy delta and test artifacts. Reviewers: infra-scheduling + runtime.
+2. Merge triggers CI; pass lint + unit tests.
+3. Apply to canary region via CD with manual approval step. Monitor for 24 hours.
+4. If canary is green, progressively roll to regions in the order: us-west-2 -> eu-west-1 -> ap-southeast-1.
+5. After full rollout, open a post-rollout review doc summarizing metrics and any incidents.
+
+Ownership and contacts:
+- Policy owner: Maya Chen (infra-scheduling)
+- Runtime contact: Arjun Patel (serving-runtime)
+- CI/CD operator: Lina Gomez (eng-infra CI)
+
+Appendix: structured error responses and suggested client retry behavior:
+- Soft-evict-in-progress: HTTP 202 with JSON:
+  {
+    "error": "interactive_migration_in_progress",
+    "retry_after_seconds": "3"
+  }
+- Reservation-failed (exhausted): HTTP 429 with JSON:
+  {
+    "error": "reservation_capacity_exceeded",
+    "suggested_backoff_ms": "200"
+  }
+
+References and related docs:
+- See allocator operator spec (internal) for CRD field definitions.
+- See modules/gpu_interactive_reservation in the infra repo for IaC examples.
+
+Change log:
+- 2024-08-12: Initial draft and design review.
+- 2024-11-03: Updated eviction_budget default from 3 -> 5 after canary feedback.
+- 2025-02-20: Added CI immutability check and migration rollback behavior.
+
+End of document.

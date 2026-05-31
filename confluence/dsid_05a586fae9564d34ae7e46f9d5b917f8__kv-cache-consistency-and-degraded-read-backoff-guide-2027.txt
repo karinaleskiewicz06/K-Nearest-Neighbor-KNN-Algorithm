@@ -1,0 +1,149 @@
+KV cache consistency and degraded-read backoff guide
+
+Overview:
+
+This guide defines the detection, containment, and remediation patterns we use when the LLM KV (key-value) cache exhibits consistency or availability problems that cause degraded reads (stale or missing KV state). It explains automated degraded-read backoff behavior, operator remediation steps, configuration knobs, and dashboards/alerts to ensure predictable failover without violating tenant SLOs.
+
+Scope:
+- Applies to the distributed LLM KV prefix cache used by the serving runtime (global name: runtime-kv-cache).
+- Covers transient network partitions, metadata index corruption, leader election flaps, and partial shard availability.
+- Excludes full model binary corruption and hardware-level memory errors (see eng-serving-runtime/known-issues).
+
+Owner and responders:
+- Primary owner: eng-platform (runtime-ops squad)
+- Oncall rotation: platform-operator (pager) -> eng-sre escalation -> runtime-infra engineering
+- Notification channels: #platform-ops, #oncall-pager, paged phone roster
+
+Definitions and failure modes:
+1) Missing-KV reads: requests that expect a cached KV entry but receive a cache-miss where a valid entry should exist.
+2) Stale-KV reads: reads that return older prefix state due to replication lag or divergent leadership.
+3) Partial-shard-unavailable: a subset of shards return 5xx or time out.
+4) Consistency-mismatch: divergence between metadata index and stored shard contents resulting in incorrect routing or invalid tokenization offsets.
+
+Detection signals (metrics & logs):
+- metric/runtime_kv_read_error_rate (per-shard, p95)
+- metric/runtime_kv_stale_read_ratio (synthetic checks comparing authoritative source to cache)
+- metric/runtime_kv_replication_lag_seconds (95/99)
+- logs: "KV_MISMATCH", "KV_SHARD_OOS", leader-change events in audit logs
+- synthetic canaries: canary-prefix-check-<region> (compare authoritative prefix store -> cache)
+
+Alerting rules and dashboard guidance:
+- Alert: KV-SHARD-ERROR-CRITICAL
+  - Trigger: shard error rate > 0.5% for 5m AND p95 latency > 250ms
+  - Severity: P1 (page)
+- Alert: KV-READ-DEGRADED-WARN
+  - Trigger: aggregated stale_read_ratio > 0.2% for 10m OR replication_lag_seconds p99 > 3s
+  - Severity: P2 (slack)
+- Dashboard panels to include:
+  - per-shard read error heatmap
+  - multi-region canary diff (ratio of mismatches)
+  - recent leader-change timeline annotated with deploys
+  - operator mitigation knobs (current backoff multiplier, degraded-serving-mode)
+
+Containment and automated degraded-read backoff pattern (high level):
+1) Detect anomalous shard behavior using the synthetic canary and metric gates.
+2) Automatically place affected shard(s) into "degraded-read-backoff" mode rather than immediate eviction when:
+   - read_error_rate spike OR replication_lag > configurable threshold AND
+   - model SLO indicates a better UX serving slightly stale responses vs 5xx errors.
+3) In degraded-read-backoff mode, the runtime will:
+   - apply exponential read delay/queuing for new requests targeting that shard (config: backoff_base_ms, max_backoff_ms)
+   - fall back to last-known-good (LKG) prefix state if the request decoder accepts slightly older KV state (config: allow_stale_prefix=true for non-strict routes)
+   - stream partial outputs with a header: X-Redwood-KV-State: degraded/LKG<br/>
+This behavior reduces 5xx storms, prevents cascading load onto healthy shards, and buys time for automated healing.
+
+Config table (recommended defaults):
+| knob | description | default |
+|------|-------------|---------|
+| backoff_base_ms | base backoff delay applied on first degraded read | "20" |
+| max_backoff_ms | maximum per-attempt backoff to avoid request starvation | "2000" |
+| backoff_multiplier | exponential multiplier per retry | "2.0" |
+| allow_stale_prefix | whether to serve last-known-good prefix on degraded read | "true" |
+| degraded_mode_min_duration_s | minimum time to stay in degraded mode before re-eval | "30" |
+| degraded_mode_probe_interval_s | frequency of probes to check shard recovery | "10" |
+| stale_tolerance_seconds | maximum age of LKG prefix allowed | "5" |
+
+(Operator note: the runtime accepts these via the /api/v1/ops/kv-config endpoint. Example YAML below.)
+
+YAML example (ops config push):
+```yaml
+kv_backoff:
+  backoff_base_ms: 20
+  max_backoff_ms: 2000
+  multiplier: 2.0
+  allow_stale_prefix: true
+  min_duration_s: 30
+  probe_interval_s: 10
+  stale_tolerance_seconds: 5
+```
+
+Automated remediation actions (order of operations):
+1) Probe: controller runs an immediate consistency probe against the shard (reads canonical store and compares prefixes).
+2) Soft-redirect: route a percentage of traffic to compatible model-variant replicas in the same region (variant-candidates list maintained by model-onboarding). See routing policy example below.
+3) If probes pass -> transition out of degraded mode.
+4) If probes fail for > 3 probes spaced by probe_interval -> start controlled re-synchronization job for shard (resync ownership -> rehydrate cache from authoritative store).
+5) If re-sync fails or OOS count > threshold -> schedule shard replacement/rehoming (operator intervention required).
+
+Routing policy example (OPA / policy hint):
+- Prefer: same-region compatible-variant -> preferred-latency < 50ms
+- Fallback: cross-region cold-variant (only when allow_cross_region_fallback=true and tenant policy allows)
+
+Operator runbook (step-by-step):
+1) Triage
+   1. Acknowledge page. Post immediate summary in #platform-ops with shard and region, include alert runbook link.
+   2. Check dashboard panels: per-shard heatmap, leader-change log, probe history.
+2) Immediate containment (automated but verify):
+   1. Confirm degraded-read-backoff mode enabled for affected shard via API: curl -sS https://ops.internal/v1/kv/shards/<shard>/status
+   2. If not enabled, enable with: curl -X POST https://ops.internal/v1/kv/shards/<shard>/degraded -d '{"mode":"backoff"}' -H 'Content-Type: application/json'
+3) Investigate root cause:
+   - Review shard logs for KV_MISMATCH and leader-election flaps.
+   - Run a targeted probe: /tools/kv_probe --shard <shard> --compare-authoritative true --output json
+4) Repair path options (pick one):
+   A) Quick rehydrate: trigger cache rehydrate job for shard (if probe shows missing entries). Command: /ops/bin/rehydrate_shard --shard <shard> --type incremental
+   B) Rehome: if leader flapping, reassign leader and wait for stable leader epoch. Command: /ops/bin/rehome_shard --shard <shard> --target-node <node-id>
+   C) Full resync: schedule full resync job during low-traffic window and notify SRE. Use: /ops/bin/full_resync --shard <shard> --window_start <UTC> --dedupe true
+5) Monitor recovery: probe-to-success ratio should reach 1.0 for three consecutive probes spaced by probe_interval_s before clearing alerts.
+6) Post-incident checklist: create retrospective (template below), tag runbook with lessons and any configuration changes.
+
+Escalation matrix and SLAs:
+- If P1 persists > 15 minutes without improved probe results -> page runtime-infra lead and eng-sre manager.
+- If degraded mode remains > 2 hours -> schedule customer-impact investigation with customer-success for tenants impacted by strict-consistency routes.
+
+Testing and validation (pre-deploy & chaos):
+- Unit tests: simulate kv-backoff with synthetic requests asserting that no more than 1% of requests see 5xx under injected 10% shard error.
+- Chaos tests: orchestrate shard flaps via canary chaos runner: cause leader-flap, confirm degraded-mode triggers and traffic falls back to LKG without customer-visible 500s.
+- Load tests: verify degraded backoff increases tail latency by < 20% for affected routes and reduces 5xx rate by > 95%.
+
+Dashboard and alert implementation details (Grafana/Prometheus):
+- Query examples:
+  - Read error rate per shard: sum(rate(runtime_kv_read_errors_total[5m])) by (shard) / sum(rate(runtime_kv_reads_total[5m])) by (shard)
+  - Stale read ratio (canary diff): sum(canary_mismatch_total) / sum(canary_probe_total)
+- Alert escalation note: alerts should include a direct link to the probe job and the current degraded-mode flags to reduce cognitive load.
+
+Release, rollout, and operator training:
+- Feature flag: kv-degraded-backoff-v2. Roll out in three phases: internal canary -> regional canary -> global.
+- Training: 45-minute ops workshop for platform-operators covering: runbook walk-through, probe tools, and rehome commands. Record session and attach to team-wiki.
+
+Retrospective template (to complete after incidents):
+1) Incident summary (one-paragraph)
+2) Timeline of key events (alerts, mode changes, operator actions)
+3) Root cause analysis (technical)
+4) Detection gaps and suggested metric additions
+5) Configuration changes made and rationale
+6) Action items, owners, due dates
+7) Follow-up verification steps and cost/latency impact post-remediation
+
+Appendix: example incident timeline snippet
+- 2027-02-03 03:14 UTC: KV-READ-DEGRADED-WARN alert fired for shard-12 (us-west)
+- 03:16 UTC: controller enabled degraded-read-backoff for shard-12 automatically
+- 03:17 UTC: probe failed (missing prefixes), rehydrate job scheduled
+- 03:28 UTC: rehydrate completed, probe green at 03:30 UTC -> degraded mode cleared
+
+Contacts and links:
+- Runtime-ops runbook index: /confluence/eng-platform/runbooks
+- Oncall rota: /confluence/eng-platform/team-wiki/operator-oncall-quick-reference-shell-helpers-and-scripts-2026
+- Tooling: /internal/tools/kv_probe (README attached on team drive)
+
+Change history:
+- 2027-01-14: created by Maya Patel (draft)
+- 2027-02-01: rewrote containment strategy to prefer LKG + backoff (reviewers Diego Martinez, Hannah Lee)
+- 2027-02-09: published after chaos-tests and led a training session

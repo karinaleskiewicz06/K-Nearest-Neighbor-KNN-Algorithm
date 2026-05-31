@@ -1,0 +1,166 @@
+On-demand sandbox GPU module with egress fencing
+
+Summary
+-------
+This document describes the design, Terraform module interface, CI/CD promotion workflow, and runbook for the On-Demand Sandbox GPU Provisioner. The goal is to provide developers a safe, cost-controlled, network-restricted GPU sandbox that can be provisioned in minutes without granting broad cloud permissions. The module enforces egress fencing, cost quotas, and automated tear-down to prevent runaway spend and uncontrolled external access.
+
+Goals
+-----
+- Enable low-friction, self-service GPU sandboxes for engineering and research teams.
+- Enforce network egress restrictions by default (allowlist pattern) to satisfy data exfiltration constraints.
+- Integrate with existing quota and billing tags so spend is visible and charged to teams.
+- Provide a Terraform module + CI/CD path that makes promotion and security reviews straightforward.
+- Offer an operational runbook for on-call to triage sandbox-related incidents.
+
+Scope and non-goals
+-------------------
+In scope:
+- Terraform module that provisions a single-tenant sandbox VPC, subnet, GPU node (G4/G5 equivalent), IAM roles scoped to the sandbox, and an egress proxy / NAT with allowlist controls.
+- Integration with cost center tagging, short-lived credentials, and auto-destroy schedules.
+- Reference CI/CD pipeline to publish module versions and a companion policy check job (static security scans, terraform-validate).
+
+Out of scope:
+- Multi-tenant GPU pooling or fractional GPU multiplexing (use existing tenant pools).
+- Long-term production workloads; sandboxes are explicitly ephemeral.*
+
+Architecture overview (text diagram)
+-----------------------------------
+Developer (self-service UI / CLI) --> GitOps repo with workspace variables --> Terraform module (sandbox) --> Provisioned resources:
+- Sandbox VPC/subnet (isolated CIDR)
+- Bastion or short-lived jump host with limited SSH (optional)
+- GPU node(s) in a private subnet with no Internet route by default
+- Egress proxy (allowed-hosts list) or egress NAT with security group + proxy ACLs
+- VPC endpoints for required services (S3-like storage, internal API)
+- Cloud DNS entries and ephemeral certificate via internal CA
+- IAM Role with least-privilege policies and session duration = 1h
+- Auto-destroy lifecycle: tag + scheduler (7 days default)
+
+Design principles
+-----------------
+- Default-deny networking: sandboxes have no 0.0.0.0/0 egress unless explicitly allowed via team-approved allowlist.
+- Short-lived credentials: all roles assume via STS; no long-lived keys in provisioned instances.
+- Cost visibility: every sandbox must include cost_center and team_tag tags; a billing alert is created if spend > $200 in 24h.
+- Easy revoke: owners can terminate all sandboxes for a team using a single CLI action.
+
+Terraform module interface (table)
+--------------------------------
+| Input variable | Type | Default | Description |
+| module_name | string | "sandbox-gpu" | Short name used for resources |
+| team | string | "n/a" | Human-readable team id, required for billing tags |
+| gpu_instance_type | string | "g5.xlarge" | Instance size; limited to approved types list |
+| egress_allowlist | list(string) | [] | CIDR or FQDNs allowed for outbound; empty = no egress |
+| ttl_days | number | 7 | Auto-destroy after ttl_days |
+| enable_bastion | bool | false | If true, create a bastion with session logging |
+| cost_center | string | "n/a" | Billing tag that must match cost-center registry |
+| destroy_protection | bool | false | Prevent accidental destroy in CI, but manual override allowed |
+
+Example usage (Terraform snippet)
+--------------------------------
+module "sandbox_alex_ml" {
+  source = "git::ssh://git@repo.internal/redwood/terraform-modules.git//sandbox-gpu?ref=v1.2.0"
+
+  module_name        = "alex-sandbox"
+  team               = "ml-platform"
+  gpu_instance_type  = "g5.xlarge"
+  egress_allowlist   = ["10.0.0.0/16", "storage.redwood.internal"]
+  ttl_days           = 3
+  enable_bastion     = true
+  cost_center        = "platform-research"
+}
+
+Egress fencing patterns
+-----------------------
+We provide two implementations depending on cloud and security posture: 
+1) Proxy-allowlist (recommended): creates a managed HTTP(S) proxy in the sandbox VPC and forces all outbound HTTP(S) through it via route table + iptables rules. The proxy enforces a configured allowlist of hostnames and logs all requests to the internal observability endpoint.
+2) Narrow NAT + VPC endpoints: sandbox has no default Internet route; explicit VPC endpoints (S3/Storage) and a tight NAT with explicit CIDR/FQDN egress rules for specific services.
+
+Proxy configuration example (pseudo config)
+-----------------------------------------
+proxy:
+  listen: 3128
+  allow_hosts: ["storage.redwood.internal", "pip.redwood.internal"]
+  logging: true
+  auth: sts-based
+
+Security & IAM model
+--------------------
+- Resource creation limited to a central provisioning role (infra-ci) that runs Terraform. Developer-facing UX triggers pull requests with workspace variables; only infra-ci has the cloud provider credentials.
+- The provisioned GPU node gets an instance role with scoped permissions: read-only access to team's S3 prefix, write to team-specific artifact registry, and no direct KMS decrypt unless explicitly requested and approved.
+- Admins can attach an allowlist exception via a ticket; exceptions are timeboxed and audited.
+
+Cost control and quotas
+-----------------------
+- Default quota: 1 active sandbox per developer and max 3 GPUs per team concurrently.
+- Billing monitors: CloudWatch/Prometheus rule that fires if sandbox tag spend > $200 in 24h or GPU hours > 20 in 24h. Alerts route to infra-costs and the owning team slack channel.
+- Enforcement: The module registers allocation in central quota service (HTTP API). Quota service returns 200 or 403; Terraform run fails with actionable message if quota exceeded.
+
+CI/CD and module promotion
+-------------------------
+1) Author creates PR in terraform-modules repo with module changes. PR must include: update to CHANGELOG, changelog description, and smoke test plan.
+2) PR triggers pipeline: terraform fmt -> terraform validate -> static policy check (policy-as-code with OPA/Gatekeeper) -> unit tests (local module tests) -> plan generation in sandbox-preprod account.
+3) If plan applies cleanly in preprod, maintainer approves and a release tag is created (vX.Y.Z).
+4) Release pipeline runs automated security scan and publishes module to internal registry; it also creates an entry in module-catalog with supported gpu_instance_types.
+
+Promotion checks (policy highlights)
+- No module can enable public egress by default.
+- All new IAM permissions must be reviewed by security.
+- Changes to default ttl_days downward require a follow-up review with platform security.
+
+Runbook: common troubleshooting steps
+------------------------------------
+When receiving an incident about a sandbox (networking, cost, or provisioning):
+1) Identify sandbox resources from the team tag: query inventory service: curl -s https://inventory.redwood.internal/api/sandboxes?team=XYZ
+2) If networking issue: check subnet route table and proxy health:
+   - aws ec2 describe-route-tables --filters Name=vpc-id,Values=<vpc>
+   - curl -s http://proxy.sandbox.internal/health | jq
+3) If unexpected egress detected: immediately attach egress-block security group (infra tool) and open a security incident. Collect connection logs from proxy and VPC flow logs.
+4) If cost alert: snapshot current spend: query billing API and, if > threshold, suspend sandbox via central orchestration API: POST /v1/sandboxes/<id>/suspend
+5) If Terraform apply failed in CI: retrieve plan file from artifacts and run terraform plan locally with the same workspace variables; check quota service response.
+
+Operational metrics & SLOs
+-------------------------
+- Provisioning time SLO: 95th percentile < 10 minutes (from merge to resources available)
+- Auto-destroy reliability: 99.9% success for TTL-triggered destroy runs over a 30-day window
+- Egress policy enforcement accuracy: 100% of egress flows must pass through proxy in proxy-mode
+- Cost alerting latency: alert generated within 15 minutes of threshold breach
+
+Ownership and contacts
+----------------------
+- Module owner: infra/iac team (primary: Priya Nair)
+- Network policy owner: eng-infra/networking (oncall: net-oncall rotation)
+- Cost alerts: finance/internal-billing channel and infra-costs rotation
+
+Checklist for teams requesting exceptions
+---------------------------------------
+1) Submit a security exception ticket with justification, duration, and list of FQDNs/CIDRs required.
+2) Provide a data flow diagram and risk analysis.
+3) Agree to additional logging and a shorter TTL (max 48 hours) for exceptions.
+4) Accept that the exception will be audited and may be revoked.
+
+Appendix: example policy-as-code snippet (Rego-like)
+----------------------------------------------------
+# deny public egress by default
+package sandbox.policies
+
+default allow_public_egress = false
+
+allow_public_egress {
+  input.module_config.egress_allowlist != null
+  count(input.module_config.egress_allowlist) > 0
+}
+
+References and related docs
+--------------------------
+- Internal quota service API README: /docs/infra/quota-service.md
+- Network proxy config standards: /confluence/eng-infra/cloud-accounts-and-networking/proxy-standards
+- Billing tagging guidelines: /confluence/finance-and-legal/billing-tags-and-cost-centers
+
+Revision history
+----------------
+- 2025-03-18: Document created by Priya Nair (initial draft).
+- 2025-06-11: Added CI/CD promotion pipeline and proxy-mode details (reviewers: Tomás Rivera, Jin Park).
+- 2025-10-02: Clarified quota enforcement flow and added runbook suspend API call.
+
+Notes
+-----
+This module is intended as a low-friction developer capability but must remain safe: never grant broad outbound access or unrestricted cloud permissions. For production GPU workloads, teams should use the Dedicated GPU pools and follow the dedicated provisioning playbooks.

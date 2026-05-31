@@ -1,0 +1,178 @@
+Cross-tenant Data Scrubbing and Ephemeral Credentials Playbook
+
+Summary
+=======
+This playbook defines the required configuration, operator procedures, and validation tests for implementing cross-tenant data scrubbing and ephemeral credentials in Redwood private deployments (VPC and on‑prem). It codifies a minimal operator-safe path for preventing accidental tenant data leakage in shared runtime paths, and for ensuring credentials used by operators and field agents are short‑lived and auditable.
+
+Goals
+-----
+- Prevent cross-tenant exposure in control and data plane (KV cache, logging, telemetry ingest).
+- Provide an operator workflow for provisioning, rotating, and revoking ephemeral credentials.
+- Define scrubbing rules and verification steps to remove tenant identifiers from sampled logs and telemetry before they leave customer-controlled networks.
+- Provide rollback and incident procedures for failures during rollout.
+
+Scope and exclusions
+--------------------
+- Applies to Redwood Private (VPC & on‑prem) deployments where multiple tenant namespaces share runtime services (e.g., shard-level KV caches, telemetry gateways).
+- Excludes single-tenant physically isolated appliances where no shared runtime exists.
+
+Terminology
+-----------
+- tenant-id: canonical customer tenant identifier (opaque string).
+- ephemeral-cred: short-lived operator/service credential issued by redwood-ephemeral-agent.
+- scrub-agent: sidecar process that sanitizes logs/telemetry prior to egress.
+- control-plane-proxy: platform component that brokers control operations (pin, swap, rollout).
+
+Prerequisites
+-------------
+| Component | Minimum version | Owner | Notes |
+|---|---:|---|---|
+| redwood-operator-cred-proxy | v1.8.0 | eng-private-deployments | issues ephemeral tokens scoped by tenant and role |
+| scrub-agent (sidecar) | v0.9.2 | eng-private-deployments | supports regex + structured field rewrite policies |
+| telemetry-ingest | v2.4.1 | eng-platform | supports pre-ingest filters and allowlists |
+| audit-log-collector | v3.1.0 | eng-sre | configurable retention and signed entries |
+
+Security requirements (high level)
+---------------------------------
+1. All operator credentials MUST be ephemeral (max TTL 1h by default).
+2. Any log/trace/metric payload exported outside the tenant vpc must pass through scrub-agent and a whitelist filter.
+3. KV cache keys and model metadata must be namespaced by tenant and never forwarded to a shared telemetry bucket without tokenization.
+
+Design summary
+--------------
+- Ephemeral credential flow: operator authenticates to customer SSO -> requests ephemeral token via redwood-operator-cred-proxy (scoped TTL) -> token minted and logged to audit-log-collector -> operator uses token to perform runtime actions through control-plane-proxy.
+- Scrubbing flow: runtime components emit structured telemetry -> local scrub-agent applies per-tenant rules (field removal, tokenization) -> telemetry-ingest receives sanitized payload and applies global allowlists -> samples forwarded to Redwood observability/console.
+
+Operator checklist (pre-deployment)
+----------------------------------
+- [ ] Confirm redwood-operator-cred-proxy v1.8.0 is installed and reachable over mTLS.
+- [ ] Deploy scrub-agent sidecar to all runtime pods that emit tenant-identifying fields.
+- [ ] Update telemetry-ingest config with tenant allowlist and global redact rules.
+- [ ] Configure audit-log-collector to store signed entries in customer-controlled storage with retention 90 days (default).
+
+Step-by-step procedures
+-----------------------
+A. Configure and validate ephemeral credential service
+1. Install redwood-operator-cred-proxy: helm upgrade --install redwood-operator-cred-proxy redwood/chart/operator-cred --version 1.8.0 --set tls.enabled=true
+2. Create operator role bindings for the customer operator groups (example):
+   ```yaml
+   apiVersion: rbac.authorization.k8s.io/v1
+   kind: RoleBinding
+   metadata:
+     name: customer-ops-scoped
+     namespace: redwood-system
+   subjects:
+     - kind: Group
+       name: customer-ops@example.com
+   roleRef:
+     kind: Role
+     name: operator-scoped-role
+     apiGroup: rbac.authorization.k8s.io
+   ```
+3. Configure TTL policy in the proxy: set max_ttl_seconds=3600 and default_refresh=false.
+4. Test mint flow (operator machine):
+   - curl -X POST https://redwood-operator-cred-proxy.internal/v1/mint -H "Authorization: Bearer <SSO-JWT>" -d '{"tenant":"tenant-123","role":"operator"}'
+   - Expect response {"token":"ephem_...","expires_in":3600} and an audit-log entry with fields [requester, tenant, role, trace_id].
+5. Verify token revocation: revoke token via API and observe control-plane-proxy rejecting requests with revoked token within 30s.
+
+B. Deploy and validate scrub-agent
+1. Sidecar deployment: add the scrub-agent container to the pod template with configSecret reference (example snippet in /etc/scrub/config.yaml).
+2. Example scrub rules (config.yaml):
+   ```yaml
+   rules:
+     - name: remove-tenant-id
+       match: "$.request.tenant_id"
+       action: remove
+     - name: mask-email
+       match: "$.user.email"
+       action: mask
+       mask_char: "*"
+       keep_last: 3
+   ```
+3. Apply test: emit a sample log with tenant_id and confirm scrub-agent transforms it prior to TCP TLS egress.
+4. Unit tests: run scrub-agent --validate-config against policy set; expected: exit 0 and a warning-free output.
+
+C. Canary rollout and traffic migration
+1. Canary slice: pick 2% of tenant traffic (canary-tenants list) and enable scrub-agent + ephemeral-cred enforcement only for that slice.
+2. Monitor metrics for 48 hours: 
+   - telemetry-ingest.error_rate < 0.05%
+   - control-plane-proxy.auth_failures < 0.1 per minute per cluster
+   - operator action latency increase < 150ms (p50)
+3. If any metric exceeds threshold, execute rollback procedure (see section "Rollback and remediation").
+4. After 48 hours and validation, expand in geometric steps: 2% -> 10% -> 50% -> 100%, validating at each stage.
+
+Validation tests and verification
+--------------------------------
+- Functional checks:
+  1. Emit post-scrubbing sample and assert tenant_id not present in payload via curl to local-scrub-proxy.
+  2. Verify ephemeral token rejection after MMC (Manual Revocation) within 30s.
+- End-to-end tests:
+  - Run synthetic workload (1000 requests/sec) against control-plane-proxy and confirm no increase in 5xxs > 0.2%.
+- Audit checks:
+  - Spot-check 10 signed audit entries weekly for token issuance and revocation pairs.
+
+Operational metrics and SLOs
+--------------------------
+- Token issuance latency: p99 < 200ms (SLO).
+- Scrub-agent processing latency added: p95 < 30ms per request.
+- False-negative scrubs (post-deploy) target: 0; acceptable < 0.01% before escalation.
+- Audit log completeness: every ephemeral token action must have an audit entry; missing entries > 0 triggers immediate investigation.
+
+Rollback and remediation
+------------------------
+Triggers for rollback:
+- Canary metrics breach (see Canary rollout thresholds).
+- Reproducible data leakage verified by audit or customer report.
+- Major functional regression (control-plane auth failures > 1/min sustained for 5m).
+Rollback steps:
+1. Revoke newly issued ephemeral tokens via redwood-operator-cred-proxy revoke endpoint.
+2. Disable scrub-agent at pod-level by toggling annotation: redwood.scrub.enable=false and trigger rolling restart.
+3. Revert redwood-operator-cred-proxy configuration to previous release using helm rollback <release> <revision>.
+4. Engage incident triage: open Incident ticket with priority P1, assign oncall and security owner.
+
+Forensic evidence preservation
+-----------------------------
+- Preserve audit-log-collector bundle (signed) and store a copy in customer-provided S3/GCS with read-only ACL.
+- Take snapshot of scrub-agent configuration and telemetry-ingest allowlists.
+- Export control-plane-proxy auth traces (redaction applied) for analysis.
+
+Roles and ownership
+-------------------
+- Security (owner): policy, verification, and post-incident review.
+- Eng-private-deployments (operator lead): deployment, canary execution, day‑2 maintenance.
+- Eng-sre: metrics collection, alerting, and runbook automation.
+- Customer ops: approval for rollout and access to audit bundles.
+
+Templates and operator commands
+------------------------------
+- Mint ephemeral token (example CLI):
+  redwoodctl auth mint --tenant tenant-123 --role operator --ttl 3600
+- Revoke token by id:
+  redwoodctl auth revoke --token-id ephem_abcd1234
+- Validate scrub-agent config:
+  kubectl exec -n redwood-system $(kubectl get pod -l app=scrub-agent -o name | head -n1) -- /usr/local/bin/scrub-agent --validate /etc/scrub/config.yaml
+
+Change log
+----------
+- 2026-02-09: Draft created (Anika Patel).
+- 2026-02-25: Reviewed by Jordan Lee and Priya Nair, added canary thresholds.
+- 2026-03-05: Published — tightened TTL guidance and added forensic preservation steps.
+
+References
+----------
+- internal: eng-private-deployments/deployment-guides/operator-handbook-model-rollforward-and-evidence-bundle-2027.json
+- internal: security-and-compliance/audit-logging/architecture-notes-2025
+
+Appendix: Example scrub-agent regexp checklist
+--------------------------------------------
+- Remove exact tenant_id patterns: /tenant-[0-9a-f]{8}/i
+- Mask UUIDs in metadata keys longer than 24 chars: replace with first 8 chars + "..."
+- Tokenize email addresses to username-hash@example.invalid
+
+Contact and escalation
+----------------------
+- Primary oncall (security): pager: sec-oncall@redwood.internal, Slack: #sec-oncall
+- Operator lead: eng-private-deployments@redwood.internal
+- For legal/data questions: legal-privacy@redwood.internal
+
+End of playbook.

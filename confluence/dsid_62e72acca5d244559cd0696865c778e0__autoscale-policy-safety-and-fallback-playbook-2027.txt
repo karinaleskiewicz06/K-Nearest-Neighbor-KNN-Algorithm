@@ -1,0 +1,191 @@
+Autoscale Policy Safety and Fallback Playbook for Private Deployments
+
+Summary
+
+This playbook describes a conservative, telemetry-driven autoscaling policy and its associated safety gates and fallback procedures for Redwood Private deployments (VPC and on-prem). It focuses on protecting SLOs during scaling events, avoiding oscillation, preserving KV/prefix cache health for stateful inference runtimes, and providing clear rollback and escalation steps when autoscaling causes regressions. The guidance is applicable to both Dedicated and Private clusters that run the Redwood serving runtime.
+
+Scope
+
+- Applies to autoscaler configuration that controls GPU-backed inference pods and node pools in Private deployments.
+- Covers trigger signals (latency, queue depth, cache-hit ratio, memory pressure), safety gates, canary probing, fallbacks (model variant routing), and rollback procedures.
+- Out of scope: scheduling-level device allocation optimizations and hardware procurement.
+
+Goals and SLOs
+
+- Primary SLOs to defend during scaling:
+  - Latency p50 < 150ms, p95 < 800ms for short-query workload (<= 256 tokens)
+  - End-to-end error rate < 0.2%
+  - Successful model initiation and warmup within 45s for cold-start model variants
+- Operational objectives:
+  - Avoid autoscaler-driven latency regressions during scale-out/scale-in (target < 10% p95 variance during events)
+  - Ensure at least 15% capacity headroom after autoscale completes for expected traffic spikes
+
+Definitions
+
+- Probe traffic: small, instrumented requests sent to new capacity to validate correctness and warm KV-cache.
+- Warmup window: time after a new replica is created during which we expect KV cache builds and initial model compilation to complete.
+- Model variant: a functionally equivalent model binary (quantized or smaller) used as a fallback when primary model capacity is constrained.
+
+Telemetry signals and derivations
+
+Key signals used by autoscaling decisions (ranked):
+1) Request queue length (per-model route) — immediate indicator of demand backlog.
+2) Inference p95 latency (short-query cohort) — primary SLO signal.
+3) KV/prefix cache hit ratio (per-replica) — dropping hit rates indicate shard/cold caches that increase per-request cost.
+4) GPU memory utilization and OOM events — safety stop for scale-in and trigger for capacity add.
+5) Model load time and first-token latency — indicates cold-start regressions.
+6) Token-per-second throughput and token cost — used for cost-aware scale policies.
+
+Recommended derived metrics:
+- Effective headroom = (total_capacity - expected_concurrent_needed) / total_capacity
+- Warmup-impact factor = (cold_request_count_during_warmup / total_requests) 
+
+Autoscaler policy design (recommended template)
+
+Principles:
+- Conservative scale-out: prefer smaller frequent scale-outs to avoid large cold-start spikes.
+- Aggressive safety for scale-in: require sustained low load plus stable cache-hit ratios before reducing replicas.
+- Probe and validate new capacity before routing 100% traffic.
+
+Policy components (high level):
+- Primary triggers: queue length > Q_high for 30s OR p95 latency > L_high for 60s -> scale-out by N_shards (default N_shards=1 replica per 10% capacity).
+- Prefer vertical bin packing when model variant capacity available (route to quantized variant before spinning new machines).
+- Scale-in guard: queue length < Q_low AND p95 < L_low AND cache-hit ratio change < 5% for 5m -> scale-in by at most 1 replica per 10m.
+- Max-change limits: no more than 20% of capacity change in 10 minutes.
+
+Safety gates and checks (pre-commit)
+
+Every autoscale action must pass the following safety checks before being applied: 
+1) Canary-probe validation: new replicas receive probe traffic; probes must succeed (status 200) and p95_probe < 2x p95_baseline within warmup window.
+2) Cache-pressures check: if global cache-hit ratio < 50%, delay scale-in and prefer routing to warmed replicas.
+3) Memory/OOM embargo: do not scale-in replicas on nodes that have recorded any OOMs in the last 30m.
+4) Concurrency cap enforcement: when scaling out by adding GPU nodes, ensure node provisioning time and driver initialization are within expected SLA (default 3m for VPC, 5–8m for on-prem).
+
+Canary probing and staged rollout
+
+1) Stage 0 — provision capacity in Staging pool with identical runtime.
+2) Stage 1 — send 1% of traffic (probe-tagged requests) to new replicas for warmup and correctness checks for warmup window (default 60–120s depending on model).
+3) Stage 2 — gradually increase traffic to 10% over 3 minutes if probe metrics are stable, then 50% for 5m, then fully route.
+4) Abort criteria: any of the following during staged increase -> revert routing and mark nodes unhealthy: failed probes, p95 > 2x baseline, error rate delta > 0.5%.
+
+Fallback strategies (when autoscale cannot meet demand quickly)
+
+- Model variant routing: preconfigured routing rules to send traffic to quantized or distilled model variants that reduce memory and latency at modest quality cost. See example JSON routing rule below.
+- Local throttling with graceful degradation: progressively reduce max tokens and enforce token budgeting per request with HTTP 429 + Retry-After when necessary, preserving short requests.
+- Cross-region spillover (if configured): route excess traffic to a remote Redwood Hosted pool with rate limits and data handling notes in the customer's contract.
+
+Example fallback routing JSON (apply via control-plane API):
+{
+  "route_id": "mymodel-prod-fallback-2027",
+  "match": {"model": "mymodel-v2", "stage": "prod"},
+  "fallback_sequence": [
+    {"model": "mymodel-v2-quant-8bit", "weight": 100, "reason": "capacity-fallback"}
+  ],
+  "ttl": "30m",
+  "owner": "infra-team"
+}
+Rollout and rollback procedures (step-by-step)
+
+Rollout (enabling new autoscaler policy):
+1) Validate policy in staging against synthetic workload that covers short/long queries and cache-warmup patterns (use the perf-harness).
+2) Create a canary policy in control plane and enable for 1% customer traffic in a dedicated canary slice.
+3) Monitor key metrics for 60m: p95 latency, error rate, cache-hit ratio, node provisioning time.
+4) If stable, increase canary to 10% for 30m, then to 50% for 15m before promoting to 100%.
+5) Document the rollout in product/infra-channel and tag owners.
+
+Immediate rollback (if regressions observed):
+1) Switch canary slice and new replicas to drain mode: "control-plane set-route --route <route> --drain".
+2) Redirect traffic back to previous routing and variant mappings: "control-plane apply-routing --file previous-routing.json".
+3) If new nodes are unhealthy, scale them down: "infractl nodegroup scale --name <group> --replicas <prev>".
+4) Re-enable autoscaler to last-known-good policy and hold for 30m.
+5) Open an incident (severity-2) and collect the following artifacts for triage: profiler traces, per-replica cache-hit metrics, provisioning timelines, and probe logs.
+
+Runbook: responding to autoscaler anomalies (p95 spike during scale event)
+
+1) Pager triggers: p95 > 2x baseline for > 90s OR error rate > 0.5% for > 60s -> page oncall infra and runtime owners.
+2) Initial responder actions (first 10 minutes):
+   a) Confirm whether a scale event is in progress using: "infractl autoscaler status --route <route>".
+   b) If scale-out is in progress and p95 is regressing, check probe success: "infractl probes list --since 15m --route <route>".
+   c) If probes failing, immediately pause autoscaler: "infractl autoscaler pause --policy <id>" and redirect traffic to warmed replicas using weight adjustments.
+3) If scale-in caused regression, abort further scale-ins and scale back to previous replica count.
+4) If runtime-level failure (OOMs, GPU driver resets), perform node isolation: cordon node, drain non-critical pods, and open node remediation ticket.
+
+Operational checklist (pre-deploy)
+
+- Confirm model variants exist and are registered in control plane.
+- Create warmup probe definitions for each model (example below).
+- Verify monitoring dashboards for p50/p95, queue length, cache-hit ratio, node provisioning times.
+- Run a 30-minute synthetic soak that simulates rapid ramp and sustained traffic to validate no oscillation.
+
+Warmup probe example (YAML)
+
+probe:
+  name: warmup-small
+  model: mymodel-v2
+  request: '{"input": "Hello", "max_tokens": 16}'
+  frequency_s: 5
+  timeout_s: 10
+  success_criteria:
+    - status_code: 200
+    - latency_p95_ms: 2000
+
+Autoscaler config example (YAML snippet)
+
+policy:
+  id: conservative-private-2027
+  min_replicas: 2
+  max_replicas: 100
+  scale_out:
+    - trigger: queue_length
+      threshold: 50
+      duration_s: 30
+      step: 1
+    - trigger: p95_latency_ms
+      threshold: 800
+      duration_s: 60
+      step: 2
+  scale_in:
+    - trigger: queue_length
+      threshold: 10
+      duration_s: 300
+      step: 1
+  safety:
+    max_change_percent_per_10m: 20
+    warmup_window_s: 120
+    canary_fraction: 0.01
+    allow_fallback_variants: true
+
+Operational contacts and ownership
+
+- Primary owner: infra-runtime (oncall rota) — see /roster/infra-runtime.
+- Secondary owner: customer-success (for customer-visible incidents).
+- Escalation: SRE lead -> Head of Infra -> CTO if incident crosses business-impact threshold.
+
+Diagnostics to collect (automated snapshot command)
+
+- infractl collect-incident --route <route> --since 30m --out /tmp/incident-<id>.tgz
+  (includes logs, probe traces, per-replica cache metrics, node events, and autoscaler decisions)
+
+Post-incident analysis and follow-up
+
+- Create an incident postmortem within 72 hours containing: timeline, root cause, what mitigations worked, and a clear action list.
+- Common follow-up items: adjust warmup window, increase canary times, add additional model variants, or tune cache sharding for better hit ratios.
+
+Appendix: sample CLI commands
+
+- Pause autoscaler: infractl autoscaler pause --policy conservative-private-2027\- Resume autoscaler: infractl autoscaler resume --policy conservative-private-2027\- Force route to fallback variant: control-plane set-weight --route mymodel-prod --variant mymodel-v2-quant-8bit --weight 100\- Collect canary probe logs: infractl probes tail --route mymodel-prod --since 10m
+
+Notes and rationale
+
+- Private deployments have longer median provisioning times and more variable cache behavior than hosted environments; conservative policies reduce blast radius.
+- Preserving KV/prefix cache health is typically higher-value than aggressive capacity churn for quality-sensitive use cases.
+
+References
+
+- See related runbooks: post-installation-telemetry-and-acceptance-checklist-2026, kv-cache-migrations-and-runtime-state-migration-playbook-2025.
+
+Change log
+
+- 2026-12-01: Created (Aisha Patel).
+- 2027-01-20: Added canary staging flow and probe criteria (review: Marco Chen).
+- 2027-02-10: Expanded rollback checklist and sample CLI commands (review: Riley Thompson).

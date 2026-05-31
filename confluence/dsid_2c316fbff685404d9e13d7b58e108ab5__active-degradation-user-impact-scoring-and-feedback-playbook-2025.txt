@@ -1,0 +1,128 @@
+Active Degradation: User Impact Scoring and Feedback Playbook
+
+Summary:
+This playbook defines a lightweight, reproducible approach for detecting service degradations, scoring their user impact in near real-time, and closing the feedback loop to routing, cost controls, and product owners. The goal is to move from binary incident detection (up/down) to graded, actionable signals that map to business-facing impact and automated mitigation priorities.
+
+Context and scope:
+- Applies to all public-facing inference and metadata APIs (hosted + dedicated).
+- Intended to augment SLO alerts with a computed User Impact Score (UIS) used for prioritization, automated fallback decisions, and operator triage.
+- Not a replacement for existing SLIs; rather a derived signal combining multiple SLIs and business weights.
+
+Definitions:
+- Degradation event: a contiguous period where any primary latency or error SLI breaches its alerting threshold for >10s.
+- Affected user: a unique API key or tenant that experienced at least one failing request in the window.
+- User Impact Score (UIS): normalized 0–100 score where 0 = no observable customer harm and 100 = severe, high-volume, high-value customer disruption.
+
+UIS composition (recommended default weights):
+- Error rate impact (ERR): 40% — proportion of requests returning >=500 or structured error codes during the window.
+- Latency tail exposure (LAT): 30% — percentage of requests in the p95–p99 band compared to baseline p95.
+- Traffic concentration (TC): 15% — portion of total traffic attributable to top-affected tenants in window (higher concentration -> higher impact).
+- Business value multiplier (BVM): 15% — tenant-specific multiplier derived from billing tier and recent ARR contribution (capped 0.5–2.0).
+
+UIS formula (text form):
+UIS = round( 100 * (0.4 * ERR_norm + 0.3 * LAT_norm + 0.15 * TC_norm) * BVM, 1 )
+- ERR_norm, LAT_norm, TC_norm are each normalized to 0..1 against configurable baselines. Baselines are rolling 28-day medians by default.
+
+Telemetry requirements (fields to emit for every request):
+- request_id: string
+- tenant_id: string
+- api_key_hash: string (sha256)
+- route: string (e.g., /v1/complete)
+- request_ts: iso8601
+- latency_ms: integer
+- status_code: integer
+- model_variant: string
+- cost_tokens_est: integer
+- region: string
+- sample_flags: list (optional; reasons for sampling)
+
+Implementation sketch (query and pipeline):
+1) Ingest request-level telemetry into our metrics warehouse (see instrumenting guide).
+2) Aggregation window: 30s sliding window with 10s slide for operational dashboards, 5m window for alert correlation.
+3) Compute per-tenant ERR_norm = min(1, (window_error_rate / baseline_error_rate) clipped to 0..10 then scaled to 0..1).
+4) Compute LAT_norm = sigmoid-scale of p99 multiplier over baseline p95.
+5) Compute TC_norm = min(1, top-3-tenant-traffic / total-traffic).
+6) Apply BVM lookup table (billing tier + recent usage score).
+
+Example SQL (BigQuery-like) to produce windowed UIS per tenant (illustrative):
+-- NOTE: simplified, production uses materialized aggregations
+WITH window AS (
+  SELECT tenant_id,
+         COUNT(*) as requests,
+         SUM(IF(status_code >= 500, 1, 0)) as errors,
+         APPROX_QUANTILES(latency_ms, 100)[OFFSET(99)] as p99,
+         APPROX_QUANTILES(latency_ms, 100)[OFFSET(95)] as p95
+  FROM telemetry.requests
+  WHERE request_ts BETWEEN TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 SECOND) AND CURRENT_TIMESTAMP()
+  GROUP BY tenant_id
+)
+SELECT tenant_id,
+       requests,
+       errors / NULLIF(requests,0) AS error_rate,
+       SAFE_DIVIDE(p99, NULLIF(p95,0)) AS p99_over_p95
+FROM window
+ORDER BY requests DESC;
+
+Alerting and thresholds:
+- UIS < 10: no action, log for trend detection.
+- 10 <= UIS < 30: tech owner notification (Slack) with context link.
+- 30 <= UIS < 60: paging to on-call; runbook step A (see below).
+- UIS >= 60: critical incident; start incident bridge and execute mitigation playbook B.
+- Any UIS >= 85 for enterprise tenants triggers immediate traffic diversion to fallback variant and customer success notification.
+
+Operator runbook (triage flow):
+1) Confirm event: open UIS dashboard for the cluster and note top-affected tenants and routes.
+2) Correlate with infrastructure signals: GPU thermal events, preemption logs, autoscaler activity.
+3) If UIS >= 60 and root cause is compute saturation: execute mitigation B.1 -> enable model-variant-fallback (lower-fidelity quantized model) for affected tenant(s) via routing policy.
+4) If UIS >= 60 and root cause is networking: activate edge-proxy-fallback to alternative region and throttle non-critical traffic.
+5) If UIS between 30–60: apply targeted throttling per-tenant and notify account owner; schedule root-cause investigation.
+6) Record findings in post-incident ticket with UIS timeline and mitigations applied.
+
+Automated mitigations (examples):
+- Variant fallback: dynamic routing rule that switches an affected tenant to pre-approved quantized variant for 5–30 minutes.
+- Graceful degradation: reduce max tokens default and enable prefix-caching for the tenant.
+- Cost-circuit: if BVM indicates low business value and UIS is moderate, throttle to preserve capacity for higher BVM tenants.
+
+Ownership and SLAs:
+- On-call: Platform SRE owns first response.
+- Escalation: Runtime team owns mitigation actions (variant rollout, autoscaler tuning).
+- Product: POs must be notified for any UIS >= 60 involving customers in the top-100 ARR list.
+
+Release checklist for UIS pipeline (preflight):
+1) Unit tests for normalization functions and baselines.
+2) Synthetic injection tests (chaos-runner) validate UIS reacts to engineered latency/error spikes.
+3) Dashboard with per-tenant drilldown and raw telemetry link.
+4) Access control: only authorized roles can trigger automated fallback policies.
+5) Post-deploy shadow mode for 48 hours before automated actions enabled.
+
+Privacy and sampling guidance:
+- We store tenant_id and hashed api_key only; no raw prompts or PII in UIS pipeline.
+- Light sampling of request payloads (1/1000) is allowed for debugging; samples must be labeled and purged after 30 days unless retained under incident retention policy.
+
+Related pages and references:
+- link: /confluence/architecture-and-standards/observability-standards/telemetry-budget-enrichment-playbook-2026
+- link: /confluence/architecture-and-standards/model-serving-standards/runtime-cache-invalidation-and-staleness-mitigation-playbook-2026
+
+Appendix: example alert payload (JSON for alerting channel):
+{
+  "alert_name": "uis-critical",
+  "tenant_id": "acct_1234",
+  "uis": 78.4,
+  "top_routes": ["/v1/chat", "/v1/embeddings"],
+  "recommended_action": "variant_fallback"
+}
+
+Notes and rationale:
+- The UIS formalizes product-aware triage: not all technical degradations are equally important to customers.
+- Weighted components keep the algorithm interpretable and auditable for compliance.
+- The playbook favors short, reversible automated mitigations over long-running throttles.
+
+Owners and contacts:
+- SRE lead: Ravi Desai (oncall@sre.redwood.example.com)
+- Runtime lead: Marta Ivanova (runtime-team@redwood.example.com)
+- Product monitoring: Elena Park (product-monitoring@redwood.example.com)
+
+Revision history:
+- 2025-04-10: initial draft by Elena Park.
+- 2025-06-02: added BVM rules and baseline guidance (review by Ravi Desai).
+- 2025-09-12: tightened privacy sampling limits and clarified 48h shadow mode (review by Marta Ivanova).

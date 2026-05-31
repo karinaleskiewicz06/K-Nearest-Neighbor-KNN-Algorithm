@@ -1,0 +1,121 @@
+Queue Dynamics and Latency Correlator Handbook
+
+Overview
+
+Purpose: This handbook describes the design, instrumentation, and operational playbooks for the Queue Dynamics & Latency Correlator (QDLC) — a lightweight service and analysis pattern we run alongside the serving runtime to detect, attribute, and triage queue-induced latency across kernel, scheduling, and KV-cache interactions. It is intended for on-call SREs, runtime engineers, and performance-focused platform owners.
+
+Scope: correlating queue depth, per-request kernel activity, execution priority, and tail latency across host, shard, and tenant dimensions. Does NOT replace detailed kernel profiling (see profiling-playbook).
+
+Why this exists
+- Queues are the most common multi-tenant root cause for increased P50/P95/P99 token latency.
+- Pure CPU/GPU kernel traces are high-fidelity but expensive; QDLC uses aggregated probes, cheap traces, and causal correlation heuristics to speed diagnosis.
+
+Signal sources and tags
+- Metrics (Prometheus): request_queue_length, request_enqueue_time_seconds, request_dequeue_time_seconds, kernel_dispatch_time_seconds, kvcache_miss_rate, tenant_priority, kernel_backpressure_counter
+- Traces: span names: qdlc.enqueue, qdlc.dequeue, kernel.dispatch, kernel.exec, kvcache.lookup
+- Logs: structured events with fields: request_id, shard_id, tenant_id, model_variant, seq_len, prefetch_hint
+- Telemetry tags: host_zone, gpu_type, kernel_version, experiment_flag, admission_controller_profile
+
+Architecture and dataflow
+1. Ingress probe: lightweight sampler in the request front-door that emits an enqueue event with timestamp and classification (read-only, streaming, chat) and attaches a short id.
+2. Queue aggregator: per-host, in-memory rolling histogram of queue lengths and per-class enqueue/dequeue latencies. Exposes Prometheus metrics and a small local HTTP API for sample dumps.
+3. Correlator service: periodically pulls aggregated histograms + sampled traces and runs attribution heuristics (see "Attribution heuristics" below).
+4. Notifier / dashboard: alerts (PagerDuty + Slack) for policy breaches and a visual timeline in the runtime observability dashboard.
+
+Data model (flat)
+- sample_id: short hex
+- ts_start, ts_end: epoch seconds
+- queue_len_history: CSV of (sec, len)
+- class_breakdown: JSON string (class -> count) (bounded to 1k chars)
+- kernel_hints: list of kernel names separated by ';'
+
+Attribution heuristics (brief)
+- Temporal overlap: if a spike in queue_len_history correlates with rising P95 and majority of dequeues are > T_dequeue_threshold, attribute to queueing.
+- Kernel sensitivity: use per-kernel sensitivity index (S_k) from kernel-sensitivity catalog; if dequeues show kernel.exec spans with high S_k and queue lag, attribute to kernel-induced slowdowns amplified by queueing.
+- Tenant stigma: if tenant_priority==low and tokenized share > 30% of dequeues during the spike, escalate to tenancy throttling candidate.
+
+Operational SLOs and alerting thresholds
+- P99 request enqueued-to-dequeue time: target < 40ms (SLO: 99.9% under 100ms).
+- Request queue length per host: soft limit 200, hard limit 500.
+- Queue-induced tail latency alert: fires when P99 enqueue->dequeue > 150ms AND host queue_len > 250 for 30s.
+
+Runbook: investigation steps (ordered)
+1) Triage the alert: check alert window, affected clusters, and sample request_ids.
+2) Snapshot metrics: pull request_queue_length, kernel_dispatch_time_seconds, kvcache_miss_rate for host/shard/tenant for the 5m window. Use the provided queries below.
+3) Correlate traces: request a QDLC sample dump (HTTP /qdlc/sample?window=5m&limit=50). Open spans for request_id with long dequeue times.
+4) Classify root cause via checklist:
+   a) If kvcache_miss_rate jumped > 3x concurrent with queue growth -> cache warmup/regression -> go to KV remediation.
+   b) If kernel_dispatch_time increased per-dequeue and kernel sensitivity high -> kernel regression -> escalate to runtime-kernel oncall.
+   c) If queue length high but dequeue times are low (bursty enqueue) -> upstream surge -> contact traffic source team and consider rate limiting.
+   d) If low-priority tenants dominate dequeues -> apply immediate tenant-throttle policy and schedule quota adjustment.
+5) Apply mitigation (see mitigation section).
+6) Post-incident: create a triage note with sample ids, correlated kernel versions, and chosen mitigation. Attach to incident tracker and link to related pages.
+
+Mitigation options (fast to medium)
+1. Fast (within 60s): enable temporary tenant throttle via the admission controller: API call
+   curl -X POST https://controlplane/api/v1/adm-controller/throttle \
+     -d '{"tenant_id":"TENANT","target_qps":100}' -H 'Authorization: Bearer $ADMIN_TOKEN'
+2. Medium (2-15m): evict long-running low-priority requests: use the runtime eviction endpoint for shard: POST /runtime/shard/{shard}/evict?reason=queue_bust
+3. Targeted (15-60m): reroute traffic to fallback model-variant with lower kernel sensitivity: update routing rule in rollout service.
+4. Long-term: schedule kernel rollback or patch; update kernel-sensitivity index and re-run the fidelity suite.
+
+KV remediation checklist
+- Validate whether recent quantization/serialization changes increased miss rate.
+- Check if prefetch hints are flowing and if warmup policy ran successfully.
+- If miss rate persists, bump cache allocation for the shard for 1 hour and re-evaluate.
+
+Configuration table (parameters operators may edit)
+| parameter | default | safe range | notes |
+|-----------|---------|------------|-------|
+| qdlc.enqueue-sample-rate | 0.02 | 0.0 - 0.1 | Fraction of requests sampled at ingress |
+| qdlc.aggregator-window-sec | 60 | 30 - 300 | Rolling window used for histograms |
+| qdlc.alert-queue-hard-limit | 500 | 200 - 2000 | Hard queue length to trigger critical paths |
+| qdlc.dequeue-latency-threshold-ms | 150 | 50 - 1000 | Used in queue+latency alert rule |
+
+Example queries
+- Prometheus (host-level queue P99):
+  sum by (host) (histogram_quantile(0.99, sum(rate(request_dequeue_time_seconds_bucket[1m])) by (le, host)))
+- Compare queue vs kernel dispatch:
+  increase(request_queue_length[5m]) > 0 and increase(kernel_dispatch_time_seconds_sum[5m]) / increase(kernel_dispatch_time_seconds_count[5m]) > 0.02
+
+Sample trace annotation pattern (recommended conventions)
+- qdlc.enqueue: attributes {"class":"streaming","seq_len":128,"tenant_id":"t-123"}
+- kernel.exec: attributes {"kernel_name":"attn_fused_v2","lat_ms":12,"kernel_version":"k1.4.3"}
+- qdlc.dequeue: attributes {"dequeue_lat_ms":45,"queue_pos":14}
+
+Testing and rollout guidance
+- Feature gate: qdlc.enabled default off for new regions. Rollout plan: 10% traffic -> 50% -> 100% with 24h observation windows.
+- Canary tests: run synthetic microbursts (see benchmarking suite) against canary host and assert enqueue->dequeue P99 < 80ms.
+
+Ownership and escalation
+- Primary owner: eng-serving-runtime / performance (oncall alias: runtime-perf@redwood.example.com)
+- Escalation: runtime-kernel team after 10m of undiagnosed elevated dequeue latency or if kernel.exec spans show >25% regression in mean latency.
+
+Post-incident analysis template (required fields)
+1. Summary (one sentence)
+2. Window (start, end)
+3. Affected tenants and models
+4. Root cause hypothesis and evidence (metrics, traces)
+5. Mitigations applied and timestamps
+6. Action items and owners (with due dates)
+
+Related pages and references
+- Runtime telemetry sampling guide (for guidance on safe sample rates)
+- Kernel sensitivity index (living document)
+- Canary workload definitions (benchmarking suite)
+
+Appendix: debugging commands and helpers
+- Dump aggregator state (host): curl http://localhost:9081/qdlc/debug/state | jq '.'
+- Trigger a sample dump: curl http://localhost:9081/qdlc/debug/dump?duration=30s&limit=200 -H 'Accept: application/json' > dump.json
+- Local replay of sample (developer laptop): python tools/replay_qdlc.py --input dump.json --prometheus-push-url http://localhost:9091/metrics
+
+Notes and future work
+- Add a tenant-aware admission-controller policy that preemptively slows low-priority streams when kernel sensitivity on the host crosses a configurable threshold.
+- Integrate with runtime Optimize recommendations to auto-adjust qdlc.sample_rate based on cost budgets.
+
+Authors and contributors: Evan Chen (owner), Priya Nair (observability), Liam O'Connor (runtime).
+
+Document history
+- 2025-11-12: created
+- 2026-01-08: added attributable tenant heuristics and KV checklist
+- 2026-02-18: finalized SLOs and alert thresholds

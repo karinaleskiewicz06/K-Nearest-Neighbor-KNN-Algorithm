@@ -1,0 +1,411 @@
+Dedicated Autoscaling Policy: Control Plane Schema + Console UX (Bounds & Predictive Mode)
+
+## Summary
+This document specifies (1) the control plane schema and API surface for Dedicated autoscaling bounds and predictive scaling mode, and (2) the Redwood Console UX for configuring and observing these settings.
+
+Primary goals:
+- Let customers set hard, enforceable min/max capacity bounds per Dedicated deployment.
+- Provide optional predictive scaling that biases desired capacity up ahead of known ramps while preserving safety and deterministic behavior.
+- Preserve backward compatibility: no behavior change for existing deployments until explicitly enabled.
+
+Non-goals (in this design):
+- Cross-region predictive placement.
+- Contract negotiation workflows.
+- Fully automated procurement.
+
+---
+
+## Definitions
+- **Deployment**: A Dedicated customer-facing serving deployment (model + configuration) with an autoscaled replica set.
+- **Replica**: Unit of capacity for a deployment in the fleet autoscaler (implementation may map 1 replica to 1 GPU or 1 slice depending on SKU).
+- **Desired capacity**: Raw target computed by autoscaler from signals (reactive and/or predictive).
+- **Bounded desired capacity**: Desired clamped into [min_replicas, max_replicas]. This is the only value the autoscaler is allowed to enact.
+- **Predictive mode**: Optional additional signal source providing a forecasted target; reactive signals still apply and can override prediction, but bounds always apply.
+
+---
+
+## Control Plane Data Model
+### High-level structure
+We add a new optional object on Dedicated deployments:
+- `scaling_policy` (nullable): customer-configurable policy that modifies/constraints autoscaler behavior.
+
+We intentionally separate:
+- **Customer-configured policy** (stored in control plane)
+- **Effective policy** (derived from customer policy + platform defaults + feature flags)
+
+This supports backward compatibility and explicit auditability.
+
+### Schema (v1)
+Field-level specification (all fields are per-deployment; account-level defaults are out of scope for GA but may be added later).
+
+| Field | Type | Required | Default (if enabled) | Notes |
+|---|---|---:|---|---|
+| scaling_policy.enabled | boolean | no | false | Must be true for any customer-defined fields to take effect. When false or null, behavior is identical to today.
+| scaling_policy.bounds.min_replicas | integer | yes (if enabled) | 1 | Hard lower bound. Autoscaler must never scale below this value.
+| scaling_policy.bounds.max_replicas | integer | yes (if enabled) | current platform max (varies by SKU/region) | Hard upper bound. Autoscaler must never exceed this value.
+| scaling_policy.cooldowns.scale_up_seconds | integer | no | 60 | Minimum time between enacted scale-up events for this deployment.
+| scaling_policy.cooldowns.scale_down_seconds | integer | no | 300 | Minimum time between enacted scale-down events.
+| scaling_policy.scale_down.safe_min_replicas | integer | no | equals bounds.min_replicas | Optional extra floor used by platform to prevent unsafe scale-down during volatility. If set, enforced as max(bounds.min_replicas, safe_min_replicas).
+| scaling_policy.predictive.enabled | boolean | no | false | Toggles predictive biasing. Only evaluated when the account/deployment feature flag is enabled.
+| scaling_policy.predictive.mode | enum("bias", "target") | no | "bias" | bias = additively/heuristically increase desired; target = use prediction as candidate desired. Exact arbitration is defined in autoscaler/ADR; control plane stores configuration.
+| scaling_policy.predictive.lookahead_seconds | integer | no | 900 | How far ahead the prediction should represent. Used for UI explanation and validation; autoscaler can clamp.
+| scaling_policy.predictive.max_step_up_replicas | integer | no | 4 | Anti-overshoot guardrail: max replicas to add per decision interval due to prediction (before cooldown). Reactive emergencies can still scale faster (within max_replicas).
+| scaling_policy.metadata.customer_timezone | string (IANA tz) | no | null | e.g., "America/Los_Angeles". Used for UI schedule previews and interpreting time-of-day ramps.
+| scaling_policy.metadata.note | string | no | null | Freeform reason / ticket link; included in audit logs.
+
+#### Representations
+The storage representation is JSON-like in control plane DB, but exposed via API as a typed object.
+
+Example (enabled, bounds only):
+
+```json
+{
+  "scaling_policy": {
+    "enabled": true,
+    "bounds": { "min_replicas": 4, "max_replicas": 24 },
+    "cooldowns": { "scale_up_seconds": 60, "scale_down_seconds": 300 },
+    "scale_down": { "safe_min_replicas": 6 },
+    "predictive": { "enabled": false },
+    "metadata": { "customer_timezone": "America/New_York", "note": "Set per SUP-28501" }
+  }
+}
+```
+
+Example (predictive enabled):
+
+```json
+{
+  "scaling_policy": {
+    "enabled": true,
+    "bounds": { "min_replicas": 8, "max_replicas": 40 },
+    "cooldowns": { "scale_up_seconds": 60, "scale_down_seconds": 600 },
+    "predictive": {
+      "enabled": true,
+      "mode": "bias",
+      "lookahead_seconds": 900,
+      "max_step_up_replicas": 6
+    },
+    "metadata": { "customer_timezone": "Europe/London", "note": "Pilot: Hexagon daily ramp" }
+  }
+}
+```
+
+---
+
+## Validation Rules
+Validation occurs in control plane API and is mirrored in Console client-side validation (best-effort). Server-side validation is source of truth.
+
+### Bounds
+1) `min_replicas >= 1`
+2) `max_replicas >= 1`
+3) `min_replicas <= max_replicas`
+4) `max_replicas` must be <= platform hard limit for the deployment SKU and region.
+   - If customer sets above allowed limit, reject with a clear error message containing:
+     - limit value
+     - current region
+     - next step (contact support to raise contract/capacity)
+5) If `scale_down.safe_min_replicas` is provided:
+   - must be >= 1
+   - must be <= max_replicas
+   - effective_min = max(min_replicas, safe_min_replicas)
+
+### Cooldowns
+1) `scale_up_seconds` in [0, 3600]
+2) `scale_down_seconds` in [0, 86400]
+3) Recommend (warning in Console, not error): `scale_down_seconds >= scale_up_seconds`
+
+### Predictive
+1) Predictive settings are only accepted when both:
+   - `scaling_policy.enabled = true`
+   - predictive feature flag is enabled for the account OR deployment (see Rollout & Flags)
+   Otherwise: reject with a feature-not-enabled error (HTTP 403) and include remediation.
+2) `mode` must be one of {bias, target}
+3) `lookahead_seconds` in [60, 7200]
+4) `max_step_up_replicas` in [1, 50] (upper bound is defensive; practical limits are lower)
+5) If `metadata.customer_timezone` provided:
+   - must be a valid IANA timezone ID
+
+### Rate limiting / churn protection
+To prevent config thrash:
+- Limit updates to `scaling_policy` to 10 writes / deployment / hour.
+- Exceeding limit returns 429 with a message that includes:
+  - reset time
+  - suggestion to batch changes
+  - link to support if urgent
+
+(See also: audit logging; autoscaler will continue using last known good policy.)
+
+---
+
+## API Surface (Console + External)
+This is the minimum to support Console and enterprise IaC.
+
+### Endpoints
+1) Get deployment (includes scaling policy):
+- `GET /v1/dedicated/deployments/{deployment_id}`
+
+2) Update scaling policy (replace semantics):
+- `PUT /v1/dedicated/deployments/{deployment_id}/scaling-policy`
+- Body: full `scaling_policy` object.
+- Semantics: full replacement to keep audit and validation deterministic.
+
+3) Patch scaling policy (optional; not required for GA)
+- `PATCH /v1/dedicated/deployments/{deployment_id}/scaling-policy`
+- If implemented, must still produce a full “after” object for audit logging.
+
+### Permissions (RBAC)
+Roles:
+- **Dedicated Admin**: can read/write scaling policy
+- **Dedicated Operator**: can read scaling policy; cannot write
+- **Billing Admin**: read-only (needed for cost guardrail review)
+
+Write operations require:
+- `dedicated.deployments.scaling_policy:write`
+
+All reads require:
+- `dedicated.deployments:read`
+
+### Error shapes
+Errors are returned as structured, stable types for Console mapping:
+- `INVALID_ARGUMENT` (400): failed validation
+- `FORBIDDEN_FEATURE_NOT_ENABLED` (403): predictive not enabled
+- `FORBIDDEN_RBAC` (403): insufficient permissions
+- `TOO_MANY_REQUESTS` (429): update churn protection
+- `CONFLICT` (409): optimistic concurrency failure (if `etag` enabled)
+
+Example validation error (min > max):
+
+```json
+{
+  "error": {
+    "code": "INVALID_ARGUMENT",
+    "message": "min_replicas must be <= max_replicas",
+    "field_errors": [
+      { "field": "scaling_policy.bounds.min_replicas", "message": "Must be <= max_replicas" },
+      { "field": "scaling_policy.bounds.max_replicas", "message": "Must be >= min_replicas" }
+    ]
+  }
+}
+```
+
+---
+
+## Effective Policy & Backward Compatibility
+### Default behavior (existing deployments)
+- If `scaling_policy` is null OR `scaling_policy.enabled = false`:
+  - Autoscaler uses current platform-driven behavior (reactive signals + operator overrides).
+  - Console shows a “Platform-managed” state with an option to enable bounds.
+
+### Migration/rollout behavior
+- Existing deployments are not backfilled with `enabled=true` automatically.
+- We may backfill `scaling_policy.enabled=false` as an explicit record for audit clarity; either approach is acceptable as long as behavior does not change.
+
+### Precedence (informational, for UX copy)
+- Customer bounds are always hard constraints.
+- Platform may apply additional safety constraints (e.g., safe_min, step sizing) but must not violate customer bounds.
+- Predictive suggestions never bypass reactive safety or hard bounds.
+
+(Full precedence and invariants are defined in the ADR; the Console will present simplified, customer-readable wording.)
+
+---
+
+## Console UX
+### Information architecture
+In Console, add a new section on the Dedicated Deployment details page:
+- **Scaling** tab
+  - Subsections:
+    1) Overview
+    2) Bounds
+    3) Predictive scaling (optional, flag-gated)
+    4) Recent scaling events (read-only)
+    5) Audit trail (read-only)
+
+### UX states
+#### State A: Platform-managed (default)
+Displayed when scaling_policy is null or disabled.
+
+UI elements:
+- Banner: “Autoscaling is currently platform-managed.”
+- CTA button: “Configure bounds” (opens modal)
+- Read-only note: “Setting bounds enforces a minimum and maximum number of replicas for this deployment. This helps control spend and maintain a baseline capacity.”
+
+#### State B: Customer-configured bounds enabled
+Displayed when scaling_policy.enabled=true.
+
+UI elements:
+- Bounds summary card:
+  - “Min replicas: X”
+  - “Max replicas: Y”
+  - “Scale up cooldown: …”
+  - “Scale down cooldown: …”
+- Inline status:
+  - “Currently running: N replicas”
+  - “Last bounded event: (timestamp) (min|max) (reason)” (if available)
+- Buttons:
+  - “Edit bounds”
+  - “Disable bounds” (requires confirmation)
+
+#### State C: Predictive available but off
+Displayed when bounds enabled and predictive feature flag is on but `predictive.enabled=false`.
+
+UI elements:
+- Predictive section with toggle (off)
+- Description:
+  - “Predictive scaling uses historical patterns and scheduled ramps to pre-scale capacity before demand increases. Reactive signals still protect against unexpected spikes.”
+- Link: “Learn more” (docs)
+
+#### State D: Predictive on
+Displayed when `predictive.enabled=true`.
+
+UI elements:
+- Predictive toggle (on)
+- Configuration inputs:
+  - Mode dropdown: Bias / Target
+  - Lookahead slider or numeric input (minutes)
+  - Max step-up numeric input
+  - Customer timezone (optional) selector
+- Read-only panel: “Prediction health” (last forecast timestamp + staleness)
+- Warning callouts (non-blocking):
+  - “Predictions have been stale for > 30 minutes; autoscaler may fall back to reactive behavior.”
+
+### Primary user flows
+#### Flow 1: Enable bounds
+1) User clicks “Configure bounds”.
+2) Modal opens with fields:
+   - Min replicas (required)
+   - Max replicas (required)
+   - Advanced (collapsed): cooldowns, safe min, note
+3) Real-time validation:
+   - min <= max
+   - max <= platform hard limit (Console fetches limit; otherwise validate on submit)
+4) “Save changes” (PUT).
+5) Success toast + updated summary card.
+
+#### Flow 2: Enable predictive scaling
+Preconditions: predictive feature enabled for account/deployment.
+1) User toggles Predictive to ON.
+2) If timezone is missing, Console prompts (optional) and recommends setting it.
+3) User selects mode + lookahead + max step-up.
+4) Save changes.
+5) Console shows:
+   - “Prediction health” panel
+   - Link to “Recent scaling events” filtered to predictive-driven decisions.
+
+#### Flow 3: Disable bounds
+1) User clicks “Disable bounds”.
+2) Confirmation modal:
+   - Copy: “Disabling bounds returns this deployment to platform-managed scaling. Capacity may scale beyond your current max under load.”
+   - Require typing the deployment name to confirm (enterprise guardrail).
+3) On success: return to State A.
+
+### UX copy & constraints (customer-facing)
+We standardize copy to avoid implying guaranteed spend outcomes:
+- Use “helps control spend” instead of “guarantees budget cap”.
+- Clarify that max bound caps replicas, but total cost also depends on model, tokens, and utilization.
+
+Short explanations in UI:
+- Min replicas: “Baseline capacity. Autoscaler will not go below this number.”
+- Max replicas: “Hard ceiling. Autoscaler will not exceed this number.”
+- Cooldown: “Minimum time between scaling actions to reduce oscillation.”
+- Predictive: “Pre-scales using forecasts; falls back to reactive signals when predictions are unavailable.”
+
+---
+
+## Console Validation & Error Mapping
+### Inline validation (before submit)
+- Min/max numeric bounds (>=1)
+- min <= max
+- Cooldowns within allowed ranges
+- Predictive lookahead and step-up within allowed ranges
+- Timezone validity (if set)
+
+### Server error handling
+- 400 INVALID_ARGUMENT:
+  - Map `field_errors` to specific fields; show summary at top of modal.
+- 403 FORBIDDEN_FEATURE_NOT_ENABLED:
+  - Disable predictive toggle and show: “Predictive scaling is not enabled for this account. Contact your TAM or Support.”
+- 429 TOO_MANY_REQUESTS:
+  - Show: “Too many policy updates in the last hour. Try again after {reset_time}.”
+  - Provide link to docs on safe rollout of config changes.
+
+---
+
+## Auditability in Console (Read-only)
+Console surfaces audit history to satisfy enterprise change management.
+
+### Audit Trail panel
+- Table columns:
+  - Timestamp
+  - Actor (user/service)
+  - Change type (policy_update | policy_disable | predictive_toggle)
+  - Before/After summary (min/max/cooldowns/predictive)
+  - Note (from metadata.note)
+  - Correlation ID
+
+Minimum retention displayed: 30 days in Console.
+(Backend retention may be longer per enterprise tier; Console should gracefully handle older entries not being available.)
+
+---
+
+## Observability Surfaces (Console link-outs)
+Console does not re-implement full Grafana; it links to curated dashboards.
+
+In the Scaling tab, include “Open dashboards” links:
+- Desired vs bounded replicas
+- Bound-hit rate (min/max)
+- Queue depth & saturation
+- Prediction vs actual demand + prediction error
+
+Also show a small embedded “health strip” using API-provided rollups:
+- “Max-bound saturation: Yes/No (last 15m)”
+- “Prediction stale: Yes/No”
+- “Unmet min due to regional shortage: Yes/No”
+
+---
+
+## Rollout & Feature Flags (UX behavior)
+### Flags
+- `dedicated.autoscaling_bounds.enabled` (account/deployment scoped)
+- `dedicated.predictive_autoscaling.enabled` (account/deployment scoped)
+
+### UX gating
+- If bounds flag is OFF:
+  - Hide editing UI; show read-only info card: “Contact Support to enable autoscaling bounds.”
+- If bounds flag is ON but predictive flag is OFF:
+  - Show predictive section as read-only with a disabled toggle and “Not enabled” explanation.
+
+---
+
+## Edge Cases
+1) **min > max**: block save; server returns field errors.
+2) **max above platform hard limit**: block save; show limit and region.
+3) **User disables bounds during incident**: allow, but require confirmation.
+4) **Timezone set but prediction still wrong**: show that predictive is advisory; link to known issues.
+5) **Forecast stale/unavailable**: Console shows warning; autoscaler falls back to reactive.
+6) **Regional capacity shortage prevents meeting min**: Console shows degraded badge and guidance (contact Support; consider lowering min temporarily).
+
+---
+
+## Open Questions (tracking)
+1) Should we expose `safe_min_replicas` in Console for GA, or keep it internal (API-only) initially?
+   - Current proposal: keep in “Advanced” with tooltip; default hidden.
+2) Do we allow PATCH semantics for external API (Terraform) or require PUT-only for strict auditability?
+   - Current proposal: Console uses PUT; Terraform can use PUT.
+3) What is the customer-visible name for “replica” given SKU differences?
+   - Current proposal: “replicas (capacity units)” with a tooltip that clarifies mapping per SKU.
+
+---
+
+## Acceptance Criteria (Design)
+- Schema supports hard min/max with clear validation and stable error types.
+- Console provides a predictable, low-footgun bounds editing experience.
+- Predictive settings are clearly gated and explain fallback behavior.
+- Backward compatibility preserved: no changes unless explicitly enabled.
+- Audit trail is visible and useful for enterprise change management.
+
+---
+
+## Changelog
+- 2025-08-28: Added churn protection (10 updates/hr), clarified predictive gating errors, added Audit Trail UX.
+- 2025-07-31: Added predictive mode fields (mode/lookahead/max step-up) and timezone metadata.
+- 2025-06-12: Initial draft for bounds + cooldowns + migration approach.

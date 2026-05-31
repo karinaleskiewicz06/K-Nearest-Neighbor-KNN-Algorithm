@@ -1,0 +1,311 @@
+Runbook: One-click rollback for Optimization Config (Safe Apply)
+
+## Purpose
+This runbook describes how to execute a **one-click rollback** of an Optimization Config version (batching, caching, and quantization profiles) for Hosted and Dedicated deployments, and how to validate recovery.
+
+Rollback is intended to be:
+- **Fast** (single action from Console or API)
+- **Safe** (idempotent + race-condition guarded)
+- **Auditable** (structured audit events)
+- **Scoped** (tenant/model/region aware)
+
+## Audience
+- SRE on-call
+- Eng Platform (Control Plane) on-call
+- Runtime on-call
+- Console on-call
+
+## Definitions
+- **Optimization Config**: Serving-time knobs (batching heuristics, prefix/KV cache toggles, quantization profile selection) applied by the runtime.
+- **Config Version**: Immutable, versioned object (e.g., `ocv_2026_02_24_0017`).
+- **Active Version**: The version currently pinned for a given scope (tenant/model/region).
+- **Apply / Rollout**: Staged propagation of an active version to workers.
+- **Rollback**: Re-point the active version to a prior known-good version and propagate.
+
+## When to rollback (triggers)
+Rollback is appropriate when a config change is the most likely cause of a regression and mitigation speed is required.
+
+Common triggers:
+1. **Elevated error rate**
+   - 5xx rate increase correlated with an Optimization Config apply event.
+   - Error types indicating capacity/timeout (e.g., `gateway_timeout`, `runtime_overloaded`, `cuda_oom`).
+2. **Latency regression**
+   - p95 or p99 latency breach correlated with apply event.
+   - Streaming stalls / first-token latency spikes.
+3. **Throughput or saturation regressions**
+   - Sudden drop in tokens/sec or requests/sec.
+   - GPU utilization pinned high with increased queue time.
+4. **Quality regression (quantization only)**
+   - Evals gate failure (e.g., win-rate drop, task score regression) after a quantization profile promotion.
+5. **Incorrect scope / mis-apply**
+   - Config applied to wrong region/model/tenant (e.g., cache toggle intended for `us-east` landed in `eu-west`).
+
+## Decision criteria (how to decide quickly)
+Use the table below as guidance. When in doubt during a Sev event, bias toward rollback if:
+- the change was recent (≤ 60 minutes), and
+- the regression aligns with the config’s blast radius, and
+- there is a known-good prior version.
+
+### Decision table
+- Roll back immediately if any of the following are true:
+  1) **5xx rate** is above the scope SLO threshold for **10 minutes** AND the regression began after the apply event.
+  2) **p95 latency** is above the scope SLO threshold for **15 minutes** AND there is no concurrent infra incident.
+  3) **Quant quality gate** failed with high confidence (per Evals harness) AND the active quant profile was promoted in the last 24 hours.
+  4) A scoping mistake is confirmed (wrong tenant/model/region).
+
+- Consider pausing rollout (instead of rollback) if:
+  - the rollout is still in early canary and metrics are noisy but trending within bounds, OR
+  - there is an ongoing regional capacity incident unrelated to config.
+
+### Default SLO thresholds for gating/rollback decisions (unless tenant override exists)
+These are the defaults used by the rollout controller and referenced in incident decisions:
+- **5xx rate**: > 0.8% for 10 minutes (scope: tenant+model+region)
+- **p95 latency**: > 1.20x baseline for 15 minutes (baseline = previous 6h median for same scope)
+- **p99 latency**: > 1.35x baseline for 15 minutes
+- **Saturation guardrail**: queue time p95 > 250ms for 10 minutes OR GPU util > 92% with increasing queue depth
+
+Notes:
+- For Dedicated clusters, compare to that tenant’s historical baselines; do not compare to global Hosted baseline.
+- For Private, see “Private deployment rollback” section.
+
+## Preconditions / permissions
+1. You must have one of the following RBAC roles:
+   - `optimization-change-operator` (execute rollback within approved scopes)
+   - `optimization-admin` (override/cross-scope rollback; requires change ticket)
+
+2. Confirm you are acting on the correct **scope**:
+   - Tenant: `tenant_id`
+   - Model: `model_id` (or model family)
+   - Region: `region`
+
+3. Confirm you have the “known-good” target version:
+   - Typically the last promoted version before the current change.
+   - If uncertain, select the last version marked `promoted` with stable metrics (see Console timeline).
+
+## Safety notes (do not skip)
+- **Rollback is idempotent**: re-sending the same rollback request should be safe.
+- **Concurrency guard**: if an apply is currently progressing, rollback will either:
+  - pause the rollout and proceed, or
+  - fail with `409 CONFLICT` if the rollout is in a non-interruptible checkpoint (rare). Follow the “Rollback blocked by in-flight apply” procedure.
+- **Blast radius**: rollback affects the full selected scope; verify tenant/model/region carefully.
+- **Cache invalidation**: some config fields (cache toggles / KV cache strategy) can cause short transient latency changes during reconfiguration. Expect a brief bump; monitor for recovery.
+
+## Primary procedure (Console one-click rollback)
+### Step 0 — Confirm correlation and gather identifiers
+1. Open **Optimization Rollout Health Dashboard** and filter to the suspected scope:
+   - `tenant_id`, `model_id`, `region`
+2. Check chart annotations for:
+   - `optimization_config.apply.started`
+   - `optimization_config.promoted`
+   - `optimization_config.rollback.started`
+3. In Console, navigate to:
+   - **Console → Optimize → Optimization Config → History**
+4. Copy:
+   - Current active version: `active_version_id`
+   - Candidate rollback target version: `target_version_id`
+   - Most recent rollout id (if shown): `rollout_id`
+
+### Step 1 — Validate target version and scope
+In the History timeline:
+- Ensure `target_version_id` is marked **Promoted** or “Known Good” (internal tag), OR previously ran stable in production.
+- Confirm the scope shown in the right rail matches the incident scope:
+  - Tenant, model, region, and environment (Hosted vs Dedicated)
+
+### Step 2 — Initiate rollback
+1. Click **Rollback** next to the currently active version.
+2. In the confirmation modal:
+   - Verify **blast radius summary** (tenant/model/region)
+   - Verify **from → to** versions
+   - Review any warnings (e.g., “rollout is partially applied”, “cooldown active”)
+   - Enter the required confirmation text (type-to-confirm)
+3. Select a reason code:
+   - `latency_regression`, `error_rate_regression`, `quality_regression`, `scope_misapply`, `other`
+4. Click **Confirm rollback**.
+
+Expected results:
+- Rollback status changes to **In Progress** within ~10s.
+- You receive a rollback request id: `rollback_id`.
+
+### Step 3 — Monitor rollback progression
+1. Watch the **Rollback Progress** panel:
+   - Percentage of workers updated
+   - Stragglers (by availability zone / worker pool)
+2. Monitor key metrics for the scope:
+   - 5xx rate
+   - p95/p99 latency
+   - Throughput (req/s, tokens/s)
+   - GPU utilization and queue time
+
+Expected rollback completion:
+- Hosted: typically 2–8 minutes depending on worker pool size.
+- Dedicated: typically 3–12 minutes depending on cluster size and rollout policy.
+
+### Step 4 — Verify stabilization
+Proceed to the verification checklist below (do not declare “mitigated” until checks pass).
+
+## Alternate procedure (API rollback)
+Use the API if Console is unavailable, during automation, or for advanced debugging.
+
+### Required inputs
+- `tenant_id`, `model_id`, `region`
+- `target_version_id` (known-good)
+- `reason` (string)
+
+### Example (curl)
+1. Obtain an auth token with required RBAC.
+2. Trigger rollback:
+
+POST https://control-plane.redwoodinference.com/v1/optimization-config/rollbacks
+Headers:
+- Authorization: Bearer $TOKEN
+- Content-Type: application/json
+
+Body:
+{
+  "tenant_id": "tnt_123",
+  "model_id": "rw-chat-13b",
+  "region": "us-east-1",
+  "target_version_id": "ocv_2026_02_12_0009",
+  "reason": "latency_regression",
+  "incident_id": "INC-1842",
+  "dry_run": false
+}
+
+Expected response:
+- `202 Accepted`
+- includes `rollback_id` and current `state`.
+
+### Check rollback status
+GET https://control-plane.redwoodinference.com/v1/optimization-config/rollbacks/{rollback_id}
+
+If status is `blocked` or `conflict`, follow the troubleshooting section.
+
+## Post-rollback verification checklist
+### A. Control plane / config correctness
+- [ ] Console shows the scope’s **Active Version** = `target_version_id`.
+- [ ] The rollback timeline entry shows `started_at` and `completed_at` (or stable progress if still running).
+- [ ] The rollout controller is not advancing the previous version (no lingering “apply in progress” for the old version).
+
+### B. Runtime propagation
+- [ ] Worker compliance ≥ 99% (or per Dedicated policy) within 15 minutes.
+- [ ] No sustained stragglers; investigate if a specific pool/zone is stuck.
+
+### C. User-facing health
+Check for at least 10–15 minutes after rollback completion:
+- [ ] 5xx rate returns to baseline and below threshold.
+- [ ] p95 and p99 latency recover to within expected band.
+- [ ] Throughput recovers (req/s, tokens/s) and queue time decreases.
+
+### D. Quality checks (quantization rollbacks)
+If rollback reverted a quantization profile:
+- [ ] Evals harness shows gate restored to pass state (or no longer failing).
+- [ ] For high-impact tenants, run the quick eval pack (if available) against the reverted version.
+
+### E. Audit / incident hygiene
+- [ ] Audit event emitted for rollback (see “Audit events” below).
+- [ ] Incident channel updated with:
+  - scope, from→to versions, rollback_id
+  - observed recovery metrics
+- [ ] Create follow-up ticket to investigate root cause of regression.
+
+## Troubleshooting / edge cases
+### 1) Rollback blocked by in-flight apply (409 CONFLICT)
+Symptoms:
+- API/Console returns conflict indicating an apply is at a checkpoint.
+
+Actions:
+1. In Console, click **Pause rollout** for the in-flight apply (if available).
+2. Wait 60–120 seconds and retry rollback.
+3. If still blocked:
+   - Page Eng Platform on-call (Control Plane)
+   - Page Runtime on-call if worker state appears mixed
+
+Do NOT attempt manual worker restarts unless directed by Runtime/SRE; it can worsen mixed-state recovery.
+
+### 2) Rollback initiated but metrics do not recover
+Actions:
+1. Confirm rollback actually propagated (compliance ≥ 99%).
+2. Check if another change occurred concurrently (runtime deploy, autoscaling, regional incident).
+3. If no recovery and compliance is high:
+   - The regression may not be caused by Optimization Config.
+   - Escalate to Runtime/SRE to investigate capacity, kernel changes, or upstream dependencies.
+4. Consider rolling back other recent changes per standard change management policy.
+
+### 3) Mixed worker states persist (partial apply/rollback)
+Symptoms:
+- Compliance oscillates; some workers report old version.
+
+Actions:
+1. Confirm the runtime is receiving the active version (control plane “active pointer” is correct).
+2. Check worker logs for config fetch failures or cache invalidation failures.
+3. Engage Runtime on-call; they may:
+   - trigger targeted resync
+   - drain and recycle a subset of workers if safe
+
+### 4) Wrong-scope rollback executed
+Actions (time critical):
+1. Immediately roll forward to the prior active version for the mistakenly affected scope (reverse the rollback) or pin the correct version.
+2. Notify Security/Compliance if customer impact occurred.
+3. File incident follow-up and add scope guardrail feedback to Console team.
+
+## Audit events (what should be emitted)
+Rollback should emit the following audit events (names may appear in SIEM exports):
+- `optimization_config.rollback.requested`
+- `optimization_config.rollback.started`
+- `optimization_config.rollback.completed`
+- `optimization_config.rollback.failed` (if applicable)
+
+Minimum expected fields in the event payload:
+- `actor_id`, `actor_email` (or service principal)
+- `tenant_id`, `model_id`, `region`
+- `from_version_id`, `to_version_id`
+- `rollback_id`, `request_id`, `trace_id`
+- `reason`, `incident_id` (if provided)
+
+If audit events are missing, file a Security issue and reference the rollback_id and request_id.
+
+## Communications (incident channel template)
+Copy/paste:
+- Scope: tenant={TENANT} model={MODEL} region={REGION}
+- Action: rollback optimization config {FROM_VERSION} → {TO_VERSION}
+- rollback_id: {ROLLBACK_ID}
+- Reason: {REASON}
+- Expected: recovery within 5–15 min post-completion; watching 5xx + p95/p99
+
+## Private deployment rollback (VPC/on-prem)
+For Private deployments, the control plane versioning model is the same, but the operator workflow depends on installation method.
+
+High-level guidance:
+1. Identify current and target Optimization Config versions.
+2. Pin the target version using the supported mechanism (Helm values / installer / Terraform).
+3. Apply the change and monitor the customer’s dashboards.
+
+Authoritative steps are in:
+- confluence://eng-private-deployments/upgrade-and-rollback/private-deployment-optimization-config-rollback
+
+Escalation:
+- If the customer is air-gapped or has strict maintenance windows, coordinate with Solutions Engineering and Customer Success before proceeding.
+
+## Escalation policy
+- Sev1/Sev2 impacting multiple tenants/regions:
+  - Page SRE on-call + Eng Platform on-call immediately.
+- If rollback is blocked or mixed-state persists > 15 minutes:
+  - Page Runtime on-call.
+- If auditability/RBAC issues prevent rollback:
+  - Page Security on-call (product security) and use break-glass process per policy.
+
+## Appendix: Quick checks
+### Identify active version quickly
+- Console: Optimize → Optimization Config → “Active” badge for the selected scope.
+- Response header (if enabled for the route): `x-redwood-optimization-config-version: <version>`
+
+### Common root causes this rollback mitigates
+- Batching heuristic change causing increased queue time under certain prompt length distributions
+- Cache toggle misconfigured for a region with different traffic shape
+- Quantization profile promotion causing quality regression or higher latency due to kernel path mismatch
+- Semantic validation gap (config “valid” but unsafe for a specific model variant)
+
+## Change log
+- 2026-02-24: Updated thresholds section and added concurrency conflict procedure based on internal beta gameday learnings.
+- 2026-02-03: Added Private deployment section and audit event field expectations.
+- 2026-01-18: Initial published runbook for internal beta.

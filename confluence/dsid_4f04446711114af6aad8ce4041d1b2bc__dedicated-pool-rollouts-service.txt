@@ -1,0 +1,374 @@
+Dedicated Pool Rollouts Service (Control Plane)
+
+## Overview
+The **Dedicated Pool Rollouts Service** (service name: `dedicated-pool-rollouts`) is the control-plane component that manages **staged rollout plans** for **Dedicated GPU capacity pools**. It provides APIs, persistence, and auditability for creating and executing staged rollouts of:
+- Model versions (e.g., `llama-3.1-70b@2025-03-xx`)
+- Serving runtime builds (e.g., runtime image / kernel set)
+- Routing policies (e.g., fallback policy changes)
+- Pool-level configuration changes that materially affect production traffic
+
+This service is responsible for **deterministic, auditable, reversible** rollout control. It does **not** directly route traffic; instead it publishes rollout state to the policy/routing layer which enforces stage partitions at request time.
+
+Primary users:
+- Redwood SRE/Operators running Dedicated pool upgrades
+- Console workflows (customer admins and Redwood operators)
+- Release engineering automation (limited, behind feature flags)
+
+Out of scope (v1): arbitrary experiment platform, fully customer-defined custom metrics for gates.
+
+---
+
+## Key responsibilities
+1. **Rollout plan lifecycle management**
+   - CRUD for `DedicatedPoolRolloutPlan`
+   - Validation (stage monotonicity, minimum pool size/headroom constraints, multi-region constraints)
+   - Versioning and optimistic concurrency
+
+2. **Stage execution and state machine**
+   - Stage-by-stage promotion
+   - Explicit states: `draft`, `running`, `held`, `aborted`, `completed`
+   - Idempotent actions (promote/abort/hold) with audit logging
+
+3. **Gate evaluation orchestration (v1)**
+   - Stores gate definitions and evaluation settings
+   - Requests evaluation from Policy Engine / Gate Evaluator (source-of-truth for computed pass/fail)
+   - Persists last known gate results for Console display and for promotion eligibility logic
+
+4. **Audit trail + RBAC enforcement**
+   - Emits required audit events for all mutating actions (including overrides)
+   - Enforces role-based permissions for sensitive actions (force-promote, hold, abort)
+
+---
+
+## Architecture and dependencies
+### High-level flow
+1. Operator/Console creates a rollout plan for a dedicated pool.
+2. Operator starts the rollout (first promote from `draft` to Stage 0).
+3. Routing/Data Plane begins steering traffic/replicas according to the current stage partition.
+4. Telemetry tags requests/metrics with `rollout_plan_id` and `stage_id` (allowlisted tags).
+5. Gate evaluator computes gate status for the stage (latency/error/saturation/etc.).
+6. Operator (or Console with auto-promote enabled in later phases) promotes to the next stage when gates pass.
+7. On gate failure or manual decision, operator aborts which triggers rollback semantics in routing.
+
+### Dependencies
+**Hard dependencies**
+- `authz-gateway` / RBAC service: actor identity, role checks, admin override permissions
+- Control-plane datastore (Postgres cluster `cp-postgres-prod`): plan persistence + audit pointer references
+- `audit-events` pipeline: emit events to immutable log + SIEM export
+
+**Integration dependencies**
+- Policy Engine: gate evaluation requests, caching semantics, and deterministic evaluation responses
+- Smart Routing (Dedicated router): consumes current plan/stage to compute partition routing decisions per pool and per region
+- Telemetry pipeline: stage-aware metrics/traces; staleness detection for gate evaluation
+
+**Operational dependencies**
+- Fleet/Capacity signals: pool size, regional replica availability, GPU health signals used by gating
+- Console backend (`console-rollouts-api`): reads plan/timeline, gate evidence payloads, and triggers actions
+
+---
+
+## Service interfaces
+### Public API (control plane)
+Base URL (internal): `https://cp.redwood.internal/dedicated-pool-rollouts`
+
+Auth:
+- Service-to-service: mTLS + JWT
+- User-driven actions: Console passes user JWT; service validates and performs RBAC
+
+#### Resources
+- `DedicatedPoolRolloutPlan`
+- `DedicatedPoolRolloutAction` (implicitly represented via audit events + timeline view)
+
+#### Endpoints (v1)
+1) Create plan
+- `POST /v1/dedicated/pools/{pool_id}/rollout-plans`
+- Creates a plan in `draft` state.
+
+2) Get plan
+- `GET /v1/dedicated/pools/{pool_id}/rollout-plans/{plan_id}`
+
+3) List plans
+- `GET /v1/dedicated/pools/{pool_id}/rollout-plans?status=running&limit=50`
+
+4) Update plan (draft-only)
+- `PATCH /v1/dedicated/pools/{pool_id}/rollout-plans/{plan_id}`
+- Only allowed when `state=draft`.
+
+5) Promote stage
+- `POST /v1/dedicated/pools/{pool_id}/rollout-plans/{plan_id}:promote`
+- Advances from current stage to next stage.
+- Requires idempotency key.
+- Denied if gates are failing/unknown unless override is used.
+
+6) Abort (rollback)
+- `POST /v1/dedicated/pools/{pool_id}/rollout-plans/{plan_id}:abort`
+- Reverts routing to baseline partition and marks plan aborted.
+
+7) Hold / resume
+- `POST /v1/dedicated/pools/{pool_id}/rollout-plans/{plan_id}:hold`
+- `POST /v1/dedicated/pools/{pool_id}/rollout-plans/{plan_id}:resume`
+
+8) Force-promote (admin only)
+- `POST /v1/dedicated/pools/{pool_id}/rollout-plans/{plan_id}:forcePromote`
+- Requires `reason` and elevated role.
+
+9) Gate evidence (for Console)
+- `GET /v1/dedicated/pools/{pool_id}/rollout-plans/{plan_id}/stages/{stage_id}/gate-evidence`
+- Returns an evidence bundle (queries, windows, observed values, thresholds, reasoning).
+
+#### Concurrency and idempotency
+- Mutating actions require:
+  - `Idempotency-Key` header (UUID recommended)
+  - `If-Match` header (ETag / version) for optimistic concurrency on promote/abort/hold
+- If a client retries a promote due to timeout, the service returns the previously computed result for the same idempotency key.
+
+---
+
+## Data model
+### Core entities
+#### DedicatedPoolRolloutPlan
+**Purpose:** Represents a staged rollout applied to a specific dedicated pool.
+
+Key fields (conceptual):
+- `plan_id` (ULID)
+- `pool_id` (string)
+- `account_id` (string)
+- `target_change` (enum): `MODEL_VERSION`, `RUNTIME_BUILD`, `ROUTING_POLICY`, `POOL_CONFIG`
+- `target_ref` (string): the desired target (e.g., model version ID, runtime build SHA)
+- `baseline_ref` (string): the currently active reference at creation time
+- `state` (enum): `draft`, `running`, `held`, `aborted`, `completed`
+- `current_stage_index` (int, nullable when draft)
+- `stages` (ordered list): stage definitions (traffic split or replica partition; see ADR)
+- `gates_profile` (string): e.g., `dedicated-standard-v1`, `dedicated-strict-v1`
+- `created_by`, `created_at`
+- `last_modified_by`, `last_modified_at`
+- `change_summary` (string): human-readable intent
+- `feature_flag_scope` (string): resolved scope used for enforcement (account/pool/region)
+
+#### Stage definition
+Stages are monotonic and map to either:
+- **Traffic percentage** (preferred for sufficiently large pools), or
+- **Replica partitions** (for small pools / hard constraints),
+
+Each stage has:
+- `stage_id` (short stable ID)
+- `name` (e.g., `canary`, `10%`, `50%`, `100%`)
+- `partition_spec` (percentage or replicas-per-region)
+- `min_duration` (e.g., 15m) before promotion is allowed (v1: enforced by policy)
+- `gates_required` (list of gate IDs)
+
+#### Gate definition
+Gate definitions are stored in the plan for auditability and are evaluated deterministically against stage-tagged signals.
+- `gate_id` (e.g., `p95_latency_ms`, `error_rate_5xx`, `gpu_saturation`, `oom_rate`, `queue_depth`)
+- `window` (e.g., 15m rolling)
+- `threshold` (e.g., `p95_latency_ms <= 900`)
+- `min_samples` (e.g., `>= 500 requests`)
+- `missing_data_policy` (v1 default: **fail-closed**, with manual override)
+
+### Persistence
+- Primary storage: Postgres table `dedicated_pool_rollout_plans`
+- Action log: stored as audit events; service also stores a lightweight `rollout_plan_actions` table to power timeline queries efficiently (mirrors audit events by ID).
+
+### Example plan payload (abridged)
+```json
+{
+  "plan_id": "01JMD7E3V8YQ2QZK6H6D2YQ8JH",
+  "pool_id": "dp_9f3c2a_usw2",
+  "target_change": "MODEL_VERSION",
+  "baseline_ref": "llama-3.1-70b@2025-02-10",
+  "target_ref": "llama-3.1-70b@2025-03-01",
+  "state": "running",
+  "current_stage_index": 1,
+  "stages": [
+    {"stage_id": "s0", "name": "canary", "partition": "1%"},
+    {"stage_id": "s1", "name": "10%", "partition": "10%"},
+    {"stage_id": "s2", "name": "50%", "partition": "50%"},
+    {"stage_id": "s3", "name": "100%", "partition": "100%"}
+  ],
+  "gates_profile": "dedicated-standard-v1"
+}
+```
+
+---
+
+## State machine and semantics
+### States
+- **draft**: plan exists but not applied. Stages/gates editable.
+- **running**: plan actively applied; routing layer enforces current stage partition.
+- **held**: routing remains at current stage; promotions blocked until resumed.
+- **aborted**: routing reverts to baseline; plan cannot be resumed.
+- **completed**: reached final stage and stabilization period; target becomes baseline.
+
+### Promotion rules (v1)
+A stage promotion is allowed when:
+1. Plan is `running`
+2. Current stage has met minimum dwell time (if configured)
+3. Required gates for the current stage are `PASS`
+4. No global suppression rules apply (e.g., “no promote during incident/high burn”) as signaled by SRE policy input
+
+If data is missing or stale:
+- Default is **fail-closed** for automated eligibility.
+- Operators can use `hold` or `forcePromote` with a required reason; both are audited.
+
+### Abort/rollback semantics (control plane contract)
+When abort is requested:
+- The service sets plan state to `aborted` and sets `effective_partition` to baseline.
+- Routing layer is expected to converge to baseline partition quickly.
+- In-flight streaming requests remain pinned per routing semantics (see rollback ADR); control plane does not terminate in-flight traffic.
+
+---
+
+## Validation and guardrails
+### Plan validation (create/update)
+- **Stage monotonicity**: partitions must be increasing (e.g., 1% → 10% → 50% → 100%).
+- **Minimum effective capacity**: prevent stages that starve baseline or canary partitions below safe replica counts.
+- **Small pool constraints**:
+  - Pools below minimum size may require replica-partition stages rather than percentages.
+  - Service enforces `min_replicas_per_partition` based on infra guidelines.
+- **Multi-region constraints**:
+  - Disallow stage definitions that cannot be satisfied in at least one region.
+  - Require explicit behavior selection if a region is impaired (v1 default: hold promotions; do not auto-shift beyond policy).
+
+### Action validation (promote/abort/hold)
+- **ETag/version check**: avoid double-promote under retries.
+- **Idempotency key required**.
+- **RBAC check**:
+  - `promote`: operator or customer admin with `dedicated.rollouts.promote`
+  - `abort`: operator or customer admin with `dedicated.rollouts.abort`
+  - `forcePromote`: Redwood admin only (`dedicated.rollouts.override`)
+  - `hold`: operator or customer admin; `hold` is visible in audit trail
+
+---
+
+## Audit logging
+All mutating operations emit an audit event as defined in **Audit events for Dedicated rollout actions**.
+
+Minimum fields included:
+- `event_type` (e.g., `DEDICATED_ROLLOUT_PLAN_CREATED`, `DEDICATED_ROLLOUT_PROMOTED`, `DEDICATED_ROLLOUT_ABORTED`, `DEDICATED_ROLLOUT_HELD`, `DEDICATED_ROLLOUT_FORCE_PROMOTED`)
+- `actor` (user/service identity)
+- `account_id`, `pool_id`, `plan_id`
+- `from_state`, `to_state`
+- `from_stage_id`, `to_stage_id` (where applicable)
+- `reason` (required for abort and overrides; optional otherwise)
+- `request_id`, `idempotency_key`
+
+Retention:
+- Audit events: per security policy (enterprise minimum 1 year; internal default 2 years)
+- Plan records: retained 2 years after completion/abort (subject to legal holds)
+
+---
+
+## Observability
+### Golden signals (service-level)
+Metrics emitted by `dedicated-pool-rollouts`:
+- Request rate, error rate, p50/p95/p99 latency per endpoint
+- DB latency + error rate
+- Audit pipeline enqueue failures
+- Gate evidence fetch latency
+
+Service SLO (internal):
+- **Availability**: 99.9% monthly for read endpoints; 99.5% for write endpoints
+- **Latency**: p95 < 250ms for reads, p95 < 500ms for writes (excluding downstream policy engine calls)
+
+### Rollout-level observability
+The service does not compute workload metrics directly; it surfaces gate evidence from the gate evaluation pipeline. Required tagging for downstream systems:
+- `dedicated_pool_id`
+- `rollout_plan_id` (allowlisted)
+- `rollout_stage_id` (allowlisted)
+- `region`
+
+Cardinality guardrails:
+- Stage tags must use stable short IDs (`s0`, `s1`, …), not arbitrary names.
+- Avoid tagging free-form `target_ref` into metrics.
+
+---
+
+## Operational considerations
+### Deployments
+- Runs as a stateless control-plane service in `cp-prod` (multi-AZ).
+- Uses Postgres transactions for state transitions.
+- Uses outbox pattern (DB → audit pipeline) to avoid missing audit events on partial failures.
+
+### Feature flags and rollout
+Primary flags:
+- `dedicated_rollouts_enabled` (global)
+- `dedicated_rollouts_enabled_accounts` (allowlist)
+- `dedicated_rollouts_enabled_pools` (explicit pool allowlist)
+- `dedicated_rollouts_force_promote_enabled` (admin-only)
+
+Beta enablement procedure:
+- Use internal support workflow to enable per account/pool.
+- Ensure Console feature gating matches control plane gating (avoid partial exposure).
+
+### Failure modes and handling
+1) **Policy engine unavailable**
+- Writes (promote) may fail if gate status cannot be determined.
+- Default behavior: return `409 GATE_STATUS_UNKNOWN` and recommend `hold`.
+
+2) **Telemetry lag / missing data**
+- Gate status becomes `UNKNOWN` once staleness threshold is exceeded.
+- Default is fail-closed for promotion eligibility.
+- Console must display “Missing/late telemetry” guidance and provide last known good window.
+
+3) **DB contention on high activity**
+- Promotions are low-QPS by design. However, timeline polling can be high.
+- Mitigation: separate read replica for list/timeline endpoints; cache read models for 5–15s.
+
+4) **Double-promote under retries**
+- Prevented by ETag + idempotency key.
+- If client retries without idempotency key, service returns `400`.
+
+5) **Region impairment mid-stage**
+- Service records the plan stage; routing layer manages per-region convergence.
+- Operators should `hold` if partial region convergence causes misleading gates.
+
+### Oncall and escalation
+Ownership:
+- Primary: Platform Control Plane oncall (eng-platform)
+- Secondary: SRE (dedicated-sre), Routing oncall if partition routing misbehaves
+
+Paging guidance:
+- Page on sustained 5xx error rate for write endpoints, DB connectivity issues, or audit outbox backlog growth.
+- File ticket (non-page) for gate evidence query failures if promotions are not blocked.
+
+---
+
+## Security and compliance
+- RBAC is required for any mutating call.
+- Override actions (`forcePromote`) require:
+  - Elevated admin permission
+  - Explicit reason string
+  - Audit event emission with `override=true`
+- PII: the service stores no end-user request content; it stores only pool identifiers and rollout metadata.
+
+---
+
+## Runbooks and operator notes
+- Operational procedures (create/promote/abort/override) are documented here:
+  - `Runbook: Dedicated staged rollouts operations`
+- Capacity partitioning requirements and minimum headroom:
+  - `Dedicated pool partitioning guidelines for staged rollouts`
+
+Common operator checklist before promoting:
+1. Confirm gates are PASS for required window and minimum sample size.
+2. Confirm no ongoing incident / high error budget burn.
+3. Confirm GPU health gates show no ECC/throttling anomalies.
+4. Confirm no sustained 429 spike / queue depth increase attributable to partition sizing.
+
+---
+
+## Appendix: Error codes (client-facing)
+- `400 INVALID_PLAN_STATE`: action not valid for current state
+- `400 MISSING_IDEMPOTENCY_KEY`: required for promote/abort/hold
+- `403 FORBIDDEN`: RBAC denied
+- `409 VERSION_CONFLICT`: ETag mismatch; fetch latest plan and retry
+- `409 GATE_FAILED`: gate results failing
+- `409 GATE_STATUS_UNKNOWN`: insufficient/late data; hold or override
+- `422 VALIDATION_ERROR`: stage definition invalid (monotonicity/headroom/min pool size)
+
+---
+
+## Change log
+- 2025-02-18: Initial service doc drafted for beta.
+- 2025-03-08: Added idempotency/ETag requirements and audit outbox note.
+- 2025-03-22: Updated missing-data default to fail-closed with override; added cardinality guardrails and SLO targets.

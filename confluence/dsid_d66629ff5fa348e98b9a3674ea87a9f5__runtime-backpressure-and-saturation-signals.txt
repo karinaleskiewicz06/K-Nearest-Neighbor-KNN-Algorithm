@@ -1,0 +1,318 @@
+Runtime backpressure and saturation signals (export + semantics)
+
+## Purpose
+This page defines the runtime-level backpressure and saturation signals used by Hosted circuit breakers + load shedding. It documents:
+- What signals the serving runtime emits (queues, throughput, KV cache, memory pressure, fragmentation proxies).
+- Exact semantics and units.
+- Export pipeline (metric types, sampling, aggregation, and cardinality constraints).
+- How upstream systems should interpret the signals without creating feedback loops.
+
+This is a reference for Runtime, SRE, Gateway/Control Plane, Smart Routing, and Observability.
+
+---
+
+## Scope and non-goals
+**In scope**
+- Signals emitted by the GPU-serving runtime at admission/scheduling boundaries.
+- Metrics intended for near-real-time overload decisions (seconds).
+- Metrics intended for dashboards/alerting (minutes).
+
+**Non-goals**
+- Per-request tracing details (handled by tracing pipeline).
+- Model-quality or output correctness signals.
+- Fine-grained per-GPU/per-process troubleshooting metrics with high cardinality (those live in restricted debug endpoints and are not used for load shedding).
+
+---
+
+## Runtime architecture context (where backpressure happens)
+At a high level, the runtime splits work into:
+1) **Admission**: request accepted by runtime process (after gateway/routing). Some requests may be queued locally before scheduling.
+2) **Prefill**: prompt encoding + KV cache population.
+3) **Decode**: incremental token generation using the KV cache.
+4) **Streaming**: tokens flushed to the upstream response stream.
+
+The runtime enforces backpressure at two points:
+- **Runtime admission**: applies concurrency caps and queue limits (soft/hard), returning overload signals upstream when exceeded.
+- **Scheduler**: dynamically reduces effective concurrency when saturation is detected (e.g., memory pressure, KV cache exhaustion), and can mark the instance as “degraded” for routing.
+
+The signals below are designed to be robust under:
+- Prompt-length variance (prefill heavy vs decode heavy workloads)
+- Streaming-induced tail amplification
+- Noisy-neighbor patterns (single tenant sending long prompts / high max_tokens)
+
+---
+
+## Signal taxonomy
+We classify runtime saturation into four categories:
+1) **Queueing saturation**: backlog is growing and/or wait time is increasing.
+2) **Compute saturation**: tokens/sec is at or near sustainable peak; marginal load increases latency sharply.
+3) **Memory / KV cache saturation**: KV cache capacity or allocation efficiency is limiting throughput; OOM risk increases.
+4) **Health degradation**: dependency or internal faults (allocator errors, repeated CUDA errors) impacting capacity.
+
+Upstream policies should prefer **early, stable signals** (queue depth + queue wait) over late symptoms (timeouts).
+
+---
+
+## Export contract (how we emit signals)
+### Metric transport
+- Primary export: **Prometheus** (scraped) and mirrored into our metrics backend.
+- Secondary export: **OpenTelemetry metrics** for long-term correlation (not used in admission decisions).
+
+### Resolution and update cadence
+- “Breaker-grade” metrics update every **1s** (rolling window) where feasible.
+- Most gauges/counters are exported at **5s** resolution.
+- Percentiles (e.g., queue wait p95) are computed using runtime-side histograms and exported as Prometheus histograms.
+
+### Cardinality constraints (hard requirements)
+To avoid metric blowups:
+- No per-request IDs.
+- No per-customer dimensions.
+- Labels are limited to: `region`, `cluster`, `runtime_pool`, `model_family`, `route_class` (small finite sets).
+- Optional label `model` is only allowed when the catalog size is bounded in that pool; otherwise prefer `model_family`.
+
+**Important:** If a team needs high-cardinality breakdowns for a live incident, use the restricted debug endpoint (see “Debug-only signals”), not Prometheus.
+
+---
+
+## Core signals (required)
+### 1) Scheduler queue depth (prefill / decode)
+These are the primary early-warning signals.
+
+**Metrics**
+- `runtime_scheduler_queue_depth{stage="prefill"}` (gauge, requests)
+- `runtime_scheduler_queue_depth{stage="decode"}` (gauge, requests)
+
+**Semantics**
+- Number of requests currently waiting to be scheduled for the given stage.
+- Excludes requests actively running on GPU.
+
+**Interpretation**
+- Sustained non-zero decode queue depth correlates strongly with rising p95 latency for streaming workloads.
+- Prefill queue depth spikes are common during bursty long-prompt traffic; use queue *wait* to differentiate transient bursts vs persistent saturation.
+
+### 2) Scheduler queue wait time
+**Metrics**
+- `runtime_scheduler_queue_wait_seconds_bucket{stage="prefill"}` (histogram)
+- `runtime_scheduler_queue_wait_seconds_bucket{stage="decode"}` (histogram)
+
+**Semantics**
+- Time from enqueue → start of GPU execution for that stage.
+
+**Interpretation**
+- Queue depth without wait time can be misleading (e.g., many tiny tasks).
+- For overload decisions, queue wait p95 is preferred.
+
+### 3) Effective tokens/sec and saturation ratio
+We export both “actual tokens/sec” and “saturation ratio” relative to a calibrated baseline.
+
+**Metrics**
+- `runtime_tokens_generated_total` (counter, tokens)
+- `runtime_token_throughput_tps` (gauge, tokens/sec; runtime-computed over rolling 10s window)
+- `runtime_compute_saturation_ratio` (gauge, 0.0–2.0)
+
+**Semantics**
+- `runtime_token_throughput_tps` is derived from the counter and a stable rolling window.
+- `runtime_compute_saturation_ratio` is `observed_tps / sustainable_tps_baseline`.
+  - The baseline is pool+model_family specific and shipped via config; it is periodically recalibrated from load tests.
+
+**Interpretation**
+- Ratio > 0.95 sustained indicates compute saturation; additional load should be shed/queued.
+- Ratio < 0.7 with high queue depth indicates another bottleneck (often memory/KV pressure or fragmentation).
+
+### 4) In-flight requests and concurrency
+**Metrics**
+- `runtime_inflight_requests{stage="prefill"}` (gauge)
+- `runtime_inflight_requests{stage="decode"}` (gauge)
+- `runtime_admission_concurrency_limit` (gauge)
+
+**Semantics**
+- Stage-specific active work running on GPU.
+- `runtime_admission_concurrency_limit` is the current effective cap (may be lowered by degradation mode).
+
+**Interpretation**
+- Use with queue signals to reason about whether we are “maxed out” or blocked.
+
+---
+
+## KV cache + memory pressure signals
+### 5) KV cache utilization (pool level)
+**Metrics**
+- `runtime_kv_cache_bytes_used` (gauge)
+- `runtime_kv_cache_bytes_capacity` (gauge)
+- `runtime_kv_cache_utilization_ratio` (gauge, 0.0–1.0)
+
+**Semantics**
+- Capacity is the configured KV cache arena size for the pool.
+- Used bytes include active sequences plus reserved blocks for in-flight batching.
+
+**Interpretation**
+- Sustained utilization > 0.9 correlates with admission stalls and/or forced evictions.
+- Under KV pressure, prefill may look healthy while decode queue wait grows (decode needs KV residency longer).
+
+### 6) KV cache eviction / reclamation pressure
+**Metrics**
+- `runtime_kv_cache_evictions_total` (counter)
+- `runtime_kv_cache_reclaim_failures_total` (counter)
+
+**Semantics**
+- Evictions occur when the runtime must reclaim KV blocks earlier than ideal to admit new work.
+- Reclaim failures indicate allocator could not free sufficient contiguous blocks (often fragmentation-related).
+
+**Interpretation**
+- Rising eviction rate during steady traffic is a strong signal for load shedding or reduced max_tokens caps.
+
+### 7) GPU memory headroom and allocator pressure
+We avoid exporting raw per-GPU memory usage by device ID (cardinality and privacy concerns). We export pool-level aggregates.
+
+**Metrics**
+- `runtime_gpu_memory_bytes_used` (gauge, pool aggregate)
+- `runtime_gpu_memory_bytes_total` (gauge, pool aggregate)
+- `runtime_gpu_memory_headroom_ratio` (gauge, 0.0–1.0)
+
+**Semantics**
+- Aggregate across devices in the pool (sum used / sum total).
+- Includes model weights + runtime allocations + KV cache arena.
+
+**Interpretation**
+- Headroom ratio < 0.05 sustained is a high OOM risk zone. Admission should become conservative.
+
+---
+
+## Memory fragmentation proxies (practical, export-safe)
+We cannot reliably export “true fragmentation” across allocators/hardware, so we use two proxies that correlate with allocator churn and inability to satisfy large allocations.
+
+### 8) Allocation failure and retry counters
+**Metrics**
+- `runtime_allocator_allocation_failures_total{class="kv"|"workspace"|"other"}` (counter)
+- `runtime_allocator_retry_total{class="kv"|"workspace"|"other"}` (counter)
+
+**Semantics**
+- Allocation failures count unsuccessful attempts that required fallback (e.g., GC/reclaim) before succeeding or erroring.
+- Retries count attempts that succeeded after one or more reclaim cycles.
+
+**Interpretation**
+- A rising retry rate typically precedes latency spikes.
+- Allocation failures that bubble up as request errors must be classified as runtime capacity degradation and should trigger aggressive shedding.
+
+### 9) “Largest free block” approximation (bucketed)
+**Metrics**
+- `runtime_allocator_largest_free_block_bytes_bucket` (histogram)
+
+**Semantics**
+- Runtime periodically samples the allocator and records the approximate largest allocatable contiguous block.
+- Exported as a histogram to avoid per-instance variability dominating the signal.
+
+**Interpretation**
+- Falling largest-free-block distribution while total free memory remains stable indicates fragmentation (or pinned allocations).
+
+---
+
+## Backpressure state signals (explicit)
+### 10) Runtime overload state and reason
+**Metrics**
+- `runtime_overload_state{state="ok"|"degraded"|"overloaded"}` (gauge; 1 for current state)
+- `runtime_overload_reason{reason="queue"|"compute"|"kv"|"memory"|"dependency"|"unknown"}` (gauge; 1 for current dominant reason)
+
+**Semantics**
+- State is computed in runtime from a weighted ruleset (see below).
+- Reason is best-effort; it is used primarily for dashboards and oncall triage.
+
+**Interpretation**
+- Upstream circuit breakers should treat `overloaded` as a “hard stop” indicator for new admissions in that pool/region.
+- `degraded` indicates we should prefer feature reduction (caps) and cautious admission rather than blanket shed.
+
+### Runtime-side ruleset (current)
+The runtime computes state with conservative hysteresis:
+- Enter `degraded` when (any):
+  - decode queue wait p95 > 250ms for 30s
+  - compute saturation ratio > 0.95 for 30s
+  - KV utilization > 0.92 for 30s
+  - allocator retry rate > 1/s for 30s
+- Enter `overloaded` when (any):
+  - decode queue wait p95 > 750ms for 20s
+  - GPU headroom ratio < 0.03 for 10s
+  - allocation failures increasing AND error rate in runtime > 0.5% for 60s
+- Exit criteria require the signal to remain below threshold for a longer interval (typically 60–120s) to avoid flapping.
+
+**Note:** These thresholds are defaults; policy engine can override per pool/model_family with guardrails.
+
+---
+
+## Debug-only signals (restricted; not for general dashboards)
+For deep performance work we also maintain:
+- Per-GPU device utilization, memory, and kernel timings
+- Per-model exact TPS baselines
+- Per-batch sizes and microbatch timings
+
+These are available via:
+- `runtime-admin` endpoint (restricted network + RBAC)
+- Short-lived “incident capture” bundles
+
+Do not build automated shedding rules on debug-only signals.
+
+---
+
+## How upstream systems should use these signals
+### Gateway / admission control
+Recommended order of evaluation (fast to compute, stable):
+1) Runtime `runtime_overload_state` (overloaded → reject early)
+2) decode queue wait p95 and queue depth (protect p95/p99)
+3) KV utilization + eviction rate (protect memory stability)
+4) compute saturation ratio (protect throughput)
+
+Guidance:
+- Prefer consistent, explicit overload errors over timeouts.
+- Avoid retry storms: only shed with stable Retry-After contracts (see ADR-014 for semantics).
+
+### Smart routing
+- Use `overloaded` state to avoid routing new traffic into an already-saturated pool.
+- Use `degraded` as a hint to prefer alternate pools/regions for latency-sensitive tiers.
+- Do not rapidly oscillate between regions based on 1–5s spikes; require sustained state changes (>= 30s) or use the routing system’s built-in damping.
+
+### SRE dashboards and alerts
+- Alerts should be based on *sustained* signals and correlated with customer-visible impact metrics (5xx/timeouts/latency), not on single gauges.
+
+---
+
+## Example PromQL snippets (for dashboards)
+**Decode queue wait p95 by region**
+- `histogram_quantile(0.95, sum by (le, region) (rate(runtime_scheduler_queue_wait_seconds_bucket{stage="decode"}[5m])))`
+
+**KV utilization ratio (pool aggregate)**
+- `avg by (region, runtime_pool) (runtime_kv_cache_utilization_ratio)`
+
+**Compute saturation ratio (p95 across instances approximated by max)**
+- `max by (region, runtime_pool) (runtime_compute_saturation_ratio)`
+
+**Allocator retries rate**
+- `sum by (region, runtime_pool) (rate(runtime_allocator_retry_total[5m]))`
+
+---
+
+## Operational notes and pitfalls
+1) **Queue depth without queue wait is ambiguous.** Always pair them.
+2) **Prefill vs decode bottlenecks differ.** A prefill-heavy burst may not require shedding if decode remains stable.
+3) **KV pressure can masquerade as compute saturation.** When KV utilization is high, throughput may drop while GPUs look “busy.”
+4) **Sampling noise:** 1s gauges will be spiky. Use 30–60s windows for state changes.
+5) **Metric delays:** scrape + pipeline delays are typically 2–10s. Runtime state gauges help reduce dependency on downstream aggregation.
+
+---
+
+## Change management
+Any changes to:
+- metric names, labels, or types
+- runtime_overload_state ruleset thresholds
+- sampling cadence
+
+…must include:
+- A backwards-compatibility plan (add new metrics; deprecate old after 2 releases)
+- Updates to overload dashboards and any policy-engine mappings
+- SRE sign-off if used for paging or automated load shedding
+
+---
+
+## Owners
+- Runtime scheduling + backpressure: **Sofia Ivanova**, **Lena Fischer**
+- Saturation signals implementation: **Omar El-Sayed**, **Julian Moore**
+- Telemetry pipeline coordination: **Logan Wright**
+- Oncall consumers (dashboards/alerts): **Rafael Mendes**, **Aisha Bello**

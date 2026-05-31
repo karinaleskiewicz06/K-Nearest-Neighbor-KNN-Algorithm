@@ -1,0 +1,392 @@
+Overload policy engine integration (Hosted circuit breakers + load shedding)
+
+## Purpose
+This document describes how overload protection policies are represented, validated, stored, and evaluated in the request path for the Hosted API. It is the integration reference for teams wiring circuit breakers + load shedding into:
+- API Gateway admission middleware
+- Smart Routing fallback decisions
+- Serving runtime backpressure/admission
+
+Policies must be:
+- **Tenant-aware** (per tenant overrides)
+- **Tier-aware** (self-serve Hosted vs enterprise Hosted vs Dedicated)
+- **Route/model-aware** (e.g., chat.completions vs embeddings; model family selectors)
+- **Safe-by-default** (guardrails prevent unsafe configs)
+
+This doc is implementation-oriented and complements ADR-015 (layering) and ADR-014 (customer error semantics).
+
+---
+
+## System overview
+### Components
+- **policy-engine** (Eng Platform): Policy evaluation service/library. Owns schema, validation, and evaluation logic.
+- **config-registry** (Eng Platform): Storage + distribution for tier defaults and tenant overrides.
+- **gateway-edge** (Control Plane/API Gateway): Enforces admission control and emits overload errors.
+- **routerd** (Smart Routing): Applies fallback routing policies when breaker state indicates overload.
+- **runtime-admission** (Serving Runtime): Applies runtime-level backpressure; exports saturation signals.
+
+### High-level data flow
+1) Operator or automation updates tier defaults and/or tenant override policy via config-registry.
+2) config-registry validates and publishes an immutable versioned policy bundle.
+3) gateway-edge and routerd fetch the bundle (watch + cache) and evaluate per request.
+4) gateway-edge enforces admission limits; routerd optionally selects a fallback.
+5) runtime-admission applies local backpressure and reports saturation metrics upstream.
+
+---
+
+## Policy model
+### Key concepts
+- **Policy bundle**: Versioned collection of policies that includes tier defaults + tenant overrides.
+- **Selectors**: Match the request context (tenant, tier, route, model, region, feature flags).
+- **Actions**: What to do when a rule matches (reject, queue, cap, degrade, fallback).
+- **Signals**: Inputs used by rules (queue depth, scheduler backlog, token/sec saturation, memory pressure proxy, regional capacity state, dependency health).
+
+### Evaluation context (per request)
+Policy evaluation is performed against a normalized context object. Fields are derived at the edge and are designed to avoid unbounded cardinality.
+
+Context fields (canonical):
+- tenant_id
+- tier (hosted_self_serve | hosted_enterprise | dedicated)
+- route (chat.completions | responses | embeddings | rerank)
+- model (catalog slug, e.g., redwood/llama-3.1-70b-instruct)
+- model_family (optional normalized group, e.g., llama3.1)
+- region (us-east | us-west | eu-central | ap-southeast)
+- request_mode (streaming | non_streaming)
+- features (tool_calling | structured_output | json_schema | ...)
+- idempotency_present (true|false)
+
+Notes:
+- **Do not** use raw prompt length, customer org name, or full model version string as selector keys.
+- If model pinning includes a build hash, it is normalized to a stable catalog slug + optional major.minor.
+
+---
+
+## Representation (schema)
+Policies are represented as JSON documents, stored and distributed via config-registry.
+
+### Top-level structure
+A policy bundle contains:
+- metadata (id, version, created_by, created_at)
+- tier_defaults (one policy per tier)
+- tenant_overrides (optional policy per tenant)
+
+Within each policy:
+- rules: ordered list; first-match wins unless otherwise specified
+- global_limits: optional; apply regardless of route/model (with safe caps)
+- degradation_modes: explicit allowlist of degradations permitted for the scope
+
+### Rule shape
+Each rule has:
+- name (stable identifier)
+- enabled (bool)
+- priority (integer; higher wins; ties resolve by rule order)
+- match (selector expression)
+- when (signal thresholds; optional)
+- action (one of reject | queue | cap | degrade | fallback | noop)
+- response (optional override for error code mapping; must conform to ADR-014)
+
+Selector expression language:
+- Conjunction of simple predicates (AND-only) is supported in v1 for predictability.
+- OR conditions should be expressed as multiple rules.
+- Negative matches are supported for a small set of keys (e.g., model != X) but strongly discouraged.
+
+### Supported actions (v1)
+- **reject**: Return an overload response immediately (typically 429 or 503) with stable error code and correlation ID.
+- **queue**: Admit into a bounded queue for a short time (edge queue) before rejecting.
+- **cap**: Modify request parameters in a bounded, explicit way (e.g., max_tokens cap) if allowed by degradation modes.
+- **degrade**: Disable non-essential features (e.g., tool calling) behind policy flags if client request allows it.
+- **fallback**: In routerd only; attempt configured fallback model/region (bounded attempts, loop prevention).
+
+Actions are constrained by layer:
+- gateway-edge: reject | queue | cap | degrade
+- routerd: fallback | reject
+- runtime-admission: reject (local) and optional queueing within runtime scheduler (internal)
+
+---
+
+## Guardrails and validation
+### Validation goals
+Validation prevents:
+- Unsafe global settings that could create retry storms
+- Tenant overrides that exceed tier caps
+- Rules that select on high-cardinality keys
+- Conflicting or ambiguous rule ordering
+- Degradation modes that break API contracts
+
+### Where validation occurs
+- **Write-time validation (config-registry)**: Required. Reject invalid bundles.
+- **Load-time validation (clients)**: Best-effort. If a client detects an invalid bundle, it falls back to last-known-good and emits an alert.
+
+### Validation checks (non-exhaustive)
+1) Schema validation
+   - Required fields present
+   - Types correct
+   - Allowed enum values
+
+2) Selector validation
+   - Only allowed keys
+   - Only allowed operators
+   - Max number of predicates per rule (default: 8)
+
+3) Safety caps
+   - queue.max_wait_ms must be <= 250ms (Hosted) unless explicitly allowlisted
+   - reject responses must include Retry-After guidance (see ADR-014) unless status is 429 with standard semantics
+   - fallback.max_attempts must be <= 1 per request (routerd)
+   - cap.max_tokens must not exceed tier default (tenant may reduce, not increase)
+
+4) Conflict detection
+   - Duplicate rule names are forbidden
+   - Identical match+when blocks with different actions are forbidden
+   - Rules that shadow other rules at equal/higher priority trigger a warning (publish allowed with warning) unless explicitly annotated with "intended_shadow": true
+
+### Tier caps and override semantics
+Override precedence (highest to lowest):
+1) Tenant override
+2) Tier default
+3) System default (compiled into clients)
+
+Tenant overrides are permitted only to be more conservative than their tier baseline unless a specific exception is approved.
+
+Conservativeness rules (examples):
+- May reduce concurrency caps; may not increase them.
+- May lower max_tokens cap; may not raise it.
+- May disable fallback; may not enable fallback to an unapproved model family.
+
+---
+
+## Storage and distribution
+### Storage
+Policies are stored in config-registry under:
+- /overload/tier-defaults/<tier>
+- /overload/tenants/<tenant_id>
+
+Each document is versioned (monotonic integer) and stored with:
+- created_by
+- created_at
+- change_summary
+- approval (optional for enterprise-impacting changes)
+
+### Distribution
+Clients (gateway-edge, routerd) consume policies via:
+- Long-poll watch API (primary)
+- Periodic refresh (fallback; 60s)
+
+Caching:
+- In-memory LRU keyed by (tier, tenant_id) with TTL 5 minutes.
+- Policy bundles are immutable by version; safe to share across threads.
+
+Failure behavior:
+- If config-registry is unreachable: continue using last-known-good policy up to 24 hours.
+- If no policy has ever been loaded: use compiled system defaults (very conservative) and emit a high-severity alert.
+
+---
+
+## Evaluation algorithm
+### Deterministic evaluation
+1) Build evaluation context from request metadata.
+2) Choose policy: tenant override if present else tier default.
+3) Sort rules by priority descending, then stable order in document.
+4) For each rule:
+   - Evaluate match predicates.
+   - If match, evaluate when thresholds using current signals snapshot.
+   - If satisfied, return action.
+5) If no rule matches, return noop.
+
+### Signals snapshotting
+To avoid feedback loops and flapping:
+- gateway-edge uses a **1–5s smoothed** saturation snapshot (not per-request instantaneous spikes).
+- routerd uses the same snapshot plus regional capacity state.
+- runtime-admission uses local instantaneous signals but only exports aggregated gauges upward.
+
+Signal sources:
+- GPU queue depth and scheduler backlog: runtime metrics exporter
+- token/sec saturation: runtime decode throughput gauges
+- memory pressure proxy: KV cache pressure / fragmentation proxies
+- regional capacity: capacity service
+- dependency health: internal health aggregator (e.g., vector store, tool execution service)
+
+---
+
+## Examples
+### Example A: Tier defaults (Hosted self-serve)
+Intent: protect platform under bursts with fast rejection, minimal queuing.
+
+Rule examples (illustrative):
+- If region capacity is degraded OR runtime queue depth is high, reject streaming chat requests with 503 + Retry-After.
+- Under mild pressure, cap max_tokens to reduce tail latency.
+
+Pseudo-policy snippet:
+```json
+{
+  "tier": "hosted_self_serve",
+  "rules": [
+    {
+      "name": "selfserve-chat-streaming-hard-shed",
+      "enabled": true,
+      "priority": 100,
+      "match": {
+        "route": "chat.completions",
+        "request_mode": "streaming"
+      },
+      "when": {
+        "any": [
+          {"signal": "runtime.queue_depth_p95", "op": ">=", "value": 120},
+          {"signal": "region.capacity_state", "op": "in", "value": "degraded"}
+        ]
+      },
+      "action": {
+        "type": "reject",
+        "http_status": 503,
+        "error_code": "overload_region_capacity",
+        "retry_after_ms": 500
+      }
+    },
+    {
+      "name": "selfserve-soft-cap-max-tokens",
+      "enabled": true,
+      "priority": 60,
+      "match": {"route": "chat.completions"},
+      "when": {"signal": "runtime.tokens_per_sec_saturation", "op": ">=", "value": 0.85},
+      "action": {
+        "type": "cap",
+        "max_tokens": 512,
+        "reason": "overload_soft_degrade"
+      }
+    }
+  ]
+}
+```
+Notes:
+- Values above are examples; canonical thresholds live in the tuning sheet owned by SRE.
+- retry_after_ms is enforced to be consistent with ADR-014 (clients should not retry aggressively).
+
+### Example B: Enterprise Hosted tenant override (more conservative, feature reduction)
+Tenant: northbridge-ai (enterprise Hosted). Intent: prioritize low tail latency and allow feature reduction over hard rejection.
+
+- Under moderate pressure: disable tool calling (if request allows)
+- Under high pressure: reject with 429 to encourage client backoff and avoid retries to downstream dependencies
+
+```json
+{
+  "tenant_id": "tenant_northbridge_ai",
+  "rules": [
+    {
+      "name": "northbridge-disable-tool-calling-under-pressure",
+      "enabled": true,
+      "priority": 80,
+      "match": {
+        "route": "chat.completions",
+        "features": "tool_calling"
+      },
+      "when": {"signal": "runtime.queue_depth_p95", "op": ">=", "value": 80},
+      "action": {"type": "degrade", "disable_features": ["tool_calling"]}
+    },
+    {
+      "name": "northbridge-hard-shed-chat",
+      "enabled": true,
+      "priority": 100,
+      "match": {"route": "chat.completions"},
+      "when": {"signal": "runtime.queue_depth_p95", "op": ">=", "value": 140},
+      "action": {
+        "type": "reject",
+        "http_status": 429,
+        "error_code": "overload_tenant_limit",
+        "retry_after_ms": 750
+      }
+    }
+  ]
+}
+```
+
+### Example C: Model-specific rule (protect a high-demand model)
+Intent: prevent one popular model from starving others during bursts.
+
+```json
+{
+  "name": "protect-llama-70b-concurrency",
+  "enabled": true,
+  "priority": 90,
+  "match": {
+    "route": "chat.completions",
+    "model_family": "llama3.1"
+  },
+  "when": {"signal": "runtime.model_queue_depth_p95", "op": ">=", "value": 60},
+  "action": {
+    "type": "reject",
+    "http_status": 503,
+    "error_code": "overload_model_saturated",
+    "retry_after_ms": 400
+  }
+}
+```
+Guardrail: model_queue_depth is exported only for an allowlisted set of model families to keep metric cardinality bounded.
+
+### Example D: Routing fallback policy (routerd)
+Intent: when primary model is saturated, attempt a compatible variant. This is only evaluated in routerd and only if the tenant has allowlisted fallbacks.
+
+```json
+{
+  "name": "fallback-llama-70b-to-8b",
+  "enabled": true,
+  "priority": 70,
+  "match": {"route": "chat.completions", "model": "redwood/llama-3.1-70b-instruct"},
+  "when": {"signal": "breaker.state", "op": "==", "value": "open"},
+  "action": {
+    "type": "fallback",
+    "max_attempts": 1,
+    "fallback_targets": [
+      {"model": "redwood/llama-3.1-8b-instruct", "region": "same"}
+    ]
+  }
+}
+```
+Loop prevention:
+- routerd tags the request with x-redwood-fallback-attempted=true and will not attempt a second fallback.
+- If fallback target is also overloaded, routerd returns the original overload error (does not waterfall).
+
+---
+
+## Operational notes
+### Rollout strategy
+- Policies ship as **disabled-by-default** rules that can be toggled per region and tier.
+- Dark launch metrics: evaluate and emit "would_shed" without enforcing.
+- Canary enablement gates:
+  - shed rate < 0.5% overall (unless in incident)
+  - no increase in client retries per request
+  - p99 latency improvement in burst scenarios
+
+### Observability expectations
+Clients must emit:
+- overload.policy_evaluations_total{action,tier,route,region}
+- overload.shed_total{error_code,http_status,tier,route,region}
+- overload.degrade_total{degradation_type,tier,route,region}
+- overload.policy_bundle_version{service,region}
+
+Cardinality rules:
+- tenant_id is only included in debug logs and sampled traces, not in high-volume metrics.
+- model is not included in default metrics; use model_family or an allowlisted set.
+
+### Change management
+- Tier default changes require SRE review (Rafael Mendes or delegate) and must include a rollback plan.
+- Tenant overrides for enterprise customers require Product acknowledgement when customer-facing behavior changes (e.g., new 429/503 patterns).
+
+---
+
+## FAQ
+### Why is v1 selector language limited (AND-only)?
+Predictability and validation. We need to reason about rule ordering and avoid policies that are difficult to test during incidents.
+
+### Can a tenant override enable fallback if tier default doesn’t?
+Only if the fallback target is on the allowlist for the tier and has been explicitly approved for that tenant. Otherwise config-registry rejects the update.
+
+### What happens if gateway-edge and routerd are on different policy bundle versions?
+Both include the bundle version in logs/headers (x-redwood-policy-version) to support debugging. Minor skew is acceptable; config watch converges within 60s. During canary, skew is expected and should be monitored.
+
+---
+
+## Ownership
+- Policy schema + validation: Eng Platform (Benji Okafor, Jordan Lee)
+- Gateway enforcement integration: Control Plane/API Gateway (Ethan Park, Amara Diallo)
+- Routing fallback integration: Smart Routing (Mina Haddad)
+- SLOs/alerts and tuning: Eng SRE (Rafael Mendes, Aisha Bello)
+
+For urgent issues (e.g., policy bundle failing validation in prod), page #eng-oncall and include the policy bundle version + region.

@@ -1,0 +1,355 @@
+Cache recommendations batch job (MVP) — design
+
+## Overview
+This document describes the MVP batch job that aggregates prefix/KV cache telemetry and emits “increase hit-rate” recommendations for internal operators (SRE/Runtime/Platform) and an initial Console/Optimize surface.
+
+The job is intentionally conservative: it prefers fewer, higher-confidence recommendations over noisy output. It is designed to be privacy-safe (no raw prompts) and operationally boring (idempotent, bounded cardinality, and easy to reason about when data is missing).
+
+## Goals (MVP)
+1. Produce per-route (and optionally per-region/model) cache-efficiency summaries from validated telemetry.
+2. Convert summaries into actionable recommendations with:
+   - a clear “what changed / what’s wrong”
+   - a likely root cause (miss reason / pressure signal)
+   - a concrete lever (config, routing, canonicalization, TTL/policy)
+   - a confidence score and severity
+3. Support internal consumption first (Slack/email report + Console stub/table), with stable output schema for later UX.
+4. Stay within the observability cardinality budget and avoid “per-tenant explosions.”
+
+## Non-goals (this sprint)
+- Not a real-time system. (Hourly/daily batch only.)
+- Not a full optimizer. (No automatic config writes; suggestions only.)
+- Not a full causal model. (Heuristic + guardrail approach.)
+- No prompt-level or conversation-level recommendations. (Only bucketed request-shape features.)
+
+## Stakeholders & ownership
+- Product owner (MVP): Aditya Rao
+- Telemetry pipelines: Logan Wright, Nadia Rahman
+- Batch job implementation: Mei Lin (primary), Yara Haddad (support)
+- Recommendation logic templates: Hassan Mirza
+- Oncall/operations: Platform Telemetry oncall (primary), SRE as escalation
+
+## Inputs and data sources
+The batch job depends on two classes of inputs:
+
+### A) Cache telemetry aggregates (primary)
+These are derived from runtime metrics with ingestion-side cardinality controls.
+
+Source: Metrics Lake (warehouse) table produced by telemetry ingestion/rollups.
+- Table: `telemetry.cache_metrics_hourly_v1`
+- Grain: 1 hour
+- Partition: `event_date` (UTC)
+- Key dimensions (allowlisted, bounded):
+  - `deployment_mode` (hosted|dedicated|private)
+  - `region` (e.g., us-east-1, eu-west-1)
+  - `route_id` (stable route identifier; allowlisted)
+  - `model_id` (e.g., llama-3.1-70b-instruct)
+  - `model_version_id` (stable version; allowlisted)
+  - `prompt_len_bucket` (bucketed; see standards)
+- Metrics columns (examples; exact names per naming standard/ADR):
+  - `prefix_cache_hit_tokens`
+  - `prefix_cache_miss_tokens`
+  - `kv_cache_reuse_tokens`
+  - `prefill_tokens_total`
+  - `wasted_prefill_tokens`
+  - `cache_evictions_total`
+  - `cache_evictions_capacity`
+  - `cache_evictions_ttl`
+  - `cache_memory_pressure_p95` (gauge rollup)
+  - Miss-reason counters split into allowlisted enums (capacity|ttl_expired|policy_disabled|hash_mismatch|version_mismatch|other)
+
+Notes:
+- We require rollups (not raw series) for joinability and cost control.
+- If a dimension is missing due to ingestion drops/label-dropping, the record is considered partial and may be suppressed.
+
+### B) Route metadata & config (context)
+Used to generate actionable “how to fix” text and to suppress recommendations that don’t apply.
+
+Source: Control-plane snapshot exported nightly.
+- Table: `controlplane.route_config_snapshot_daily`
+- Key fields:
+  - `route_id`
+  - `org_id` (internal tenant identifier)
+  - `cache_policy_enabled` (boolean)
+  - `prefix_cache_max_bytes` (nullable)
+  - `prefix_cache_ttl_seconds` (nullable)
+  - `routing_policy` (string enum)
+  - `deployment_mode`, `region` (if pinned)
+
+### Optional (MVP+)
+- Error/latency rollups to correlate user-visible regressions.
+- Release markers / model rollout events to attribute version-mismatch misses.
+
+## Windowing, schedule, and freshness
+### Schedule
+- Job name: `cache_recommendations_v1`
+- Orchestrator: Airflow (Platform-managed)
+- Cadence:
+  1) Hourly aggregation step: reads last 48 hours of hourly rollups to produce stable window metrics.
+  2) Daily recommendation emission: runs at 06:00 UTC, using the previous day as the primary analysis window.
+
+### Analysis windows
+We compute recommendations based on two windows to reduce false positives:
+- Primary: last 24h (D-1, UTC)
+- Baseline: prior 7d excluding last 24h (D-8 to D-2)
+
+The daily run emits recommendations when:
+- primary window has sufficient volume, and
+- deltas vs baseline exceed thresholds, and
+- the miss-reason/pressure signals are consistent with the suggested lever.
+
+### Volume gating (anti-noise)
+We require per (org_id, route_id, model_id, region, prompt_len_bucket) minimums:
+- `prefill_tokens_total >= 250k` OR `requests_total >= 5k` in the primary window
+If below threshold, we only emit “informational” summaries (internal-only) and suppress customer-facing recommendations.
+
+## High-level architecture
+1. **Extract** hourly cache rollups (`telemetry.cache_metrics_hourly_v1`) for the analysis windows.
+2. **Join** to route config snapshot (`controlplane.route_config_snapshot_daily`) by `route_id` and `org_id`.
+3. **Compute** derived KPIs (hit-rate, wasted prefill rate, eviction rate, miss-reason shares) with standardized definitions.
+4. **Detect** candidate issues using guarded heuristics.
+5. **Generate** recommendation records with templated text + suggested actions.
+6. **Write** output to a stable table for Console/Optimize + internal reporting.
+7. **Notify** internal channels (Platform Telemetry + SRE) when severe recommendations appear or when pipeline health checks fail.
+
+## Derived metrics (definitions)
+All definitions must match the ADR: “prefix/KV cache hit-rate definition.”
+
+Computed per window and dimension key:
+- `prefix_hit_rate = prefix_cache_hit_tokens / (prefix_cache_hit_tokens + prefix_cache_miss_tokens)`
+- `wasted_prefill_rate = wasted_prefill_tokens / prefill_tokens_total`
+- `evictions_per_million_prefill = 1e6 * cache_evictions_total / prefill_tokens_total`
+- `miss_reason_share_<reason> = miss_tokens_<reason> / total_miss_tokens`
+- `pressure_indicator = max(cache_memory_pressure_p95)` (window max of hourly p95 pressure)
+
+Important: If denominators are zero or missing, we mark the metric as `insufficient_data` and suppress recommendation emission.
+
+## Recommendation types (MVP set)
+The job emits a small, stable set of recommendation types. Each maps to one “primary lever” and includes guardrails.
+
+### 1) CACHE_POLICY_DISABLED
+When:
+- prefix hit rate is low (< 0.10) AND
+- miss_reason_share_policy_disabled is high (> 0.60) AND
+- route_config shows `cache_policy_enabled = false`
+Then suggest:
+- enable per-route caching (if allowed for that tenant/deployment mode)
+
+Guardrails:
+- Do not emit for routes tagged as `no_cache_expected` (internal allowlist in control plane snapshot).
+
+### 2) CAPACITY_PRESSURE_INCREASE_MAX_BYTES
+When:
+- prefix hit rate dropped vs baseline by >= 0.15 absolute AND
+- pressure_indicator >= 0.85 OR evictions_per_million_prefill increased by >= 2x AND
+- miss_reason_share_capacity >= 0.40
+Then suggest:
+- increase `max_prefix_cache_bytes` (or dedicated pool size), or reduce competing routes on same pool
+
+Guardrails:
+- Suppress if deployment_mode=hosted and route is on a shared tier where we cannot honor per-route cache bytes (emit internal-only “needs capacity tier” note).
+
+### 3) TTL_TOO_SHORT_INCREASE_TTL
+When:
+- miss_reason_share_ttl_expired >= 0.35 AND
+- baseline hit rate was healthy (> 0.35) but primary dropped AND
+- pressure_indicator is not high (< 0.70)
+Then suggest:
+- increase prefix-cache TTL (or align TTL with typical session intervals)
+
+Guardrails:
+- Avoid if workload is clearly non-repeating (see “repeatability proxy” below).
+
+### 4) VERSION_MISMATCH_ALIGN_MODEL_PINNING
+When:
+- miss_reason_share_version_mismatch >= 0.20 AND
+- model_version_id churn observed in the window (>= 2 versions active) OR a known rollout marker exists
+Then suggest:
+- pin model version for the route during rollouts, or enable fallback policy that preserves cache locality, or stage rollouts per region
+
+Guardrails:
+- Suppress if route intentionally uses multi-version A/B policy and hit-rate impact is within expected band.
+
+### 5) HASH_MISMATCH_CANONICALIZE_PROMPTS
+When:
+- miss_reason_share_hash_mismatch >= 0.25 AND
+- wasted_prefill_rate is elevated (> 0.25) AND
+- prompt_len_bucket indicates mid/long prompts (e.g., >= 1k tokens bucket)
+Then suggest:
+- canonicalize system prompts (stable ordering/whitespace), remove timestamps/nonce fields, normalize tool schemas
+
+Guardrails:
+- Never include raw prompt fragments. Provide generalized guidance + link to docs.
+
+### Repeatability proxy (used as a guardrail)
+Because we do not store prompts, we approximate repeatability using cache reuse signals:
+- `reuse_depth_p50` and `reused_tokens_share` (from prefix reuse histograms) where available
+If repeatability proxy is low, we avoid TTL/canonicalization suggestions and instead emit an informational summary (“workload appears low-repeat; caching gains may be limited”).
+
+## Scoring and prioritization
+Each emitted recommendation has:
+- Severity: `info | warning | critical`
+- Confidence: float 0.0–1.0
+
+Heuristic scoring (MVP):
+- Confidence increases with:
+  - higher volume
+  - clearer miss-reason dominance
+  - consistent pressure/eviction correlation
+  - stable join keys (no missing labels)
+- Severity increases with:
+  - estimated cost impact proxy: wasted_prefill_tokens and hit-rate delta
+  - breadth: affects multiple regions or top traffic routes
+
+We also apply deduping/suppression:
+- Do not emit the same recommendation type for the same key more than once every 72h unless severity increases.
+- If multiple recommendation types trigger, emit at most 2, preferring (1) capacity/pressure, then (2) version mismatch, then (3) canonicalization/TTL.
+
+## Output storage and schema
+### Destination
+Warehouse table for downstream consumption (Console/Optimize + internal reports):
+- Table: `optimize.cache_recommendations_v1`
+- Partition: `event_date` (UTC date of `generated_at`)
+- Clustering: `org_id`, `route_id`
+
+### Output keys
+A “recommendation instance” is keyed by:
+- `org_id`, `route_id`, `deployment_mode`, `region`, `model_id`, `model_version_id`, `prompt_len_bucket`, `recommendation_type`, `analysis_window_start`, `analysis_window_end`
+
+### Columns (MVP)
+All columns are flat; any structured blobs are stored as JSON strings.
+- `recommendation_id` (string; deterministic hash of the key)
+- `generated_at` (RFC3339)
+- `event_date` (YYYY-MM-DD)
+- `analysis_window_start` (RFC3339)
+- `analysis_window_end` (RFC3339)
+- `org_id` (string)
+- `route_id` (string)
+- `deployment_mode` (string)
+- `region` (string)
+- `model_id` (string)
+- `model_version_id` (string)
+- `prompt_len_bucket` (string; per standards)
+- `recommendation_type` (string enum)
+- `severity` (info|warning|critical)
+- `confidence` (stringified float)
+- `title` (short string)
+- `summary` (1–2 sentences)
+- `rationale` (multi-line string; include key metrics and deltas)
+- `suggested_actions` (multi-line string; step-by-step)
+- `estimated_impact` (string; e.g., “potentially reduce wasted prefill by 10–25%”)
+- `metrics_snapshot_json` (string; JSON blob with derived metrics)
+- `data_quality_flags` (string; comma-separated flags, e.g., “missing_region_tag,low_volume”)
+- `links` (string; comma-separated internal URLs to dashboards/runbooks)
+- `audience` (internal|customer_preview)
+- `expires_at` (RFC3339; for suppression/cleanup)
+
+### Example output record (illustrative)
+{
+  "recommendation_id": "rec_7f3c2b...",
+  "generated_at": "2025-03-20T06:02:11Z",
+  "event_date": "2025-03-20",
+  "analysis_window_start": "2025-03-19T00:00:00Z",
+  "analysis_window_end": "2025-03-20T00:00:00Z",
+  "org_id": "org_29KJ...",
+  "route_id": "route_support-agent_chat",
+  "deployment_mode": "dedicated",
+  "region": "us-east-1",
+  "model_id": "llama-3.1-70b-instruct",
+  "model_version_id": "v2025-03-18.2",
+  "prompt_len_bucket": "1024-2047",
+  "recommendation_type": "VERSION_MISMATCH_ALIGN_MODEL_PINNING",
+  "severity": "critical",
+  "confidence": "0.86",
+  "title": "Cache misses dominated by model version mismatch",
+  "summary": "Prefix cache hit-rate dropped 0.22 (baseline 0.41 → 0.19) while version-mismatch misses increased during a multi-version window.",
+  "rationale": "miss_reason_share_version_mismatch=0.34; 2 model versions active in-window; wasted_prefill_rate=0.28; pressure_indicator=0.52.",
+  "suggested_actions": "1) Pin model version for this route during rollouts.\n2) If A/B testing, keep variants sticky by session key to preserve locality.\n3) Roll per-region to avoid cross-region cache fragmentation.",
+  "estimated_impact": "Potentially recover 10–20% hit-rate in stable periods; reduce wasted prefill.",
+  "metrics_snapshot_json": "{...}",
+  "data_quality_flags": "",
+  "links": "https://console.redwood-inference.internal/dashboards/cache-hit-rate?route_id=...",
+  "audience": "internal",
+  "expires_at": "2025-03-23T06:02:11Z"
+}
+
+## Data quality and join correctness
+The job performs explicit quality checks before emitting any recommendation:
+- Required dimensions present: `org_id`, `route_id`, `deployment_mode`, `region`, `model_id`, `model_version_id`.
+- Metric sanity:
+  - hit/miss tokens non-negative
+  - hit+miss denominators consistent
+  - wasted_prefill_tokens <= prefill_tokens_total
+  - miss-reason shares sum within [0.9, 1.1] (tolerance for missing “other”)
+- Cross-source join:
+  - route_id exists in control-plane snapshot
+  - if route_config missing, emit internal-only summary with `data_quality_flags=missing_route_config`
+
+If checks fail, we:
+- suppress customer_preview output
+- emit an internal “pipeline health” event for investigation
+- keep a small sample of failed keys for debugging (no prompts; only IDs and flags)
+
+## Privacy & security
+- No raw prompts, no prompt hashes, no user identifiers.
+- Only bucketed request-shape features (prompt length buckets, reuse histograms).
+- org_id/route_id are internal identifiers and treated as internal telemetry; output table is access-controlled to Platform, SRE, Product (Optimize).
+- Any future plan to export recommendations to customer-visible UI must pass privacy review (owner: Marcus Lin).
+
+## Failure modes and operational behavior
+### Expected failure modes
+1) Missing telemetry rollups (ingestion delays/drops)
+2) Label dropping due to cardinality guards (route_id/model_version missing)
+3) Control-plane snapshot stale/missing
+4) Warehouse query failures / timeouts
+
+### Handling
+- Idempotent writes: recommendation_id is deterministic; job uses MERGE semantics.
+- Late data: job reprocesses last 3 days daily (“backfill on schedule”) to catch late-arriving rollups.
+- Alerting:
+  - Page Platform Telemetry oncall if daily run fails twice consecutively.
+  - Create ticket (no page) if output volume drops >80% day-over-day (likely pipeline/label issue), unless also explained by low-volume gating.
+
+Runbook link: Cache telemetry pipeline incident runbook (see related pages).
+
+## Implementation notes
+- Language: Python + SQL
+- Repository: `redwood/telemetry-jobs`
+- Job steps:
+  1) `extract_rollups.sql`
+  2) `compute_kpis.py`
+  3) `detect_candidates.py`
+  4) `render_templates.py`
+  5) `write_output.sql` (MERGE)
+
+Templates live in versioned code, not in the database, to keep behavior reviewable and to allow safe rollbacks.
+
+## Backtesting and evaluation (MVP)
+We evaluate the heuristics on:
+- Known incidents (e.g., version mismatch after rollouts; streaming retry double counts)
+- Synthetic canary workloads with controlled cache behavior
+
+Acceptance criteria:
+- Precision target: >= 0.7 for “critical” severity recommendations in internal review
+- Low operational noise: < 5% of top routes generate a new recommendation per day (unless a real regression occurs)
+- Join correctness: >= 99% of emitted records have complete required dimensions
+
+## Rollout plan
+1) Stage: run daily in staging against staging rollups; validate schema and suppression.
+2) Canary in prod (internal-only): audience=internal; share results with SRE + Runtime for 3–5 business days.
+3) Expand internal: add scheduled Slack report to #eng-platform and #eng-sre with top critical items.
+4) Customer preview (limited): audience=customer_preview for 3–5 design partners after PM sign-off and privacy review.
+
+## Open questions
+- Should we emit per-model-family recommendations (aggregate across versions) in addition to per-version? (Risk: conflates rollout behavior.)
+- How should we represent “recommended knob value” (e.g., bytes/TTL) without overfitting? Current plan: suggest direction + safe ranges only.
+- Do we need a dedicated suppression mechanism in Console (customer can “dismiss”)? MVP is table-only; dismissal is out of scope.
+
+## Appendix: Thresholds (initial)
+These are conservative starting points and will be tuned with SRE.
+- Hit-rate drop trigger: >= 0.15 absolute drop vs baseline
+- High pressure trigger: pressure_indicator >= 0.85
+- High wasted prefill trigger: wasted_prefill_rate >= 0.25
+- Miss-reason dominance trigger: share >= 0.35 (>= 0.60 for policy_disabled)
+- Severe impact trigger: wasted_prefill_tokens >= 50M tokens/day for a key
+
+All thresholds are configuration-driven in code and documented in release notes when changed.

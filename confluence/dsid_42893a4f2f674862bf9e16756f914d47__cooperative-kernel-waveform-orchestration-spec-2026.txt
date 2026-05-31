@@ -1,0 +1,164 @@
+Cooperative Kernel Waveform Orchestration Spec
+
+Summary
+-------
+This spec describes the Cooperative Kernel Waveform Orchestration (CKWO) design: a scheduling abstraction and operational playbook for coordinating short-lived inference kernels across heterogeneous GPU pools to reduce tail latency and improve packing efficiency while preserving isolation guarantees. CKWO is intended for the high-concurrency, mixed-model workloads that characterize Redwood’s hosted API and Dedicated clusters.
+
+Goals
+-----
+- Reduce 95th/99th percentile token-generation latency by coordinating micro-batches across kernels.
+- Improve kernel packing to reduce per-token GPU cycles without increasing head-of-line blocking.
+- Make kernel coordination observable and debuggable with explicit wave metadata.
+- Provide safe degradation modes that never violate customer SLOs (latency/COST isolation).
+
+Scope and non-goals
+-------------------
+- In-scope: inter-kernel coordination for attention/matmul kernels, batching signals, KV-cache-aware warmup, and telemetry annotations for wave events.
+- Out-of-scope: model architecture changes, driver-level preemption, and tenant-level admission control policy (higher-level quota layer handles admission).
+
+Conceptual overview
+-------------------
+CKWO organizes short-lived kernel executions into "waves". A wave is a logical grouping of kernels that can be co-scheduled with cooperative guarantees:
+- Wave phases: PREPARE -> PACK -> EXECUTE -> COMMIT -> CLEANUP.
+- Each wave carries a Wave ID (UUID), priority class (low/normal/high), and waveform hints (expected sequence length, kv-cache affinity, quantization tag).
+- Waves may be single-tenant or multi-tenant depending on affinity and isolation constraints.
+
+Architecture components
+-----------------------
+- Wave Controller (service): creates and coordinates waves per GPU node. Runs in the runtime control plane.
+- Kernel Coordinator (in-runtime agent): local to each GPU process, executes the waveform phases and enforces packing and fairness.
+- Wave Metadata Bus (lightweight pub/sub): transports wave lifecycle events (wave-start, pack-complete, exec-complete) to telemetry and tracing.
+- Admission shim: lightweight hook at request enqueue time that emits waveform hints and SLO tags.
+
+Scheduling primitives and contracts
+---------------------------------
+1. Slot promises: a kernel can promise a time-limited slot to the wave controller when it has partial readiness (e.g., token prefix loaded). The promise includes expected slot duration and token budget.
+2. Cooperative preemption token: short consensus token to allow higher-priority waves to reclaim unused slots during PACK phase (fast-path only).
+3. Quiesce boundary: kernels must implement a quiesce handler to checkpoint the KV cache pointer and return consistent partial outputs on preemption.
+
+Wave orchestration lifecycle (detailed)
+-------------------------------------
+1) PREPARE
+   - Admission shim validates hints and annotates the request.
+   - Wave Controller assigns preliminary Wave ID and target node(s) based on affinity and SLOs.
+   - Telemetry: emit wave.prep.{wave_id}.
+2) PACK
+   - Kernel Coordinator gathers ready kernels and evaluates pack candidates using waveform hint heuristics.
+   - Pack decision includes which kernels will run together and estimated duration.
+   - Telemetry: emit wave.pack.{wave_id} with pack composition and estimated duration.
+3) EXECUTE
+   - Kernels execute with coordinated start. Micro-batching may be performed only if all kernels meet packing constraints.
+   - Cooperative preemption may be triggered if a higher-priority wave claims slots.
+   - Telemetry: wave.exec.{wave_id} including per-kernel timing and kernel IDs.
+4) COMMIT
+   - Outputs are merged, cache pointers advanced; per-tenant quotas updated.
+5) CLEANUP
+   - Memory and ephemeral allocations released; pack accounting updated.
+
+Observability contract (what to emit)
+------------------------------------
+- Required events: wave.created, wave.pack_attempt, wave.pack_commit, wave.exec_start, wave.exec_end, wave.preempt_request, wave.preempt_granted, wave.cleanup_complete.
+- Each event must include: wave_id, node_id, kernel_id(s), priority, estimated_duration_ms, actual_duration_ms, pack_reason (latency/cost/affinity), and a diagnostic tag.
+- Correlate with existing traces: append wave_id to the request trace root.
+
+Config knobs (table)
+--------------------
+| name | default | description | operator guidance |
+| wave.max_pack_size | 8 | Max kernels in a single pack | Start at default, tune downward for high tail latency |
+| wave.max_pack_latency_ms | 8 | Max time to wait while assembling a pack | Lower to prioritize latency; increase for better efficiency |
+| wave.priority_strictness | medium | How strongly controller prefers higher-priority waves | Set to high for SLO-critical clusters |
+| wave.coop_preempt_window_ms | 2 | Time window where cooperative preemption can be claimed during PACK | Keep small to minimize instability |
+| wave.kv_affinity_threshold | 0.7 | Confidence threshold to colocate wave with warm KV cache | Use 0.8+ for latency-sensitive traffic |
+
+Example pack decision pseudocode
+-------------------------------
+```
+// simplified pack selection logic
+candidates = gather_ready_kernels()
+score(candidate) = affinity_score*0.6 + priority_score*0.3 - est_duration*0.1
+selected = top_k(candidates, wave.max_pack_size, score)
+if max_est_duration(selected) > wave.max_pack_latency_ms: fallback_to_singleton()
+```
+
+Safe degradation and fallbacks
+------------------------------
+- If pack assembly time exceeds wave.max_pack_latency_ms, controller falls back to executing available kernels immediately (singletons).
+- If cooperative preemption fails repeatedly for >3 waves in 60s for a node, disable PACK on that node for 60s (circuit breaker).
+- If observed 95th latency increases by >20% after a rollout, rollback the new controller and enable conservative packing config.
+
+Runbook: investigating long PACK times
+-------------------------------------
+1. Alert triggers: packing_latency.node > 99th percentile threshold for 5m.
+2. Triage steps:
+   a) Query last 10 wave.pack_attempt events for the node: composition, estimated vs actual durations.
+   b) Check node GPU utilization and dispatch queue lengths (node/gpu/{id}/utilization, dispatch.queue.length).
+   c) Verify kv-cache hit ratio for packed kernels — low affinity increases waiting.
+   d) If packing contention due to small kernels, reduce wave.max_pack_size or increase priority_strictness.
+3. Mitigation:
+   - Temporarily set wave.max_pack_latency_ms to 3ms for high-priority traffic.
+   - Trigger node-level PACK-disable circuit breaker if pack attempts > 100 and mean wait > 15ms.
+4. Postmortem: record root cause, pack composition, and correlate with traffic mix.
+
+Benchmarks and validation strategy
+---------------------------------
+- Microbenchmarks: synthetic mixes of (short, medium, long) sequences at concurrencies [10, 50, 200] measuring p50/p95/p99 for token latency and per-token GPU cycles.
+- A/B rollout: shadow CKWO with pack disabled for 24h; compare cost-per-token and tail latency. Staged rollout matrix described below.
+
+Rollout plan and metrics
+-----------------------
+1) Canary (5% traffic, internal customers): run CKWO controller in parallel mode (no-enforce) for 48h. Monitor wave packing ratio and tail latency.
+2) Limited (20%): enable CKWO with conservative knobs; monitor 1h and 24h windows.
+3) Gradual (50% -> 100%): increase over days if both cost and latency show improvement or remain within 3% of baseline.
+
+Key success metrics (track weekly)
+- pack_efficiency_ratio: (tokens served under packs)/(tokens total) target > 0.35 after warmup.
+- p95_token_latency change <= +3% during rollout.
+- per_token_gpu_cycles delta <= -5% (cost savings target).
+
+Telemetry dashboards and alerts (minimum)
+- Wave overview: pack rate, average pack size, pack latency distribution.
+- Node health: pack_attempts, pack_failures, preempt_requests/grants.
+- Alerts: pack_latency.node.high, pack_preempt.failure_spike, wave.exec.error_rate.
+
+Instrumentation examples
+-----------------------
+- Example Wave event JSON (annotate into existing trace):
+{
+  "event": "wave.pack_commit",
+  "wave_id": "wf-2a7d9c1e",
+  "node_id": "node-gpu-34",
+  "kernels": ["k-124", "k-125"],
+  "priority": "normal",
+  "est_duration_ms": 4,
+  "actual_duration_ms": 3
+}
+
+- Example runtime config snippet (YAML):
+wave:
+  max_pack_size: 6
+  max_pack_latency_ms: 6
+  priority_strictness: medium
+  coop_preempt_window_ms: 2
+  kv_affinity_threshold: 0.75
+
+Operational ownership and contacts
+----------------------------------
+- Primary owner: eng-serving-runtime/kernel-and-scheduling team.
+- Oncall rotation: runtime-sre (pager: see oncall roster).
+- Design/implementation contacts: Asha Patel (author), Diego Morales (kernel lead).
+
+References and related work
+---------------------------
+- Predictive slotting and quota orchestration (related decisions).
+- Telemetry feedback kernel autotune playbook for continuous tuning loops.
+- Runtime packing experiments in /playbooks/bench/ckwo-experiments-2025 (internal notebook).
+
+Appendix: experiment checklist
+-----------------------------
+1. Prepare synthetic load generator with realistic prompt length distribution.
+2. Baseline run (no CKWO) for 12h, record p50/p95/p99, cost.
+3. Enable CKWO in no-enforce mode for 24h, compare signals.
+4. Enable conservative CKWO config on a single node pool for 6h, validate correctness and tail behaviour.
+5. Execute A/B run for 24h with 20% traffic, evaluate.
+
+End of spec. For implementation RFC, see the kernel-and-scheduling team wiki space and open the design PR referenced in related_pages.

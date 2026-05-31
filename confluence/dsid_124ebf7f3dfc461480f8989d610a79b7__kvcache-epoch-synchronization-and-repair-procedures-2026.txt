@@ -1,0 +1,169 @@
+KVCache epoch synchronization and repair procedures
+
+Overview
+--------
+This page documents the operational contract, detection signals, and step-by-step repair procedures for KV cache (kvcache) epoch divergence across runtime shards and kernels. The document is intended for oncall SREs, runtime engineers, and release engineers executing maintenance or incident mitigation related to kvcache epoch drift, partial corruption, or replay divergence.
+
+Intro and intent
+- The kvcache is a soft-state prefix/KV cache used by the serving runtime to avoid recomputing early key/value activations for long-context workloads.
+- An epoch is an integer monotonic marker stamped into shard-local kvcache state at the time of checkpoint or warmstart. Epochs must be aligned for a shard group to accept replayed prefix tokens and to safely resume session continuation across host failovers.
+- This runbook covers: detection signals, triage, safe repair patterns (resync, targeted purge, rehydrate), verification checks, and automated mitigation best practices.
+
+Fast summary (TL;DR)
+1) If the alert "kvcache_epoch_mismatch" fires, do not mass-purge immediately. Run the inspection steps below to determine divergence scope (single shard, cohort, or cluster).
+2) For single-shard epoch mismatch with low error rate: attempt soft resync (admin API epoch bump + passive replay) -> verify hashes -> promote.
+3) For cohort-level drift or corruption: perform coordinated epoch rotate with drain and staged rehydrate (detailed below).
+4) If disk-backed checkpoint is corrupted, engage oncall runtime-owner and disable cross-shard routing until fixed.
+
+Observability signals and thresholds
+- Alerts (Prometheus/Alertmanager):
+  - kvcache_epoch_mismatch (firing when >0.5% shard request failures referencing mismatched epoch over 5m)
+  - kvcache_rehydrate_failure_rate (>1% failed rehydrates per shard over 5m)
+  - kvcache_hash_divergence (binary alert when checksum mismatch detected during meta-replay verification)
+  - kvcache_eviction_surge (when eviction rate increases >5x baseline for a shard cohort)
+
+- Key metrics to inspect (PromQL examples):
+  - Rate of epoch mismatch: sum(rate(kvcache_epoch_mismatch_events[5m])) by (shard)
+  - Hash divergence ratio: sum(kvcache_hash_mismatch_total) / sum(kvcache_hash_checks_total)
+  - Rehydrate latency P95: histogram_quantile(0.95, sum(rate(kvcache_rehydrate_latency_bucket[5m])) by (le))
+
+Telemetry artifacts to collect before repair
+1) kvcache meta dump (HTTP API): curl -sS http://admin.{env}.local:9090/kvcache/meta?shard={shard} > meta-shard-{shard}.json
+2) kvcache local checksum: rwi kvcache inspect --shard {shard} --checksum > checksum-{shard}.txt
+3) short trace covering a mismatched request: trace id from logs and link to tracing UI
+4) node runtime logs (last 1h) and kernel handshake logs
+
+Triage flow (detailed)
+1) Scope detection (3 quick checks)
+   a) Is the mismatch limited to a single shard? Query meta for epoch values across the shard group:
+      - admin API: /kvcache/meta?cohort={cohort_id}
+      - If only one shard shows a different epoch, proceed with single-shard repair.
+   b) Does the hash divergence alert also fire? If no, consider epoch misstamp (clock skew or delayed checkpoint) rather than corruption.
+   c) Check shard health: rehydrate errors, OOM logs, kernel panic, disk IO errors. If hardware symptoms present, escalate to infra SRE.
+
+2) Impact assessment
+   - Compute affected request percentage (use kvcache_epoch_mismatch events correlated with request counts). If <1% of requests and only warm path, prefer rolling/soft options. If >5% or critical customer routes affected, escalate to incident severity and use coordinated rotate.
+
+Repair procedures
+-----------------
+A. Safe soft resync (preferred when divergence is minor and single-shard)
+1) Preconditions:
+   - Divergence confirmed on single shard only.
+   - No disk corruption indicated.
+   - Rehydrate latency within normal bounds.
+2) Steps:
+   1. Put shard into passive mode: curl -X POST http://admin.{env}.local:9090/kvcache/mode?shard={shard}&mode=passive
+   2. Bump epoch via admin API (this triggers a soft checkpoint boundary):
+      - curl -X POST http://admin.{env}.local:9090/kvcache/epoch?shard={shard}&action=force_bump
+   3. Allow the shard to receive passive replay traffic for 30s to 2m to rehydrate prefixes from normal request flow.
+   4. Run checksum verification: rwi kvcache inspect --shard {shard} --verify
+   5. If checksums match cohort leader, set mode back to active: curl -X POST http://admin.{env}.local:9090/kvcache/mode?shard={shard}&mode=active
+
+3) Post-verify steps:
+   - Monitor kvcache_epoch_mismatch and kvcache_hash_divergence for 10m. If no recurrence, close incident.
+
+B. Targeted purge and rehydrate (use when some prefixes are corrupted)
+1) Preconditions:
+   - Hash divergence localized to identifiable prefix ranges or key patterns
+   - Customer request impact moderate
+2) Steps:
+   1. Identify offending prefix hash set from meta dump.
+   2. Use targeted purge API: curl -X POST http://admin.{env}.local:9090/kvcache/purge?shard={shard} --data '{"prefixes":["hk:abc...","hk:xyz..."]}'
+   3. Wait for background rehydrate to repopulate from canonical model execution or forward the next N matching requests through bypass path to rebuild state.
+   4. Verify each purged prefix checksum after rehydration.
+
+C. Coordinated epoch rotate (cohort-level)
+1) Preconditions:
+   - Multi-shard or cohort-level epoch mismatch or corruption
+   - Rolling soft options failed or not applicable
+2) Safety checklist (pre-rotate)
+   - Notify customers via incident channel if >5% request impact
+   - Confirm backups of disk checkpoints available and validated
+   - Verify automated rollback playbooks present and tested in lab
+3) Coordination steps (sequence)
+   1. Set cohort to read-only routing (no new sessions anchored to this cohort).
+   2. For each shard in cohort, in parallel: mark passive -> drain existing requests -> snapshot meta -> force epoch bump -> restart kvcache process if necessary. Use the orchestration tool: rwi kvcache rotate-cohort --cohort {cohort_id} --mode coordinated
+   3. Wait for rehydration and cross-shard checksum convergence. Allow at least 5m for warm paths and up to 30m for long-prefix workloads.
+   4. Re-enter cohort into active routing and ramp traffic using a 5-step circuit: 5% -> 20% -> 50% -> 80% -> 100% with 3–5 minute observation windows.
+
+D. Disk checkpoint repair (when checkpoint file corrupted)
+1) Preconditions:
+   - Checkpoint verification fails, file-level corruption detected
+   - There's a recent healthy checkpoint on another replica or in object store
+2) Steps
+   1. Pause cross-shard routing for cohort.
+   2. Copy healthy checkpoint from s3://redwood-kvcache-checkpoints/{cohort}/{shard}/latest to node (use signed URL).
+   3. Verify file checksum locally: sha256sum checkpoint.bin | grep {expected_hash}
+   4. Replace corrupted file atomically: mv checkpoint.bin checkpoint.bin.bak && mv checkpoint.bin.new checkpoint.bin
+   5. Restart kvcache service: sudo systemctl restart rw-kvcache && monitor startup logs.
+
+Verification and tests (post repair)
+- Functional checks (runbook)
+  1) Run kvcache meta diff across cohort: rwi kvcache meta-diff --cohort {cohort_id} > meta-diff.txt
+  2) Run sample replay test suite (contains 50 canonical prefix scenarios): ./tools/replay-suite/run.sh --shard {shard} --cases sample-50
+  3) Hash agreement test: rwi kvcache verify-hash --cohort {cohort_id}
+- Performance checks
+  - Ensure rehydrate latency P95 back within 10% of baseline within 30 minutes.
+- Safety observation window
+  - Maintain elevated monitoring for 60 minutes. If any of the following recur, escalate to Runtime Incident:
+    * kvcache_epoch_mismatch firing again
+    * kvcache_rehydrate_failure_rate > 1%
+    * kvcache_hash_divergence reappears
+
+Automation and tooling notes
+- rwi (runtime ops CLI) has commands used above. See rwi help for subcommands and flags. Example: rwi kvcache rotate-cohort --help
+- The orchestration job uses a preflight check that validates checkpoint availability and verifies storage IOPS before starting coordinated rotate.
+- A small Lambda/cron job performs nightly checksum sampling and records a digest manifest to object storage. This is used for fast verification during repairs.
+
+Rollout and release considerations
+- Changes to the kvcache serialization format or epoch semantics must be accompanied by:
+  1) A compatibility test in the benchmark suite that performs cross-version meta-diff using shadow cohorts.
+  2) A staged rollout: dev -> canary (5%) -> regional canary (20%) -> global (100%) with the kvcache epoch rotate orchestration able to abort mid-rotation.
+- Release note template snippet:
+  - Component: runtime.kvcache
+  - Change: bump epoch marker to 64-bit and add robust checkpoint CRC
+  - Safety: automated coordinated rotate orchestration and nightly checksum manifests
+  - Rollback: restore previous checkpoint from s3 and rotate cohort back.
+
+Known issues and caveats
+- Clock skew can cause false-positive epoch mismatch alerts if leader shard epoch bumps while follower is slightly behind; always check NTP health and kernel clock offset before repair.
+- Very long prefix workloads may require up to 30m for full rehydrate convergence; do not prematurely escalate if inspection shows slow but steady convergence.
+- Partial serialization changes without back-compatibility will cause cross-version epoch mismatch; ensure model-serving and kvcache serialization version are co-deployed.
+
+Escalation matrix and ownership
+- First responder: serving-runtime oncall (pager duty)
+- Secondary: runtime-kvcache owner (Asha Kapoor)
+- Tertiary: infra-sre (for disk or hardware IO issues)
+- Legal/Customer-Sensitive: if a customer reports data leakage correlated with kvcache keys, tag confidentiality=restricted and escalate to security oncall.
+
+Appendices
+A. Example commands
+- Inspect meta for cohort:
+  curl -sS http://admin.prod.local:9090/kvcache/meta?cohort=cohort-42 | jq '.' > cohort-42-meta.json
+- Force epoch bump for shard 7:
+  curl -X POST http://admin.prod.local:9090/kvcache/epoch?shard=7&action=force_bump
+- Targeted purge (JSON body escaped for shell):
+  curl -X POST http://admin.prod.local:9090/kvcache/purge?shard=7 \\--header 'Content-Type: application/json' \\--data '{"prefixes":["hk:abc123","hk:def456"]}'
+
+B. Checksum manifest format (nightly)
+- A nightly manifest (JSON) stored at s3://redwood-kvcache-checksums/{date}.json with records: 
+  - {"cohort_id":"cohort-42","shard":7,"epoch":12345,"sha256":"ab..."}
+
+C. Quick decision table
+| Symptom | Likely cause | Recommended action | Owner |
+|---|---:|---|---|
+| Single-shard epoch mismatch, no hash divergence | delayed checkpoint / clock skew | soft resync (force bump) | serving-runtime oncall |
+| Hash divergence on multiple shards | serialization/corruption | coordinated epoch rotate + restore checkpoint | runtime-kvcache owner |
+| Disk IO errors + rehydrate failures | node hardware or disk corruption | escalate to infra-sre, isolate shard | infra-sre |
+
+D. Contact links
+- Runtime runbook Slack: #runtime-oncall
+- Incident bridge template: https://incidents.redwood.ai/template/kvcache-epoch
+
+Document history
+- 2026-02-10: Created by Asha Kapoor
+- 2026-03-21: Expanded verification section and added automation notes (reviewed by Miguel Alvarez, Ruth Chen)
+
+Related reading
+- session-lifecycle-kvcache-consistency-guidelines-2024 (session consistency specifics)
+- kv-prefetch-audit-and-experiment-guide-2026 (profiling and rehydrate experiments)

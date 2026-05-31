@@ -1,0 +1,143 @@
+GPU graded-degradation and tenant fallback playbook
+
+Summary:
+
+This playbook documents the decision matrix and operational run steps to perform graded degradation and tenant-level fallbacks for GPU-backed inference pools. Graded degradation is an automated + manual strategy to keep the service available with reduced feature set and preserved SLOs when the GPU fleet is under stress (high utilization, preemptions, network egress pressure, or supply loss). The goals are: preserve P95 latency for critical tenants, minimize cost spikes, and avoid hard failures or data loss.
+
+Scope and applicability:
+- Applies to inference GPU pools (hosted and dedicated) managed by the pool allocator service (allocator-svc).
+- Targets tenant-facing request paths: predict/generate/chat/embedding.
+- Not applicable to offline batch training or long-running checkpoint jobs. Those jobs should use the separate batch-queue runbook.
+
+Owners and contacts:
+- Primary runbook owner: eng-infra oncall (alias: eng-infra-oncall@redwood.com)
+- Fallback policy maintainer: runtime-team (runtime-team@redwood.com)
+- Escalation: oncall -> senior-sre -> head of infra (escalation matrix below)
+
+When to run this playbook (signals):
+1) Capacity signals (any of the following for > 5 minutes):
+   - Cluster GPU utilization > 92% (sustained)
+   - Warm-pool deficit > 30% (ten-second moving average)
+   - Preemption/spike interruption rate > 1.8%
+2) Latency signals:
+   - P95 tail latency for critical routes > target + 40%
+   - P99 errors or timeouts increasing > 3x baseline
+3) Cost / billing signals:
+   - Unexpected spot reclaim costs or burst egress charges > 2x projection for rollout windows
+4) Multi-region degradation: regional capacity loss with cross-region failover saturation
+
+Decision matrix (short):
+- Priority customers (SLA tier: enterprise): try capacity reallocation and cross-region routing first; avoid feature degradation unless evacuation is unavoidable.
+- PLG/self-serve tenants: prefer aggressive graded degradation earlier (model downscaling, token caps) and quota enforcement.
+- New model rollouts: if rollout causes resource pressure, pause and revert to previous model variant.
+
+Graded degradation levels (automated policy order):
+Level 0 — nominal
+- No changes. All routing normal.
+
+Level 1 — soft cost/latency relief (automated):
+- Lower per-request max_tokens by 20% for non-critical tenants (runtime flag: max_tokens_overcommit = 0.8).
+- Aggressive KV-prefix cache reuse (cache-ttl bump).
+- Increase batching window by up to 15ms if latency SLO still met.
+
+Level 2 — feature-trim (automated + manual approval):
+- Swap heavy samplers (top_p sampling) to deterministic nucleus or greedy for lower token churn (runtime profile: sampling_mode=reduced_variance).
+- Switch medium-load tenants to 8-bit quantized model variants when available (model_tag: q8a).
+- Disable optional telemetry enrichment on generation requests (enrichment=false).
+
+Level 3 — graceful fallback (manual triggered by oncall):
+- Route non-SLA tenants to a dedicated low-cost pool (fractional-gpu-pool) with strict per-request token limits and higher batching.
+- Temporarily suspend long-streaming responses (streaming=false) and replace with chunked polling.
+- Enact tenant-level throttles or short circuit to cached fallback responses for non-critical routes.
+
+Level 4 — evacuation and service-preservation (manual + exec approval):
+- Evacuate non-enterprise tenants from primary pools; route enterprise traffic to reserved capacity.
+- Enable best-effort degrade: shorter prompt truncation, lower context window, fallback to smaller model families (e.g., model: rwd-small-1).
+- If eviction is due to preemption, proactively snapshot and rehydrate KV caches for enterprise tenants.
+
+Decision table (example)
+| Trigger | First action | Secondary action | Owner | Rationale |
+|---|---|---|---|---|
+| GPU util > 92% | Level 1 automated | If persists 10m -> Level 2 | oncall | Reduce token/time per request |
+| P95 > target + 40% | Increase batching (auto) | Notify runtime-team; consider Level 2 | oncall | Lower bursts causing tail latency |
+| Spot reclaim rate > 2% | Pause non-critical evictions | Move to reserved capacity | SRE | Preserve enterprise SLAs |
+
+Operational commands and quick toggles
+- Query current pool state:
+  curl -sS "https://internal-api.redwood/v1/pools/summary" | jq
+- Trigger a Level 2 policy toggle (runtime feature flag):
+  rw-admin feature-flip --flag graded_degrade_level --value 2 --reason "latency spike" --actor $ONCALL
+- Re-route tenant to low-cost pool (tenant_id is required):
+  curl -X POST "https://internal-api.redwood/v1/tenants/{tenant_id}/route" -H "Authorization: Bearer $ADMIN_TOKEN" -d '{"target_pool":"fractional-gpu-pool","max_tokens":128,"batching_hint_ms":25}'
+
+Terraform / IaC knobs to adjust (fast/controlled changes)
+- autoscaler.weighting: reduce eval_warmup_weight and increase enterprise_reserve_ratio (example in HCL):
+  module "allocator" {
+    source = "git::ssh://git@repo/infra/allocator.git//modules/pool?ref=release"
+    autoscaler = {
+      min = 2
+      max = 120
+      enterprise_reserve_ratio = 0.12
+      eval_warmup_weight = 0.6
+    }
+  }
+- feature flags stored in config store (do not commit secrets):
+  - graded_degrade_level (int)
+  - sampling_mode (string)
+  - model_fallback_map (map)
+
+Operational play (step-by-step)
+1) Triage: confirm alert, validate metrics in dashboards (latency, util, preemptions, admission queue length).
+2) Scope: determine affected tenants and SLA tiers using the tenant-impact query.
+3) Apply Level 1 automated mitigations and observe for 2–5 minutes.
+4) If no improvement, prepare Level 2 toggles and notify runtime-team; open incident in PagerDuty -> create internal incident channel.
+5) If Level 2 insufficient and critical tiers impacted, follow Level 3 actions and prepare communications (QBR and status page template below).
+6) For evacuation (Level 4), coordinate cross-team action: SRE, runtime-team, account-exec for impacted enterprise customers.
+
+Post-incident sequencing and tests
+- After stabilization, run the rollback validation:
+  1. Revert runtime flags in staging, run synthetic P95/P99 replay for 30 minutes.
+  2. Reintroduce small volume of prod traffic using canary gating (5% traffic for 10 minutes).
+  3. If stable, increment rollout to 25% then to 100%.
+- Runbook test frequency: quarterly tabletop + automated chaos test during scheduled maintenance windows. Document test in the incident-runbook log.
+
+Common troubleshooting checklist
+- Verify allocator-svc logs for rebalancing errors: systemctl status allocator-svc; journalctl -u allocator-svc -n 500 | grep -i error
+- Check preemption and spot signals from cloud provider (console or cloud-metrics): spot_interrupt_count and spot_recovery_time
+- Confirm KV cache hit-rate is healthy: metrics.kv_cache.hit_rate < 0.7? If yes, consider cache pre-warm for enterprise tenants.
+- Inspect egress link utilization and NAT exhaustion: vpc/nat-gw/egress_bytes and ephemeral port usage.
+
+Communication templates
+- Status page short message (for internal slack/channel):
+  "We are currently running graded degradations in region us-west-2 to reduce P95 latency. Enterprise traffic is unaffected; non-critical tenants may see reduced max_tokens and slower streaming. Eng-infra is actively remediating. ETA: 60-90 minutes."
+
+- Customer-facing escalation email (for enterprise only): include incident id, exact start time, what was affected, mitigation steps, and action items. Use the account-exec content template stored in /confluence/sales-enablement/pitch-decks/incident-communication-template.json
+
+Safety and guardrails
+- Never edit model binaries in-place in the production image; use model-tag routing and model_registry references.
+- All manual Level 3+ actions must be recorded in the incident channel and signoff by a Senior SRE.
+- Feature-flag changes must use the admin audit endpoint; ensure actor and reason are recorded.
+
+Appendices
+A. Example tenant-impact query (SQL):
+  SELECT tenant_id, sla_tier, avg(p95_latency) as p95, avg(gpu_seconds)
+  FROM metrics.requests
+  WHERE ts > NOW() - INTERVAL '10 minutes'
+  GROUP BY tenant_id, sla_tier
+  ORDER BY p95 DESC
+
+B. Test checklist for runbook drills:
+- Scenario: warm-pool loss (simulate draining 30% of warm nodes)
+  - Execute scheduled drain in staging using iac operator and verify auto-scaling reaction.
+  - Validate that Level 1 to Level 2 automation triggers as expected.
+  - Confirm that reserved enterprise lanes remain within SLO.
+
+C. Related runbooks and docs:
+- /confluence/eng-infra/gpu-fleet-and-capacity/gpu-tenant-backpressure-and-queue-smoothing-runbook.json
+- /confluence/eng-infra/terraform-and-iac/gpu-spot-fallback-autoscaler-module-and-runbook.json
+
+Change log:
+- 2024-10-12 (Ava Chen) - Created initial playbook and decision matrix.
+- 2025-06-03 (Priya Nair) - Added Terraform knobs and automated feature-flag guidance.
+- 2026-01-18 (Ava Chen) - Expanded Level 3/4 procedures and added post-incident sequencing and test checklist.
+

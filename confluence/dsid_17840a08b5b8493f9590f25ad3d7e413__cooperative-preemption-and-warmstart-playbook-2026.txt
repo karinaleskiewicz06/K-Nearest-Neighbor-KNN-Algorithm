@@ -1,0 +1,120 @@
+Cooperative Preemption and Warm-Start Playbook for Latency-SLO Workloads
+
+Overview:
+This playbook defines a cooperative preemption model and warm-start procedures for the Redwood serving runtime to preserve customer latency SLOs while maximizing GPU utilization. It consolidates scheduler signals, kernel boundary preemption, and KV/prefix cache warm-start techniques into an operationally safe procedure that on-call and platform engineers can follow during scale events, upgrades, and transient overloads.
+
+Scope:
+- Applies to GPU-backed serving nodes running the Redwood inference runtime (all major variants: hosted, dedicated, private).
+- Focused on interactive text-generation and chat endpoints with strict P50/P95 latency SLOs (<= 50ms P50, <= 200ms P95 typical).
+- Excludes bulk embedding/long-batch offline workloads except where co-located on shared pools (see co-location section).
+
+Goals:
+1. Maintain customer-visible latency SLOs during transient overloads and rolling upgrades.
+2. Avoid noisy eviction cascades that cause repeated cold-starts and SLA regressions.
+3. Provide deterministic, observable preemption behavior that is easy to reason about in postmortems.
+
+Key concepts and components:
+- Cooperative preemption: scheduler and runtime negotiate preemption at well-defined kernel boundaries instead of forced GPU context kills. This preserves partial KV state and allows graceful request migration.
+- Preemption tokens: lightweight reservation tokens issued by the scheduling coordinator that carry preemption priority (urgent, standard, background) and preemption TTL.
+- Warm-start checkpoints: serialized KV/prefix cache snapshots and minimal model context capture stored locally (ephemeral SSD) for fast rehydration after eviction.
+- Eviction fencing: short quiesce windows (typically 50-200ms) to allow kernels to finish completions before eviction.
+
+Architecture overview (short):
+1) Request arrives at fronting gateway with priority header (derived from customer tier and endpoint config).
+2) Scheduler maps request to a shard and provides a preemption token if eviction is possible.
+3) Runtime accepts token and places request into a guarded execution lane that checks for preemption signals at kernel boundaries (attention-block, layer normalization boundary, kv-flush points).
+4) If preemption is required, runtime quiesces new work, finishes the current micro-kernel, checkpoints minimal KV state, and returns mutable fallback or routes to warm node.
+
+Decision table: when to preempt vs. when to deny new requests
+| Condition | Action | Rationale |
+|---|---|---|
+| Node overloaded (GPU util > 95% for 5s) and incoming request priority = background | Reject with 429/backoff header | Background work should not destabilize interactive SLOs |
+| Node overloaded and incoming request priority = standard | Try cooperative preemption: identify background lanes to evict | Preserves mid-tier throughput while protecting high-priority clients |
+| Node overload + rolling upgrade drain | Graceful preempt with warm-start enabled | Avoids cold-cache penalties at the cost of short quiesce windows |
+
+Operational parameters (recommended defaults):
+- Kernel preemption check interval: 1-3 kernel boundaries per request (~every 8-16 transformer layers or 50-200ms for long decodes).
+- Preemption fencing timeout: 200ms (must be < endpoint P95 target).
+- KV warm-start snapshot cadence: on eviction and every 30s for long-lived sessions > 60s.
+- Max concurrent warm-start restores: 4 per node to limit SSD contention.
+
+Runbook: normal-scale preemption flow (engineer-facing)
+1) Detect: alert fires when cluster-wide overload fraction > 10% and observed P95 > target for 2 minutes.
+2) Evaluate: check agent dashboard: preemptible-lanes metric, current kernel preemption events, and SSD write queue depth.
+3) Trigger soft-throttle: increase rejection probability for background priority by 20% via gateway feature flag.
+4) If SLOs do not recover in 2 minutes, enable cooperative eviction on suspect nodes: set scheduler flag "enable_coop_preempt=true" for affected pool.
+5) Monitor: watch metrics (listed below). If eviction errors or excessive cold-starts occur, roll back the flag immediately and open an incident.
+
+Emergency eviction flow (when nodes must be drained for hardware or security patch):
+1) Set graceful-drain=60s for maintenance windows, enable warm-start checkpoints.
+2) Scheduler marks node as draining; new high-priority requests are migrated immediately, background lanes are queued for eviction.
+3) Runtime performs ordered checkpointing of KV caches for active sessions and flushes ephemeral artifacts to local SSD with immediate replication to a standby within the AZ.
+4) After checkpoint success or fencing timeout, scheduler migrates in-flight sessions to target nodes and resumes traffic.
+
+KV cache warm-start details:
+- What we save: minimal per-session KV ranges (start/end positions), per-segment attention state, and a 64-byte session manifest. Avoid saving full activations.
+- Format: LZ4-compressed protobuf manifest + per-shard segment files. Example path: /var/lib/redwood/warmcheckpoints/<node>/<session-id>.lz4
+- Restore time target: <= 150ms for a typical 1–3-layer prefix recomposition on NVMe SSDs. Test with the included microbenchmark (see commands).
+
+Observability checklist (metrics & traces to inspect):
+- preemption.events.count (by reason: load, drain, upgrade)
+- preemption.latency-ms (time from preempt-signal to kernel quiesce)
+- kv.checkpoint.size-bytes and kv.restore.latency-ms
+- runtime.fallback-ratio (requests routed to fallback model or node)
+- gateway.429-by-priority (measure rejecting behaviour)
+- per-node ssd.write-ms and ssd.iops
+- trace: follow a preemption trace (trace span name: runtime.preempt.sequence)
+
+Table: Key thresholds (suggested)
+| Metric | Warning | Critical |
+|---|---:|---:|
+| GPU util (5m avg) | 85% | 95% |
+| preemption.latency-ms | 100ms | 300ms |
+| kv.restore.latency-ms | 100ms | 400ms |
+| ssd.write-ms | 10ms | 50ms |
+
+Example CLI snippets and configs:
+- Enable cooperative preemption for pool 'interactive-pool':
+  $ rctl scheduler set-pool-config interactive-pool --enable-coop-preempt=true --preempt-fence-ms=200
+
+- Trigger a manual warm checkpoint for node 'node-17':
+  $ rctl runtime checkpoint node-17 --session all --force --dest /var/lib/redwood/warmcheckpoints
+
+- YAML fragment (runtime config):
+  runtime:
+    preemption:
+      enabled: true
+      fence_ms: 200
+      kernel_checkpoints_per_request: 2
+    kv_cache:
+      checkpoint_dir: "/var/lib/redwood/warmcheckpoints"
+      snapshot_interval_s: 30
+      max_simultaneous_restores: 4
+
+Safety and failure modes to watch for:
+- SSD saturation: frequent checkpoints can queue writes and slow restores, increasing cold-starts. Mitigation: reduce snapshot cadence or increase node-level restore concurrency cap.
+- Eviction storm: misconfigured scheduler flags may evict too many sessions at once. Use staggered eviction windows and a global circuit breaker.
+- Incomplete checkpoints: detect via checksum mismatches and abort migration; revert to fallback routing and alert SRE.
+
+Testing and validation guidance:
+- Microbenchmark to validate restore latency (run on target instance type):
+  $ ./bench/warm-restore-bench --sessions 100 --concurrency 8 --checkpoint-dir /var/lib/redwood/warmcheckpoints
+  Expected: 95th percentile restore latency < 150ms on NVMe-backed nodes.
+- Chaos tests: simulate scheduler preemption toggles and measure SLO drift for 1h windows.
+- A/B rollout: start with 5% of interactive-pool then 25% before global rollout. Watch runtime.fallback-ratio and preemption.latency histograms.
+
+Operational play examples (short):
+- Rolling upgrade with minimal SLO impact: enable coop preempt, drain old nodes with checkpointing, warm restore on new nodes, monitor P95.
+- Sudden traffic spike: raise background rejection at gateway, enable coop preempt on overflow pool, activate autoscale burst if available.
+
+Ownership and run-once checklist:
+- Owner (primary): runtime-scheduling (pager: @runtime-scheduling)
+- Secondary support: sres-serving, infra-storage for NVMe health
+- Post-incident: complete Eviction & Warm-Start incident checklist and link to postmortem ID.
+
+Appendix: quick reference links and artifacts:
+- Runtime preemption sequence diagram (diagram id: diag-preempt-2026)
+- Notebook: warm-restore-bench-readme.md (internal repo: infra/benchmarks/warm-restore)
+- Related runbooks: numa-aware-shard-placement-eviction-playbook-2026 (for co-location policies)
+
+If you are on-call and uncertain which path to take: prioritize keeping P95 within SLO. If cooperative preemption introduces regressions, disable it for the pool and revert to conservative rejection until a postmortem has been completed.

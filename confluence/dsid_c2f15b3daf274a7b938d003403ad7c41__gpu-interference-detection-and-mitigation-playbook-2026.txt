@@ -1,0 +1,172 @@
+GPU interference detection and mitigation playbook
+
+h1. GPU interference detection and mitigation playbook
+
+Short description
+This playbook describes how to detect, triage, and mitigate cross-workload GPU interference (noisy neighbors, kernel contention, NUMA/memory-bandwidth saturation) in Redwood's inference fleet. It provides concrete alerting expressions, investigative queries, mitigation actions (eviction, migration, isolation), and post-incident followups. Target readers: oncall eng-serving-runtime, infra-sre, GPU-fleet owners, and platform engineers responding to tail-latency regressions.
+
+Overview and goals
+- Goal: identify interference events that meaningfully degrade per-tenant p95/p99 generation latency or reduce GPU efficiency below acceptable thresholds.
+- Scope: shared GPU pools and multitenant nodes running inference workload containers (K8s + device-plugin, MIG-enabled and non-MIG nodes).
+- Impact metrics: model-serving p99 token latency, model throughput (tokens/sec), GPU SM utilization variance, memory bandwidth stalls, and queue-length growth.
+
+Key definitions
+- Interference event: a transient period where one or more tenants cause measurable resource contention (GPU SMs, memory bandwidth, PCIe bandwidth) leading to >= 20% degradation in p95 or >= 15% increase in p99 latency for a model route over a 5-minute window.
+- Noisy neighbor: a tenant or non-production job producing >30% increase in GPU memory copies or long-running kernels that block scheduling.
+
+Detection and alerting
+- Recommended SLI thresholds (example):
+  - route_p99_generation_latency > 1500ms (for latency-sensitive routes)
+  - gpu_sm_efficiency_drop: baseline_sm_efficiency - sm_efficiency >= 15% over 2 minutes
+  - gpu_mem_bandwidth_stall > 40% sustained for 2+ minutes
+  - p95_queue_length_growth: queue_length_current / queue_length_baseline >= 2 for 5 minutes
+
+Alert examples (PromQL and rationale)
+1) Alert name: GPU_SM_EFFICIENCY_DEGRADATION_HIGH
+Expression (Prometheus / node-exporter + DCGM metrics):
+
+  avg_over_time(dcgm_sm_efficiency{job="gpu-metrics"}[2m]) 
+    < (avg(dcgm_sm_efficiency{job="gpu-metrics"}) by (gpu_node) * 0.85)
+
+Severity: P1 for host-exposed customer traffic (oncall pages)
+Runbook quick action: follow "Investigate" steps below. If confirmed, trigger "evict-low-priority-pod" policy.
+
+2) Alert name: ROUTE_TAIL_LATENCY_SPIKE_BY_NODE
+Expression (serving metrics):
+
+  sum by (node) (increase(route_request_latency_seconds_bucket{le=">=1.0"}[5m] )) 
+    / sum by (node) (increase(route_request_count[5m])) > 0.15
+
+Severity: P0 for dedicated and reserved-capacity customers, P2 for best-effort tenants
+
+Investigation checklist (ordered)
+1) Correlate p99/p95 spike to node(s) and time window
+   - Use Alerts -> Affected Nodes -> link to node-level dashboard panel.
+2) Check GPU telemetry for the time window:
+   - dcgm_sm_efficiency, dcgm_sm_active_cycles, dcgm_memory_read_bw, dcgm_memory_write_bw, pci_rx_bytes/sec, pci_tx_bytes/sec, nvlink_tx/RX if present.
+   - PromQL examples:
+
+     avg_over_time(dcgm_memory_read_bw{node="$NODE"}[5m])
+     and
+     max_over_time(dcgm_sm_active_cycles{node="$NODE"}[5m])
+
+3) Inspect per-pod GPU metrics and kernel durations (if FTRACE/async-pipeline tracing enabled)
+   - kubectl top pod --containers --namespace=redwood-serving --selector=gpu=true
+   - kubectl describe pod <candidate> to see eviction history and restart counts
+
+4) Look for simultaneous high host CPU steal or NUMA imbalances (dmesg, node-exporter metrics)
+
+5) Check recent scheduling events and live migrations
+   - kubectl get events --field-selector involvedObject.kind=Pod --namespace=redwood-serving --since=10m
+
+Mitigation actions (choose minimal-impact first)
+1) Soft-eviction (automatic preferred)
+   - Trigger: small noisy jobs or low-priority batch tasks.
+   - Command (example):
+
+     kubectl label pod <pod> disruption=evict-me --namespace=infra-batch
+     kubectl evict pod <pod> --namespace=infra-batch --grace-period=30
+
+   - Policy snippet (Kubernetes):
+
+     ```yaml
+     evictionPolicy:
+       lowPriorityThreshold: 0.2
+       gracePeriodSeconds: 30
+       selectors:
+         - namespace: infra-batch
+           label: workload-type=batch
+     ```
+
+2) Move traffic away from afflicted node
+   - Use runtime routing: add node to routing blacklist for 15m via the router control plane: `redwoodctl route update --node-blacklist $NODE --duration 15m`
+
+3) Promote dedicated capacity for impacted tenants
+   - If tenant has reserved capacity offer, move their pods to dedicated pool using nodeSelector: `dedicated=true`
+
+4) MIG partitioning and hardware isolation (longer-term)
+   - For NVIDIA A100 / H100, schedule heavy and light tenants on different MIG slices. Use `nvidia-mig-manager` steps (see appendix).
+
+Emergency full-node drain (if severe)
+1) Drain node if multiple services compromised and eviction/migration not restoring SLOs:
+   - `kubectl drain $NODE --ignore-daemonsets --delete-local-data --grace-period=60`
+2) Trigger orchestration to reschedule inference workers to other pools. Monitor queue lengths and p99 during reschedule.
+3) If drain fails, escalate to infra-sre for node reprovisioning.
+
+Post-incident triage and remediation
+- Required artifacts for postmortem:
+  - Alert timeline (console screenshots), correlated DCGM graphs (SM efficiency, mem BW), p95/p99 route time series, pod list with GPU assignments, any kernel crash traces, and node config (driver/driver-version, CUDA, MIG config).
+- Remediation candidates:
+  - Move noisy workload class to separate GPU pool or schedule in off-peak windows.
+  - Adjust autoscaler to avoid overpacking shared nodes.
+  - Add placement constraints for latency-sensitive routes (taints/tolerations).
+  - Tune CUDA context preemption settings and driver flags (listing in appendix).
+
+Dashboard and instrument panels (recommended)
+- Node overview panel: per-node p99 latency (all routes), GPU SM efficiency, mem BW, PCIe throughput, queue length heatmap.
+- Tenant impact panel: per-tenant p95/p99 with historical baseline and anomaly shading.
+- Workload scatter: kernel-duration distribution by pod label.
+- Eviction action panel: recent evictions and reasons, correlated with latency.
+
+Sample dashboard queries (Grafana / Loki links)
+- Per-node p99: `histogram_quantile(0.99, sum(rate(route_request_latency_seconds_bucket[5m])) by (le, node))`
+- SM efficiency: `avg(dcgm_sm_efficiency) by (node)`
+- Kernel long tail: `topk(10, max_over_time(kernel_duration_seconds{job="gpu-kernel-traces"}[5m]))`
+
+Ownership and escalation matrix
+- Primary owner: eng-serving-runtime (oncall)
+- Escalate after 15 minutes of persistent P1 to: infra-sre -> GPU-fleet (hardware & drivers) -> platform-engineering (routing & autoscaler)
+- Pager routing: P0/P1 pages to oncall, P2 via Slack channel `#gpu-observability`.
+
+Config table: example alert definitions
+| alert_name | expression (summary) | severity | auto_action |
+| GPU_SM_EFFICIENCY_DEGRADATION_HIGH | sm_efficiency drops >=15% over 2m | P1 | soft-evict low-priority pods |
+| ROUTE_TAIL_LATENCY_SPIKE_BY_NODE | route p99 spike localized to node | P0/P2 | route-blacklist for 15m |
+| GPU_MEM_BW_SATURATION | memory bandwidth >40% sustained | P1 | migrate heavy kernels |
+
+Appendix A — Useful CLI snippets
+- NVSMI quick checks:
+  - `nvidia-smi dmon -s u` (SM/Memory utilization over time)
+  - `nvidia-smi topo --matrix` (verify NVLink/PCIe topology)
+- DCGM export troubleshoot:
+  - `dcgmi dmon --gpu=0 --samples=10 --delay=1`
+
+Appendix B — Suggested kernel/driver tuning (do with infra-sre)
+- Ensure driver version >= recommended baseline (see release-notes/drivers matrix).
+- Enable KFD and large page support for high-throughput workload classes.
+- Consider `CUDA_LAUNCH_BLOCKING=0` for production inference; only enable blocking in debug.
+
+Appendix C — Eviction policy YAML example
+```yaml
+apiVersion: v1
+kind: EvictionPolicy
+metadata:
+  name: gpu-interference-eviction
+spec:
+  thresholds:
+    sm_efficiency_drop_pct: 15
+    mem_bandwidth_pct: 40
+  selectors:
+    - label: workload-type
+      allowed_values: [best-effort, batch]
+  actions:
+    - type: soft-evict
+      gracePeriodSeconds: 30
+    - type: route-blacklist
+      durationSeconds: 900
+```
+
+Postmortem checklist (must complete within 72 hours)
+1) Owner: attach timeline and artifacts to JIRA ticket and postmortem doc.
+2) Decide one of: configuration change, scheduler rule change, or capacity purchase.
+3) If recurring: schedule follow-up to add automated mitigation.
+4) Update playbook with new detection thresholds if baseline drifted.
+
+Related pages and references
+- GPU pool live shrink and maintenance runbook (see related pages)
+- DCGM metrics reference: internal link to telemetry handbook
+- Driver and MIG configuration guide: internal ops repo
+
+Change log
+- 2025-11-03: Created by Lina Patel (initial detection/mitigation flow).
+- 2026-02-15: Added PromQL alerts, evacuation YAML example, and escalation matrix.

@@ -1,0 +1,133 @@
+GPU feature-flag strategy and IaC variant modules
+
+Overview
+
+Purpose: This document defines a repeatable pattern for introducing feature-flag driven behavior into GPU-related Terraform/IaC modules and the associated CI/CD gating, rollout, and rollback playbooks. The goal is to reduce blast radius for infra changes that affect accelerator attachment, scheduling behavior, and cost-mode toggles (e.g., spot vs reserved).
+
+When to use
+- New GPU cluster types (e.g., A100-80GB, H100) or placement variants.
+- Switching scheduling strategy (e.g., strict vs opportunistic preemption).
+- Enabling experimental optimizations (e.g., pinned NUMA affinity, MIG partitioning).
+- Quick toggles for cost-control (enable/disable burst pools).
+
+Motivation and trade-offs
+- Benefits: small, reversible changes; targeted testing; safer canaries; easier audit trail.
+- Costs: additional IaC complexity, slightly longer review loops, need for a reliable flag evaluation service.
+
+Pattern summary (high level)
+1) Module family: maintain one canonical base module (gpu-node-base) and expose small variant wrappers (gpu-node-spot-variant, gpu-node-burst-variant). Variants are thin and reference the shared core.
+2) Feature flags: expose behavioral knobs either at deploy-time (Terraform variable) or runtime (remote flag via internal flag service). Use deploy-time for resources that cannot be mutated safely (network attachments, node group size); use runtime flags for scheduler behavior and throttles.
+3) Safe default: all flags default to conservative values and require explicit opt-in in a feature-flag manifest stored in Git.
+
+Design details
+- Interface contract: modules must present a stable set of inputs (tags, capacity, instance_type_family) and a single optional map variable 'feature_flags' for transient toggles.
+- Mutability rules: mark variables as immutable in module docs if changing causes resource replacement. Document replacement impact in the module README.
+- Flag resolution precedence: CLI/terraform var > environment override (CI secret) > repo feature manifest > runtime flag service.
+
+Example Terraform module API (canonical variables table)
+Name | Type | Description | Default
+--- | --- | --- | ---
+node_group_name | string | Logical name for the node group | ""
+instance_family | string | Instance family prefix (e.g., nvidia-a100) | "nvidia-a100"
+capacity | number | Desired number of instances | "0"
+life_cycle | string | spot | reserved | "reserved"
+feature_flags | map(string) | opt-in toggles: {"numa_affinity":"off"} | {}
+replace_safe | bool | If true, run canary replacement workflow | "false"
+
+Implementation notes (Terraform module patterns)
+- Keep variant logic out of main module as much as possible. Use small wrapper modules that import the base and set defaults. This keeps plan diffs readable.
+- Use locals to compute final attachment config and annotate resources with a standard tag: "x-redwood-feature-flags" (JSON string) so auditing systems can see which flags were set during apply.
+- Where a flag toggles an immutable property (e.g., instance type family), implement a staged migration module that creates a parallel node group, shifts traffic, then tears down the old one. Never flip immutable flags in-place.
+
+Runtime flags vs deploy-time flags (guidelines)
+- Deploy-time: instance type, subnet placement, IAM role attachments, disk size. Requires terraform apply; follow migration workflow.
+- Runtime: scheduler backpressure thresholds, preemption penalties, dynamic batching policy. Implement via our internal flag service (flagd) and supported by the node agent.
+
+CI/CD gating and testing strategy
+1) Lint and unit tests: terraform fmt, tflint, module unit tests (kitchen/terratest) for each variant.
+2) Plan verification: automated 'pr plan' runs in CI; label shows which flags are changed.
+3) Feature manifest review: changes to the repo feature manifest (feature-flags.yaml) require an approvals gate from infra-owners + SRE.
+4) Staged apply pipeline:
+   a) dry-run in staging tenant (apply to staging account).
+   b) run automated smoke tests (node registration, sample workload, perf sanity).
+   c) apply to canary account/region with limited capacity.
+   d) monitor metrics for 30 minutes (see observability checklist).
+   e) progressive rollout to remaining accounts.
+
+Observability checklist for canary
+- Node join latency (SLO target: median < 45s, p95 < 120s)
+- Scheduler rejection rate (SLO: < 0.5% for 5m window)
+- Cost delta vs baseline (expected cost uplift < 8% for experimental opt-ins)
+- GPU utilization distribution (detect skewed placement)
+- Kernel panic / oom logs rate (should remain at baseline)
+- Drift in autoscaler decisions (compare desired vs actual scaling)
+
+Canary monitoring automations (recommended)
+- Create a temporary alert group with reduced thresholds during canary. Alerts auto-disable after successful rollout.
+- Add a short-lived dashboard snapshot for the canary node group and post to the rollout PR thread.
+
+Rollback playbook (if canary fails)
+1) Immediately set runtime flags to conservative defaults (if applicable).
+2) If the issue originates from a deploy-time flag: pause rollout and run a tactical rollback by destroying the canary node group and reattaching workloads to the last-good node group.
+3) If automated rollback required: trigger the repo 'infrastructure-rollbacks' job which reverts the last merge and applies the previous state to affected accounts.
+4) Postmortem: capture timeline, metrics, and the precise flag values. Add remediation items to the module's ADR.
+
+Operational examples and snippets
+- Example feature-flags.yaml (manifest stored in repo):
+
+  # feature-flags.yaml
+  - name: numa-affinity-experiment
+    description: "Enable NUMA affinity scheduling for H100 clusters"
+    scope: ["staging", "canary:us-west-2"]
+    default: false
+    owner: infra/gpu-team
+
+- Example Terraform local computation (pseudo-HCL):
+
+  locals {
+    final_flags = merge({"numa_affinity" = "off"}, var.feature_flags, parsejson(coalesce(var.repo_feature_manifest_json, "{}")))
+    annotations = jsonencode({"feature_flags" = local.final_flags, "applied_by" = var.last_changed_by})
+  }
+
+- Tagging policy (resource-level):
+  Key: x-redwood-feature-flags  Value: {"numa_affinity":"on","migration_id":"mig-20250201-01"}
+
+Governance and ownership
+- Module ownership: each module must set 'owner' metadata in README (team and primary owner). GPU modules default owner: infra/gpu-team.
+- Change approvals: any change that modifies an immutable variable or introduces a new variant requires a CCR (change control request) with SRE sign-off.
+- Audit: all applies must include an apply metadata payload (who, PR id, commit sha). This is enforced by the ci apply wrapper.
+
+Appendix A — Example staged migration checklist
+1) Create parallel node group with target configuration in a canary account.
+2) Add a temporary routing rule to shift 5% of new pods to canary nodes.
+3) Run synthetic workload for 60 minutes and collect metrics.
+4) If green, escalate to 25% for 30 minutes, then 100% traffic shift.
+5) Decommission old node group during low traffic window.
+
+Appendix B — Troubleshooting quick hits
+- Symptom: high node join latency after variant enablement
+  - Check: boot scripts (cloud-init), instance profile errors, subnet IP exhaustion.
+  - Fix: revert runtime flags, scale up control plane for join traffic, open GR to cloud provider if capacity constrained.
+
+- Symptom: unexpected replacement during apply
+  - Check: terraform plan output, look for lifecycle-ignore or drift in immutable vars.
+  - Fix: restore previous git manifest and trigger the rollback job.
+
+Owners and contacts
+- Primary: infra/gpu-team (oncall rotation: infra-gpu-oncall)
+- Secondary: infra-ci-cd (for pipeline failures)
+- Pager: #infra-sre (Slack) and infra-pager duty phone
+
+Related artifacts
+- feature-flags.yaml template (repo: infra/terraform-templates)
+- ci job: infra/ci/feature-flag-plan-check
+- monitoring: dashboards infra/gpu/feature-flag-canary
+
+Notes and future work
+- Evaluate integrating flag evaluation into plan-time (plan-simulation) so CI can surface runtime flag effects.
+- Prototype an automated drift-detection job that compares applied tags vs expected manifest and surfaces mismatches.
+
+Document history
+- Drafted by Aisha Kumar 2024-08-15
+- Reviewed by Diego Morales and Priya Nandakumar 2024-10-02
+- Updated with canary automation guidance 2025-02-10

@@ -1,0 +1,214 @@
+GPU IaC Guardrails and CI/CD Policy Kit
+
+Overview
+========
+This document describes a reusable policy kit and CI/CD patterns for provisioning GPU pools, tenant network attachments, and GPU-enabled instances via Infrastructure-as-Code (Terraform) with automated safety checks. The kit is intended for teams building self-service GPU environments (hosted, burst, or dedicated) and focuses on: cost guardrails, cross-account networking constraints, deployment safety, and testable pipelines.
+
+Goals
+-----
+- Prevent accidental large-scale GPU spend from misconfigured IaC.
+- Standardize tagging and cost attribution for tenant resources.
+- Enforce network and security constraints for cross-account GPU attachments.
+- Provide CI/CD templates that run policy-as-code checks and ephemeral integration tests before merge.
+- Enable fast, safe promotion of GPU module changes across staging -> prod.
+
+Scope
+-----
+Includes: Terraform modules that provision GPU pools, autoscaling groups (or node pools), VPC attachments, NAT/egress config, and IAM roles for GPU tenancy. Also includes GitHub Actions / Buildkite templates for linting, policy checks, plan review, and canary applies into a sandbox account.
+Excludes: GPU runtime image build pipelines (see ci-cd/gpu-image-rotation-and-cve-response-runbook).
+
+Ownership
+---------
+- Module owner (primary): infra-iac-team
+- CI templates: platform-ci-team
+- Cost attribution & billing tags: finance-legal (advisor) + infra-iac-team
+- Security & network rules: security-and-compliance (review)
+
+High-level architecture (text diagram)
+------------------------------------
+- Git repo (gpu-iac-modules) -> PR triggers CI checks (lint, fmt, tfsec, OPA)
+- If checks pass -> plan in sandbox account via ephemeral creds -> run integration smoke tests against ephemeral GPU pool
+- Manual review gate for production plans -> canary apply to a single region/zone -> monitor metrics -> promote via automated apply job
+
+Module contract (required variables and outputs)
+------------------------------------------------
+| Variable | Type | Description | Constraint / Guardrail |
+|----------|------|-------------|------------------------|
+| cluster_name | string | Logical name of the GPU cluster | must match regex ^[a-z0-9-]{3,32}$ |
+| tenant_id | string | Internal tenant identifier | required for billing tags |
+| max_gpu_count | number | Maximum GPUs allowed for this cluster | <= account_quota AND <= 1024 by default |
+| preemptible_policy | string | fallback behavior for spot/preemptible nodes | enum: [disabled, opportunistic, constrained] |
+| network_attachment_mode | string | how to attach tenant traffic | enum: [isolated, shared-vpc, proxy] |
+| billing_center | string | Finance cost center code | must be present |
+
+Outputs (must include): cluster_id, pool_stack_version, last_apply_id
+
+Example Terraform module usage (snippet)
+--------------------------------------
+```hcl
+module "gpu_pool_tier_a" {
+  source = "git::ssh://git@github.com/redwood/gpu-iac-modules.git//pool?ref=v1.12.0"
+
+  cluster_name = "tenant-foo-gpu-a"
+  tenant_id = "foo-prod"
+  max_gpu_count = 64
+  preemptible_policy = "opportunistic"
+  network_attachment_mode = "isolated"
+  billing_center = "FC-1234"
+}
+```
+
+Policy-as-code checks (required in CI)
+------------------------------------
+1. Terraform fmt and validate
+2. tfsec with company profile (block IAM wildcard, public S3, etc.)
+3. OPA / Rego policies (examples below)
+   - deny if max_gpu_count > account_quota_threshold
+   - require billing_center tag with valid pattern (FC-\d{4})
+   - deny public subnet for GPU nodes unless explicit allow flag set
+4. Sentinel/Conftest for network_attachment_mode constraints
+
+Example Rego rule (text)
+-----------------------
+```
+package redwood.iac
+
+deny[msg] {
+  input.resource_changes[_].change.after.max_gpu_count > input.policy.max_allowed
+  msg = sprintf("max_gpu_count exceeds allowed threshold: %v", [input.resource_changes[_].change.after.max_gpu_count])
+}
+```
+
+CI/CD pipeline template (GitHub Actions example)
+------------------------------------------------
+name: GPU IaC CI
+
+on: [pull_request]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+      - name: Terraform fmt
+        run: terraform fmt -check -diff
+      - name: Terraform init
+        run: terraform init -backend=false
+      - name: Run tfsec
+        run: tfsec . || true
+      - name: Run OPA policies
+        run: |
+          opa test ./policies || exit 1
+      - name: Plan (sandbox account)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.SANDBOX_AWS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SANDBOX_AWS_SECRET }}
+        run: |
+          terraform workspace select pr-${{ github.event.number }} || terraform workspace new pr-${{ github.event.number }}
+          terraform plan -out=plan.tfplan
+          terraform show -json plan.tfplan > plan.json
+          ./scripts/plan-analyzer.py plan.json || exit 1
+
+Canary apply and promotion
+--------------------------
+- After merge to main, the pipeline automatically applies to the staging account (non-prod) using a queued runner.
+- Production applies are gated: a canary apply job will apply in one region (region-priority list) limited to a single availability zone, and then wait for 30–60 minutes while metrics are evaluated.
+- Metrics to evaluate during canary:
+  - node-provision-latency (95th percentile) < 15 minutes
+  - failed-instance-rate < 1% over the monitoring window
+  - unexpected egress bytes increase > 20% triggers rollback
+
+Ephemeral integration smoke tests (what we run against sandbox)
+--------------------------------------------------------------
+1. Node boot health check: SSH to one provisioned node, verify GPU driver present, run nvidia-smi, confirm expected CUDA major version.
+2. Workload warmup: schedule a short eval run that generates 500 inference tokens spread across 5 models to verify scheduler and autoscaling.
+3. Network validation: ensure tenant-specific egress path, IP addressing, and NAT gateway are reachable from a test harness.
+
+Runbook: failed apply in sandbox (quick recovery steps)
+-----------------------------------------------------
+1. Abort apply job and capture logs: artifacts/plan.json and terraform logs.
+2. If apply partially succeeded, run `terraform state list` to identify partially created resources.
+3. If orphaned instances exist, tag them with `iac-orphan: true` and notify infra-oncall.
+4. Re-run plan with `TF_LOG=TRACE` for debugging and attach to the PR.
+5. If a resource exceeded max_gpu_count, update the PR to reduce requested capacity or open a request to infra-capacity-runbook for quota increase.
+
+Cost and tagging policy (mandatory)
+----------------------------------
+All resources created by these modules must include the following tags:
+- Name: cluster_name
+- Tenant: tenant_id
+- BillingCenter: billing_center
+- Env: {dev,staging,prod}
+- CostOwner: team-email (for chargeback)
+- OwnerOncall: team-pager-duty
+
+If any tag is missing OPA denies the plan. Finance will reconcile cost reports weekly and provide alerts for anomalous spend.
+
+SLOs and operational metrics
+---------------------------
+- Provisioning SLO: 95% of sandbox applies complete within 20 minutes.
+- Canary success SLO: 99% of canary applies complete without manual rollback within 1 hour.
+- Cost guardrail: no single PR can increase committed GPU capacity by more than 10% for a tenant without explicit finance approval.
+
+Monitoring & Alerts
+-------------------
+Emit the following metrics to telemetry: cluster.provision.duration_seconds, cluster.node.failures_total, cluster.egress.bytes, cluster.max_allocated_gpus.
+Alert rules (examples):
+- P1: cluster.node.failures_total > 5 in 10m after an apply -> paging oncall (pagerduty: infra-iac-pager).
+- P2: cluster.egress.bytes increase > 200% vs baseline in 30m -> email + slack channel #infra-cost-alerts.
+
+Promotion checklist (manual gate before prod apply)
+--------------------------------------------------
+1. CI checks green and all OPA rules passed.
+2. Sandbox integration tests passed and artifacts uploaded.
+3. Canary plan reviewed by two infra approvers.
+4. Finance sign-off if requested capacity delta > 10%.
+5. Runbook owner oncall acknowledged the window and rollback plan.
+
+Security considerations
+----------------------
+- GPU admin roles must use least privilege; forbid broad IAM policies on instance roles.
+- SSH bastion access only via ephemeral SSO session and short-lived certs.
+- Kernel and GPU driver upgrades must be staged via image promotion pipeline and linked in the module's `image_id` variable.
+
+Decommissioning and deprecation policy
+-------------------------------------
+- Modules have semantic versioning. Major version bump required for breaking changes (network mode, tag schema).
+- A deprecation label must be added in code and docs 90 days before removal.
+
+Troubleshooting tips
+--------------------
+- If OPA denies due to billing tag pattern, add `billing_center = \"FC-XXXX\"` and run `opa eval -i plan.json -d policies/ -f pretty` locally.
+- For slow node provisioning, capture cloud provider events and compare with `cluster.provision.duration_seconds` to identify API throttling.
+
+Appendix: Useful CLI commands
+-----------------------------
+- `terraform plan -out=plan.tfplan`
+- `terraform show -json plan.tfplan > plan.json`
+- `jq . < plan.json | less`
+- `tfsec .`
+- `opa test ./policies`
+
+Appendix: Example plan-analyzer rules (short)
+-------------------------------------------
+- Reject plans that create more than 100 GPUs in a single apply unless `force_approval=true`.
+- Translate plan.json into an HTML summary and post to PR as a comment for reviewers.
+
+FAQ
+---
+Q: Can a tenant request >1024 GPUs?
+A: Yes but must go through capacity request process and require finance + infra leadership approval.
+
+Q: How do we handle spot preemption for long-running jobs?
+A: Use `preemptible_policy = \"constrained\"` which pins a fraction of the pool to on-demand instances.
+
+Related work
+------------
+- See `eng-infra/runbooks/gpu-ephemeral-sandbox-lifecycle-and-cost-reclamation-playbook` for sandbox lifecycle.
+- Coordination with `security-and-compliance/rbac-and-auth` for IAM baseline.
+
+Document cadence
+----------------
+This doc is reviewed quarterly or on major infra module changes.

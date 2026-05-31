@@ -1,0 +1,246 @@
+ADR: Hot-route capacity protection — enforcement points (gateway vs routing vs runtime)
+
+## Status
+Published. Effective for Hosted API + Dedicated shared pools.
+
+## Summary
+We will implement **hot-route capacity protection** as a **layered (hybrid) enforcement model**:
+
+1) **API Gateway (primary, deterministic):** tier-aware **rate limits + quota evaluation** with consistent 429 semantics and auditable decision logging.
+2) **Smart Routing (primary under pressure):** **priority classes + admission control** driven by fleet capacity/queue depth signals; enforce per-route/per-tier budgets during overload.
+3) **Serving Runtime (last-resort safety):** **backpressure + controlled shedding** to prevent GPU pool collapse when upstream controls are insufficient or delayed.
+
+This ADR answers: *Where should enforcement live (gateway vs routing vs runtime), and why?*
+
+## Context / Problem
+A small number of high-traffic, high-SLA routes ("hot routes" like **/v1/chat/completions**, embeddings, rerank) can drive disproportionate load into shared GPU pools. In past incidents, overload from a single route/customer/workload shape created:
+- Fleet-wide p99 latency spikes
+- Increased 5xx due to scheduler instability / queue buildup
+- Cascading failure across routes and tiers
+
+We need overload behavior that:
+- Preserves **enterprise SLOs** via explicit priority classes and budgets
+- Makes **best-effort throttling earlier and predictable**
+- Produces **explainable/auditable** decisions (especially for enterprise escalations)
+- Keeps data plane overhead low
+
+Non-goals (explicit):
+- Rewriting the fairness scheduler
+- Dynamic pricing/billing changes (only metadata hooks)
+
+## Decision Drivers
+### Reliability + safety
+- Avoid “meltdown mode” when queue depth and scheduler lag diverge.
+- Provide multiple control points so any single failure mode does not take down the fleet.
+
+### Determinism + auditability
+- Enterprise escalations require explainable answers (what limit, what tier, what window, what reason).
+
+### Latency and overhead
+- Gateway and routing are on the request critical path; policy evaluation must be cached/low cardinality.
+- Runtime checks must be O(1) and avoid per-tenant logic.
+
+### Customer experience
+- Consistent 429 behaviors (headers, reason codes, retry guidance).
+- Avoid silent quality changes (fallback guardrails) especially on enterprise routes.
+
+### Operability
+- Clear knobs for on-call: allowlists, safe flags, thresholds.
+- Metrics and alerts aligned with SLOs and overload states.
+
+## Options Considered
+### Option A — Gateway-only enforcement
+**Description:** Enforce all tier, route, and overload behavior at the API gateway.
+
+**Pros**
+- Single point of policy, easy to standardize 429 semantics.
+- Deterministic per-tenant/per-key enforcement.
+
+**Cons**
+- Gateway has limited real-time insight into GPU pool health (queue depth, scheduler lag) without introducing heavy coupling.
+- Overload is not purely request-rate based (prompt length, output tokens, batching effects). Request-based throttles alone can be too coarse.
+- Increased gateway complexity and risk of high-cardinality checks.
+
+**Conclusion:** Not sufficient as the only mechanism.
+
+### Option B — Routing-only enforcement
+**Description:** Implement priority routing + admission control in the routing service only; gateway remains mostly unaware.
+
+**Pros**
+- Routing already has placement logic and can incorporate fleet signals.
+- Central place to enforce priority budgets per route/model/region.
+
+**Cons**
+- Customer-facing semantics (429 reasons, quota windows) become less consistent unless gateway also participates.
+- Harder to provide per-api-key deterministic quotas (routing sees requests but does not own authn/authz boundaries in all cases).
+- If routing becomes degraded, losing enforcement worsens overload.
+
+**Conclusion:** Necessary for overload admission control, but insufficient alone for customer-visible quota/rate semantics.
+
+### Option C — Runtime-only enforcement
+**Description:** Let the serving runtime enforce fairness/priority and shed work when overloaded.
+
+**Pros**
+- Closest to the GPU; best insight into real bottlenecks.
+- Can react quickly to queue depth and scheduler lag.
+
+**Cons**
+- Per-tenant policy is difficult and expensive at runtime (cardinality, state).
+- Poor customer experience: failures may be late (after waiting), and reason attribution is limited.
+- Harder to guarantee enterprise behavior across routes; risks turning into an implicit scheduler rewrite.
+
+**Conclusion:** Must exist as a “circuit breaker”, but not the primary enforcement point.
+
+### Option D — Hybrid (gateway + routing + runtime) [CHOSEN]
+**Description:** Layered enforcement where each layer is responsible for what it can do best.
+
+**Pros**
+- Deterministic and auditable customer-level enforcement at the edge.
+- Priority classes and overload-aware admission control where fleet signals exist.
+- Runtime prevents catastrophic collapse as the final safety net.
+- Better defense-in-depth; more graceful degradation.
+
+**Cons**
+- More moving parts; needs careful reason-code taxonomy and deduped metrics.
+- Requires a clear contract of responsibilities to avoid “double-throttling” surprises.
+
+**Conclusion:** Best balance of reliability, operability, latency, and customer experience.
+
+## Decision
+We adopt **Option D (Hybrid)** with the enforcement responsibilities below.
+
+### 1) API Gateway responsibilities (deterministic, customer-facing)
+**The gateway is the source of truth for customer-visible limits**:
+- Authenticate and determine **tenant + tier** (enterprise vs best-effort) and **route group**.
+- Evaluate **quotas and rate limits** (token-agnostic at this layer; request-based limits plus quota windows).
+- Return **consistent 429** response schema, including:
+  - Reason code (quota vs rate limit vs overload admission control vs runtime shed)
+  - Retry guidance and relevant headers
+  - Correlation identifiers (request id, policy decision id)
+
+Gateway should *not* attempt deep workload-shape modeling (prompt length/output token prediction) beyond minimal, low-cardinality inputs.
+
+**Gateway output contract**
+- Must attach a small, stable set of fields to the request context forwarded to routing:
+  - `tier`, `priority_class`, `route_group`, `policy_decision_id` (names illustrative)
+- Must emit metrics with bounded cardinality (no raw tenant ids in tags; use tier/route_group).
+
+### 2) Routing responsibilities (overload-aware, fleet-signal driven)
+**Routing is responsible for admission control under pressure**:
+- Enforce **priority classes** (enterprise first) using budgets per route group/model pool.
+- Integrate fleet signals (e.g., queue depth, scheduler lag, GPU saturation) to drive:
+  - Early throttling of best-effort
+  - Preservation of enterprise budgets
+  - Regional/model fallback where allowed by policy
+
+Routing is the right place for **dynamic** decisions because it is already in the path for placement and can incorporate near-real-time capacity.
+
+**Routing output contract**
+- If routing denies admission due to overload, it must return a denial reason that maps to a stable 429 reason code.
+- Routing must log a deterministic “why” record (inputs + threshold identifiers), without high-cardinality tags.
+
+### 3) Runtime responsibilities (safety circuit breaker)
+**Runtime enforces safety when upstream layers fail or lag**:
+- Apply backpressure when queue depth/scheduler lag exceed safe bounds.
+- Shed work in a controlled manner to prevent pool collapse.
+- Emit standardized overload/shed metrics and link to request ids so upstream layers can correlate.
+
+Runtime shedding is expected to be rare relative to gateway/routing denial. Its main goal is protecting fleet health.
+
+## How the layers work together (high-level flow)
+1. **Gateway** computes tier + route group, checks quotas/rate limits.
+2. If allowed, request enters **routing** with attached tier/priority context.
+3. **Routing** checks fleet signals + budgets; may admit, reroute/fallback (if allowed), or deny.
+4. If admitted, request reaches **runtime**.
+5. **Runtime** may still backpressure/shed if safety thresholds are exceeded.
+6. Response includes consistent 429 schema and headers regardless of where the denial originated.
+
+## Rationale
+- **Customer-visible semantics must be consistent.** Gateway owns the API contract and is the best place to standardize 429 payload/headers and quota windows.
+- **Overload decisions require fleet signals.** Routing is the natural place to incorporate queue depth and region/model selection.
+- **The runtime must never be forced to accept unsafe load.** A final circuit breaker prevents fleet-wide cascades.
+
+## Implications
+### Latency overhead
+- Gateway policy evaluation must be designed to be low overhead:
+  - Cached policy lookups
+  - Route groups to avoid per-route bespoke evaluation
+  - Avoid per-tenant tags/labels in metrics
+- Routing admission checks must be O(1) per request:
+  - Precomputed thresholds
+  - Small set of signals (queue depth, lag, saturation)
+- Runtime checks must be constant-time and not require external calls.
+
+### Operability
+- Feature flags must exist at each layer with clear precedence:
+  - Region enablement
+  - Allowlist accounts (enterprise canary)
+  - Emergency bypass (SRE-controlled) with audit
+- On-call runbooks must specify:
+  - Which layer is denying requests (gateway quota vs routing admission vs runtime shed)
+  - Where to look for thresholds, dashboards, and decision logs
+
+### Customer experience
+- 429s will increase for best-effort traffic during pressure, by design.
+- Enterprise customers should see more stable latency/availability on protected routes.
+- 429 responses must be actionable:
+  - Stable reason codes
+  - Retry-after / backoff guidance
+  - Streaming termination semantics consistent with non-429 failures
+
+### Security and auditability
+- Any debug endpoint for admission decisions must be restricted (internal authz + auditing).
+- Decision logs must not contain sensitive prompt payloads.
+
+## Detailed responsibilities table
+| Concern | Gateway | Routing | Runtime |
+|---|---|---|---|
+| API key / tenant authn | Yes | No | No |
+| Tier determination | Yes | Consumes | Consumes (optional) |
+| Quota windows (e.g., per minute/day) | Yes | No | No |
+| Rate limits (requests/sec, burst) | Yes | No | No |
+| Priority classes | Sets + enforces basic | Enforces under pressure | Safety only |
+| Fleet-signal driven admission | No (consume only if cheap) | Yes | Indirect (local) |
+| Model/region fallback | No | Yes (guardrailed) | No |
+| Backpressure + shed | No | No | Yes |
+| 429 schema + headers | Yes (source of truth) | Provide reason mapping | Provide reason mapping |
+| Explainability/audit logs | Yes (policy decision id) | Yes (threshold ids) | Limited |
+
+## Consequences and follow-ups
+### Positive
+- Stronger enterprise SLO isolation on hot routes.
+- Reduced probability of fleet-wide cascades.
+- Improved debuggability across Support/SRE/Engineering.
+
+### Negative / trade-offs
+- More coordination required across teams.
+- Need tight alignment on:
+  - Reason-code taxonomy
+  - Metrics naming and tagging
+  - Precedence rules (avoid double counting / double throttling)
+
+### Follow-ups (tracked in implementation epics)
+- Standardize 429 reason codes and headers across layers.
+- Implement decision logging with low cardinality.
+- Add dashboards and burn-rate alerts per protected route group.
+- Game day to validate that enterprise latency/availability is preserved during simulated overload.
+
+## Precedence and semantics (must be consistent)
+When a request is rejected, the client should be able to distinguish:
+1) **Quota exceeded** (deterministic, time window) — handled at gateway.
+2) **Rate limit exceeded** (deterministic, burst) — handled at gateway.
+3) **Overload admission control** (capacity protection) — denial typically decided in routing, surfaced as 429 with overload reason.
+4) **Runtime shed/backpressure** (last resort) — may manifest as 429/503 depending on path; target is 429 with clear shed reason where feasible.
+
+SRE/Support guidance: treat (1) and (2) as customer configuration / expected limit behavior; treat (3) and (4) as fleet pressure requiring correlation to overload dashboards.
+
+## Rollout guidance (enforcement points)
+- Phase 1 (Canary): Enable gateway tier-aware limits + routing admission control in **one region** for allowlisted enterprise accounts.
+- Phase 2: Expand to additional regions; validate metric cardinality.
+- Phase 3 (GA): Enable by default for protected route groups; keep emergency bypass flags.
+
+Rollback principle: disable routing admission control first (preserve deterministic gateway quotas), then disable gateway tier-aware limits only if necessary.
+
+## Notes
+- This ADR intentionally scopes the “runtime-only fairness scheduler” approach out of band. Runtime remains a safety valve, not the policy brain.
+- This ADR assumes route grouping (not per-path bespoke policies) to keep policy evaluation and telemetry low-cardinality.

@@ -1,0 +1,157 @@
+egress-cost-capping-and-proxy-sharding-playbook
+
+Summary
+
+This playbook documents the operational pattern we use to cap GPU-hosted egress costs via coordinated proxy sharding and automatic BGP/NAT failover. It covers normal-mode configuration (cost-aware autoscaling), incident-mode actions (emergency cost cap and graceful degradation), Terraform/IaC snippets for the proxy fleet, alerting rules, ownership, and a step-by-step incident runbook. The goal is to prevent a single runaway tenant or eval job from causing large egress bills while preserving best-effort latency for high-priority traffic.
+
+When to use this doc
+
+- Routine: implement proxy sharding and cost-capping for any multi-tenant GPU pools with >$1k/month egress risk.
+- Incident: triggered when egress spend trend alert fires (see thresholds below) or when a billing anomaly is reported.
+
+Key goals and tradeoffs
+
+- Primary goal: cap monthly/24h egress spend growth to a predictable budget while avoiding hard outages for business-critical routes.
+- Secondary goal: keep 95th-percentile egress latency within 200 ms for routes marked "priority".
+- Tradeoff: aggressive cost caps may lead to increased latency for lower-priority tenants or queued jobs.
+
+Ownership and contacts
+
+- Owning team: eng-infra / cloud-accounts-and-networking
+- Pager: GPU Networking oncall (PagerDuty)
+- Escalation chain: oncall -> Lina Rodriguez (Network Lead) -> Ethan Park (SRE Manager) -> Samir Patel (Infrastructure Director)
+- Billing contact: finance-cloud-billing@redwood.ai
+
+SLOs and thresholds
+
+| Metric | Target / Threshold | Action when breached |
+|--------|--------------------|----------------------|
+| 24h egress spend (per-account) | <= $2,500/day | Create incident, set emergency cap policy to 50% for non-priority shards |
+| Project-level egress anomaly | 3x historical baseline in 1h | Auto-scale proxies to limit outbound connections, throttle low-priority tenants |
+| 95p egress latency for priority routes | <= 200ms | If >300ms, failover to alternate NAT region |
+| Egress rate (Gbps) per shard | <= 4 Gbps | Rebalance shards or promote warm pool |
+
+Design overview
+
+1) Proxy sharding model
+- We maintain a horizontally scaled fleet of HTTP/TCP egress proxies (env: egress-proxy-service). Proxies are organized into shards (shard-01..shard-N) and annotated with labels: priority={high,standard,low}, region, and cost-group.
+- Routing layer (service-mesh egress-router) pins tenant tokens to shard buckets using a consistent-hash function salted by tenant id + project tag.
+- Each shard is backed by a NAT gateway or egress IP pool. Proxies apply per-tenant rate limiting, circuit-breakers, and optional URL-level rewrite/caching for heavy-transfer endpoints.
+
+2) Cost-capping and budget controllers
+- Cost Controller reads daily egress spend (billing exporter) and computes a burn-rate score for each tenant and shard.
+- If a shard's projected burn rate exceeds its budget window, controller reduces non-priority shard scaleTarget by a configured percent or moves new connections to an overflow shard where traffic is throttled to a lower bandwidth class.
+- Emergency cap policy: a short-lived Kubernetes Feature Flag that routes 80% of non-priority traffic to a throttled circuit with >1s tail latency but preserved success rates.
+
+Terraform / IaC snippet (proxy ASG with cost-aware autoscaler)
+
+Terraform pseudocode (must be adapted to our module naming):
+
+```hcl
+module "egress_proxy_asg" {
+  source = "git::ssh://git@repo/internal-iac.git//modules/egress-proxy-asg"
+
+  name_prefix       = "egress-proxy-shard-01"
+  instance_type     = "c6i.large"
+  desired_capacity  = var.desired_capacity_shard_01
+  min_capacity      = 2
+  max_capacity      = 40
+  tags = { "shard" = "shard-01", "priority" = "standard" }
+
+  cost_controller = {
+    enabled        = true
+    budget_daily   = 2500
+    throttle_percent = 60
+  }
+}
+```
+
+Prometheus alert rule (examples)
+
+- alert: EgressSpendBurst
+  expr: increase(billing_egress_bytes[1h]) > (3 * avg_over_time(billing_egress_bytes[7d]))
+  for: 5m
+  labels: { "severity": "critical", "team": "eng-infra" }
+  annotations: { "summary": "Unusual egress spike", "runbook": "/confluence/eng-infra/cloud-accounts-and-networking/egress-cost-capping-and-proxy-sharding-playbook" }
+
+- alert: EgressShardHighLatency
+  expr: histogram_quantile(0.95, sum(rate(egress_proxy_request_duration_seconds_bucket[5m])) by (le, shard)) > 0.3
+  for: 10m
+  labels: { "severity": "page", "team": "gpu-networking" }
+
+Operational runbook: incident-mode steps
+
+1) Triage (first 10 minutes)
+- Confirm alert validity: cross-check billing exporter, CloudWatch / GCP BigQuery billing table, and proxy request logs.
+- Determine scope: single tenant, single shard, or cross-shard. Query: `SELECT tenant_id, SUM(bytes) FROM billing_export WHERE time > now() - INTERVAL '1 hour' GROUP BY tenant_id ORDER BY SUM(bytes) DESC LIMIT 20;`
+- If billing shows a single tenant > 50% of spike, mark it as runaway and proceed to Step 2a.
+
+2a) Runaway tenant mitigation (single-tenant)
+- Apply tenant-level emergency quota: `kubectl exec -n infra deploy/egress-controller -- /bin/egressctl set-quota --tenant $TENANT --max-bytes 1000000000 --window 3600`
+- If tenant is internal/known, page the owner.
+- If it’s a customer, escalate to Finance & CS for potential account suspension following the billing policy.
+
+2b) Shard-wide mitigation (multi-tenant)
+- Flip emergency cap feature flag for affected shard: `PATCH /featureflags/egress/emergency-cap { shard: "shard-09", action: "enable" }`
+- Redirect new sessions to overflow-proxy pool with throttling class.
+- Scale up high-priority shards if capacity allows to migrate mission-critical routes.
+
+3) BGP/NAT failover (latency or egress pricing arbitrage)
+- If latency or egress price in a region spikes, initiate BGP swap to alternate NAT (steps below). Page Lina if you need manual AS-path adjustments.
+
+BGP/NAT swap quick commands (AWS example using Transit Gateway + TGW attachments)
+
+- Verify current route tables and attachments: `aws ec2 describe-transit-gateway-attachments --filters Name=resource-type,Values=vpc`
+- Modify route priority (annotate on route table): `aws ec2 replace-route --route-table-id rtb-012345 --destination-cidr-block 0.0.0.0/0 --transit-gateway-id tgw-0abcd1234efgh5678`
+- To flip NAT: update proxy Service to point to new ENI egress IPs or update iptables SNAT chain on proxy nodes: `sudo iptables -t nat -R POSTROUTING 1 -o eth0 -j SNAT --to-source <new-egress-ip>`
+
+Post-incident recovery
+
+- Re-enable normal routing incrementally: disable emergency cap flag, move a small percentage (5-10%) of sessions back to original shard and monitor for cost/latency regression for 30 minutes.
+- Run a causal analysis: gather logs, billing rows, and reviewing proxy metrics. Document findings in an incident report (see templates below).
+- If policy changes needed (e.g., lower budget, new tenant guardrails), file a Terraform change with `egress-proxy-asg` module updates and run a normal PR/CD pipeline.
+
+Monitoring and dashboards
+
+- Required Grafana panels:
+  - Egress bytes per tenant (1h/24h)
+  - Shard burn rate projection vs budget
+  - 95p egress latency by shard and priority label
+  - Number of throttled connections (emergency cap active)
+
+Example emergency incident report template (copy into new confluence incident page)
+
+- Incident title: Egress spike — shard-09 — 2025-11-15
+- Detection time: 2025-11-15T03:12Z
+- Impact: Cost overrun risk + increased latency for standard tenants
+- Mitigation: emergency cap enabled, tenant ABC rate-limited, NAT swapped to us-west-2
+- Root cause hypothesis: large eval job from internal research account hitting external dataset URLs without CDN
+- Action items: add pre-flight egress quota on eval CI, update onboarding docs, create a billing export alert for tenant ABC
+
+Safety notes and rollback criteria
+
+- Never delete NAT attachments without pre-approved maintenance window; use route replacement or iptables edits to change egress path.
+- Rollback criteria: if enabling emergency cap increases p95 latency for priority routes > 350ms for 15 minutes, revert and escalate.
+
+Appendices
+
+A: Example Terraform variables (stringified)
+
+```json
+{
+  "desired_capacity_shard_01": "6",
+  "budget_daily": "2500",
+  "throttle_percent": "60"
+}
+```
+
+B: Links and references
+
+- Egress billing exporter (internal): https://metrics.redwood.internal/dashboards/billing-egress
+- Proxy repo: git@repo:redwood/egress-proxy.git
+- Related docs: /confluence/eng-infra/terraform-and-iac/tenant-subnet-horizon-ip-reclamation-module-runbook.json
+
+Change log
+
+- 2024-03-05: Created by Maya Singh
+- 2025-11-15: Expanded incident steps, added BGP/NAT quick commands and Terraform snippets (Ethan Park review)

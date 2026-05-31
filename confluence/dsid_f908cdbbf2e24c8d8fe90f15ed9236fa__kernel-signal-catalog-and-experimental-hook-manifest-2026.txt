@@ -1,0 +1,151 @@
+Kernel Signal Catalog and Experimental Hook Manifest
+
+Overview
+
+Purpose: Provide a single, practical reference for all kernel-level signals, experimental hook points, and safe experiment templates used by runtime engineers when validating scheduler changes, kernel rollouts, or fallback policies. This document is intended for runtime, infra, and applied-ML engineers who run controlled experiments or require a repeatable instrumentation manifest.
+
+Scope
+
+- Signals covered: kernel lifecycle, dispatch credits, eviction events, preemption indicators, KV cache warmup/evict traces, and per-request kernel hints.
+- Hook points: places in the runtime where lightweight, gated instrumentation or short-circuit behavior can be installed for experiments (no PLT changes required).
+- Safety: rollout-gates, SLO checks, and automated rollback criteria are included.
+
+Signal catalog (short-form)
+
+Note: field names below map to telemetry keys emitted by kernel-agent v3+ and the runtime-scheduler. Use these keys in dashboards, span tags, and experiment metadata.
+
+| Signal key | Source component | Semantics | Typical cardinality | Severity / priority |
+|------------|------------------|----------:|--------------------:|--------------------:|
+| kernel.alloc.lat_us | kernel-agent | microsecond latency to allocate kernel slot | per-kernel | high |
+| kernel.dispatch.credit_delta | runtime-scheduler | change in token credits for a dispatch cohort | per-dispatch | high |
+| kernel.handoff.attempts | kernel-agent | number of handoff attempts between kernels | per-request | medium |
+| kv.prefetch.hit_ratio | kv-cache | rolling hit ratio for prefetch hints | per-session | medium |
+| kernel.preempt.marker | kernel-agent | boolean marker when preemption path invoked | per-kernel | high |
+| runtime.fidelity.level | orchestrator | current fidelity mode (low/med/high) | per-tenant | medium |
+| scheduler.queue.depth_p50_p95 | runtime-scheduler | queue depth percentiles used for admission decisions | per-pool | high |
+| kernel.quant.hint | kernel-agent | kernel-level quantization mode hint (int8/int4/float16) | per-model | low |
+| eviction.reason | eviction-controller | canonical reason string (pressure/tenant-limit/fragmentation) | per-eviction | medium |
+| kernel.sticky_affinity | scheduler | affinity token used for stickiness heuristics | per-instance | low |
+
+Full telemetry mapping and JSON schema for these keys is maintained in the telemetry repo (see related_pages for links).
+
+Experiment hook manifest (safe pattern)
+
+High-level contract for hooks:
+
+1) All hooks must be gated behind feature flags in the runtime-config service; flags must include an EXPERIMENT_ID and an OWNER.
+2) Hooks are read-only by default: they emit telemetry and optionally short-circuit a non-critical code path. Any mutation requires an explicit canary plan.
+3) Hooks must attach an experiment metadata header to outgoing spans: experiment.id, experiment.variant, experiment.owner.
+
+Common hook types and usage examples
+
+- Probe (telemetry-only): Inserted at allocation/handoff boundaries to emit signal snapshots. Use when you want visibility without behavior change. Example span tags: {"probe.phase":"alloc-end", "kernel.alloc.lat_us": 123}.
+- Shadow-invoke: Call a new kernel path in parallel but do not use its result for production. Good for measuring compatibility cost. Ensure shadow result sampling < 0.1% to limit overhead.
+- Weighted path selection toggle: Allow deterministic routing to alternate kernel for a percentage of traffic (A/B by request-id hash). Must have automatic failback after 10m if error rate delta > 0.5%.
+- Soft-fallback: On kernel preempt marker, route to a lower-fidelity path maintaining a durable mapping to the original request for tracing.
+
+Experiment template (example)
+
+Title: Kernel-credit-hedge (weighted rollout)
+Owner: Elliot Zheng
+Experiment id: KCH-2026-11
+Objective: Measure tail latency and error delta when applying a credit-borrowing heuristic in the scheduler for small requests.
+
+Steps:
+1) Create feature flag KCH-2026-11.enabled with 0% rollout.
+2) Instrument hook at runtime-scheduler::allocate() to emit kernel.dispatch.credit_delta and kernel.alloc.lat_us.
+3) Start with 0.5% traffic (random by request-id). Validate telemetry for 15 minutes.
+4) Bump to 2% if no SLO violations. Continue sampling and run a 2-hour plateau.
+5) If p99 latency delta > +10% OR error_rate_delta > +0.3% (vs baseline), immediately rollback to previous flag value and mark the experiment as failed.
+6) If metrics stable, expand in geometric phases (2% -> 10% -> 40% -> 100%) with 1-hour observation windows.
+
+SLOs and safety gates
+
+- Latency: p50/p95/p99 measured at the token-generator boundary. Gates: rollback if p99 delta > +10% for more than 10m.
+- Error rate: rollback if error_rate_delta (absolute increase) > +0.3% sustained for 5m.
+- Cost: estimate per-token cost delta; abort experiment if cost increase > +12% without commensurate quality improvement.
+- Resource pressure: if GPU memory pressure > 70% cluster-wide and eviction rate spikes > 2x baseline, pause rollout.
+
+Profiling and data collection checklist
+
+- Low-overhead profiling: enable tiered sampling at 0.5% for kernel traces using profiler-sidecar; capture stack + kernel tags for sampled requests.
+- Deterministic microbench: use the op-bench harness with --seq-len=64 --batch=1 --count=10000 to measure kernel.alloc.lat_us stable baseline.
+- End-to-end regression: run shadow-replay of 10k production traces in the sandbox with both paths enabled; collect token-per-ms and memory footprint.
+
+CLI snippets and monitoring queries
+
+- Toggle feature flag (example):
+  rdw-ff toggle KCH-2026-11.enabled --percent=2 --owner=elliot.zheng@redwood.ai
+
+- Start low-overhead sampling:
+  rdw-profiler set-sample --target kernel-agent --rate 0.005 --dest telemetry-prod-lz
+
+- Grafana example (PromQL):
+  increase(kernel_alloc_attempts_total[5m]) / increase(kernel_alloc_success_total[5m])
+
+- Alerting rule (pseudo-YAML):
+  - alert: KernelCreditHedge_p99_regression
+    expr: (histogram_quantile(0.99, sum(rate(kernel_alloc_latency_bucket[5m])) by (le)) - baseline_p99) / baseline_p99 > 0.10
+    for: 10m
+    labels: {severity: page}
+
+Operational playbook (quick triage)
+
+1) Detection: Alert fires for p99 regression or preempt marker spike.
+2) Initial triage (first 5 minutes):
+   - Confirm the experiment ID in recent spans.
+   - Check feature flag state and rollout percent.
+   - Look at kernel.dispatch.credit_delta distribution and kernel.alloc.lat_us percentiles.
+3) Immediate mitigation:
+   - If experiment traffic > 0, roll flag back to previous percent.
+   - If rollback not possible, add an ingress rule to divert traffic from affected pool to fallback pool.
+4) Deeper investigation:
+   - Replay sampled traces in the lab with debug logging ON for kernel-agent.
+   - Run microbench for kernels observed with high alloc latencies.
+   - Correlate infra metrics: GPU memory, NVLink errors, host load.
+5) Postmortem:
+   - Owner files an incident note and attaches experiment logs, replay artifacts, and the decision timeline.
+
+Run governance and ownership
+
+- Experiments must have a single owner and at least one technical reviewer from SRE or Kernel team.
+- A QA signoff must exist for experiments that mutate data paths.
+- All experiments must be tracked in the experiment registry with tags: owner, risk, baseline_hash, expected_resource_delta.
+
+Appendix: lightweight JSON manifest for experiments (example)
+
+{
+  "experiment_id": "KCH-2026-11",
+  "owner": "elliot.zheng@redwood.ai",
+  "variants": ["control", "credit-hedge"],
+  "telemetry_keys": ["kernel.dispatch.credit_delta", "kernel.alloc.lat_us"],
+  "safety_gates": {"p99_latency_pct": 10, "error_rate_abs_pct": 0.3},
+  "start_percent": 0.5
+}
+
+(When you create a registry entry paste this JSON into the experiments board; the registry will expand it into CI/CD hooks.)
+
+Notes and caveats
+
+- Do not use hooks that increase per-request memory by > 100KB in hot paths.
+- Shadow-invoke should not be enabled for HS (highly stateful) models without explicit approval.
+- Kernel signal names are semi-stable; use the telemetry-schema repo for canonical names in dashboards.
+
+Ownership and contacts
+
+- Primary owner: Elliot Zheng (runtime kernel team)
+- SRE reviewer: Maya Thompson
+- Kernel reviewer/approver: Ravi Iyer
+- Telemetry: Ana Gómez
+
+Related artifacts and links
+
+- Telemetry schema: /repos/telemetry/schema/kernel-signals.yaml
+- Experiment registry: /tools/experiments/board/KCH
+- Profiler playbook: /confluence/eng-serving-runtime/profiling-playbook/telemetry-feedback-kernel-autotune-playbook-2026
+
+Revision history
+
+- 2025-11-12: Created by Elliot Zheng (initial catalog and templates).
+- 2026-01-08: Added soft-fallback template and SLO gates after pilot.
+- 2026-02-18: Clarified sampling guidance and added CLI snippets.

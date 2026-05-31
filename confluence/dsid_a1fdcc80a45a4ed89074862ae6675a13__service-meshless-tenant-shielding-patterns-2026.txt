@@ -1,0 +1,196 @@
+Service-meshless tenant shielding patterns for private deployments
+
+Overview
+========
+This document presents a reference architecture and operational playbook for "service-meshless" tenant shielding in Redwood private deployments (VPC and on-prem). The goal is to provide strong tenant isolation, predictable degradation behaviors, and straightforward day-2 ops without introducing a sidecar-based service mesh. This pattern is intended for customers who require minimal runtime modification, low operational overhead, and clear evidence for audits.
+
+Scope
+-----
+- Applies to private deployments (VPC-connected and on-prem appliances) hosting multiple tenants on a shared control plane and a shared GPU serving tier.
+- Focuses on network- and host-level isolation primitives, cryptographic tenant segmentation, and operator workflows for rollout, upgrade, and rollback.
+- Not a replacement for zero-trust at the app layer; use in combination with per-tenant TLS, RBAC, and workload-level quotas.
+
+Motivation and tradeoffs
+-----------------------
+- Why meshless? Avoids per-pod/per-container sidecars that increase memory/CPU and complicate KV cache locality, model hot-swap, and real-time batching.
+- Tradeoffs: slightly more complex network policy and host configuration; less protocol-level request observability than a full sidecar mesh. Suitable when predictable latency and GPU locality are critical.
+
+Architecture summary
+--------------------
+- Control plane and management network remain logically separated from tenant data paths.
+- Tenant shielding is implemented with a layered approach:
+  1. Network segmentation: per-tenant virtual subnets (VLANs/VRFs or overlay segments) with enforced egress/ingress boundaries.
+  2. Host-level enforcement: eBPF-based policy agents and nftables rules for process-level allowance and rate-limiting.
+  3. Crypto tenancy: per-tenant TLS certificates / mTLS and per-tenant KMS key prefixes for encryption-at-rest labels.
+  4. Orchestration guards: admission-time validators that map tenant identifiers to allowed model catalogs and resource quotas.
+
+Logical dataflow (text description of diagram)
+------------------------------------------------
+Control-plane (Mgmt VNet) -> Tenant ingress gateway -> Tenant virtual subnet -> Worker hosts (host net + eBPF enforcement) -> GPU serving process (redwood-runtime) -> KV cache / local disk
+
+Configuration table: minimum platform contract
+------------------------------------------------
+| Component                  | Minimum requirement (per tenant)                               |
+|---------------------------:|:--------------------------------------------------------------|
+| Virtual subnet             | /26 (supports up to 62 tenant endpoints) or VRF per tenant     |
+| Control-plane link         | 1 Gbps isolated VPC/VPN, MTU 9000 recommended                  |
+| Host kernel               | Linux 5.10+ with eBPF CO-RE support                            |
+| KMS                       | Per-tenant key prefixes + rotation API                         |
+| Observability retention   | 30 days for tenant-level metrics (default)                     |
+| Model artifact storage    | Per-tenant ACLs with signed manifests                          |
+
+Ownership and responsibilities
+------------------------------
+- Redwood operator (redwood-ops): configure control-plane networks, supply signed runtime bundles, and operate the management control-plane.
+- Customer infra: owns VPC/VPN connections, allocated subnets, and tenant egress firewall ACLs.
+- Field engineer (onboarding): runs the initial tenant segmentation playbook and validates telemetry contracts.
+
+Detailed design components
+--------------------------
+1) Tenant virtual subnets and routing
+   - Use cloud VPC segmentation (subnets, VRFs) on public/private clouds. For on-prem, use VLANs + BGP VRF.
+   - Routing policy: advertise only the tenant prefix to tenant gateways, do not advertise tenant prefixes in the control plane.
+   - BGP communities: set a "redwood-shield" community to prevent accidental export of tenant routes.
+
+2) Host-level enforcement (eBPF agent)
+   - Deploy a lightweight eBPF agent (we maintain redwood-ebpf-agent) on every worker host.
+   - Responsibilities:
+     - Process-to-network mapping (pin runtime processes to tenant IDs)
+     - L3/L4 allowlists (reject unknown remote endpoints)
+     - Token bucket rate-limits per source/destination tuple for DoS protection (default 1000 req/s burst 200)
+   - Advantages: no per-workload sidecars, kernel-enforced policy, low overhead.
+
+3) Cryptographic tenancy and KMS
+   - Each tenant receives a unique key prefix and signing certificate.
+   - TLS termination occurs at tenant ingress gateway; mTLS between gateway and control-plane endpoints is optional.
+   - Key rotation: automated rolling every 90 days; rollback window 30 days.
+
+4) Admission-time enforcement
+   - Admission validators are executed in the control plane when customer-provided deployment manifests are accepted.
+   - Validators enforce: allowed-model-list, max-gpu-units, allowed-regions, and artifact-signature checks.
+
+Operational playbook: deploy a new tenant (step-by-step)
+-------------------------------------------------------
+1. Preflight checklist (operator)
+   - Confirm tenant CIDR allocation in customer VPC.
+   - Verify BGP peering/session (if on-prem) or VPN connectivity.
+   - Confirm KMS key prefix provisioned and accessible via IAM.
+   - Ensure host eBPF agent is at least v1.4 on target worker pool.
+2. Control-plane configuration
+   - Create tenant entry in control plane with model catalog ACLs and quota.
+   - Upload tenant cert chain and KMS prefix.
+3. Network activation
+   - Provision tenant subnet and update routing filters (apply redwood-shield BGP community).
+   - Apply tenant ingress ACLs on edge gateway.
+4. Host binding
+   - Tag worker hosts with tenant affinity labels via orchestration tool (example CLI):
+     redwoodctl host tag --host=worker-12 --tenant-id=tenant-acme
+   - Verify eBPF policy binds the runtime process to the tenant ID.
+5. Smoke tests
+   - Synthetic inference run at low concurrency (10 qps) for baseline latency.
+   - Verify telemetry is flowing: metric names: tenant.requests.total, tenant.latency.p95, tenant.errors.rate.
+6. Acceptance
+   - Customer and operator agree on SLOs and sign-off in the acceptance checklist.
+
+Day-2 ops: common runbook entries
+--------------------------------
+- Detecting cross-tenant traffic:
+  1. Query host process mappings: redwood-ebpfctl list-processes --host worker-12
+  2. Check connection logs: /var/log/redwood/ebpf-connections.log (rotate daily)
+- Throttling noisy tenant:
+  1. Reduce tenant token bucket with redwood-ebpfctl quota set --tenant tenant-xyz --rate 250
+  2. If sustained, move tenant to isolated worker pool: redwoodctl tenant relocate --tenant tenant-xyz --pool isolated-1
+- Debugging cold-start spikes:
+  - Observe local KV cache misses: metric tenant.kvcache.misses
+  - If misses correlated with rollout, scale cache warmers prior to rollout.
+
+Upgrade and rollback
+--------------------
+Strategy
+- All runtime upgrades follow an incremental canary-first pattern with tenant-scope gating.
+- No in-place sidecar changes; upgrades target the runtime binary and eBPF agent separately.
+
+Upgrade steps (runtime)
+1. Build and sign runtime bundle.
+2. Deploy to a canary pool (isolated tenants or internal test tenants).
+3. Run synthetic traffic and collect baseline metrics for 24 hours.
+4. Gradually expand rollout (10% -> 30% -> 60% -> 100%) by worker-pool label updates.
+5. Monitor: tenant.latency.p95, tenant.errors.rate, runtime.cpu.percent, kvcache.hit_rate.
+
+Rollback criteria
+- Immediate rollback if any tenant group shows:
+  - p95 latency regression > 30% over baseline for > 10 minutes
+  - error rate increase > 1% absolute
+  - host-level OOMs or GPU driver failures
+- Rollback action: redeploy previous signed bundle to affected pools and validate with smoke tests.
+
+Example network policy (nftables snippet)
+-----------------------------------------
+# nftables fragment for tenant isolation (illustrative)
+table inet redwood-tenant {
+  set tenant-ips {
+    type ipv4_addr; flags interval;
+  }
+  chain prerouting {
+    type filter hook prerouting priority 0;
+    iifname "eth0" tcp dport 22 ct mark set 0x0
+  }
+  chain input {
+    ip saddr @tenant-ips ct mark 0x0 counter drop
+  }
+}
+
+KMS rotation snippet (example)
+-------------------------------
+# Pseudocode for rotating tenant keys via redwood-kms-proxy
+POST /kms/rotate
+payload: {
+  "tenant_id": "tenant-abc",
+  "rotation_window_days": 90
+}
+
+Telemetry contract
+------------------
+- Metrics (per-tenant tags): tenant.requests.total, tenant.latency.p50/p95/p99, tenant.errors.total, tenant.kvcache.hit_rate, tenant.gpu.utilization
+- Logs: connection logs, eBPF policy decision logs (retain 30d), audit trail for KMS operations (retain 365d)
+- Traces: sampled 1% by default for tenant inference request paths; increase for troubleshooting.
+
+Acceptance criteria for field handoff
+-------------------------------------
+- Successful smoke test with < 5% baseline p95 latency variance vs. lab profile.
+- No cross-tenant connection logs for 24h in staging after activation.
+- Audit evidence for KMS key provision and certificate chain transfer.
+
+Troubleshooting matrix (quick reference)
+----------------------------------------
+- Symptom: tenant requests intermittently see 503
+  - Likely: admission-time ACL rejects or eBPF deny
+  - Debug: redwoodctl tenant describe tenant-id; redwood-ebpfctl dump-rules --host
+- Symptom: cross-tenant traffic observed
+  - Likely: missing BGP community or eBPF agent mismatch
+  - Debug: check route tables, run redwood-ebpfctl list-flows
+- Symptom: sudden p99 latency spike
+  - Likely: GPU thermal or driver issue; check nvidia-smi, dmesg, and runtime logs
+
+Audit and compliance notes
+--------------------------
+- Keep a signed manifest for each tenant deployment. Manifests must include model checksum, runtime bundle hash, and KMS key ID.
+- Evidence artifacts (logs, manifests, KMS history) must be archived to customer-provided storage or an encrypted Redwood audit bucket.
+
+Related reading and references
+-------------------------------
+- See reference-architectures/edge-gateway-and-airgapped-bridge-architecture-2026 for ingress gateway options.
+- See deployment-guides/vpc-entropy-segmentation-and-tenant-shielding-playbook-2026 for operational checklists.
+
+Appendix: sample acceptance checklist
+-----------------------------------
+- Tenant CIDR allocated and peered: [ ]
+- eBPF agent v>=1.4 running on worker pool: [ ]
+- KMS key prefix provisioned: [ ]
+- Synthetic inference p95 within lab baseline +/-5%: [ ]
+- Audit manifest signed and stored: [ ]
+
+Document revision history
+-------------------------
+- 2025-11-12: Initial draft by Asha Menon
+- 2026-02-03: Added eBPF rate-limiting defaults and rollback criteria (reviewers: Diego Alvarez, Marta Kuznetsova)

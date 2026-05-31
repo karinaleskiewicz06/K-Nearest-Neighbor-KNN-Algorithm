@@ -1,0 +1,106 @@
+Heterogeneous accelerator CI release coordinator and surge handling protocol
+
+Summary:
+This doc defines the release coordination and emergency surge-handling protocol for CI/CD flows that promote artifacts (container images, kernel modules, runtime kernels) to heterogeneous accelerator pools (GPUs/TPUs/FPGAs) across multiple cloud accounts and VPCs. It covers preflight checks (IaC + image signing), canary promotion choreography, network/egress safety limits, and an operator-run rollback path for large-scale release-induced traffic and capacity surges.
+
+Why this exists:
+- We operate mixed-accelerator fleets with different performance and preemption characteristics. A bad release (image/kernel/TF op) can trigger widespread tenant retries and create egress/egestion storms or force preemptions that cascade across pools.
+- This protocol reduces blast radius and gives SRE/Infra predictable, documented steps to contain and remediate incidents related to CI-promoted artifacts.
+
+Scope / non-goals:
+- In scope: promotion of inference runtime images, accelerator-specific kernels, IaC module releases that touch GPU node pools or NAT/egress constructs, CI pipeline steps for canarying.
+- Out of scope: application-level rollback policies within customer workloads, model-level evaluation (see applied-ml-and-evals).
+
+Ownership and contacts:
+- Release Coordinator (primary): infra-release@redwood.internal (pager: oncall-infra-release)
+- CI Pipeline Owners: eng-ci-team (Slack: #ci-builds)
+- GPU Fleet SRE: gpu-sre@redwood.internal
+- Network/Egress Owner: cloud-networking@redwood.internal
+- Escalation: Eng SRE Manager -> Head of Infra -> CTO (per oncall rota)
+
+Key definitions:
+1) Canary cohort: small subset of nodes (usually 1-3% of capacity) tagged with label: release-canary/<release-id>.
+2) Surge: >=25% increase in outbound egress connections or >=20% increase in request retry rate within 10m of rollout start.
+3) Preempt-sensitive pool: spot/interruptible instances with cold-start > 45s or KV cache rehydration cost > 5s per tenant.
+
+SLOs and safety thresholds (operator-facing):
+| Metric | Warning | Critical | Action |
+|---|---:|---:|---:|
+| Canaries failing healthchecks | >3% failing over 5m | >10% failing over 2m | Pause promotion, collect artifacts, rollback canary images |
+| Egress rate (bytes/s) from new image cohort | >150% baseline | >250% baseline | Throttle egress, revert route, notify network oncall |
+| Tenant retry-rate | +15% over baseline | +50% over baseline | Halt rollout, engage SRE, circuit-break top callers |
+
+Preconditions (automated checks CI must pass before promotion):
+- Signed image artifact present in artifact registry (cosign / sigstore).
+- Terraform plan for node-pool or NAT changes passes policy-as-code (OPA) and is staged in `promotion` workspace.
+- Runtime compatibility checks: kernel module ABI matrix validation, quantized kernel smoke tests, memory-pressure profiling.
+- Telemetry smoke: local synthetic traffic run showing <10% increase in p95 latency vs baseline.
+
+Release choreography (step-by-step):
+1) Create release ticket and tag artifacts with release-id (format: R-YYYYMMDD-<shortsha>). Attach signed manifests and terraform plan id.
+2) Trigger Canary Promotion job in CI that does the following in order (automated):
+   a) Create a canary node pool (or label existing warm nodes) with label release-canary/<id> and limit to 2–3 nodes per region.
+   b) Schedule 1–2 synthetic traffic generators (canary-prober) against canaries and validate P99/P95 and health endpoints for 15 minutes.
+   c) If synthetic checks pass, gradually shift 1–5% of production traffic per 10 minutes using the rollout controller (traffic-weight policy).
+   d) Monitor real traffic signals for 30 minutes at each weight step: egress, retries, p99 latency, kernel OOM logs.
+3) If all thresholds remain green, promote canary images to a blue-green promotion for 25% of each region and continue staged ramp to 100% over 3–6 hours.
+4) Update terraform module versions only after image promotion succeeds in all regions. The promotion job will create a versioned IaC release and open a separate PR for Terraform promotion with a required 24-hour review hold for cross-account network changes.
+
+Surge detection and automated mitigations (operational rules):
+- Detect: Alerts triggered by egress-guard (metric-based) OR ingestion of tenant retries >= threshold generate a 'release-surge' page.
+- Automated mitigations (order of operations, CI rollback if enabled):
+  1) Pause rollout controller (CI abort on promotion job) — immediate automated action.
+  2) Apply egress throttle policy to canary cohort via egress-control CRD (rate limit per-node and per-src IP) to cap egress at baseline * 1.1.
+  3) If throttle does not stabilize within 2 minutes, automatically revert traffic routing to previous image tag using the router's pinned-route API.
+  4) Notify Network oncall to temporarily expand NAT pool if egress NAT exhaustion is detected, and open ticket to reconcile billing impact.
+
+Manual intervention / operator runbook (if automated mitigations fail):
+1) Confirm scope: check dashboards for canary label, node-pool health, kernels, and NAT exhaustion metric (nat.active-sessions).
+2) Execute emergency revert: `rbctl revert --cluster <cluster> --filter label=release-canary/<id> --to-tag <previous-tag>` (RBCTL is our internal rollout tool).
+3) Drain canary nodes and cordon if necessary: `kubectl cordon <node>`; remove label release-canary/<id> from nodes; immediately scale down canary node pool.
+4) If network saturation persists after revert, coordinate with cloud-networking to apply egress ACLs restricting non-essential destinations for the impacted account(s).
+5) Create incident (severity based on blast radius) and kick off postmortem cadence per oncall runbook.
+
+Terraform/IaC promotion checklist (minimal gated steps):
+- All module PRs must include: testcase plan output, drift-scan result, preflight acceptance tests (integration harness IDs).
+- For changes touching NAT/egress: include egress-capacity-plan and cost estimate in PR body.
+- Module version bump strategy: semantic versioning for modules that change behavior; pin older clusters to previous module version until 24h after image promotion success.
+
+Telemetry and dashboards to monitor during rollout:
+- release.controller.progress (gauge)
+- egress.bytes_per_minute{cohort}
+- tenant.retry_rate{service}
+- node.kernel_ooms{node}
+- nat.active_sessions{account}
+- synthetic.canary_p95_latency{region}
+
+Sample CLI snippets (for operators):
+- Check canary nodes: `rbctl list --label release-canary/R-20260110 --fields node,name,region,status`
+- Pause rollout: `rbctl pause --release R-20260110`
+- Revert traffic routing to previous tag: `rbctl revert --release R-20260110 --to-tag stable-20260101`
+- Terraform plan for module promotion: `TF_WORKSPACE=promotion terraform plan -var-file=promo.tfvars`
+
+Post-incident process and continuous improvements:
+1) Run a 72-hour telemetry extraction scoped to the release-id and generate a triage doc with attached logs and graphs.
+2) Postmortem owners must publish a blameless report within 5 business days and identify at least one follow-up: automation, test, or guardrail.
+3) If the incident was egress-related, require a change to the egress capacity model or add a new OPA policy to the Terraform pipeline before the next major promotion.
+
+Checklist (pre-release quick tick):
+- [ ] Image signed and checksum verified
+- [ ] Terraform plan id attached to release ticket
+- [ ] Canary node pool sizing calc complete
+- [ ] Synthetic-prober run passes
+- [ ] Telemetry dashboards configured for release-id
+- [ ] Network oncall notified if NAT/egress changes planned
+
+Appendix: quick decision matrix
+- If canary synthesis fails but no egress spike -> Pause and fix artifact, run extended smoke tests.
+- If egress spike observed but only in 1 region -> Revert region and isolate nodes, continue rollout in healthy regions after review.
+- If egress spike is cross-region and sustained -> Global rollback, open Sev1 and follow major-incident runbook.
+
+Related resources:
+- IaC module compatibility matrix (terraform-and-iac)
+- GPU image promotion examples (ci-cd-and-build)
+- Egress guard operator docs (cloud-accounts-and-networking)
+
+End of document.

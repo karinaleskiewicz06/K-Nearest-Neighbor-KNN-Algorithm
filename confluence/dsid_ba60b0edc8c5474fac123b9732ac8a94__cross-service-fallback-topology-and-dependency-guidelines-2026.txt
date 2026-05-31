@@ -1,0 +1,146 @@
+Cross-Service Fallback Topology and Dependency Guidelines
+
+Overview
+--------
+This document defines recommended topologies, API and infra contracts, and operational controls for cross-service fallbacks and dependency isolation across Redwood services. It prescribes patterns for graceful degradation when downstream capacity, latency, or correctness problems occur, plus the observability and rollout controls required to keep customer-facing SLAs intact.
+
+Goals
+-----
+- Preserve user-facing availability and meaningful semantics for LLM endpoints when parts of the system are degraded.
+- Minimize blast radius of downstream failures and provide clear automatic and manual fallback paths.
+- Make trade-offs explicit: correctness vs latency vs cost.
+- Ensure consistent telemetry for debugging root causes and regression detection.
+
+Scope
+-----
+Applies to all service-to-service dependencies in the public inference path: request-router, model-gateway, kv-prefix-cache, batching-service, fallback-proxy, and any external model endpoints (hosted or private). Not in scope: background analytics pipelines and offline training jobs, except where those pipelines feed runtime state (e.g., prefix caches).
+
+Key terminology
+---------------
+- Primary path: The normal low-latency route for a request (example: request-router -> model-gateway -> model-worker).
+- Fallback path: An alternative route used when the primary path fails or violates policies (example: request-router -> fallback-proxy -> distilled-quantized-model).
+- Graceful degradation: Controlled reduction in functionality to keep latency and availability targets (e.g., truncate context, switch to cached response, or return partial structured outputs).
+- Degradation tier: A named level (tier-0, tier-1, tier-2) with explicit policy mapping to actions.
+
+Recommended Topologies
+---------------------
+1) Tiered Fallback Mesh (preferred)
+   - Each model-gateway instance registers a set of fallback targets with the request-router service-discovery (local config or service catalog).
+   - Router tries targets in order: primary -> regional-variant -> quantized-variant -> cache proxy -> synthetic-response generator.
+   - Failover uses exponential backoff and a per-request deadline (default request deadline = client timeout minus 100ms).
+
+2) Isolation Edge (for high-sensitivity tenants)
+   - Dedicated model pools + dedicated router shard for the tenant.
+   - Only allow deterministic fallbacks (e.g., previously signed model variants) and no synthetic responses.
+
+3) Read-Through Cache Forwarding
+   - On prefix-cache hit, return immediately with a canonical response and recorded origin tag.
+   - On miss, forward to primary and write through asynchronously if successful.
+
+Fallback Policy (JSON example)
+-----------------------------
+{
+  "policy_name": "default-inference-fallback",
+  "degradation_tiers": [
+    {"name": "tier-0", "actions": ["route:primary"], "p99_latency_threshold_ms": 500},
+    {"name": "tier-1", "actions": ["route:regional-variant", "truncate:context(256)"], "p99_latency_threshold_ms": 800},
+    {"name": "tier-2", "actions": ["route:quantized-variant", "serve:cache_proxy_or_partial"], "p99_latency_threshold_ms": 1500}
+  ],
+  "circuit_breaker": {"error_rate_window_s": 60, "error_rate_threshold": 0.05, "minimum_request_volume": 100}
+}
+
+API and Contract Requirements
+-----------------------------
+- Idempotency: All mutation-like control endpoints must accept an idempotency key header X-Request-Id (RFC4122 style) and tolerate retries.
+- Deadlines and timeouts: Every RPC must accept a deadline header (X-Deadline-At) and propagate it to downstream services. Default generation endpoint deadline: client_timeout - 100ms.
+- Typed fallback hints: Responses from model-gateway must include a header X-Fallback-Used with values: none|regional|quantized|cache|synthetic and a trace tag fallback.reason.
+- Error model: Use typed error codes (400/403/404/409/429/500/502/503/504). Circuit-breaker errors should return 503 with structured body: {"error_code": "circuit_breaker", "service": "model-gateway", "fallback_action": "quantized"}.
+
+Coding and API Standards for Graceful Degradation
+-------------------------------------------------
+- Prefer explicit feature gates and small surface toggles over ad-hoc if/else.
+- Implement fallback actions as composable middleware pieces (e.g., TruncateContext, SwitchModelVariant, ReturnCachedResponse) that are testable in isolation.
+- Timeouts and cancellation must be cooperative; always check context cancellation at network and compute boundaries.
+- Add unit tests that simulate downstream latency and failure modes at p50/p95/p99 levels. Include golden-file asserts for cached and synthetic outputs.
+
+Infrastructure Requirements
+---------------------------
+- Network: Deploy fallback-proxy and kv-prefix-cache in same AZs as model workers to keep cross-AZ latencies < 5ms median for cache hits.
+- QoS: Mark model-worker egress to cache with higher priority in network QoS to reduce cache miss amplification during spikes.
+- Autoscaling: Model pools must expose a predictive-scaling API that router uses to decide to route to regional variants before circuit-breaking.
+- Circuit breaker defaults: error_rate_window_s=60, error_rate_threshold=0.05, minimum_request_volume=100. These values are tunable per-service via the service-catalog config.
+
+Kubernetes deployment knobs (example table)
+------------------------------------------
+| config | recommended | rationale |
+| replicas | 6-12 per AZ (model-gateway) | absorb bursty traffic without cold-starting |
+| readiness probe | /health?mode=quick, 200 | fail fast when instance overloaded |
+| liveness probe | /health?mode=full, 200 | detect degraded state (e.g., memory leak) |
+| cpu limit | 80% of node allocatable per pod | avoid OOM and noisy neighbors |
+| preStop hook | sleep 5s + graceful-shutdown | drain inflight requests to fallback chain |
+
+Observability and Telemetry
+---------------------------
+- Mandatory fields in trace/span for inference path: request_id, client_tier, model_id, fallback_used, route_hops, origin_node.
+- Metrics to emit (names in Prometheus style):
+  - inference_request_total{result=success|fallback|error} (counter)
+  - inference_request_latency_ms_bucket (histogram)
+  - fallback_invocation_total{tier=tier-1|tier-2|...} (counter)
+  - fallback_circuit_open{service="model-gateway"} (gauge)
+  - cache_hit_ratio{prefix_cache="kv-prefix-cache"} (gauge)
+- Alerts (suggested):
+  1) Fallback surge: increase in fallback_invocation_total by >200% (5m) for critical route -> page SRE.
+  2) Circuit Open: fallback_circuit_open > 0 for >1m and error rate > 2% -> page oncall of owning service.
+  3) Tail latency regression: p99_latency increases by 30% vs baseline (1h) -> create investigation ticket.
+
+Performance SLOs
+----------------
+- Customer-facing generate endpoint (default): availability 99.95% monthly; p95 latency < 250ms; p99 latency < 600ms under normal load.
+- Fallback invocation should not exceed 5% of requests for tier-0 customers; for free-tier customers, up to 15% may be acceptable with notification.
+- Cache write amplification target: writes per request < 0.1 on average.
+
+Decision Record: Why layered fallbacks (summary)
+------------------------------------------------
+- Problem: Single-model dependency causes correlated outages and unpredictable tail latency under multi-tenant spikes.
+- Decision: Adopt layered fallback mesh with explicit policy and distributed circuit breakers to reduce customer impact and to make trade-offs auditable.
+- Alternatives considered: Global queueing (rejected for latency), synchronous downscaling (rejected for complexity).
+
+Rollout and Runbook (high level)
+--------------------------------
+1) Implement policy stubs in staging with synthetic failure injection.
+2) Canary: enable Tiered Fallback Mesh for 5% of traffic on low-risk routes for 24h.
+3) Validate telemetry: ensure fallback metrics, header propagation, and traces show expected behavior.
+4) Gradually increase to 50% then 100% with daily checkpoints.
+5) If fallback surge or p99 regressions observed, abort and rollback to previous router config; page SRE.
+
+Quick triage checklist for oncall
+--------------------------------
+- Check fallback_invocation_total, p99_latency, and circuit_open gauges.
+- Inspect traces for X-Fallback-Used and fallback.reason.
+- Validate recent deploys (router or model-gateway) and rollback if new config introduced tier changes.
+- If a regional variant is overloaded, temporarily route traffic to quantized-variant but set a short TTL for policy to avoid cost escalations.
+
+Ownership and Contacts
+----------------------
+- Primary owners: Serving Runtime team (owner alias: #team-serving-runtime).
+- SRE oncall: follow oncall rotation documented at /confluence/eng-sre/oncall-rotations.
+- Product stakeholder: product-inference@redwood.ai.
+
+References and further reading
+----------------------------
+- See: /confluence/architecture-and-standards/decision-records/adr-request-segmentation-cost-priority-routing-2026
+- See: /confluence/eng-serving-runtime/profiling-playbook for tail latency debugging
+- Telemetry spec: /confluence/architecture-and-standards/observability-standards/telemetry-ingestion-and-retention-guidelines-2025
+
+Appendix: example client-visible header behavior
+-----------------------------------------------
+- Success: HTTP 200 + X-Fallback-Used: none
+- Fallback: HTTP 200 + X-Fallback-Used: quantized; Trace contains fallback.reason=capacity_constrained
+- Circuit-breaker triggered: HTTP 503 + body {"error_code": "circuit_breaker", "fallback_action": "cache_proxy"}
+
+Notes and future work
+---------------------
+- Evaluate machine-learned routing (cost + latency prediction) for selecting fallback order.
+- Add per-tenant fallback budgets and configurable tolerance levels in the Console.
+- Formalize synthetic-response signing when used as a last-resort to comply with safety and provenance requirements.
+

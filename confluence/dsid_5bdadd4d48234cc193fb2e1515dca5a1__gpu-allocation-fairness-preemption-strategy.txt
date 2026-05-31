@@ -1,0 +1,149 @@
+Cross-tenant GPU Allocation, Fairness, and Preemption Strategy
+
+Overview
+
+Goal: Provide a clear, operational policy for allocating GPUs across mixed workloads (hosted inference, dedicated reserved pools, background training/batching, and internal experiments) that balances fairness, SLO compliance, and cost efficiency. This document describes the allocation hierarchy, preemption windows, eviction thresholds, terraform config patterns, monitoring/alerts, and an incident runbook.
+
+Context and motivation
+- Redwood operates a multi-tenant GPU fleet that must support: hosted API inference (low-latency, customer-facing), Dedicated reserved capacity (contracted throughput), asynchronous batch/embeddings jobs (throughput-optimized), and internal experiments (best-effort).
+- Historically we prioritized utilization and spot capacity, which increased customer impact during high demand spikes. This policy formalizes deterministic behavior to reduce customer-facing regressions.
+
+Principles
+1) SLO-first for customer-facing workloads: Hosted API and Dedicated pools have top priority to meet latency SLOs.
+2) Predictability: Preemption and fallback behavior must be deterministic and observable.
+3) Fairness by intent: Teams with reserved capacity keep their guarantees; remaining capacity is apportioned by priority tiers and recent usage.
+4) Cost-awareness: Prefer spot/spot-like nodes for best-effort work but provide safe fallbacks.
+
+Allocation hierarchy (high-level)
+1. Reserved Dedicated Pools (contracted capacity) — absolute priority.
+2. Hosted inference (hosted API / low-latency customers) — SLO backed, autoscaled.
+3. Platform critical background work (model-serving warmup, cache rebuilds) — policy-controlled.
+4. Best-effort batch (training, large embedding jobs, experiments) — preemptible on demand.
+
+Priority tiers and labels
+- reserved: dedicated_capacity (immutable to autoscaler decisions for other tenants)
+- hot: hosted_inference (SLO 95p latency target; non-preemptible except in extreme network/region failure)
+- platform: platform_maintenance (short windows allowed for maintenance throttles)
+- spot: best_effort (preemptible, scheduled lower-priority)
+
+Preemption policy summary
+- Trigger conditions: global GPU usage >= 92% in region OR hosted queue latency > configured SLO window for 2 consecutive 30s windows.
+- Eviction order: spot -> platform -> hot (only if entire region degraded and no cross-region failover available) -> reserved (never evicted by autoscaler).
+- Grace period: 120s default for graceful eviction; 30s for forced immediate eviction during critical overload (emergency).
+- Preemption signalling: Pod annotation "gpu-preempt: pending" + SIGTERM delivered to process. Jobs must implement checkpointing hooks.
+
+Concrete thresholds and SLOs
+- Hosted API SLO: 95th percentile p99 token latency <= 350ms for standard small models; targeted per-route SLOs defined in dashboards.
+- Eviction threshold: region_gpu_utilization_percent >= 92% triggers proactive scaling and eviction window.
+- Spot fallback: spot_spare_capacity_percent >= 5% must be maintained during business hours; otherwise batch queue throttles.
+
+Terraform / IaC patterns (examples)
+- Module: modules/gpu-pool (variables shown as example). Use the following minimal pattern to create a labeled pool: 
+
+Example: terraform snippet (text)
+variable "pool_name" { default = "spot-batch-west-1" }
+variable "node_labels" { default = { "priority" = "spot", "region" = "us-west-1" } }
+module "gpu_pool_spot" {
+  source = "github.com/redwood-inference/terraform-modules//gpu-pool"
+  name   = var.pool_name
+  labels = var.node_labels
+  instance_type = "nvidia-a100-80gb"
+  min_nodes = 0
+  max_nodes = 80
+  preemptible = true
+}
+
+Recommended module variables (table-style in text)
+- name: string (pool identifier)
+- labels: map(string) (applies priority and tenant tagging)
+- instance_type: string (gpu instance to use)
+- min_nodes: int (autoscaler lower bound)
+- max_nodes: int (autoscaler upper bound)
+- reserved_for: string (optional tenant id for dedicated pools)
+- preemptible: bool (spot behavior)
+
+Scheduler implementation notes
+- Service: gpu-scheduler (internal) consults capacity-manager to allocate nodes by label and tenant.
+- Cache: the scheduler maintains a per-tenant weighted token bucket used for short-term fairness when contention is present.
+- Continuous batching: hosted_inference uses continuous-batching lanes pinned to non-preemptible nodes when latency SLOs require.
+
+Monitoring and alerts (metrics and thresholds)
+- region_gpu_utilization_percent (prometheus)
+  - warning: 80% sustained for 15m
+  - critical: 92% sustained for 2m -> trigger preemption-window workflow
+- hosted_queue_latency_ms_p95
+  - warning: > 250ms for 2m
+  - critical: > 350ms for 30s -> autoscaler scale-up and eviction of spot lanes
+- preemption_evictions_count_by_pool > 10 in 5m -> alert on noisy preemption
+- spot_fallback_rate: percentage of spot jobs restarted due to evictions
+
+Runbook: handling a preemption-driven customer-impact incident
+1. Detection: Pager fires from hosted_queue_latency_ms_p95 critical alert.
+2. Triage (first responder): check region_gpu_utilization_percent, autoscaler logs, and recent scaling events in capacity-manager.
+3. Immediate mitigation (first 5 minutes):
+   - Trigger on-call playbook: run `kubectl get pods -l priority=spot -n gpu-jobs` and cordon top spot nodes if necessary.
+   - Scale up reserved pools or hot pools using CLI helper: `ci-infra capacity-manager scale --pool hosted-west-1 --delta +8` (requires approver).
+   - If cross-region failover configured for VIP customers, enable fallback routing in gpu-router: `gpu-router set-fallback --from us-west-1 --to us-east-1 --tenants tenant-123`
+4. Stabilize (5-30 minutes):
+   - Throttle batch queues: set batch concurrency to 25% via queue-admin: `queue-admin set-concurrency --queue embeddings --percent 25`
+   - Increase spot fallback margin on spot-autoscaler: `spot-autoscaler update --spare-percent 10`
+5. Post-incident (30m+): run full root-cause analysis and a capacity simulation to determine whether permanent pool resizing is required.
+
+Checklist for application owners (must-haves for preemptible workloads)
+- Implement graceful SIGTERM handling and checkpointing (/opt/redwood/checkpoint).
+- Export `preemption_expected_duration_seconds` metric during graceful shutdown window.
+- Use the `priority` node label to opt into expected behavior.
+
+Ownership and responsibilities
+- Capacity Manager Team: owns capacity-manager service, terraform modules under modules/gpu-pool, autoscaler rules. (Pager: eng-infra)
+- Scheduler Team: owns gpu-scheduler binary, token-bucket fairness algo, and preemption signalling. (Pager: eng-serving-runtime)
+- Platform SRE: owns monitoring, alerting, and incident playbooks.
+- Tenant App Owners: ensure apps implement the checkpointing hooks and respect node labels.
+
+Rollout plan (4 phases)
+1. Canary (2 weeks): apply policy to non-customer internal tenants only (internal experiments). Monitor preemption_evictions_count_by_pool.
+2. Beta (6 weeks): include low-traffic customer-facing buckets (non-critical SLAs).
+3. Gradual rollout (8 weeks): enable in half of the production pools per region and run mixed-load stress tests.
+4. GA (post-metrics review): enforce policy fleet-wide and update IaC defaults.
+
+Testing and validation matrix
+- Unit tests: scheduler fairness invariants, preemption order, token-bucket weights.
+- Integration: simulate 110% demand with workload generator and assert hosted p95 latency remains within SLO after preemption flows.
+- Chaos: run preemption-injector chaos experiments in staging and ensure evicted spot jobs restart with checkpoint.
+
+Examples of telemetry dashboards (links/references)
+- GPU Fleet Overview: /dashboards/gpu-fleet-overview
+- Per-region preemption heatmap: /dashboards/preemption-heatmap
+- Per-tenant utilization and reserved vs used: /dashboards/tenant-utilization
+
+Open risks and next steps
+- Cross-region capacity transfer delays can cause brief SLO violations; investigate faster routing updates in gpu-router.
+- Some older internal batch jobs lack checkpointing; schedule remediation and apply a kill-switch in 2025-04 to opt them out of spot lanes.
+
+Appendix A: recommended terraform IAM and tagging policy (example)
+- IAM roles required: terraform-gpu-admin, gpu-autoscaler-runner, capacity-manager-ci
+- Tagging standard: "{\"team\":\"<team-name>\",\"env\":\"<prod|staging>\",\"priority\":\"<reserved|hot|spot>\"}"
+
+Appendix B: sample preemption annotation for pod spec (Kubernetes)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: embedding-job-01
+  annotations:
+    gpu-preempt: "enabled"
+    checkpoint-path: "/opt/checkpoints/embedding-job-01"
+spec:
+  containers:
+  - name: worker
+    image: ghcr.io/redwood/embedding-worker:stable
+    lifecycle:
+      preStop:
+        exec:
+          command: ["/bin/sh","-c","/opt/redwood/bin/graceful_checkpoint --path /opt/checkpoints/embedding-job-01"]
+
+Related documents
+- See also: GPU fleet scaling metrics and oncall runbook, node bootstrap pipeline docs, and tenant GPU quotas guidance.
+
+Contact
+- Primary owner: Marcus Li (eng-infra) — #infra-gpu Slack
+- Secondary: Asha Kapoor (capacity-manager)

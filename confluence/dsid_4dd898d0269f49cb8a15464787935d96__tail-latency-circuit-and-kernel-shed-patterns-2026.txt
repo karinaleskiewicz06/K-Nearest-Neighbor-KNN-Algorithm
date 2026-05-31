@@ -1,0 +1,163 @@
+Tail-latency circuit patterns and kernel-shed strategy
+
+Executive summary
+
+This document defines an operational and architectural pattern to control tail latency in Redwood's inference serving runtime by combining request-level circuit breakers, proactive kernel shedding (GPU/accelerator scheduling decisions), and short-lived queue smoothing. It provides concrete thresholds, configuration examples, telemetry keys, and a safe rollout procedure for production. The goal is to reduce p99/p999 latency excursions while keeping overall throughput and request fairness predictable.
+
+Context and problem statement
+
+- Observed symptom: intermittent p99/p999 spikes driven by a small percentage of long-sequence generation requests, adversarial input shapes, or kernel stalls when heterogeneous accelerators (A100, H100, and LLM-optimized TPU-like devices) are mixed in a shard.
+- Impact: customer-facing latency SLO violations, elevated cost during surges as autoscaler spins up nodes, increased error budget burn for downstream services (request-router, console, telemetry-ingest).
+- Existing gaps: kernel scheduler currently prioritizes throughput; there is no standardized circuit contract between request-router and kernel-agent to gracefully shed work or downgrade to degraded variants.
+
+Design goals and non-goals
+
+Goals:
+1) Bound tail latency (p99, p999) for routes with strict latency SLOs by enabling fast local decisions at the edge of the runtime (request-router) and coordinated shedding in the kernel-agent.
+2) Maintain predictable unit cost: ensure shedding decisions prefer graceful degradation over dropping or unbounded retries.
+3) Maintain observability and explainability: every shed/downgrade decision must emit structured telemetry for post-incident analysis.
+
+Non-goals:
+- This doc does not replace higher-level routing policies (policy-service) for multi-region failover.
+- It is not prescribing specific model quality fallback prompts; model fallbacks are orchestrated elsewhere (model-fallback-service).
+
+Key components and responsibilities
+
+- request-router: applies client-side and tenant-level SLOs, issues circuit decisions, maintains per-tenant running counters. Owner: request-platform team.
+- kernel-agent (per-node): enforces kernel-shed decisions, implements token-budget preemption, and selects degraded execution paths (quantized kernel, shorter KV cache warmups). Owner: serving-runtime team.
+- admission-proxy: queues and shapes incoming requests, exposes backlog length metric admission.queue_length. Owner: edge-team.
+- telemetry-pipeline: captures structured decisions under serving.shed_event with tags {tenant, route, reason, action}. Owner: observability-team.
+
+Pattern overview
+
+1) Two-tier circuit model:
+   - Fast local circuit: decision made in request-router within 50ms based on moving-window metrics (requests/s, queue length, p95 latency). Short TTL (1s).
+   - Node-level kernel circuit: longer horizon (30s–2m) in kernel-agent that aggregates local kernel health (GPU utilization, kernel stalls, OOM counts).
+
+2) Kernel-shed actions (ordered by preference):
+   a) Prefer model-variant downgrade (e.g., switch to int8/4-bit variant) with preserved schema.
+   b) Reduce generation max_tokens for tail-risk requests (mutating request with explicit max_tokens cap).
+   c) Move request to slow-path batching with preemptible background slot.
+   d) Reject (HTTP 429) only as last resort when capacity and fallbacks are exhausted.
+
+Operational thresholds and SLOs
+
+- Service SLOs (example for low-latency route /v1/generate/fast):
+  - p50 <= 60ms, p95 <= 180ms, p99 <= 400ms, p999 <= 1.5s
+- Circuit triggering thresholds (examples; adjust per-tenant):
+  - local fast circuit opens when admission.queue_length > 150 OR p95(latency) > 220ms for 3 consecutive 1s windows.
+  - kernel circuit enters degraded mode when kernel.utilization_pct > 92% for 30s OR kernel.stall_count > 5 in 60s.
+  - automatic cooldown: circuits move to half-open after 10s (fast) / 90s (kernel).
+
+Telemetry and metrics (canonical names)
+
+Use the following structured metrics and events. All metrics must include {cluster, node_id, tenant, route} dimensions.
+
+- serving.request_duration_ms (histogram)
+- serving.queue_length (gauge)
+- serving.kernel_utilization_pct (gauge)
+- serving.kernel_stall_count (counter)
+- serving.shed_event (event) with fields: action, reason, pre_shed_latency_ms, post_action_variant, trace_id, request_id
+
+Alerting rules (suggested)
+
+- P99 latency breach: p99(route) > SLO threshold for 5m -> P1 oncall-severity, page runtime-core team.
+- Excessive shedding: count(serving.shed_event[action=reject]) > 10/min across cluster -> P0, page exec oncall + incident commander.
+- Kernel health: kernel.utilization_pct > 95% for 2 minutes -> P2, page infra-oncall.
+
+Configuration examples
+
+1) Example YAML for request-router fast-circuit (request-router config):
+
+```yaml
+fast_circuits:
+  - id: low_latency_route_1
+    match_route: "/v1/generate/fast"
+    queue_threshold: 150
+    p95_threshold_ms: 220
+    sample_window_seconds: 1
+    consecutive_windows: 3
+    open_ttl_seconds: 10
+    actions_when_open:
+      - type: downgrade_variant
+        variant: int8_v2
+      - type: cap_max_tokens
+        max_tokens: 64
+      - type: route_to_slowpath
+```
+
+2) Kernel-agent policy (kernel-agent config):
+
+```json
+{
+  "kernel_circuits": [
+    {
+      "id": "node-kernel-approx",
+      "utilization_threshold_pct": 92,
+      "stall_threshold_count": 5,
+      "window_seconds": 60,
+      "degraded_actions": ["promote_degraded_kernel","shorten_max_tokens"],
+      "cooldown_seconds": 90
+    }
+  ]
+}
+```
+
+Acceptance criteria and testing
+
+- Unit tests: request-router config evaluation with simulated metrics (latency, queue length), kernel-agent policy parser and action executor unit tests.
+- Integration tests: synthetic traffic harness (perf-harness) must produce a controlled p99 spike, and the combined circuit+kernel-shed should bring p99 down by >= 30% within 60s without rejecting > 5% of requests.
+- Chaos testing: introduce GPU kernel stalls via kernel-fault-injector; ensure circuit transitions and telemetry are emitted, no silent failures.
+
+Runbook (high-level)
+
+1) Incident triage summary: If p99 spikes are observed, check serving.shed_event and serving.kernel_stall_count.
+2) Immediate actions:
+   1. If serving.shed_event[action=reject] count is rising -> pause new canaries and escalate to runtime-core.
+   2. If kernel.utilization_pct > 95% -> trigger node isolation (policy: mark node as prewarm-only) and shift traffic via request-router dynamic routing.
+   3. If large numbers of downgrade_variant events are observed -> notify platform engineering to review model-variant correctness.
+3) Postmortem data points: number of shed events, average cost delta, number of 429s, timeline of circuit state transitions.
+
+Rollout and safe deployment procedure
+
+1) Feature flag behind: runtime.kernel_shed_v1 (default off).
+2) Canary rollout steps:
+   - Stage 1 (internal test clusters): enable for non-production clusters, run perf-harness for 48h.
+   - Stage 2 (low-traffic tenant): enable for 2% of tenants with low traffic for 72h; monitor shed events and p99.
+   - Stage 3 (high-traffic tenant subset): enable 10% of production tenants for 7 days.
+   - Global rollout: enable by default with per-tenant opt-out for 14 days of monitoring.
+3) Rollback criteria: >5% increase in overall error rate or >20% unexpected 429s attributable to shedding within a 1h window.
+
+Open items and follow-ups
+
+- Define the canonical mapping table of model-variants and quality/regret impact (product + applied-ml).
+- Automate post-incident cost attribution pipeline for shed decisions.
+- Evaluate ML-based prediction for preemptive kernel-shed (research spike).
+
+Related pages and runbooks
+
+- confluence:eng-serving-runtime/runtime-architecture/sequence-length-aware-kernel-selection-guidelines-2026 (reference for kernel selection heuristics)
+- confluence:eng-sre/runbooks/node-isolation-and-draining (node drain playbook)
+- confluence:eng-platform/dashboards/latency-and-shed-events-dashboard (dashboard to monitor serving.shed_event)
+
+Ownership and maintenance
+
+- Primary owner: serving-runtime (runtime-core)
+- Secondary stakeholders: request-platform, observability, applied-ml
+- Review cadence: quarterly, or after any P0/P1 incident involving tail latency.
+
+Appendix: example alert DSL rule (PromQL-like)
+
+- Alert: KernelHighUtilization
+  - Expr: avg_over_time(serving_kernel_utilization_pct[2m]) > 0.92
+  - For: 2m
+  - Severity: page:infra-oncall
+
+- Alert: ExcessiveShedRejections
+  - Expr: increase(serving_shed_event_total{action="reject"}[1m]) > 10
+  - For: 1m
+  - Severity: page:runtime-core
+
+Appendix: sample log line (structured JSON)
+
+{"timestamp":"2026-02-28T14:03:12.123Z","level":"info","event":"serving.shed_event","tenant":"tenant-42","route":"/v1/generate/fast","action":"downgrade_variant","pre_shed_latency_ms":480,"chosen_variant":"int8_v2","trace_id":"4a7f...","node_id":"node-13"}

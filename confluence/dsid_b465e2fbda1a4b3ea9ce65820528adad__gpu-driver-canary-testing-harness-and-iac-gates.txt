@@ -1,0 +1,147 @@
+GPU driver canary testing harness and IaC gating
+
+Summary:
+This document describes the GPU driver canary testing harness and the Terraform/IaC gating controls we use to safely roll out driver upgrades across our heterogeneous GPU fleet. The goal is to minimize blast radius, detect regressions early (both functional and performance), and ensure automated, auditable rollbacks when criteria fail.
+
+Background and motivation:
+- GPU driver upgrades (NVIDIA/AMD) carry risk: kernel panics, driver incompatibilities with CUDA/cuDNN/toolkit, thermal behavior changes, and performance regressions for inference workloads.
+- Historically we have had a mix of image-level canaries and manual validation; this harness codifies a repeatable, automated pipeline that ties into Terraform and our CI/CD gates.
+
+Scope:
+- Applies to managed GPU node pools across cloud accounts (GCP, AWS) and on-prem clusters managed via the same IaC modules.
+- Covers device drivers, kernel module configuration, and the signed runtime bundle that ships with node images.
+- Does not cover customer-managed private clusters (private deployments) unless they opt into our canary program.
+
+Assumptions and prerequisites:
+1. Image bundles are signed and notarized by the build pipeline (see "signed-gpu-runtime-bundle-and-verifier-guidelines").
+2. Terraform GPU node module exposes module variables for canary tags, pool selectors, and rollout percentages.
+3. Observability hooks (Prometheus metrics, node-exporter, nvidia-smi exporter, and logging) are present and shipping to our central telemetry.
+4. A canary operator service (internal) orchestrates the phased rollouts driven by IaC changes and CD triggers.
+
+Roles and ownership:
+- Canaries owner: infra-release (primary), eng-sre (secondary)
+- CI/CD pipeline owner: infra-ci team
+- Terraform module owner: iac-guild
+- Emergency rollback owner: oncall infra-sre rotation
+
+Architecture overview:
+- Build: Driver binaries + runtime bundle built in secure CI, signed, published to artifact registry.
+- IaC: Terraform module accepts driver_bundle_version, canary_group_label, and rollout_fraction.
+- Orchestration: Canary operator watches Terraform apply events (via a webhook), executes preflight tests and monitors telemetry for N minutes for each phase before advancing.
+- Observability: Telemetry streams into the Canary Dashboard and triggers alerts when thresholds crossed.
+
+Canary phases (high level):
+1) Dry-run validation (CI pipeline): unit-level smoke tests on golden VM images. Fail fast if package checksum mismatch or signature invalid.
+2) Lab canary: deploy to isolated lab pool (2-4 nodes) with synthetic inference workloads. Minimum pass: boot success + kernel modules present + nvidia-smi OK for 1 hour.
+3) Small fleet canary (1% of capacity): Terraform changes apply to a labeled pool with a 1% subset across two regions. Monitor for 24h.
+4) Staged ramp: 1% -> 5% -> 20% -> 50% -> 100% with automated gates and manual approval at configurable thresholds.
+5) Full promotion: once 24–72h metrics stable and no alerts, finalize and mark artifact as stable in registry.
+
+Automated gate criteria (examples):
+- Health signals (all must pass):
+  - Node boot success rate >= 99% for canary nodes in phase window
+  - Driver kernel module load errors < 0.5% of canary nodes
+  - Node reboots due to OOPS/panic: 0 allowed in lab, <= 1 per 1,000 nodes in fleet phases
+- Performance signals (must not regress beyond thresholds):
+  - 95th percentile token latency regression <= +10% relative to baseline workload for the service-level test harness
+  - Throughput (tokens/sec) regression <= 8%
+  - GPU memory error metrics (ECC/uncorrectable) no increase vs baseline
+- System metrics:
+  - Thermal excursions > 90C: none tolerated in lab, rate limit in fleet phases
+  - cgroup OOM events: zero for inference containers in baseline test jobs
+- Telemetry health: metric ingestion gap < 60s, logs present for each canary node for the observation window
+
+Terraform/IaC gating and required module fields:
+(Provide a sample variable table that every GPU node module must expose to participate in the canary pipeline)
+| Variable name | Type | Description | Default/Notes |
+| driver_bundle_version | string | Signed runtime bundle version to install on nodes | n/a (required) |
+| canary_group_label | string | Label used to select nodes for canary (e.g. "driver-canary-v2026-02") | optional |
+| rollout_fraction | number | Fraction of fleet to target in this apply (0.01 = 1%) | 0.0 (manual) |
+| canary_timeout_minutes | number | Observation window per phase in minutes | 1440 |
+| preflight_script_url | string | Remote script run as preflight smoke test | optional |
+| image_signing_key_id | string | KMS key id used to verify signatures | n/a |
+
+Example minimal Terraform usage snippet (illustrative):
+```
+module "gpu_node_pool" {
+  source = "git::ssh://git@internal.repo/terraform-modules//gpu-node-pool"
+
+  driver_bundle_version = "2026.02.12-driver-abc123"
+  canary_group_label    = "driver-canary-2026-02"
+  rollout_fraction      = 0.01
+  canary_timeout_minutes = 1440
+}
+```
+
+Preflight test matrix (CI runs):
+- Boot smoke: kernel loads, nvidia-smi presence, docker runtime start (x86 images), kubelet join success
+- CUDA sanity: compile and run micro-benchmarks (matrix across CUDA versions we support)
+- Inference sanity: run 10 representative prompts on small models, validate output presence and latency within baseline
+- Integration: run a canary of the canary operator in a dedicated test org to validate webhook triggers
+
+Canary operator behavior and safety features:
+- Rollouts are timeboxed and reversible; each phase uses Terraform to create a new node pool or adjust labels instead of mutating the entire fleet in-place.
+- Canary operator calculates target subset using a stratified sampling algorithm to cover region + instance-type diversity.
+- If rollouts fail, operator triggers an automated rollback: (1) mark artifact as blocked, (2) Terraform apply to restore previous driver_bundle_version, (3) notify slack #infra-alerts and page oncall.
+- Operator respects "maintenance windows" configured in org-level settings; rollouts will pause outside windows unless forced by an owner.
+
+Rollback runbook (step-by-step):
+1) Detect failure: alert triggers in #infra-alerts with runbook link.
+2) Owner acknowledges and sets incident channel.
+3) Execute fast rollback plan:
+   a) Terraform change to set driver_bundle_version = last-known-good and rollout_fraction = 1.0 to targeted canary pools (apply with auto-approve disabled).
+   b) If Terraform apply cannot complete due to scheduling, trigger node pool recreation via cloud console with image rollback.
+4) Validate system recovery: health signals return to baseline for 30m.
+5) Run postmortem and link to regression test that caught the issue.
+6) Block the artifact in registry and tag with "reverted" and incident id.
+
+Testing and CI/CD pipeline specifics:
+- Pipeline stages: build -> sign -> unit smoke -> lab canary trigger -> iac-plan -> iac-apply-to-lab -> monitoring -> promote plan -> staged-apply
+- Artifact signing: use ephemeral build keys rotated per release; public key published to KMS for verification during boot.
+- Automated test harness produces a digest report (JSON) that the canary operator ingests to make promotion decisions.
+- Canary runs are tagged in CI with the terraform plan id and build id for traceability.
+
+Observability and dashboards (what to monitor):
+- Canary Dashboard: canary pool health, driver-specific kernel errors, nvidia-smi metrics, pod-level inference latency percentiles, node reboot count, thermal metrics, OS-level OOM counts.
+- Alerts: page oncall for any of: node panic, repeated driver module unloads, sustained latency regression > 10% at p95, or ingestion gap > 2m.
+
+Post-promotion hygiene:
+- Mark artifact as stable and update module default driver_bundle_version only after a full fleet promote.
+- Update changelog and compliance evidence (driver version, signed artifact hash) in the release catalog.
+- Schedule follow-up in 7 days to validate longer-term telemetry (cost, power, error trends).
+
+Operational considerations and edge cases:
+- Heterogeneous hardware: ensure canary groups include each major accelerator family (A100, H100, Ampere v2, AMD MI) — if a driver only affects a family, treat promotion per family.
+- Spot/preemptible nodes: exclude from lab canaries; include in fleet canaries with reduced weighting.
+- On-prem clusters with older BIOS or firmware: run extended lab validation and require sign-off from onprem-eng before fleet promotion.
+- Emergency skip: provide a documented emergency override that can apply a forced rollback; requires two approvers (infra-release lead + oncall).
+
+Appendix A: Example alert thresholds (copyable):
+- canary.node.boot_success_rate < 0.99 -> sev2
+- canary.driver.kernel_load_errors > 0.005 (fraction) -> sev1
+- canary.p95_inference_latency > baseline_p95 * 1.10 for > 15m -> sev1
+- telemetry.ingest_lag_seconds > 120 -> sev2
+
+Appendix B: Scripting and CLI examples:
+- Trigger a lab canary via internal CLI:
+  infra-cli canary start --pool lab-gpu-1 --driver 2026.02.12-driver-abc123 --timeout 60m
+
+- Check canary status (returns JSON):
+  infra-cli canary status --canary-id C-20260212-01
+
+- Force rollback (protected):
+  infra-cli canary rollback --canary-id C-20260212-01 --reason "kernel_panic_count" --approvers "aisha,diego"
+
+Related reading and references:
+- signed-gpu-runtime-bundle-and-verifier-guidelines (artifact signing)
+- gpu-node-image-supply-chain-and-multi-account-iac-pipeline (image pipeline)
+- runbooks/gpu-rolling-reboot-and-network-bridge-playbook (reboot patterns)
+
+Change history:
+- 2025-04-12: Created by Aisha Romero (initial draft).
+- 2025-09-03: Added canary operator details and stratified sampling algorithm.
+- 2026-02-15: Finalized Terraform sample, added operational thresholds and CLI examples.
+
+Contact:
+- Primary: infra-release@redwood.example.com
+- Secondary: eng-sre-oncall@redwood.example.com

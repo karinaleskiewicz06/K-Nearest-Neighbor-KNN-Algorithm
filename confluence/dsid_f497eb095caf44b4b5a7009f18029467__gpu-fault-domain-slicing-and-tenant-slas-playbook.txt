@@ -1,0 +1,132 @@
+GPU Fault Domain Slicing and Tenant SLAs Playbook
+
+Summary:
+This runbook describes the fault-domain slicing strategy for the GPU fleet and the operational playbook to enforce tenant SLAs during burst, preemption, and zone-level failures. It covers the control-plane services (placement-coordinator, fault-slicer, tenant-quota-controller), IaC inputs, CI/CD gating rules for the placement logic, monitoring dashboards, and a step-by-step incident response for common failure modes.
+
+Scope:
+- Applies to all multi-zone GPU pools used for Hosted, Dedicated, and Private deployments.
+- Audience: SREs, infra engineers, and on-call rotation for the GPU fleet.
+- Excludes GPU provisioning pipelines (see ci-cd-gpu-image-promotion-canary-cd-playbook).
+
+Background and intent:
+When a zone, rack, or host exhibits degraded behavior we create a transient "fault domain" and slice capacity to limit blast radius. Fault-domain slicing allocates tenants into smaller subdomains with strict isolation policies (network egress fencing, QoS reservations, and preemption tiers). The goal is to keep tenant-level SLOs by:
+- Preserving warm-pool seeding for latency-critical tenants.
+- Enforcing tenant credit buckets during bursts.
+- Allowing graceful degradation with automatic fallback to cheaper/compatible model variants.
+
+Architecture overview:
+- placement-coordinator: central service that assigns allocation tokens. Responsible for global placement decisions and multi-region fallback.
+- fault-slicer: executes slicing policy when a fault domain is detected; updates cluster-level labels and triggers the allocation resync.
+- tenant-quota-controller: enforces per-tenant credits and burst caps; integrates with cost-exporter.
+- warm-pool-seeder: maintains preemptive KV cache warmers and session seeds for high-SLA tenants.
+
+SLOs and thresholds (operator-visible):
+| Metric | SLO | Alert threshold | Pager | Notes |
+|---|---:|---:|---|---|
+| Allocation success (p95) | <= 250ms | p95 > 350ms | oncall-gpu | Allocation token issuance latency |
+| Warm-pool hit-rate | >= 85% | < 70% | infra-runbook | Measured per-tenant during 5m windows |
+| Tenant SLA breach rate | < 0.5% requests | > 1% | product-slo | Count of requests that fall into fallback model |
+| Preemption-induced errors | < 0.1% | > 0.5% | oncall-gpu | Error spikes due to preempted nodes |
+
+Fault-domain detection signals (examples):
+- Network probe failures > 3 consecutive pings to rack egress gateway
+- Telemetry: packet loss on pod-to-pod overlay > 2% for 1 minute
+- Hardware: ECC memory corrected errors rate spike > 5x baseline for 10 minutes
+- Cloud signals: instance HostDown / degraded health status
+
+Runbook: Fault domain detected (automatic path)
+1) fault-slicer receives telemetry and marks affected topology keys (zone/rack/host) as quarantined.
+2) placement-coordinator transitions active allocations:
+   a) Reduce new allocations into quarantined domains.
+   b) Shift warm-pool seeding to unaffected pools.
+   c) Start best-effort rescheduling for placements with promotional grace (see tolerance policy below).
+3) tenant-quota-controller enforces burst caps: decline new high-cost requests when tenant credits < 15% of burst allotment and alternative pools are saturated.
+4) Notify tenants (via tenancy-events bus) if SLA fallback is imminent: include fallback model id and estimated duration.
+5) If reschedule fails for > 90s for > 5% of requests, escalate to page (oncall-gpu).
+
+Runbook: Allocation failures or high allocation latency (manual remediation)
+1) Confirm scope: run: 
+   - kubectl -n infra logs deployment/placement-coordinator -c coordinator --since=5m | grep "allocation latency"
+   - ./infractl probe topology --target rack:<rack-id> --checks network,health
+2) If placement-coordinator reports DB contention (write latency > 200ms):
+   - Increase leader replicas for the write-queue: kubectl -n infra scale deployment/placement-queue --replicas=3
+   - Apply rate-limit to external API clients: infractl rate-limit create --scope global --limit 1200rps
+3) If fault-slicer stuck applying policies to >1 cluster: restart with care: kubectl -n infra rollout restart deployment/fault-slicer
+4) Post-fix: run an allocation-sanity-check across tenants: infractl allocation check --sample 500 --output json
+
+Terraform / IaC guidance (snippet and table):
+Ensure the following module inputs are validated in PR gates. The placement module exposes the minimum required knobs below:
+
+| Variable | Type | Default | Description |
+|---|---|---:|---|
+| fault_domain_policy | string | "standard" | Policy name (standard | conservative | permissive) |
+| warm_pool_target_pct | number | "10" | Target warm pool percent per high-sla tenant |
+| burst_credit_window_sec | number | "3600" | Sliding window for tenant credits |
+| preempt_tier_weight | number | "100" | Weight used to decide preemption ordering |
+
+Example terraform module usage:
+```hcl
+module "gpu_placement" {
+  source = "github.com/redwood-inference/terraform-modules//gpu-placement"
+  fault_domain_policy = var.fault_domain_policy
+  warm_pool_target_pct = var.warm_pool_target_pct
+  burst_credit_window_sec = var.burst_credit_window_sec
+  preempt_tier_weight = var.preempt_tier_weight
+}
+```
+CI/CD gating and test matrix (must pass before merge into main):
+- Unit: 100% coverage for policy branch logic (fault, permissive, conservative).
+- Integration: placement-coordinator + fake-fleet simulator health checks (end-to-end allocation test under 20% simulated host failure).
+- IaC: terraform plan must show no unexpected resource replacement; validate module inputs with policy-as-code (OPA rule set: gpu-placement.rego).
+- Canary: deploy placement-coordinator to 2 internal clusters, synthetic load should maintain allocation success p95 < 300ms for 30m.
+
+Operational dashboards and alerts (examples):
+- Dashboard: "GPU Placement: Allocation Latency" (p50/p95/p99, per-tenant).
+- Dashboard: "Warm Pool and Seeding" (per-tenant warm cache occupancy, seeding lag).
+- Alert: allocation-latency-p95 > 350ms for 5m -> Sev2 page oncall-gpu.
+- Alert: warm-pool-hitrate < 65% for 10m for any high-sla tenant -> notify infra and product-slo.
+
+Escalation paths and contacts:
+- oncall-gpu rotation (primary) -> Slack: #oncall-gpu, PagerDuty: PD-GPU.
+- placement-coordinator team: eng-platform (owner) -> eng-platform-email@redwood.ai.
+- If incident crosses to network domain -> escalate to cloud-networking team and follow cross-account egress playbook.
+
+Canary / Rollout checklist (safe deploy of a new fault-slicer or placement logic):
+1) Create feature-flagged rollout with target-runner = 5% tenants.
+2) Verify integration tests pass in canary env.
+3) Monitor allocation latencies and warm-pool hit rates for 60 minutes.
+4) Gradually increase to 25%, 50%, then 100% with 30m observation windows.
+5) If at any step allocation-latency-p95 increases > 15% relative to baseline, pause and rollback.
+
+Common failure scenarios and playbook snippets:
+- Symptom: sudden drop in warm-pool-hit-rate for multiple tenants.
+  1) Check warm-pool-seeder logs for OOMs: kubectl -n infra logs deployment/warm-pool-seeder | tail -n 200
+  2) Rehydrate KV caches from snapshots: infractl kv restore --cluster <cluster> --prefix warmpool/tenant/<id>
+  3) If seeder OOM is persistent, reduce warm_pool_target_pct via IaC and trigger a canary deploy.
+
+- Symptom: "Allocation stuck" due to Etcd write contention.
+  1) Verify etcd latency: curl -s http://etcd-metrics/metrics | grep "etcd_request_duration_seconds"
+  2) If >200ms, promote a new etcd leader or enlarge etcd CPU request and restart in rolling fashion.
+
+Post-incident checklist:
+- Run retro with placement and fleet owners within 48 hours.
+- Update tenant incident notifications and adjust burst-credit thresholds if needed.
+- Create a follow-up ticket for any IaC change with full rollback plan.
+
+Ownership and SLAs:
+- placement-coordinator: eng-platform (primary), eng-sre (oncall support)
+- fault-slicer: eng-infra-runtime (primary), eng-platform (secondary)
+- tenant-quota-controller: billing-and-quotas (primary), customer-success (notification templates)
+
+References and related pages:
+- See: /confluence/eng-infra/gpu-fleet-and-capacity/gpu-topology-simulation-and-cost-sensitivity-framework for simulation guidance.
+- See: /confluence/eng-infra/terraform-and-iac/gpu-lease-ledger-and-claim-module.json for lease semantics and claim reconciliation.
+
+Appendix: policy tolerance levels
+- conservative: minimal allocations into marginal hardware, warm_pool_target_pct = 15, preempt_tier_weight=200
+- standard: balanced (defaults in module)
+- permissive: aggressive allocations into hetero pools, warm_pool_target_pct = 5
+
+Document history:
+- 2025-11-02: Created by Maya Chen
+- 2026-01-15: Added terraform module inputs and canary checklist (reviewed by Arjun Patel and Lena Kowalski)

@@ -1,0 +1,276 @@
+Tiered SLO definitions (Hosted vs Dedicated): SLIs, targets, exclusions, and reporting windows
+
+## Purpose
+This page defines the canonical Service Level Indicators (SLIs) and Service Level Objectives (SLOs) for Redwood Inference’s customer-facing inference paths across **Hosted (shared)** and **Dedicated (reserved capacity)** tiers.
+
+These definitions are the source of truth for:
+- SLO dashboards and alerting (burn-rate)
+- Error budget computation (rolling windows)
+- Product/Sales alignment (SLO → SLA mapping)
+- Incident thresholds tied to budget burn
+
+> Note: Redwood Private (VPC/on-prem) is out of scope for enforcement in this phase. We reference it only where definitions should remain compatible.
+
+---
+
+## Scope
+### In-scope request paths
+Measurement covers the full customer request path:
+1) API Gateway (edge) request acceptance
+2) Routing/control plane policy evaluation
+3) Model serving request path (including queuing / batching)
+4) Response emission (final response for non-streaming; stream events for streaming)
+
+### In-scope endpoint classes
+We group endpoints into three endpoint classes for tiered SLOs:
+- **Chat/Completions (non-streaming)**: `POST /v1/chat/completions` and `POST /v1/completions` with `stream=false`
+- **Chat/Completions (streaming)**: same endpoints with `stream=true`
+- **Embeddings**: `POST /v1/embeddings`
+
+Reranking and other specialized endpoints are tracked but not included in this SLO set (future doc).
+
+---
+
+## Tier and labeling rules (must be true for SLO accounting)
+All SLI events MUST be tagged at ingress and preserved through routing/fallback:
+- `deployment_tier`: `hosted` | `dedicated`
+- `region`: Redwood region identifier (see below)
+- `endpoint_class`: `chat_nonstream` | `chat_stream` | `embeddings`
+- `route`: stable route identifier (low-cardinality)
+- `model_family`: stable family identifier (low-cardinality; e.g., `llama3`, `qwen2`, `mistral`)
+
+Dedicated requests additionally carry:
+- `account_id` (restricted access in dashboards; do not use for global recording rules)
+
+Reference: ADR-0142 (tier-aware tagging at ingress).
+
+---
+
+## Supported regions (for SLO reporting)
+SLOs are computed and reported **per region** and **per tier**.
+
+Regions in this rollout:
+- `us-east-1`
+- `us-west-2`
+- `eu-west-1`
+
+Rollups:
+- **Regional SLO**: primary enforcement surface (alerts, error budgets)
+- **Global rollup**: informational only for Hosted; Dedicated global rollups are used in exec reporting but do not replace regional enforcement
+
+---
+
+## Canonical SLIs
+We track three primary SLI families:
+1) Request success rate (availability / error-rate)
+2) End-to-end latency (percentiles + good-event coverage)
+3) Streaming reliability (disconnect/error events)
+
+### 1) Request success rate (Availability SLI)
+**Intent:** Measure the fraction of eligible requests that complete successfully from the customer’s perspective.
+
+**SLI definition (event-based):**
+- **Total events**: all *SLO-eligible* requests reaching the API gateway for the endpoint class and tier.
+- **Good events**: requests that return a successful response status and are not classified as platform errors.
+
+**What counts as “bad” (counts against availability):**
+- Any **5xx** returned by gateway, routing, or serving (includes `502`, `503`, `504`)
+- Any **platform-generated 4xx** that indicates platform failure or overload *when not attributable to customer configuration*, specifically:
+  - `429` with reason `overload_shed` (see exclusions below for quota/rate-limits)
+  - `408` if emitted by gateway due to upstream timeout (rare; generally maps to `504`)
+
+**What counts as “good”:**
+- `2xx` responses for non-streaming
+- For streaming: an established stream that completes normally (see streaming SLI for additional failure accounting)
+
+**Example formula (PromQL-style, illustrative):**
+- `availability = good_requests / eligible_requests`
+- `good_requests = sum(rate(rw_api_requests_total{eligible="true", outcome="success"}[window]))`
+- `eligible_requests = sum(rate(rw_api_requests_total{eligible="true"}[window]))`
+
+### 2) Latency SLIs (End-to-end)
+We publish and alert on **p50/p95/p99** latency, and we compute an **event-based good-latency SLI** for error budgets.
+
+**Latency measurement points:**
+- Start: `gateway_request_received_timestamp`
+- End (non-streaming): `gateway_response_completed_timestamp`
+- End (streaming TTFT): first token/first SSE data event emitted to client
+
+**Latency SLIs reported:**
+- **Non-streaming latency**: `e2e_latency_ms`
+- **Streaming time-to-first-token (TTFT)**: `ttft_ms`
+- **Streaming inter-token gap**: `inter_token_gap_ms` (computed on stream events)
+
+**SLO-eligible latency population (guardrails):**
+To avoid a single pathological request dominating the percentile distribution, latency SLO eligibility applies only when:
+- Request is SLO-eligible (see Exclusions)
+- `input_tokens <= 8,192` (measured/estimated at ingress)
+- `max_output_tokens <= 2,048` (declared parameter)
+- For embeddings: `input_tokens <= 16,384`
+
+Requests outside these limits are still served and measured, but excluded from latency SLO accounting (availability still applies unless otherwise excluded).
+
+**Event-based good-latency SLI (for budgets):**
+- `good_latency = count(latency_ms <= threshold_ms) / count(eligible_latency_requests)`
+
+We still publish p50/p95/p99 as primary observability signals; the budget uses the threshold-based SLI to support burn-rate math and consistent policy.
+
+### 3) Streaming reliability SLI
+**Intent:** capture stream health beyond HTTP status codes (e.g., mid-stream disconnects).
+
+**Definition:** For streaming requests that successfully establish a stream, we count a stream as **bad** if the stream terminates unexpectedly due to server-side or upstream failures.
+
+**Bad stream outcomes (count against streaming reliability):**
+- Server-side disconnect with `termination_reason in {upstream_reset, serving_crash, gateway_timeout, internal_error}`
+- Stream error event emitted by server prior to completion
+
+**Excluded (do NOT count against streaming reliability):**
+- Client abort / client disconnect (explicitly detected)
+- Customer-requested cancellation (SDK cancellation)
+
+**Illustrative formula:**
+- `stream_reliability = 1 - (bad_streams / established_streams)`
+
+---
+
+## Exclusions (canonical)
+Exclusions apply to SLO calculations to avoid charging the platform for customer-caused or explicitly non-service-impact outcomes.
+
+### Excluded from ALL SLIs (availability + latency + streaming)
+- Invalid requests: `400` schema/validation errors
+- Auth errors: `401`, `403`
+- Not found / wrong path: `404`
+- Explicit customer quota or plan enforcement:
+  - `429` with reason `quota_exceeded`
+  - `429` with reason `rate_limit_customer`
+- Requests blocked due to customer safety settings/policies (customer-configured): `4xx` with `policy_origin=customer`
+
+### Excluded from latency + streaming only (still count for availability unless noted)
+- Client aborts / disconnects prior to completion (classified as `outcome=client_abort`)
+- Customer-requested cancellations (SDK cancellation)
+
+### NOT excluded (counts against platform)
+- `429` with reason `overload_shed` (platform overload protection)
+- Any `5xx` and gateway/serving timeouts
+- Routing fallback that returns an error (fallback itself is not an exclusion)
+
+---
+
+## Retries, fallbacks, and deduplication rules
+To keep accounting consistent and avoid “double charging” when retries occur:
+- We compute SLIs on the **final attempt** when the SDK/gateway attaches a stable `request_id` and monotonic `attempt`.
+- Default aggregation uses `request_id` deduplication where available; otherwise we use `attempt="final"` tagging from gateway.
+
+Fallback/routing rules:
+- If a request is served by a fallback model/region and succeeds, it is **good** for availability.
+- Latency is attributed to the **customer-visible tier and region** at ingress (i.e., what the customer targeted), not the internal fallback destination.
+- We annotate fallback usage separately (not part of SLO numerator/denominator), so we can correlate SLO risk with mitigation actions.
+
+Reference: SLI specification for gateway/routing (observability standards page).
+
+---
+
+## Reporting windows and aggregation
+### Standard windows
+- **SLO compliance reporting:** rolling **28 days** (default), updated every 5 minutes
+- **Error budget computation:** rolling **28 days** (matches SLO compliance)
+- **Alerting (burn-rate):** multi-window alerting as defined in ADR-0143 (e.g., fast burn on 5m/1h and slow burn on 6h/3d)
+
+### Aggregation levels
+- SLOs are computed **per** (`deployment_tier`, `region`, `endpoint_class`).
+- Dedicated dashboards additionally support per-`account_id` views with RBAC.
+
+### Minimum traffic for latency percentiles
+Latency percentiles are only considered stable when there is sufficient traffic:
+- If fewer than **300 eligible requests** occur in a 30-minute period for a slice, we show percentiles but do not page on percentile-only anomalies. (Availability/stream reliability still applies.)
+
+---
+
+## Tiered SLO targets
+Targets below are the canonical objectives for this program milestone. Any change requires SRE + Product approval and an update to the SLO → SLA mapping page.
+
+### Summary table (28-day rolling)
+**Availability (request success rate)**
+
+| Tier | Endpoint class | Availability SLO (28d) |
+|---|---|---|
+| Hosted | chat_nonstream | 99.90% |
+| Hosted | chat_stream | 99.85% |
+| Hosted | embeddings | 99.90% |
+| Dedicated | chat_nonstream | 99.95% |
+| Dedicated | chat_stream | 99.90% |
+| Dedicated | embeddings | 99.95% |
+
+**Streaming reliability (stream completion health)**
+
+| Tier | Endpoint class | Streaming reliability SLO (28d) |
+|---|---|---|
+| Hosted | chat_stream | 99.70% |
+| Dedicated | chat_stream | 99.85% |
+
+**Latency (published percentiles + budgeted good-latency threshold)**
+
+For latency, we:
+- **Publish**: p50/p95/p99 for each slice
+- **Budget**: % of eligible requests under a tier/endpoint threshold
+
+| Tier | Endpoint class | Latency threshold for good-latency SLI | Good-latency SLO (28d) | Published percentile guardrails |
+|---|---|---|---|---|
+| Hosted | chat_nonstream | e2e_latency_ms <= 2500ms | 95.0% | p95 <= 2500ms, p99 <= 5000ms |
+| Hosted | chat_stream (TTFT) | ttft_ms <= 1200ms | 95.0% | p95 <= 1200ms, p99 <= 2500ms |
+| Hosted | chat_stream (inter-token) | inter_token_gap_ms <= 150ms | 95.0% | p95 <= 150ms |
+| Hosted | embeddings | e2e_latency_ms <= 450ms | 97.0% | p95 <= 450ms, p99 <= 900ms |
+| Dedicated | chat_nonstream | e2e_latency_ms <= 1800ms | 95.0% | p95 <= 1800ms, p99 <= 3500ms |
+| Dedicated | chat_stream (TTFT) | ttft_ms <= 800ms | 95.0% | p95 <= 800ms, p99 <= 1800ms |
+| Dedicated | chat_stream (inter-token) | inter_token_gap_ms <= 110ms | 95.0% | p95 <= 110ms |
+| Dedicated | embeddings | e2e_latency_ms <= 300ms | 97.0% | p95 <= 300ms, p99 <= 600ms |
+
+Notes:
+- Latency thresholds apply only to **latency-eligible** requests (token guardrails in Latency SLIs section).
+- Percentile guardrails are used for visibility and triage; the error budget uses the good-latency SLI.
+
+---
+
+## What to page on (high-level)
+Paging policy details live in the Error Budget Policy page. From an SLO-definition standpoint:
+- We page on **burn-rate** for availability and streaming reliability for each (`tier`, `region`, `endpoint_class`).
+- We page on **burn-rate** for good-latency SLI where traffic volume is sufficient.
+- Percentile-only alerts (p99 spikes) are routed to Slack/triage unless they correlate with budget burn.
+
+---
+
+## Examples (for dashboard validation)
+### Availability numerator/denominator checks
+- A `429` due to `quota_exceeded`: excluded from denominator.
+- A `429` due to `overload_shed`: included in denominator and counted as bad.
+- A `500` from serving after routing fallback: counted as bad against the ingress tier/region slice.
+
+### Streaming classification checks
+- Client closes the connection early: excluded from streaming reliability.
+- Gateway emits a stream error after 20 tokens due to upstream reset: counted as bad stream.
+
+---
+
+## Change management
+Any changes to:
+- target percentages/thresholds
+- exclusion rules
+- region list
+- latency eligibility guardrails
+
+…require:
+1) Update proposal from SRE (owner: Aisha Bello)
+2) Review by Product owners (Hosted: Nikhil Sharma; Dedicated: Lauren Bishop)
+3) Review by Observability Standards (Allison Grant) and Telemetry (Logan Wright) if metrics change
+4) Update to SLO tooling config + dashboards + alert rules
+5) Announcement in `#eng-sre` and `#product` with effective date
+
+---
+
+## Appendix: Metric names (current)
+These names are referenced by dashboards/recording rules; consult the observability standards page for the full event taxonomy.
+- `rw_api_requests_total{deployment_tier,region,endpoint_class,eligible,outcome,http_status,reason}`
+- `rw_api_request_latency_ms_bucket{deployment_tier,region,endpoint_class,eligible_latency}`
+- `rw_stream_events_total{deployment_tier,region,endpoint_class,event_type,termination_reason}`
+
+If you need to add new labels, consult Telemetry for cardinality review (Thomas Baird as escalation).

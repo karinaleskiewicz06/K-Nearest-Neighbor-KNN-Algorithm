@@ -1,0 +1,300 @@
+KV Cache Compaction Profiling Playbook
+
+## Purpose
+This page documents how to profile KV cache fragmentation and compaction behavior in the serving runtime. It focuses on:
+- Capturing allocator state snapshots (fragmentation, freelists, per-sequence residency)
+- Correlating compaction/eviction activity with tail latency (p95/p99) and scheduler phase boundaries
+- Diagnosing “pathological fragmentation” cases (bursty churn, mixed sequence lengths, long-lived sessions)
+
+This is an engineering playbook (not a runbook). If you are actively mitigating a production incident, follow the runtime operational runbook and use this page for deeper diagnosis.
+
+## When to use this playbook
+Use these steps when you see one or more of the following:
+- p95/p99 decode latency spikes during burst traffic, especially with mixed prompt lengths
+- Increased allocator overhead (alloc/free/defrag) or copy activity, without throughput gains
+- Unexpected evictions or opportunistic shedding correlated with KV memory pressure
+- Intermittent OOMs in high-churn chat workloads even when average utilization looks “safe”
+
+## Prerequisites / access
+- Access to the runtime host (Hosted canary or staging pool) via standard SRE SSH / debug workflow
+- A trace viewer for Redwood distributed traces (Console → Tracing) and access to the “Serving Runtime” service
+- Permission to use runtime debug endpoints (these are internal-only and may be disabled in some Dedicated/Private environments)
+
+Recommended tooling (internal):
+- `rwdctl` (runtime debug CLI) or equivalent admin RPC client
+- `rwtrace` (trace export helper) or Console trace export
+- `pprof` (CPU profiling) where enabled
+
+## Safety and performance notes
+- Allocator snapshots are designed to be low overhead, but they still walk allocator structures. Do not take snapshots at very high frequency in production.
+- If you enable compaction debug logging, it can increase overhead and may distort latency measurements.
+- Never capture request payloads or raw prompts in artifacts. Store only allocator state, counters, and trace IDs.
+
+---
+
+## Key concepts / what to look for
+### Fragmentation vs utilization
+High KV utilization is not necessarily bad. The key risk factor is fragmentation (free memory exists but cannot satisfy contiguous page/block needs without relocation).
+
+Symptoms of pathological fragmentation:
+- Fragmentation ratio stays high or increases over time even after load stabilizes
+- Allocation failures/slow-path allocations rise while total free bytes are non-trivial
+- Compaction bytes moved spikes repeatedly but fragmentation does not improve
+- Eviction rate increases during bursts in a way that correlates with latency spikes
+
+### Scheduler phases
+Most deployments budget compaction around scheduler boundaries:
+- Prefill → Decode transition
+- Decode loop time-slices
+- Background compaction worker (if enabled)
+
+When correlating to tail latency, the question is: “Did compaction work happen on the critical path of decode?”
+
+---
+
+## Metrics to pull (minimum set)
+Use these metric names/definitions as standardized in the metrics standard page. If names differ in your environment, consult the runtime metrics catalog.
+
+Minimum set (per model + pool):
+- `kv_cache_fragmentation_ratio` (gauge)
+- `kv_cache_free_bytes` (gauge)
+- `kv_cache_used_bytes` (gauge)
+- `kv_cache_alloc_slowpath_total` (counter)
+- `kv_cache_compaction_runs_total` (counter)
+- `kv_cache_compaction_bytes_moved_total` (counter)
+- `kv_cache_compaction_time_ms_total` (counter)
+- `kv_cache_compaction_budget_exhausted_total` (counter)
+- `kv_cache_evictions_total` (counter; with labels for reason/tier)
+- `runtime_decode_latency_ms` (histogram; p50/p95/p99)
+
+Helpful breakdowns:
+- By tier (Hosted standard vs enterprise vs Dedicated)
+- By scheduler phase (prefill vs decode)
+- By model version and quantization profile
+
+---
+
+## Procedure A: Capture allocator state snapshots
+Allocator snapshots should be captured at three times:
+1) Baseline (steady state, before inducing burst)
+2) During a latency spike / burst window
+3) After compaction has run for a while (or after workload cool-down)
+
+### A1) Snapshot via debug endpoint (recommended)
+1. Identify a target runtime instance
+   - Hosted: choose a canary instance in the target region/pool
+   - Dedicated: choose a single replica where you can safely reproduce the behavior
+
+2. Capture a snapshot
+   Command (example):
+   - `rwdctl runtime kv snapshot --format=json --include=freelist,arenas,sequences --output=/tmp/kv_snapshot_$(date +%s).json`
+
+3. Collect instance metadata alongside the snapshot
+   - Runtime version (e.g., `runtime-1.22.x`)
+   - Model name + revision
+   - GPU type + memory size
+   - Feature flags (compaction enabled, background worker enabled)
+   - Active limits (compaction budget time/bytes, trigger thresholds)
+
+4. Upload artifacts
+   - Store in the engineering perf artifact location for the project (follow your org’s artifact retention policy)
+   - Include the trace IDs captured in Procedure B
+
+### A2) Snapshot cadence guidance
+- For investigation: no more than 1 snapshot every 30–60 seconds during a burst.
+- For long soak tests: 1 snapshot every 5–10 minutes plus on event triggers (latency spike, eviction spike, OOM near-miss).
+
+### A3) What a snapshot should contain (fields)
+Snapshot should include (at minimum):
+- Arena summary: total bytes, used bytes, free bytes
+- Fragmentation summary: fragmentation ratio, largest contiguous free run
+- Free-list histogram: free run sizes (p50/p95/p99)
+- Relocation state (if compaction enabled): pending moves, in-flight moves
+- Sequence residency summary: number of active sequences, pinned sequences, per-tier counts
+
+If the snapshot does not include “largest contiguous free run” or free-run histogram, the snapshot is incomplete for diagnosing fragmentation.
+
+---
+
+## Procedure B: Correlate compaction/eviction to latency traces
+### B1) Collect trace exemplars during spikes
+1. Identify the time window where `runtime_decode_latency_ms` p99 increases.
+2. Export trace exemplars for that window:
+   - At least 10 traces near p99
+   - At least 10 “normal” traces from an adjacent non-spiky window
+
+3. For each trace, record:
+   - Trace ID
+   - Route / endpoint (chat vs generate)
+   - Model + revision
+   - Request shape (prompt length bucket, max_new_tokens bucket) — only as coarse buckets
+
+### B2) Spans to look for
+The runtime emits spans around compaction and eviction. Common span names:
+- `kv.compaction.step`
+- `kv.compaction.relocate_block`
+- `kv.compaction.copy_kernels`
+- `kv.eviction.select_candidate`
+- `kv.eviction.evict_sequence`
+- `scheduler.decode_tick`
+- `scheduler.prefill`
+
+What you want to determine:
+- Whether compaction steps overlap decode critical sections
+- Whether compaction “step” durations cluster around the spike window
+- Whether eviction selection/eviction work is happening during decode bursts
+
+### B3) Correlation checklist
+For each spike window:
+- Does `kv_cache_compaction_bytes_moved_total` slope increase?
+- Does `kv_cache_compaction_budget_exhausted_total` increase (indicating we tried to compact but hit limits)?
+- Does fragmentation ratio improve after bytes moved, or stay flat?
+- Are evictions rising (especially for higher tiers or pinned sessions)?
+- Do traces show compaction spans on the critical path of decode?
+
+If traces show compaction on the decode critical path, confirm whether compaction is being triggered in the wrong scheduler phase or whether budgeting is too aggressive.
+
+---
+
+## Procedure C: Diagnose “pathological fragmentation” patterns
+This section provides common patterns and how to validate them.
+
+### Pattern 1: Mixed-length churn causes “Swiss cheese” freelists
+Indicators:
+- Free bytes are moderate/high
+- Largest contiguous free run is small
+- Free-list histogram is heavily skewed to small run sizes
+- Slow-path allocations rise during bursts
+
+Validation steps:
+- Compare baseline vs burst snapshot: free-run histogram should shift toward smaller runs
+- Check if compaction runs increase but largest run does not recover
+
+Likely root causes:
+- Block/page sizes mismatch common sequence length distribution
+- Compaction trigger threshold too high (reactive instead of proactive)
+- Compaction budget too low to “catch up” during churn
+
+Next actions:
+- Try lowering fragmentation trigger (canary only)
+- Increase compaction budget slightly and confirm compaction stays off decode critical path
+- Confirm scheduler hook placement (prefill/decode boundary vs continuous background)
+
+### Pattern 2: Long-lived pinned sessions block compaction
+Indicators:
+- Many sequences marked pinned
+- High fragmentation ratio localized to specific arenas
+- Compaction repeatedly skips large pinned regions
+
+Validation steps:
+- Snapshot: verify pinned counts and pinned-byte totals
+- Trace: evictions may spike for non-pinned sequences while pinned remain resident
+
+Next actions:
+- Confirm pinned semantics are correct (e.g., tool-calling sessions, Dedicated enterprise settings)
+- Evaluate whether pinned sessions should be moved to separate arena/pool configuration
+- Confirm eviction policy is tier-aware and respects pinned sequences
+
+### Pattern 3: Compaction “thrash” (bytes moved high, no benefit)
+Indicators:
+- `bytes_moved_total` grows quickly
+- Fragmentation ratio does not improve (or improves briefly then regresses)
+- Copy kernels show up frequently in traces
+
+Validation steps:
+- Compare snapshots across 3 points (before/during/after): does largest run increase and stay increased?
+- Check if eviction events immediately re-fragment the arena (churn after compaction)
+
+Likely root causes:
+- Workload churn rate is higher than compaction’s steady-state ability to maintain contiguity
+- Compaction trigger oscillation (no hysteresis)
+
+Next actions:
+- Add/adjust hysteresis between “start compaction” and “stop compaction” thresholds
+- Reduce compaction aggressiveness and rely more on eviction under overload, or vice versa, depending on tier goals
+
+### Pattern 4: Budgeting misplacement causes decode stalls
+Indicators:
+- Traces show compaction spans nested under decode critical spans
+- p99 spikes align with `kv.compaction.step` durations
+- `budget_exhausted_total` may be low (we are doing work, but at the wrong time)
+
+Validation steps:
+- Inspect scheduler phase annotations in trace
+- Check whether compaction is being called at every decode tick instead of at safe boundaries
+
+Next actions:
+- Move budget enforcement to safe scheduler boundaries
+- Cap step duration more aggressively (time-based budget) rather than bytes-only
+
+---
+
+## Procedure D: Minimal reproducible benchmark in perf lab
+When you need a reliable repro outside prod:
+
+1) Use the fragmentation workload generator (benchmark-lab) configured for:
+- Mixed prompt lengths (e.g., 128–8k)
+- Mixed max_new_tokens (e.g., 64–2k)
+- High cancellation rate (to mimic churn)
+- A small proportion of long-lived sessions
+
+2) Run two variants:
+- Compaction OFF (baseline)
+- Compaction ON with canary settings
+
+3) Collect artifacts:
+- p95/p99 decode latency
+- Throughput
+- Allocator snapshots at the same cadence for both runs
+- Trace exemplars for spikes
+
+4) Acceptance criteria (investigation phase):
+- Compaction should reduce fragmentation ratio under the same workload without increasing steady-state p50 latency
+- p99 should not show new spikes attributed to compaction spans
+
+---
+
+## Interpreting snapshot outputs (quick guide)
+### Key derived values
+- “Largest contiguous free run” matters more than “total free bytes” for avoiding slow-path alloc/defrag.
+- A healthy steady state often looks like:
+  - Fragmentation ratio stable or slowly improving
+  - Largest free run not collapsing under burst
+  - Slow-path allocations near zero except at ramp-up
+
+### Red flags
+- Largest free run collapses during bursts and does not recover after compaction
+- Slow-path alloc counter increases monotonically in a steady workload
+- Compaction bytes moved increases while fragmentation ratio stays flat
+- Evictions spike for high-priority tiers or for pinned sequences (should not happen)
+
+---
+
+## What to attach to an investigation ticket
+When opening a runtime investigation (Linear/Jira), attach:
+- 2–3 allocator snapshots (baseline / spike / after)
+- A metrics screenshot showing fragmentation ratio, bytes moved, evictions, and p99 over the same window
+- 5–10 trace IDs around p99 and 5–10 trace IDs around baseline
+- Runtime version + model revision + GPU type
+- Feature flag state and compaction budget settings
+
+Owners to @ for triage:
+- KV cache / allocator: Omar El-Sayed, Samir Qureshi
+- Scheduler integration: Sofia Ivanova, Julian Moore
+- Metrics standardization: Allison Grant
+- SRE escalation / canary guardrails: Sean Gallagher, Rafael Mendes
+
+---
+
+## Appendix: Debug toggles (engineering-only)
+These are common toggles used during controlled canaries and lab testing. Do not change production defaults without the rollout owner and SRE approval.
+
+- `kv_compaction_enabled` (bool)
+- `kv_compaction_background_worker_enabled` (bool)
+- `kv_compaction_trigger_fragmentation_ratio` (float)
+- `kv_compaction_budget_max_ms_per_tick` (int)
+- `kv_compaction_budget_max_bytes_per_tick` (int)
+- `kv_eviction_enabled` (bool)
+- `kv_eviction_policy` (enum: tier_aware_lru, …)
+
+If you suspect compaction is contributing to an incident, use the kill-switch path documented in the runtime compaction runbook (do not attempt ad-hoc changes).

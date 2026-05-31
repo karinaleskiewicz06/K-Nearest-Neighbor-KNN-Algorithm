@@ -1,0 +1,217 @@
+latency-tiered-routing-and-shape-spec
+
+Overview
+
+This design spec defines the Latency-Tiered Routing and Request Shaping (LTRS) system: a policy-driven routing layer that classifies incoming inference requests into latency tiers (instant, interactive, batch) and applies per-tier shaping, model selection, and fallback policies to meet customer SLAs while optimizing cost. LTRS is intended to sit in the request plane immediately upstream of the serving runtime and integrate with Router, Autoscaler, and Billing subsystems.
+
+Goals
+
+- Provide deterministic latency behavior for 90th/95th percentile requests by enforcing per-tenant per-route latency tiers.
+- Enable automated cost/latency trade-offs with measurable unit economics per tier.
+- Support gradual rollout and runtime configuration without service restarts.
+- Maintain compatibility with Dedicated and Private deployments.
+
+Non-goals
+
+- LTRS will not replace lower-level kernel or scheduler optimizations in the serving runtime.
+- LTRS will not attempt to infer semantic equivalence or rerank model outputs (that remains higher-level)
+
+Personas and Stakeholders
+
+- Product Engineers: configure per-route latency tiers and budgets.
+- Platform Engineers: monitor LTRS metrics and tune autoscaling knobs.
+- Customer Success: advise customers on trade-offs and migration.
+- Billing/Finance: compute per-tier unit economics for pricing.
+
+High-level Requirements
+
+Functional requirements (must):
+1. Accept route-level configuration with: latency_tier, max_allowed_queue_ms, preferred_model_list, fallback_models, tenant_capacity_tag.
+2. Classify requests into "instant" (p95 <= 120ms), "interactive" (p95 <= 500ms), "batch" (no strict latency SLO).
+3. Enforce per-tier queueing and admission control to protect latency SLOs.
+4. Route to preferred models when capacity allows; automatically fall back to quantized/cheaper models when constrained.
+5. Emit structured traces and metrics to Console: per-tier latency histogram, queue depth, admission_drop_rate, fallback_rate, per-token-cost.
+
+Non-functional requirements:
+- Support 99.99% availability for routing control-plane changes in Hosted/Dedicated clusters.
+- Configuration changes should propagate within 60s (target 15s) to edge routers.
+- Support 100k RPS across regions with <5ms median routing overhead.
+- All routing decisions must be auditable for compliance: log policy version and decision reason.
+
+Design overview
+
+Components
+- LTRS Control Plane: stores policies, validates schemas, exposes API for product/config UI.
+- LTRS Data Plane (routers): enforces per-request classification, admission, model selection, and emits telemetry.
+- Admission Service: per-tenant token bucket + priority queues + backpressure signal to client SDKs.
+- Fallback Engine: model compatibility matrix and conversion rules (e.g., float32 -> int8 quantized) with estimated quality delta.
+
+Flow (high level)
+1. Request arrives at API gateway with route_id and tenant_id.
+2. Router fetches cached policy (expires ~15s) from LTRS Control Plane.
+3. Request is classified into a latency tier using route policy and request headers (e.g., priority_hint).
+4. Admission Service decides: accept -> forward to model endpoint; queue -> buffered with per-tier max queue time; reject -> return structured 429 with retry-after and 'fallback_suggestion' field.
+5. If accepted but preferred model is saturated, Fallback Engine selects next compatible model and annotates the response with fallback_reason.
+
+Policy model and schema
+
+Example policy YAML (for route-level config):
+
+---
+route_id: chat-completions-v1
+latency_tier: interactive
+max_allowed_queue_ms: 300
+preferred_model_list:
+  - redwood-alpha-2b-fp16
+  - redwood-alpha-4b-q8
+fallback_models:
+  - redwood-alpha-4b-q4\  - redwood-legacy-3b\priority_mapping:
+  low: batch
+  default: interactive
+  high: instant
+autoscale_hint:
+  min_replicas: 2
+  max_replicas: 50
+  target_utilization_pct: 70
+---
+
+Policy fields explained:
+- latency_tier: one of [instant, interactive, batch] and maps to target p95 latency and admission parameters.
+- max_allowed_queue_ms: how long a request may be queued before being rejected.
+- preferred_model_list: ordered list of model variants to try before fallback.
+- fallback_models: models acceptable as degraded-quality alternatives.
+- priority_mapping: maps client-side priority hints to latency tiers.
+- autoscale_hint: non-binding signals for the Autoscaler; policy does not replace autoscaler logic.
+
+Admission and queueing semantics
+
+- Instant tier uses strict admission (tiny token bucket) and no queueing except a micro-buffer for prefetch operations.
+- Interactive tier allows small queues (max_allowed_queue_ms) and organizes requests by estimated compute cost (tokens * model_cost_multiplier).
+- Batch tier permits large queues and background capacity.
+
+Backpressure and graceful degradation
+
+When capacity is constrained:
+- Step 1: Apply admission thresholds; lower-priority requests are rejected with Retry-After header.
+- Step 2: For accepted but unschedulable requests, attempt fallback model in preferred order.
+- Step 3: If no compatible fallback exists, respond with deterministic error and a link to customer guidance.
+
+Fallback decision logging
+
+Every fallback event must log: timestamp, tenant_id, route_id, original_model, selected_model, decision_reason, policy_version. This is required for quality regression triage and billing reconciliation.
+
+Model compatibility and quality budgeting
+
+- Compatibility matrix owned by Applied ML: maps model families to compatibility score and expected quality delta per task class (chat/summary/embedding).
+- LTRS consults matrix to enforce per-request maximum allowed quality delta (configurable per-route as quality_budget_pct).
+
+Telemetry and SLOs
+
+Metrics to emit (per-route, per-tenant, per-region):
+- ltrs.latency.histogram (p50/p95/p99)
+- ltrs.queue_depth.gauge
+- ltrs.admission_drop_rate
+- ltrs.fallback_rate
+- ltrs.estimated_cost_per_request_usd
+
+SLO targets (default):
+- Instant: p95 <= 120ms, fallback_rate <= 1%
+- Interactive: p95 <= 500ms, fallback_rate <= 5%
+- Batch: availability 99.9% (latency not bound)
+
+Operational runbook (summary)
+
+1. Detect: Alert on ltrs.admission_drop_rate > 0.5% sustained for 5 minutes or p95 latency SLO violation.
+2. Diagnose: Check policy version, current replica counts for models in preferred_model_list, and queue depths.
+3. Mitigate: Increase model replicas (scale-up), adjust tier thresholds (widen interactive window), or enable auto-fallback to next model.
+4. Post-incident: Create a regression ticket with fallback logs and sample request IDs for Applied ML review.
+
+Migration and rollout plan
+
+Phase 0 (canary - 2 weeks):
+- Deploy LTRS data plane to staging and one small hosted region.
+- Enable for internal product routes only (no customer traffic).
+- Validate metrics and decision latency.
+
+Phase 1 (limited customer opt-in - 4 weeks):
+- Invite 10 low-risk customers to opt in.
+- Observe per-tenant cost delta and fallback rates.
+
+Phase 2 (gradual ramp - 6 weeks):
+- Enable for 30% of traffic by routing fraction in Router.
+- Monitor SLOs, regressions, and billing attribution.
+
+Phase 3 (full rollout):
+- Default-enable for interactive and batch routes with escape hatch flags.
+
+Rollout safety checks
+
+- Automatic rollback triggers: sustained p95 SLO breach or increase in customer-facing errors by >0.5%.
+- Config gating: policy changes require signed-off validation in staging before production deployment.
+
+Backward compatibility
+
+- If a route has no policy, LTRS defaults to legacy behavior: first-fit model routing with no admission enforcement.
+- Policy versioning: policies are immutable; edits create a new version with a changelog field.
+
+Security and compliance considerations
+
+- All policy modifications are audited; store diff with author and timestamp.
+- Fallback decisions do not send model payloads outside customer region in Private deployments.
+- Sensitive fields (customer_tier tags, quotas) are restricted to owners and platform-admin roles.
+
+Billing and pricing implications
+
+- Each latency tier will map to an internal cost multiplier used for visibility (not necessarily public pricing at launch). Example: instant x1.8, interactive x1.0, batch x0.45.
+- Billing team will provide recommended public pricing bundles in Q4 2026 that reflect per-tier SLO guarantees.
+- For Dedicated customers with reserved capacity, LTRS will prefer capacity-tagged model pools to avoid cross-tenant cost leakage.
+
+Example billing annotation (response header JSON):
+{"estimated_cost_usd":"0.0014","latency_tier":"interactive","policy_version":"v13"}
+
+Open questions (needs product/finance decision)
+
+- Whether to expose latency tiers as first-class billable product (premium SLA for instant).
+- How to present fallback quality deltas to customers and whether to offer credit/refund for measurable regressions.
+- Pricing for Private deployments where model pool cost accounting is opaque.
+
+Testing strategy
+
+- Unit tests for policy validation and admission logic.
+- Load tests that simulate mixed-tier traffic and verify p95 SLOs under stress.
+- Chaos tests that kill model replicas to verify fallback behavior and audit logging.
+
+Release notes (planned for 2026-07-15)
+
+- Feature: Latency-Tiered Routing and Request Shaping (LTRS) initial launch (canary).
+- API: route policy CRUD endpoints: POST /policies, GET /policies/{id}, PATCH /policies/{id}.
+- Metrics: new ltrs.* metrics in Console with dashboard template.
+- SDK: client SDKs return structured 429 with retry-after and fallback_suggestion.
+
+Ownership and contact
+
+- Product owner: Priya Khanna (product).
+- Engineering lead: Ethan Myers (eng-serving-runtime).
+- Applied ML owner (compatibility matrix): Lina Alvarez.
+- On-call rotations: refer to eng-sre/runbooks/ltrs-oncall (planned).
+
+Appendix A: sample validation errors (human-friendly)
+
+- invalid_policy: "preferred_model_list must include at least one model"
+- unsupported_tier: "latency_tier must be one of instant, interactive, batch"
+- quality_budget_violation: "requested fallback would exceed allowed quality_delta for route"
+
+Appendix B: small config table (text)
+
+| Field | Type | Meaning | Default |
+| latency_tier | enum | tier that determines SLOs | interactive |
+| max_allowed_queue_ms | int | max permitted queue time | 300 |
+| preferred_model_list | list | ordered model variants | [] |
+| fallback_models | list | acceptable degraded models | [] |
+| quality_budget_pct | int | max allowed quality delta | 10 |
+
+Feedback / next steps
+
+- Reviewers: please comment on policy schema and billing multipliers by 2026-07-13.
+- Product will schedule cross-functional review with Billing and Applied ML on 2026-07-14.
+

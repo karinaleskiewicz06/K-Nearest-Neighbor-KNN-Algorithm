@@ -1,0 +1,402 @@
+Runbook: Backup/Restore Smoke Test (On-Call) — Redwood Private
+
+## Purpose
+This runbook describes the periodic smoke test SRE performs to ensure Redwood Private backup artifacts are usable and that a restore into a staging environment is repeatable.
+
+This runbook is used for:
+- Weekly (or per-customer requirement) integrity checks of the most recent control-plane backup.
+- Scheduled restore drills into a dedicated staging cluster.
+- Alerting and paging guidance when checks/drills fail.
+
+## Scope
+In scope (smoke test):
+- Validate the **latest control-plane backup** exists, can be decrypted, and passes integrity checks.
+- Perform a **restore drill into staging** using the supported installer workflow.
+- Run post-restore validation (health, API checks, basic tenancy/config verification).
+- Record drill duration and outcomes; trigger paging/escalation per policy.
+
+Out of scope:
+- Full region-loss DR execution (see DR plans).
+- Cluster-level recovery (e.g., etcd rebuild) unless the restore drill indicates cluster corruption.
+- Customer-specific, bespoke workflows not supported by the toolkit.
+
+## Definitions
+- **Backup artifact**: Encrypted tarball + manifest (format per ADR-027). Stored in configured backend (S3/NFS/GCS).
+- **Restore drill**: Restore artifact into a clean staging namespace/cluster and validate readiness.
+- **RPO/RTO (targets)**: See matrix page; this runbook focuses on verifying we can meet targets in supported reference setups.
+
+## Ownership and escalation
+Primary:
+- SRE on-call (this runbook)
+
+Escalate to:
+- Control plane restore/ordering issues: **Ethan Park** (Control Plane Eng), **Benji Okafor**
+- Backup artifact format / migrations: **Michael Nguyen**
+- KMS/encryption failures: **Hanae Suzuki**, **Marcus Lin**
+- Release/bundle signing issues (on-prem/offline tooling): **Connor O'Brien**, **Sahana Iyer**
+- Observability/dashboard gaps: **Allison Grant**, **Sergio Costa**
+
+Slack channels (internal):
+- #eng-oncall (coordination)
+- #eng-sre (triage)
+- #eng-platform (control plane)
+- #eng-security (KMS/crypto)
+- #eng-releases (signing/packaging)
+
+## Preconditions / access
+You will need:
+- Access to staging K8s cluster(s) used for drills (kubeconfig + RBAC).
+- Access to the backup storage backend (read-only is sufficient for integrity checks; restore requires read).
+- KMS permissions (decrypt) for the backup key used by staging.
+- The Redwood Private installer CLI version pinned for staging drills (see “Version alignment”).
+
+Required tooling:
+- kubectl
+- helm
+- installer CLI (examples use `rw-private`)
+- jq
+
+## Cadence
+Recommended default cadence:
+- Integrity check: **daily** (automated) + **weekly** (manual spot-check by SRE)
+- Restore drill: **weekly** for Redwood-managed staging; **monthly** for release branches or when requested by enterprise accounts
+
+If a staging restore drill is currently automated, use this runbook for manual execution and for triage when automation fails.
+
+## Version alignment (critical)
+Restore drills must use:
+- The same or explicitly compatible **backup format version** supported by the installer.
+- A staging deployment version that is within the supported compatibility window.
+
+Policy:
+- If the installer reports “incompatible backup version”, do **not** attempt ad-hoc patching. File an escalation ticket and block the drill as “tooling regression”.
+
+---
+
+# Procedure A — Validate latest backup integrity
+
+## A1. Identify the latest backup artifact
+1) Determine the environment and backup backend for staging drills.
+   - Common: S3 bucket + prefix (e.g., `s3://rw-private-backups-staging/control-plane/`)
+
+2) List the most recent backup and capture:
+- Backup ID (timestamp or UUID)
+- Manifest path
+- Artifact blob path
+
+Example (S3):
+- `aws s3 ls s3://rw-private-backups-staging/control-plane/ --recursive | tail -50`
+
+## A2. Validate manifest structure and checksums
+The manifest should include at minimum:
+- backup_id
+- created_at
+- platform_version
+- backup_format_version
+- components included
+- encryption metadata (provider, key reference)
+- checksums for artifact(s)
+
+Example:
+- Download manifest locally:
+  - `aws s3 cp s3://.../backup-<ID>.manifest.json ./`
+- Validate fields:
+  - `jq -e '.backup_id and .backup_format_version and .checksums and .encryption' backup-<ID>.manifest.json`
+
+Checksum verification:
+- Download encrypted artifact locally (or stream):
+  - `aws s3 cp s3://.../backup-<ID>.enc.tar ./`
+- Verify checksum matches manifest:
+  - `sha256sum backup-<ID>.enc.tar`
+  - Compare to `.checksums["backup-<ID>.enc.tar"].sha256` (field name may vary by version)
+
+Pass criteria:
+- Manifest parses.
+- All required fields present.
+- Artifact sha256 matches.
+
+Fail criteria:
+- Missing manifest, invalid JSON, mismatched checksums, or missing encryption metadata.
+
+## A3. Validate decryptability (KMS / envelope encryption)
+Goal: ensure we can decrypt with the configured KMS key and that the decrypted stream is structurally sound.
+
+Run a non-destructive decrypt test using the installer CLI (preferred) because it validates expected headers/format.
+
+Example:
+- `rw-private backup verify --manifest ./backup-<ID>.manifest.json --artifact ./backup-<ID>.enc.tar --output ./verify-report.json`
+
+If verify supports a “decrypt-only” mode:
+- `rw-private backup verify --manifest ... --artifact ... --mode decrypt-only`
+
+Pass criteria:
+- Verify exits 0 and report indicates “decrypt_ok=true” and “checks_ok=true”.
+
+Common failure modes:
+- KMS AccessDenied / missing grants
+- Wrong region/key ARN
+- KMS throttling/outage (retry logic may mask; inspect report)
+- Clock skew causing token expiry (if using short-lived credentials)
+
+## A4. Confirm backup recency and retention
+Check:
+- Last backup timestamp <= expected interval (e.g., 24h).
+- Retention policy is respected (no unexpected deletion).
+
+Recommended thresholds:
+- STAGING: last_success_age > 48h => investigate (non-page)
+- PROD: last_success_age > 24h or 2 consecutive failures => page per policy below
+
+Record:
+- Backup ID
+- created_at
+- verify-report.json (attach to ticket if failures)
+
+---
+
+# Procedure B — Run a restore drill in staging
+
+## B0. Safety and environment selection
+Only run restore drills in:
+- Dedicated staging cluster, or
+- Dedicated staging namespace with clear isolation and an approved restore workflow.
+
+Do NOT run restores in production.
+
+Before starting:
+- Announce in #eng-oncall: “Starting Private restore drill in staging, ETA 60–90 min.”
+- Confirm no conflicting maintenance windows.
+
+## B1. Prepare a clean target
+Choose one:
+
+Option 1 (preferred): clean staging cluster
+- Provision a fresh cluster using the standard staging Terraform/cluster template.
+
+Option 2: clean namespace in shared staging cluster
+- Create namespace:
+  - `kubectl create ns rw-restore-drill-<YYYYMMDD>`
+- Ensure required CRDs are installed cluster-wide (common failure: missing CRDs).
+
+Pre-flight checks:
+- `kubectl get nodes`
+- `kubectl -n <ns> get pods`
+- Confirm storage class, ingress controller, cert-manager (if required by staging profile).
+
+## B2. Ensure the correct installer and charts
+- Identify the expected platform version from the backup manifest:
+  - `jq -r '.platform_version' backup-<ID>.manifest.json`
+- Use the matching/compatible installer build.
+
+If staging uses a Helm-based install:
+- Ensure chart version matches the installer expectations.
+
+## B3. Run restore apply
+Preferred flow uses the installer restore workflow which enforces ordering and produces a validation report.
+
+Example (conceptual):
+- `rw-private restore apply \
+    --manifest s3://rw-private-backups-staging/control-plane/backup-<ID>.manifest.json \
+    --artifact s3://rw-private-backups-staging/control-plane/backup-<ID>.enc.tar \
+    --kube-context <staging-context> \
+    --namespace rw-restore-drill-<YYYYMMDD> \
+    --wait \
+    --report-out ./restore-report-<YYYYMMDD>.json`
+
+If artifacts must be imported locally (restricted egress/air-gapped-like staging):
+- `rw-private backup export --manifest s3://... --artifact s3://... --out ./bundle/`
+- `rw-private restore apply --manifest ./bundle/... --artifact ./bundle/... ...`
+
+Pass criteria:
+- Restore exits 0.
+- Report indicates:
+  - preflight_ok=true
+  - restore_steps_ok=true
+  - postchecks_ok=true
+
+Hard stop criteria (abort restore and escalate):
+- Incompatible backup format version
+- Repeated missing CRDs/ordering failures that indicate a broken release artifact
+- KMS decrypt failures (unless confirmed transient and retriable)
+
+## B4. Post-restore validation (smoke)
+Run the following checks (minimum set):
+
+1) Core pods healthy
+- `kubectl -n <ns> get pods`
+- No CrashLoopBackOff; no pending pods due to PVC issues.
+
+2) Control plane API health
+- If an internal health endpoint exists, hit it via port-forward:
+  - `kubectl -n <ns> port-forward svc/rw-control-plane 8080:80`
+  - `curl -fsS http://127.0.0.1:8080/healthz`
+
+3) Backup status endpoint surfaces last-success (if enabled)
+- Verify endpoint responds and shows a plausible last_success timestamp.
+
+4) Configuration restore sanity
+Validate that a known staging tenant/config object is present (use the standard staging test tenant if configured):
+- Routing policy exists
+- Model pins/versions restored (if part of control plane state)
+- Secrets are NOT expected to be restored as raw material if policy is “references only” (confirm expected behavior)
+
+5) Basic functional smoke
+- Run the standard “Private smoke test” job if available.
+- At minimum: create a no-op request to a staging inference endpoint if wiring exists (this can be a stub depending on staging topology).
+
+Record:
+- Duration from restore start to “all checks green”
+- Any manual interventions required
+
+## B5. Cleanup
+If using a temporary namespace:
+- Save reports to the runbook folder / attach to ticket.
+- Delete namespace:
+  - `kubectl delete ns rw-restore-drill-<YYYYMMDD>`
+
+If using a dedicated cluster:
+- Decide whether to keep it for additional validation or tear down per cost policy.
+
+---
+
+# Alerting and paging policy
+
+## Signals (expected)
+Dashboards/alerts should be based on structured metrics emitted by backup/restore tooling, including:
+- backup_job_success (0/1)
+- backup_job_duration_seconds
+- backup_bytes_written
+- backup_last_success_timestamp
+- restore_drill_success (0/1)
+- restore_drill_duration_seconds
+- failure_reason (enum/tag)
+
+## Paging thresholds
+Production (customer-impact risk):
+- Page SRE on-call when:
+  1) **Two consecutive scheduled backups fail** for any production Private deployment we operate, OR
+  2) **backup_last_success_age > 24h**, OR
+  3) Integrity verification fails (checksum mismatch or decrypt failure)
+
+Staging (quality signal, usually non-customer-impact):
+- Create a ticket and notify #eng-sre when:
+  - restore drill fails once
+- Page only when:
+  - restore drill fails **2 weeks in a row**, OR
+  - failure indicates a release regression likely to affect customers (e.g., incompatible backup version, systematic CRD ordering bug)
+
+Silencing / maintenance windows:
+- If backups are intentionally paused, silence alerts with an expiration and a linked change record.
+
+## What to include in the alert/ticket
+- Environment (prod/staging), cluster identifier, region
+- Backup ID, manifest path, artifact path
+- Installer version and chart version used
+- verify-report.json and/or restore-report.json
+- Top 50 lines of relevant logs (KMS errors, RBAC denies, missing resource types)
+
+---
+
+# Triage guide (when something fails)
+
+## Category 1: Storage backend access (S3/NFS/GCS)
+Symptoms:
+- 403/AccessDenied, timeouts, partial downloads
+
+Actions:
+- Confirm credentials/role assumption
+- Validate bucket policy / NFS export permissions
+- Check for object lock/retention preventing expected rotation
+- Re-run download with increased timeout and log verbosity
+
+Escalate:
+- Infra/SRE if backend is Redwood-managed
+- Customer/Solutions if customer-managed and we need confirmation of IAM/policies
+
+## Category 2: KMS / envelope encryption
+Symptoms:
+- Decrypt fails, “invalid ciphertext”, KMS throttling, key disabled
+
+Actions:
+- Confirm key ARN/alias matches manifest
+- Confirm KMS policy grants decrypt to the restore identity
+- Check for recent key rotation changes
+
+Escalate:
+- #eng-security, Hanae Suzuki / Marcus Lin
+
+## Category 3: Kubernetes RBAC / missing permissions
+Symptoms:
+- Restore job can’t create resources; “forbidden” errors
+
+Actions:
+- Confirm service account and clusterrole bindings
+- Compare RBAC to known-good Helm values
+- If this is from the backup CronJob, check service account permissions for listing CRDs and reading necessary resources
+
+Escalate:
+- Helm chart owners / platform team
+
+## Category 4: Missing CRDs / ordering bugs
+Symptoms:
+- Errors creating custom resources because CRDs not installed yet
+
+Actions:
+- Verify CRDs present cluster-wide:
+  - `kubectl get crds | grep -i redwood`
+- Ensure restore workflow applies CRDs before CRs
+
+Escalate:
+- Control plane engineering (restore ordering)
+
+## Category 5: Compatibility / migrations
+Symptoms:
+- “Unsupported backup_format_version”
+- Schema/migration failures
+
+Actions:
+- Stop and capture full report
+- Confirm installer version
+
+Escalate:
+- Michael Nguyen (migrations), Ethan Park
+
+---
+
+# Reporting (after each drill)
+Post in #eng-oncall (or the automated thread) with:
+- Date/time
+- Backup ID
+- Result (PASS/FAIL)
+- Restore duration
+- Any manual steps required
+- Link to ticket if FAIL
+
+Suggested template:
+- “Private restore drill YYYY-MM-DD: PASS. Backup ID: <ID>. Duration: <X> min. Notes: <none/summary>.”
+
+If FAIL, include:
+- Failure category and first failing step
+- Report artifacts location
+- Whether paging occurred
+
+---
+
+# Appendix A — Expected contents of validation reports
+Minimum fields SRE expects in verify/restore reports:
+- tool_version
+- platform_version
+- backup_format_version
+- artifact_checksum_ok
+- decrypt_ok
+- preflight_checks: pass/fail summary
+- restore_steps: per-step status
+- post_restore_checks: pass/fail summary
+- timestamps: start/end
+- failure_reason + actionable message
+
+# Appendix B — When to use etcd snapshot restore instead
+If the staging restore drill fails due to cluster corruption (API server errors, etcd unavailable) and you are explicitly testing cluster-level recovery, follow:
+- confluence://eng-infra/runbooks/restore-k8s-cluster-from-etcd-snapshot
+
+For normal Private DR readiness, prefer application-level restore drills (this runbook) over etcd restore.

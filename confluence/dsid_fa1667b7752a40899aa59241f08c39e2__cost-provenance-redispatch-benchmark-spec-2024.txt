@@ -1,0 +1,132 @@
+cost-provenance-and-redispatch-benchmark-spec-2024
+
+Overview:
+
+This document defines a benchmark specification and playbook for measuring cost provenance and redispatch overhead across the Redwood serving runtime. The goal is to produce reproducible, SLO-driven measurements that connect observed token-level cost and latency back to routing/redispatch decisions, kernel scheduling characteristics, and model-variant selection. Results are used to validate cost-accounting telemetry, guide scheduler tuning, and certify fallback/redispatch policies before rollout.
+
+Audience:
+- Runtime engineers (kernel/scheduler)
+- Performance/benchmarking team
+- SRE and capacity planning
+- Product owners for routing and pricing
+
+Goals and success criteria:
+- Accurate attribution: >=95% of per-request cost is attributed to a provenance chain (routing -> model-variant -> kernel profile -> quantization profile).
+- Redispatch overhead measurement: measure median and 95th percentile end-to-end latency and token-cost delta introduced by redispatch within the runtime.
+- Sensitivity matrix: quantify how scheduler preemption, slot admission, and KV-cache eviction influence cost per token and end-user latency across three canonical workloads (chat, completions, and embeddings).
+- Benchmarks are automatable and checkpointed for regression detection in CI.
+
+Scope:
+- In-scope: Hosted and Dedicated runtime modes; synthetic and shadowed production traffic; benchmarking against model variants including full FP16, int8, and mixed-quantized kernels; network redispatch and region failover routes.
+- Out-of-scope: Private (air-gapped) installations unless explicitly requested by a customer experiment.
+
+Terminology (short):
+- Cost provenance: end-to-end mapping from a user request to chargeable units and underlying kernel resource usage that produced them.
+- Redispatch: runtime action that reroutes a request mid-flight or before execution (e.g., fallback model variant, different GPU pool, region).
+- Kernel profile: measured execution characteristics (per-token FLOPs, memory bandwidth, kernel latency distribution) for a specific model+quantization combo.
+- Attribution trace: structured telemetry event that links request id -> routing decisions -> kernel ids -> cost bucket.
+
+Benchmark suite overview:
+- Suite name: cp-redispatch-v1
+- Scenarios:
+  - Steady-state chat load (95% short-turn tokens, 5% long-turn outliers)
+  - Burst completion load (many short requests with high concurrency)
+  - Embedding throughput (large batch sizes, variable tokenization overhead)
+  - Redispatch storm (induced capacity shortfall triggering model and region fallbacks)
+
+Per-scenario tests (summary):
+1) Steady-state chat + shadow-redispatch
+  - Purpose: measure cost drift when prefix caching hits are present and occasional redispatches occur due to model rollouts.
+  - Synthetic payloads: 5k unique prompt templates, mean tokens per request=120, entropy skew to create KV-cache hit ratio ~40%.
+
+2) Burst completion + preemption interference
+  - Purpose: measure scheduling preemption latency and cost increase when high-priority bursts preempt long-running batches.
+  - Synthetic payloads: 200 concurrent long completions (mean tokens=800) with interleaved 2k short requests.
+
+3) Embedding throughput tuning
+  - Purpose: validate batching kernel throughput and tokenization cost attribution, especially when redispatch moves batches between GPU types.
+  - Synthetic payloads: 1M short texts (2–32 tokens) streamed in adjustable batch sizes.
+
+4) Redispatch storm
+  - Purpose: stress routing and fallback logic, measure end-to-end overhead and cost provenance fidelity under frequent redispatches and partial KV-cache invalidation.
+  - Synthetic payloads: ramping concurrency to 3x steady-state, force a configured region capacity-limit at 70% to trigger tiered fallback.
+
+Harness, config, and reproducibility
+- Run harness: use benchmark-orchestrator (internal) with the following flags and experiment manifest pattern. All experiments must be run from the ci/benchmarks pipeline with the cp-redispatch-v1 manifest.
+
+Sample manifest table (plain text):
+| field | example | description |
+|------|---------|-------------|
+| experiment_id | cp-redispatch-chat-20241201 | unique id for run |
+| model_variants | redwood-v2-7b-fp16, redwood-v2-7b-int8 | comma-separated target variants |
+| routing_policy | latency-first, cost-first, tiered-fallback | policy under test |
+| concurrency_profile | steady|burst|burst then decay | shorthand profile |
+| kv_cache_seed | 0.4 | target cache hit fraction |
+| simulated_region_limits | eu-west-1:70% | force capacity to trigger fallback |
+
+CLI example (synth harness):
+- ./bench-runner --manifest manifests/cp-redispatch-chat-2024.yaml --out-dir /tmp/cp-run --tags cp-redispatch,canary
+
+Telemetry and cost provenance traces
+- Required trace fields (JSON event, exported to telemetry pipeline):
+  - request_id (string)
+  - experiment_id (string)
+  - route_decision_chain (list of route ids)
+  - model_variant_id (string)
+  - kernel_profile_id (string)
+  - quantization_profile (string)
+  - redispatch_events (list of {timestamp, from_route, to_route, reason})
+  - kvcache_hit (bool)
+  - tokens_generated (int)
+  - effective_charge_units (float)
+  - start_ts, end_ts (ISO8601)
+  - per-token_latency_ms_distribution (summary)
+  - tenant_id (string)
+  - cpu_ns / gpu_ns attribution buckets (floats)
+
+Note: telemetry export must include consistent sampling keys so bench analysis can correlate kernel telemetry with request-level traces. Use trace_key = sha256(request_id + experiment_id).
+
+Metrics and SLOs (primary):
+| metric | target | acceptance criteria |
+|-------|--------:|---------------------|
+| provenance_coverage (%) | >=95 | percent of requests with a complete attribution chain |
+| redispatch_latency_add_ms (median) | <=12 ms | median added latency when a redispatch occurs |
+| redispatch_latency_add_ms (p95) | <=120 ms | 95th percentile added latency |
+| per_token_cost_variation (%) | <=7 | delta in cost-per-token between baseline and redispatched path |
+| kernel_preemption_overhead (p95 ms) | <=80 | p95 preemption-induced latency observed in kernel traces |
+
+Data collection and analysis steps (numbered):
+1) Provision benchmark cluster matching the target mode (hosted or dedicated) and attach synthetic traffic generator.
+2) Seed KV-cache and warm models as described in manifest.
+3) Run baseline (no redispatch) for 30 minutes and collect telemetry.
+4) Run redispatch-enabled policy for same profile for 30 minutes. Ensure experiment ids are distinct.
+5) Export raw traces to analysis bucket and run the cp-analysis notebook to synthesize provenance coverage and redispatch overhead reports.
+6) Compare baseline vs redispatch runs to produce a delta report with breakdowns by tenant, model_variant, and kernel_profile.
+
+Failure modes and investigation checklist:
+- Low provenance coverage (<95%): verify telemetry pipeline sampling keys, check agent instrumentation versions on runtimes, and ensure kernel_profile_id is surfaced.
+- High redispatch p95: check region queue depths, syscall wait spikes, and kernel preemption counters. Run kernel trace diff (see Appendix).
+- Unexpected cost delta: inspect quantization mismatch, model-variant selection mismatch, and hidden reheating (model cold starts).
+
+Runbook / escalation (short):
+- On detection of >10% regression in per_token_cost_variation across a release gate:
+  1) Open incident in Jira with label bench/cp-redispatch.
+  2) Attach raw run manifest and analysis output.
+  3) Page runtime-oncall and scheduling owners.
+  4) If regression correlates with kernel change, execute canary rollback and re-run the experiment.
+
+Rollout safety checklist for routing changes that enable redispatch by default:
+- Have validated cp-redispatch-v1 experiments for both hosted and dedicated modes.
+- SLO fast-fail gates: provenance_coverage >=95% and redispatch p95 <= defined threshold.
+- Observability hooks: live dashboards for route_decision_count, redispatch_rate, and per-tenant cost-delta.
+- Canary window: 48 hours with shadowing enabled and 5% traffic pilot.
+
+Ownership and contacts:
+- Benchmark owner: Marisol Vega (benchmarking@redwood.com)
+- Runtime scheduling: Ethan Cole (scheduling@redwood.com)
+- Telemetry and cost accounting: Priya Natarajan (telemetry@redwood.com)
+
+Appendix A — Example telemetry snippet (JSON):
+{"request_id":"r-12345","experiment_id":"cp-redispatch-chat-20241201","route_decision_chain":["route-a","route-b"],"model_variant_id":"redwood-v2-7b-int8","kernel_profile_id":"kp-int8-v2-7b-cuda-1","quantization_profile":"int8-qs0","redispatch_events":[{"timestamp":"2024-12-01T12:02:03.456Z","from_route":"route-a","to_route":"route-b","reason":"capacity-fallback"}],"kvcache_hit":false,"tokens_generated":142,"effective_charge_units":0.0042,"start_ts":"2024-12-01T12:02:03.100Z","end_ts":"2024-12-01T12:02:05.200Z","per_token_latency_ms_distribution":{"p50":6.2,"p95":28.3},"tenant_id":"t-acme","cpu_ns":12000000,"gpu_ns":44000000}
+
+(Note: the actual file above contains the full doc body; the analysis tooling expects the doc content in the 'content' field.)

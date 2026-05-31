@@ -1,0 +1,136 @@
+ADR: KV-prefetching and consistency model for inference runtime cache
+
+Summary:
+
+This ADR defines the chosen consistency model and prefetching strategy for Redwood's inference KV cache ("kv-cache") used by the serving runtime. The goal is to maximize token-level throughput and reduce per-request latency and cost while preserving safety and correctness of cached key-value (KV) data across multi-replica, multi-region deployments and during rolling upgrades.
+
+Context and problem statement:
+
+- The inference runtime (service: inference-runtime) uses an LLM KV cache to store prefix key/value shards for repeated conversational state and to accelerate autoregressive decoding across requests.
+- Increased cache effectiveness directly reduces GPU computation and token cost; however, incorrect or stale KV state can produce incorrect outputs or privacy violations.
+- We must support:
+  - multi-replica read-scaling (stateless frontends with shared cache layer),
+  - private deployments where local on-node caches are allowed, and
+  - migrations between cache formats (v1 float32 -> v2 quantized / sharded).
+
+Requirements and constraints:
+
+- Safety: never serve cached KV that would cause user-visible corruption (high confidence requirement).
+- Availability: degrade gracefully — if cache is unavailable, fall back to compute path within 150ms median additional latency budget.
+- Performance: aim for 20–35% median per-token cost reduction for typical chat workloads via cache hits.
+- Ops: support on-demand invalidation by request-id / customer-id and targeted eviction for rollouts.
+- Compatibility: allow hybrid topologies: centralized Redis/Plasma cluster in Hosted, local on-node persistent cache in Private.
+
+Decision:
+
+We adopt a hybrid eventual-strong consistency model with conservative prefetching and explicit versioning tokens in the cache key. Key aspects: 
+
+1) Versioned keys and schema evolution
+- Each cached KV shard key includes a schema-version and model-build-id: "kv:<model-id>:<schema-v>:<shard-id>:<prefix-hash>".
+- The runtime refuses to use a cached shard whose schema-version does not exactly match the model-build-id pinned by the request. This ensures incompatible binary formats are never used.
+
+2) Write-through + asynchronous replication for Hosted control plane
+- Primary writer (cache-writer) performs write-through writes to persistent cache (Redis or Plasma) synchronously on first write for a prefix.
+- Replication to regional read-clusters is asynchronous but tagged with a monotonic commit-seq. A read must verify commit-seq >= acceptable-lag for safety-critical customers (configurable per-customer).
+
+3) Conservative prefetching policy
+- Prefetch is enabled only when:
+  - request history length > 8 tokens AND
+  - measured model ram/latency benefit predicted > 5% for next N tokens (N configurable, default 64).
+- Prefetching happens at block boundaries (every 64 tokens) and is throttled by a global prefetch budget to avoid thrashing.
+
+4) Strong local validation on use
+- Prior to using a cached shard, the runtime validates: schema/version match, checksum (SHA256) of shard metadata, and an access-control tag (customer-id match). If any validation fails, shard is rejected and recomputed.
+
+Alternatives considered:
+
+A) Strong consistency (synchronous replication on all writes): rejected because write latency increases ~30–250ms in multi-region and degrades tail latency under sustained write-heavy workloads.
+
+B) Unversioned, best-effort caching: rejected due to unacceptable migration risk and potential for silent format mismatches during upgrades.
+
+C) Aggressive speculative prefetching (every request): rejected due to increased read amplification and potential bursty load on cache clusters leading to higher cost and instability.
+
+Operational implications and SLOs:
+
+- SLOs and thresholds:
+  - Cache correctness SLO: 100% of successful cache uses must pass validation checks. Non-validation should lead to recompute; incidents where invalid cache served = P0.
+  - Cache-availability SLO: cache read availability 99.9% per region for Hosted customers.
+  - Fallback latency SLO: when cache is rejected/unavailable, additional compute latency must be < 150ms (p50) and < 400ms (p95).
+
+- Alerts (examples):
+  - cache-validation-failure-rate > 0.1% over 5m -> paging on-call inference-runtime-owner.
+  - prefetch-throttle-saturation > 90% for > 10m -> runbook: reduce prefetch budget or scale cache shard readers.
+  - replication-lag > configured threshold for > 1m -> page infra-sre.
+
+Runbook excerpts (quick triage):
+
+1) Symptom: cache-validations spiking.
+   - Check recent deploys: did schema-version change? -> roll back or trigger cache migration job.
+   - Run: curl -s "https://ops-api/cache/validation-stats?region=us-west" | jq
+   - If validations are > 1%: set prefetch-budget=0 and enable compute-only mode for affected model id.
+
+2) Symptom: prefetch budget saturated -> increased Redis IO.
+   - Identify hot prefixes: ops CLI: rwinsh --prefix-hotlist --model <model-id>
+   - Temporarily disable prefetch globally: infra-cli set-config inference.prefetch.enabled false
+
+Migration and rollout plan (for schema changes):
+
+1) Deploy code that writes new schema-version but continues to read old schema if requested (dual-write mode).
+2) Backfill hot prefixes using backfill-worker with rate limits (default 10 MB/s per region).
+3) Monitor cache-validation-failure metric to ensure < 0.01% during backfill.
+4) Flip runtime to prefer new schema, keep fallback-to-old for 24h.
+5) After 72h of stability, deprecate old-schema reads and run a global eviction job.
+
+Example configs (YAML):
+
+inference.cache:
+  prefetch:
+    enabled: true
+    block_size: 64
+    prefetch_threshold_tokens: 8
+    global_budget_qps: 250
+  validation:
+    require_checksum: true
+    schema_strict_match: true
+  migration:
+    dual_write_enabled: true
+    backfill_rate_mb_s: 10
+
+Ownership and responsibilities:
+
+- inference-runtime team: implement runtime validation, prefetch control hooks, and fallback.
+- infra-sre: maintain Redis/Plasma clusters, configure replication monitoring and capacity planning.
+- eng-serving-runtime: maintain backfill-worker and release migration tooling.
+- security: review access-control tags and ensure KMS keys used for checksums are rotated per policy.
+
+Telemetry and dashboards to ship:
+
+- cache_hit_rate by model-id and prefix-hash (rolling 1h / 24h)
+- cache_validation_failure_rate (p50/p95) by region
+- prefetch_budget_utilization per-cluster
+- replication_lag histogram per-region
+
+Open questions and future work:
+
+- Explore per-customer configurable consistency windows for enterprise customers that require stronger guarantees.
+- Investigate opportunistic hardware-local caching on GPU nodes for private deployments (tradeoffs: memory pressure vs latency).
+- Research predictive prefetching using short-horizon next-token models to reduce wasted reads.
+
+References and links:
+
+- RFC: kv-cache-design-2024 (internal link)
+- Runbook: caching-incident-playbook
+- Tooling: backfill-worker README and infra-cli docs
+
+Appendix: sample health-check CLI commands
+
+- Check validation stats:
+  curl -H "Authorization: Bearer $OPS_TOKEN" https://ops-api/cache/validation-stats | jq
+- Evict model cache:
+  ops-cli cache evict --model-id redwood-chat-2 --schema-v 2
+
+Revision history:
+
+- 2025-04-15: ADR created (Priya Narang).
+- 2025-06-03: Added prefetch budget and global throttling recommendations (reviewer: Daniel Kwon).
+- 2025-09-22: Clarified migration dual-write steps and added exact SLO numbers (Alicia Gomez).

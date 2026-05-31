@@ -1,0 +1,158 @@
+SLO Sensitivity & Capacity Sentinel Playbook
+
+Overview
+========
+
+This playbook defines the SLO Sensitivity and Capacity Sentinel pattern used by Redwood to proactively detect SLO regressions that are driven by capacity, workload composition, or sudden sensitivity of model-serving paths (e.g., quantized vs full-precision kernels, KV cache miss storms). The Capacity Sentinel is a lightweight, autoscaling-aware decision agent that correlates SLO signal changes with capacity/serving state and triggers controlled mitigations.
+
+Motivation
+----------
+- Model-serving SLOs (latency, availability, token-completion quality) can degrade for reasons that are operational (capacity, scheduling, OOMs) or model-related (regression after model rollout). Distinguishing cause quickly reduces mean time to mitigation and avoids unnecessary rollbacks.
+- Automated, conservative mitigations (prefix throttles, model variant fallback, burst capacity lift) restore surface-level SLOs while preserving investigation time.
+
+Scope
+-----
+Applies to all inference clusters backing the Redwood Hosted API and Dedicated pools. Exclusions: on-prem private deployments where customer policy prohibits autoscaling; those deployments must use the sentinel as guidance only.
+
+Ownership
+---------
+- SLO Owner: eng-sre (primary action owner)
+- Runtime/Serving Owner: eng-serving-runtime (responsible for model variant toggles and kernel fallbacks)
+- Observability/Tooling Owner: eng-platform (dashboards, alerting rules)
+- Oncall: model-serving-oncall (first responder for sentinel escalations)
+
+High-level workflow
+-------------------
+1. Telemetry agents produce SLO windows (5m, 1h) for latency p50/p95/p99, tail token latency, correctness regressions (quality evals).
+2. Capacity Sentinel correlates SLO windows with: GPU utilization, pending queue depth, autoscaler decisions, KV cache miss rate, and recent model rollout tags.
+3. If correlation crosses a configured sensitivity threshold, Sentinel runs a mitigation policy (graded, reversible).
+4. Sentinel creates an incident with diagnostic evidence and a hypothesis tag (capacity|model|infra).
+5. Oncall follows the runbook; if hypothesis is model-related, serving runtime triggers canary rollback. If capacity-related, follow capacity remediation steps.
+
+Signals and thresholds
+----------------------
+Primary signals (examples):
+- latency_p95_ms (5m): > 1200 ms -> signal high
+- latency_p99_ms (5m): > 1800 ms -> signal critical
+- request_error_rate (5m): > 0.5% absolute increase and > 0.2% baseline -> signal medium
+- gpu_utilization (cluster, 1m): > 85% for 5m -> capacity-pressure
+- queue_depth (per-pool, 1m): > 200 requests -> capacity-pressure
+- kv_cache_miss_rate (rolling 10m): > 30% and increasing -> cache-eviction storm
+- recent_deploy_tag (metadata): rollout_fraction > 10% in last 15m -> suspect-deploy
+
+Sensitivity correlation heuristic (implemented by Sentinel):
+- If (latency_p95 degrade) && (gpu_utilization > 80% OR queue_depth > threshold) -> probable capacity
+- If (latency degrade) && (recent_deploy_tag present) && (gpu_utilization < 60%) -> probable model regression
+- If (kv_cache_miss_rate spike) && (latency tail increase) -> cache storm -> partial mitigation: prefetched-prefix warming
+
+Mitigation tiers (automated, safe-by-default)
+--------------------------------------------
+1) Tier 1 — Soft throttle and cache warm: prefix-based admission control (new requests throttled to 70% of usual), prewarm KV cache for high-volume keys. No model changes.
+2) Tier 2 — Autoscaler soft-lift: temporarily increase desired capacity by up to 20% for the pool with a 15-minute cool-down. If cloud spend budget disallows, fall back to tier 1.
+3) Tier 3 — Model variant fallback: route 30% of traffic to a lower-latency/quantized variant with validated quality guardrails. Triggered only when correlation indicates model-serving path sensitivity and after operator approval when possible.
+4) Tier 4 — Canary rollback: automatic only if rollback-safe flag is set on the rollout. Otherwise create incident and require manual rollback.
+
+Runbook: immediate steps for oncall (first 30 minutes)
+----------------------------------------------------
+1. Acknowledge Sentinel incident and check hypothesis tag. Collect the following evidence links and paste into incident:
+   - Grafana dashboard: "SLO Sentinels / {pool}" (link)
+   - Prometheus query snapshots (see samples below)
+   - Last 30m of autoscaler events: /internal/autoscaler/events/{pool}
+2. Verify scope: is degradation localized to single pool / region / model?
+   - Use query: sum by (pool_id) (increase(requests_failed_total[10m]))
+3. Correlate with capacity metrics: GPU utilization, pending queue, OOM events.
+4. If hypothesis == capacity AND gpu_utilization > 85%: execute Tier 2. Run: 
+   - CLI (internal): rwdctl capacity bump --pool {pool_id} --pct 20 --duration 15m --owner "oncall"
+5. If hypothesis == cache_storm: execute Tier 1 and initiate cache prewarm: 
+   - Sample prewarm script (described): call /internal/kvcache/prewarm with top-keys list from Telemetry.
+6. If hypothesis == model_regression AND rollback-safe: execute Tier 4 rollback: 
+   - rwdctl rollout rollback --model {model_id} --to-version {previous_version} --reason "SLOSentinelAutoRollback"
+7. If mitigation restored SLO window within 15 minutes, mark incident as mitigated and start investigation ticket for root cause. If not restored after Tier 3, escalate to eng-serving-runtime and oncall lead.
+
+Prometheus/Grafana examples
+---------------------------
+Prometheus sample alerts (text):
+- AlertRule: SLO_Sentinel_Latency_P95_High
+  Expr: histogram_quantile(0.95, sum(rate(request_duration_seconds_bucket[5m])) by (le, service)) * 1000 > 1200
+  For: 5m
+  Labels: severity=page, hypothesis=latency
+
+- AlertRule: SLO_Sentinel_GPU_Overload
+  Expr: avg by (pool) (gpu_utilization_percent) > 85
+  For: 5m
+  Labels: severity=page, hypothesis=capacity
+
+Note: alerts must contain hypothesis label and pool_id for the sentinel to attach evidence automatically.
+
+Capacity Sentinel configuration (YAML example)
+-------------------------------------------
+# sentinel-config.yaml (simplified)
+sentinel_name: slo-sensitivity-1
+signal_windows: ["5m","1h"]
+correlation_rules:
+  - name: capacity_pressure
+    conditions: ["latency_p95 > 1200","gpu_utilization > 80"]
+    mitigation: tier2
+  - name: cache_storm
+    conditions: ["kv_cache_miss_rate > 30","latency_p99 > 1800"]
+    mitigation: tier1
+mitigations:
+  tier1: { action: "throttle_prefix:70", reversible: true }
+  tier2: { action: "autoscale_bump:20", reversible: true }
+  tier3: { action: "route_variant:quantized-30pct", reversible: true }
+  tier4: { action: "rollback_canary", reversible: false }
+
+Investigation checklist (post-mitigation)
+-----------------------------------------
+- Collect and preserve telemetry windows (export to incident evidence store).
+- Validate whether a model rollout was correlated (tagged deploys in last 30m).
+- If capacity: evaluate whether autoscaler policy needs adjustment (scale sensitivity or upper/lower bounds).
+- If model: run quick-run of evaluation harness against saved prompt-sets to detect quality regressions.
+- Create follow-up Jira ticket with: root_cause_hypothesis, mitigation_taken, time_to_mitigate, suggested action (tuning/infra/model).
+
+SLO & error budget guidance (practical notes)
+-------------------------------------------
+- Prefer SLO windows that align with user experience: for generation endpoints use p95 token-latency and completion success rate. For embeddings use 99th percentile tail latency.
+- Track both absolute SLO breaches and rate-of-change (delta) to detect sudden sensitivity. A 30% relative jump in p95 over 10 minutes is considered a high-sensitivity event.
+- Maintain a 24/7 error budget reserve for emergency autoscale lifts; this is consumed before billing exceptions and must be reconciled weekly.
+
+Operational tooling integration checklist
+--------------------------------------
+- Ensure alerts include hypothesis labels and pool_id.
+- Dashboards: create per-pool SLO Sentinels panel set and an executive SLO-sensitivity heatmap.
+- Incident automation: sentinel should attach snapshot links and issue templates automatically.
+- Simulation: use the stress harness in eng-serving-runtime to rehearse sentinel triggers quarterly.
+
+Fallout and rollback policy
+--------------------------
+- All automated mitigations are tagged with a reversible flag. Tier 4 rollback is non-reversible and requires additional guardrails (canary safety flag).
+- Any billing-impactful mitigation (autoscaler lift beyond reserved capacity) must include a human approval within 30 minutes or be automatically scaled back.
+
+Metrics to track success of the playbook
+--------------------------------------
+- Median time to mitigation (target < 10m for Tier 1/2).
+- Fraction of incidents where sentinel hypothesis matched postmortem root cause (target > 80%).
+- Count of unnecessary rollbacks or rollbacks that were avoidable (target < 5% of rollbacks).
+- Weekly spend from emergency autoscale budget.
+
+Appendix: quick commands and links
+---------------------------------
+- rwdctl capacity bump --help (internal CLI)
+- Grafana: /dashboards/slo-sentinels
+- Autopilot event snapshot API: /internal/autoscaler/events/{pool}?lookback=30m
+
+Change history
+--------------
+- 2025-09-15: Created by Aisha Patel (initial draft)
+- 2025-12-03: Added KV cache heuristics and tier3 variant routing (review by Marco Reyes)
+- 2026-02-10: Updated autoscaler bump defaults and human-approval policy (review by Jin Soo Park)
+
+References
+----------
+- "SLO-driven Autoscale and Hedging Patterns" internal design note
+- eng-serving-runtime / rollout safety cookbook
+- Observability spec: SLO telemetry schema
+
+Contact
+-------
+For questions or updates, contact eng-sre@redwood.ai or file a PR against this page.

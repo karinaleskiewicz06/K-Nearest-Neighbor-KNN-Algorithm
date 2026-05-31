@@ -1,0 +1,340 @@
+PRD: Hosted Data Residency Enforcement (Region Pinning + Request-Time Blocking)
+
+## Summary
+Hosted data residency enforcement adds customer-configurable **region pinning** for Redwood Hosted API and enforces that pinning at request time via deterministic checks.
+
+This PRD defines:
+- The customer problem and target personas (EU regulated + Enterprise platform teams)
+- Policy model requirements (allowed region set + primary region; optional API key overrides)
+- Enforcement requirements across routing/fallback, background work, logging/observability, and operational tooling
+- Public error contract requirements (consistent HTTP status + machine-readable code + actionable guidance)
+- Auditability requirements (decision logs + audit log events for config changes)
+- Success metrics and phased rollout plan
+
+## Problem statement
+Enterprise customers increasingly require guarantees that **customer content** (prompts, uploaded inputs, tool outputs, model outputs, embeddings text inputs) is processed and stored within specific geographies (e.g., **EU-only**). Today, Redwood Hosted API routing can attempt cross-region fallback for capacity and reliability, and not all subsystems have a consistent mechanism to enforce residency constraints.
+
+As a result:
+- Regulated prospects (payments, healthcare, public sector) block procurement without strong, auditable residency controls.
+- Customers have limited ability to understand *why* a request was served in a region, or why it was blocked.
+- Support escalations occur when routing behavior surprises customers (e.g., unexpected fallback attempts).
+
+We need a platform-level capability that makes residency **predictable, enforceable, and explainable**.
+
+## Goals
+### Product goals
+1) **Region pinning**: Allow orgs/projects (and optionally API keys) to declare:
+   - An **allowed region set** (e.g., {eu-west-1, eu-central-1})
+   - A **primary region** for initial routing within the allowed set
+2) **Enforcement**: Guarantee that request routing and any fallback behavior do not move customer content outside the pinned region(s), unless explicitly permitted.
+3) **Clear errors**: When a request would violate policy, block it with:
+   - Consistent HTTP status
+   - Machine-readable error code
+   - Human-readable remediation guidance
+   - Correlation via request_id
+4) **Observability & auditability**:
+   - Residency decision logs for every request (evaluation summary, selected region, block reason)
+   - Dashboards/alerts (block rates, policy evaluation latency)
+   - Audit log events for policy create/update/delete and overrides
+
+### Business goals
+- Unblock EU-only Hosted API deals and shorten security review cycles.
+- Reduce support load from confusing 500s / ambiguous routing behavior.
+
+## Non-goals (initial release)
+- Automatic multi-region replication of customer data.
+- Advanced geo-fencing beyond routing and logging boundaries (phased hardening will address subsystem-by-subsystem follow-ups).
+- Full custom residency rules per endpoint/subsystem. The initial release defines a single policy model applied consistently at the gateway/routing boundary.
+- Dedicated and Private parity beyond alignment where applicable (Dedicated has different routing/control plane characteristics; we will align policy semantics but not rebuild Dedicated topology in Phase 1).
+
+## Definitions
+### Customer content (in-scope)
+- Request payloads containing user/customer text: prompts, messages, documents sent for embeddings/reranking
+- Model outputs streamed or returned in response bodies
+- Tool/function call arguments/results when they contain customer-provided content
+
+### Explicitly allowed cross-region metadata (out of scope for enforcement)
+Per ADR-021, limited non-content metadata may be processed outside the pinned region (e.g., global account identifiers, billing metrics) provided it does not include prompt/output text. This must be documented and validated by Security.
+
+### Residency decision
+A deterministic evaluation that produces:
+- effective policy (resolved across org/project/api-key scopes)
+- allowed regions
+- primary region
+- enforcement outcome (allow/block)
+- selected region (if allowed)
+- reason + rule that triggered outcome
+
+## Customer personas
+### Persona A: EU regulated buyer (security-driven)
+Profile:
+- Industry: payments, fintech, healthcare, B2B SaaS with EU PII/health data
+- Requires: EU-only processing, clear contract language, audit evidence
+- Failure mode: blocks purchase if any cross-region fallback is possible
+
+Representative requirements:
+- “If we pin to EU, do you ever process prompts in the US during failover?”
+- “Can we show an auditor that routing is enforced and changes are audited?”
+
+### Persona B: Enterprise platform team (multi-tenant, governance)
+Profile:
+- Central team provides internal AI platform for multiple business units
+- Needs per-project controls and separate API keys
+- Wants: guardrails, troubleshooting, low operational overhead
+
+Representative requirements:
+- “We need EU-only for one business unit and global for another.”
+- “When something breaks, we need a clear error and a place to see blocked requests.”
+
+## User stories
+1) As an org admin, I can configure allowed regions and a primary region so that Hosted API requests never leave those regions.
+2) As a platform admin, I can override residency at the project or API key level to support multiple teams safely.
+3) As a developer, I receive a deterministic, actionable error when my request would violate residency policy.
+4) As Security/GRC, I can export evidence that policies exist, changes were audited, and enforcement is active.
+5) As SRE/on-call, I can monitor block rates and investigate false positives without exposing customer content.
+
+## Requirements
+### R1. Policy configuration model (control plane)
+**Policy scopes** (initial):
+- Organization-level policy (default for org)
+- Project-level policy (optional override)
+- API key-level policy (optional override)
+
+**Precedence** (highest wins): API key > Project > Org.
+
+**Required policy fields**:
+- allowed_regions: set of internal region IDs (mapped to cloud regions)
+- primary_region: one region ID that must be within allowed_regions
+- enforce: boolean (true for enforcement; may be toggled behind feature flag for rollout)
+
+**Optional fields**:
+- allow_cross_region_fallback: boolean (default false). If true, fallback is allowed only to regions explicitly listed in allowed_regions.
+- mode: “block” | “monitor” (monitor logs what would have happened but does not block; used only for early rollout stages)
+
+**Validation rules**:
+- primary_region ∈ allowed_regions
+- allowed_regions must be non-empty when enforce=true
+- Only supported Hosted regions may be selected (control plane rejects unsupported regions)
+- Changes should be validated against current product region availability (e.g., if a model is not available in the primary region, UI warns; API returns validation warning but does not automatically expand allowed set)
+
+**Migration defaults**:
+- Existing orgs with no policy: implicit “global” (all hosted regions) and primary region = current routing default.
+- No customers should be blocked purely due to migration. Initial rollout uses mode=monitor (see Rollout).
+
+### R2. Request-time enforcement (gateway + routing)
+**At request entry (API gateway)**:
+- Determine effective policy for the request (org/project/api key context)
+- Attach a “residency decision context” to downstream calls (routing layer, logging)
+- If enforcement blocks, return standardized error payload (see R4)
+
+**At routing decision (smart routing)**:
+- Route only within allowed_regions.
+- Select primary_region by default; if primary is unhealthy/unavailable, attempt fallback only within allowed_regions and only if allow_cross_region_fallback=true.
+- If no eligible region is available, block (do not silently route outside allowed regions).
+
+**Streaming**:
+- For streaming endpoints, residency violations must fail early and deterministically with the standardized error contract. (No generic 500; no partial streaming of content.)
+
+**Background processing and async tasks**:
+- Any background work that processes customer content (e.g., retry queues, deferred tool execution, trace sampling with payloads) must run in-region or be disabled for pinned workloads.
+- Any globally shared queue must not carry customer content; only opaque references allowed, and references must resolve to region-local storage.
+
+### R3. Enforcement boundaries (what must not cross regions)
+When a request is pinned to region set X:
+- Prompts/inputs/outputs must not be processed or stored outside X.
+- Cross-region fallback to regions outside X is prohibited.
+- Logs/traces/metrics must not contain raw customer content outside X.
+
+Allowed exceptions must be explicitly documented (ADR-021) and reviewed by Security.
+
+### R4. Public error contract (actionable + consistent)
+When enforcement blocks a request, return:
+- **HTTP status**: 409 Conflict (per ADR-022)
+- **error.code**: a stable machine-readable code
+- **error.message**: short human-readable summary
+- **error.details**: remediation-oriented fields (allowed regions, configured primary, requested/attempted region, policy scope)
+- **request_id**: always present
+- **help_url**: points to public docs troubleshooting
+
+**Required error codes** (initial):
+- RESIDENCY_POLICY_VIOLATION (generic block)
+- RESIDENCY_REGION_NOT_ALLOWED (attempted route outside allowed set)
+- RESIDENCY_NO_ELIGIBLE_REGION (all allowed regions unhealthy/unavailable)
+- RESIDENCY_POLICY_NOT_FOUND (context missing; should be rare; treated as server misconfig)
+
+**Example (non-streaming JSON response)**:
+- status: 409
+- code: RESIDENCY_REGION_NOT_ALLOWED
+- message: “Request blocked by data residency policy: region us-east is not allowed.”
+- details: includes allowed_regions, primary_region, evaluated_scope, policy_id (see below), selected_region (if any), and block_reason
+
+**Policy identifier exposure**:
+- Default: include an opaque policy reference (e.g., policy_ref) safe for customers to share with support.
+- Do not expose internal database IDs or sensitive tenant structure.
+
+### R5. Observability (metrics, dashboards, alerting)
+Must emit:
+- Counter: residency_blocked_requests_total (by region, customer tier, policy scope, error code)
+- Histogram: residency_policy_evaluation_latency_ms (p50/p95/p99)
+- Counter: residency_cross_region_routing_attempts_total (should trend to zero)
+- Gauge: residency_policy_cache_hit_ratio (if caching policy lookups)
+
+Dashboards must provide:
+- Block rate over time by region and top affected orgs/projects
+- Error code breakdown (misconfig vs capacity)
+- Policy evaluation latency and impact on overall request latency
+
+Alerts (initial guidance):
+- Page SRE if block rate increases >X% for multiple tenants across a region (indicates systemic regression)
+- Ticket if evaluation latency p99 exceeds threshold (e.g., 10ms) consistently
+
+### R6. Auditability
+**Audit log events** for:
+- residency.policy.create
+- residency.policy.update
+- residency.policy.delete
+- residency.policy.override (emergency override / feature flag bypass)
+
+Each event includes:
+- actor (user/service), timestamp, org/project/api key scope
+- before/after summaries (without sensitive content)
+- source (console, API, internal tool)
+
+**Residency decision logs**:
+- Must be emitted for every request at a consistent point (gateway recommended) and include request_id.
+- Must not include customer content.
+
+### R7. Console/admin UX requirements (high-level)
+(Details in the UX design spec.)
+- Settings page for residency policy at org/project scope
+- Clear copy explaining “Allowed regions” vs “Primary region”
+- Confirmation modal highlighting enforcement impact (requests may be blocked)
+- Troubleshooting view: recent blocked requests with reason + request_id + policy scope
+- Configuration history: view changes and link to audit log entries
+
+### R8. Compatibility and SDK behavior
+- SDKs should surface residency violations as a dedicated exception type (mapped from error.code), preserving request_id and help_url.
+- Backward compatibility: existing clients should still receive valid JSON error bodies for non-streaming; streaming clients should receive a terminal error event consistent with existing streaming protocol.
+
+### R9. Security, privacy, and compliance requirements
+- Residency policies are security-sensitive configuration. Console/API access must respect admin roles.
+- All config changes must be auditable and retained per audit log retention policy.
+- Documentation must clearly state what is guaranteed and what is excluded (per internal policy doc).
+
+## Out of scope / Explicit exclusions
+- “Geo-fenced” analytics where raw prompts are stored in global warehouses (we must not do this; prompts are out of scope for global analytics). If any subsystem currently does, it must be remediated or disabled for pinned tenants.
+- Automated data replication across regions.
+- Customer-managed keys (KMS/HSM) expansion as part of this release (tracked separately).
+
+## Dependencies
+- Control plane: Residency Policy Service (schema, validation, admin APIs)
+- API gateway: request context propagation + standardized error contract
+- Smart routing: residency-aware routing + disable cross-region fallback by default
+- Observability pack: dashboards + alerts
+- Console: policy configuration and troubleshooting UX
+- Docs: public documentation and internal enablement
+
+## Risks and mitigations
+| Risk | Impact | Mitigation |
+|---|---|---|
+| False positives block legitimate traffic | High (customer impact) | Phased rollout using monitor mode + allowlist; runbook for override; strong metrics + alerting |
+| Policy evaluation adds latency | Medium | Cache policy lookups; strict p99 budget; measure and optimize |
+| Hidden cross-region subsystem processes content | High (trust/compliance) | Define enforcement boundaries; audit logging/tracing; runtime review; phased hardening |
+| Region capacity constraints cause blocks for pinned customers | Medium/High | Clear error (NO_ELIGIBLE_REGION); capacity planning for EU; optional multi-region allowed set |
+| Confusing configuration (primary vs allowed) | Medium | Console UX + validation warnings + docs; troubleshooting page |
+
+## Success metrics
+### Adoption / enablement
+- % of Enterprise Hosted orgs with residency policy configured (target: 25% within 90 days of GA)
+- # of enterprise security reviews completed using the evidence pack (target: 10 within 1 quarter)
+
+### Reliability / correctness
+- 0 confirmed incidents of customer content processed outside pinned regions after enforcement is enabled (severity 0)
+- Cross-region routing attempts for pinned tenants trend to ~0 (measured by residency_cross_region_routing_attempts_total)
+
+### Developer experience
+- Reduction in support tickets related to “unexpected region fallback” or “generic 500 during streaming” (target: -50% after GA)
+- Error contract coverage: 100% of residency blocks return standardized status/code/message across streaming and non-streaming endpoints
+
+### Performance
+- Policy evaluation latency p99 <= 10ms at the gateway (initial target; revisit after dogfood)
+
+## Phased rollout plan
+### Phase 0: Discovery (1–2 weeks)
+Deliverables:
+- Requirements finalized (this PRD)
+- Threat model + enforcement boundaries (ADR-021)
+- Error contract decision (ADR-022)
+
+Exit criteria:
+- Agreement on what is “customer content” and what must stay in-region
+
+### Phase 1: Design (2–3 weeks)
+Deliverables:
+- Detailed policy schema + precedence + migrations
+- Console UX spec (settings + troubleshooting)
+- Observability plan (metrics + dashboards)
+
+Exit criteria:
+- Design review sign-off from Product, Security, Platform, SRE
+
+### Phase 2: Implementation (4–6 weeks)
+Deliverables:
+- Control plane policy service + admin APIs + migration
+- Gateway enforcement and standardized errors
+- Routing enforcement (no cross-region fallback by default)
+- E2E tests (pinned EU org hitting US region, streaming behavior, failover)
+
+Exit criteria:
+- E2E suite green in CI; dogfood orgs run without regressions
+
+### Phase 3: Rollout (2–4 weeks)
+Step plan:
+1) Enable feature flags in staging; seed test orgs/keys
+2) Internal dogfood: Redwood internal org pinned to EU (monitor mode → enforce)
+3) Allowlist 3–5 design partners (EU-only prospects) in monitor mode
+4) Progressively enable enforce mode for allowlisted customers
+5) Expand to broader Enterprise Hosted cohort
+
+Operational requirements:
+- On-call runbook for false positives and emergency override
+- Dashboards live with agreed thresholds
+
+### Phase 4: GA + hardening
+- Public docs finalize + FAQ updates
+- Evidence pack v1 published for GRC
+- Post-launch retro + follow-up backlog for subsystem hardening
+
+## Rollout flags and controls (initial)
+- residency_policy_enabled (global)
+- residency_enforcement_mode: off | monitor | enforce
+- residency_enforcement_allowlist (org/project)
+- residency_emergency_bypass (restricted, audited)
+
+## Open questions
+1) Do we allow API key-level policies in v1, or defer to project-level only to reduce complexity?
+2) What is the customer-facing terminology for “region” (cloud region vs Redwood region group)?
+3) Which internal subsystems currently write request/response content to logs or traces, and what is the remediation plan for pinned tenants?
+4) How do we message “NO_ELIGIBLE_REGION” in a way that encourages configuring multiple allowed EU regions without implying we will silently fail over cross-geo?
+
+## Appendix
+### Example policy configurations
+- EU-only, single primary:
+  - allowed_regions: eu-west-1
+  - primary_region: eu-west-1
+  - allow_cross_region_fallback: false
+- EU-only, multi-region resilience:
+  - allowed_regions: eu-west-1, eu-central-1
+  - primary_region: eu-west-1
+  - allow_cross_region_fallback: true
+
+### Copy requirements (error message tone)
+- Avoid blame; state the enforced policy outcome.
+- Always provide a next step (update allowed regions; verify primary; contact support with request_id).
+
+### Stakeholders
+Primary owner: Naomi Feldman (Product)
+Key engineering owners: Ethan Park (Control Plane), Mina Haddad / Ravi Menon (Routing), Amara Diallo (Gateway)
+Security/GRC: Marcus Lin, Dr. Aisha Rahman, Olga Petrov
+SRE: Sean Gallagher, Rafael Mendes
+Docs: Elliot Price, Wei Chen, Kira Thompson

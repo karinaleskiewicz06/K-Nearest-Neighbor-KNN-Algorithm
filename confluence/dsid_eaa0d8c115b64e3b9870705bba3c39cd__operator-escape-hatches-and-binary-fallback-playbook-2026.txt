@@ -1,0 +1,189 @@
+Operator escape-hatches and binary fallback playbook
+
+Summary
+-------
+This playbook defines operator-level "escape-hatches" and a tested binary-fallback path for private Redwood deployments (VPC and on-prem). It is intended for use during severe runtime degradations, kernel/driver regressions, model binary failures, or when the primary serving runtime must be forcibly degraded to a minimal, validated inference binary to preserve customer SLAs. The document covers decision criteria, prerequisites, step-by-step procedures, verification checks, communication templates, and a customer requirements crosswalk.
+
+Scope and audience
+------------------
+- Audience: Field operators, SREs, on-call platform engineers, and customer success engineers performing emergency remediation for private deployments.
+- Scope: Applies to: private VPC deployments managed by Redwood control plane, hybrid customers with an operator on-site, and fully air-gapped on-prem clusters. Not intended for hosted Redwood instances.
+
+Key goals
+---------
+1) Provide deterministic, low-risk procedures to:
+   - Transition traffic to a minimal inference binary (safe-mode) when the primary runtime is unstable.
+   - Revert to previously validated binary artifacts quickly (binary fallback).
+   - Ensure telemetry and audit evidence are captured for post-incident analysis.
+2) Define clear owner responsibilities and SLO gating to minimize customer impact.
+
+When to use this playbook (trigger conditions)
+----------------------------------------------
+Use these escape-hatches only when one or more of the following are true:
+1. Token-level error rate crossing: >= 5% client-facing error rate for > 3 minutes AND sustained latencies > 3x SLO (see SLOs below).
+2. KV-cache corruption or severe state divergence where soft restarts repeatedly fail to clear errors.
+3. Primary runtime introduces regressions after an upstream kernel/driver upgrade that cannot be resolved within the maintenance window.
+4. Binary or model-loading path causes node-level GPU lockups impacting > 10% of pool.
+
+SLOs and thresholds referenced in this playbook
+----------------------------------------------
+- Per-tenant p95 latency SLO: 200ms (interactive workloads); emergency fallback allowed if latency <= 800ms for degraded mode.
+- Error budget guardrail for fallback: less than 2% fatal error rate post-fallback (we aim to restore to <=1%).
+- Customer notification threshold: if fallback will affect more than 1 high-priority tenant or >10% of requests, notify CS and account owner within 15 minutes.
+
+Prerequisites and pre-validated artifacts
+----------------------------------------
+- Validation matrix entry exists for the fallback binary (artifact tag, SHA-256) stored in the release bucket. Example: redwood-safe-infer:v2025.11-rc2 (sha256:abc...).
+- A signed, pinned package for on-prem: redwood-safemode-image-2026.01.tar.gz with accompanying signature file and verified checksum.
+- Runbook owner has access to customer-specific control-plane keys, KMS token rotation window, and the operator vault.
+- Customer acceptance: check customer deployment conformance record (see related_pages) for compatibility flags (gpu-driver, kernel-version, cgrouplist).
+
+Decision matrix (high level)
+---------------------------
+- If node-level GPU hangs are present and cannot be isolated within 10 minutes -> perform node-evac + safe-mode drain on affected nodes.
+- If control-plane model-loading errors are widespread across zones and root cause points to recent runtime change -> initiate binary fallback on all replicas in canary then cohort roll.
+
+Primary escape-hatches (ordered by risk)
+----------------------------------------
+1) Soft drain + rolling restart of agents (low risk).
+2) Canary swap: deploy safe-mode binary to 1-2 replicas (medium risk) and validate telemetry for 10 minutes.
+3) Full cohort binary fallback (higher risk): switch all replicas to safe-mode, disable advanced optimizations (quantization fallback), and serve using stateless mode when needed.
+4) Network-level traffic-steering to an alternate provisioned Dedicated pool (highest operational cost) if available.
+
+Operator runbook: Canary safe-mode swap (step-by-step)
+----------------------------------------------------
+Preconditions: Canary target selected (prefer non-primary zone), artifact present, operator on-call and CS informed.
+1. Announce intent: post in incident channel and notify CS: "Initiating safe-mode canary for tenant X in zone Y".
+2. Verify artifact checksum: sha256sum redwood-safemode:v2026.01 -> compare with release manifest.
+3. Create canary deployment:
+   - For Kubernetes-based private deployments: 
+     kubectl -n redwood apply -f safemode-canary-deployment.yaml
+   - safemode-canary-deployment.yaml should reference the pinned image and set replicaCount: 2.
+4. Update service selector to include canary pods with weight=10% (traffic-split). Example: Istio VirtualService weighted routing snippet.
+5. Monitor for 10 minutes for: p50/p95 latencies, 5xx rate, error logs mentioning "model-load" or "gpu-fence". Use these dashboards: CONFLUENCE-DB-DASH-OPS (internal link).
+6. Validation checks (all must PASS):
+   - p95 latency <= 3x SLO baseline for canary
+   - Fatal errors < 0.5% of canary requests
+   - No new OOM or GPU driver resets on canary nodes
+7. If checks PASS: escalate to cohort fallback plan. If FAIL: rollback canary and proceed to deeper investigation (see triage checklist).
+
+Binary fallback: full cohort procedure
+------------------------------------
+The cohort fallback is intended when canary shows success or incident severity mandates a fast switch.
+1. Freeze control-plane routing policies: set emergency flag to bypass advanced routing.
+2. Take a rolling snapshot of runtime state (KV cache manifest) for potential rollback. Command: redwood-admin state snapshot --namespace tenant-123 --out /tmp/kv-snapshot-<ts>.json
+3. Apply cohort deployment update using the pinned safemode image with immutable tags. For k8s: kubectl -n redwood set image deploy/serving redwood-serving=redwood-safemode:v2026.01 --record
+4. Disable model hot-swap features via configmap: redwood-serving-config -> safe_mode: true, hot_swap: false, advanced_quant: disabled.
+5. Progressively increase traffic weight to safemode across zones using traffic orchestration (10% -> 30% -> 60% -> 100%), validating telemetry at each step (10 minutes).
+6. Post-fallback verification checklist (all must PASS):
+   - Total error-rate <= 2%
+   - p95 latency within emergency latency target
+   - No new hardware faults reported by GPU telematics
+   - Customer-visible degradation logged and CS notified
+7. If any critical check fails during increase, execute immediate rollback to snapshot and previous image using recorded kubectl rollout undo or image revert.
+
+Rollback to previous binary (safest path)
+----------------------------------------
+- If cohort fallback failed, revert to snapshot+previous-image:
+  1) kubectl -n redwood rollout undo deployment/serving --to-revision=<prev_rev>
+  2) Reapply configmap values for advanced features.
+  3) Validate KV cache integrity against snapshot and mark suspect keys for eviction.
+
+Escape-hatch commands (cheat-sheet)
+----------------------------------
+- Check node GPU resets: journalctl -u nvidia-gpu-manager | tail -n 200
+- Evacuate a node safely: kubectl drain <node> --ignore-daemonsets --delete-local-data --grace-period=120
+- Create safemode canary: kubectl apply -f safemode-canary-deployment.yaml
+- Promote image and record: kubectl -n redwood set image deploy/serving redwood-serving=redwood-safemode:v2026.01 --record
+- Snapshot state: redwood-admin state snapshot --namespace <ns> --out /tmp/kv-<ts>.json
+- Force rollback: kubectl -n redwood rollout undo deployment/serving --to-revision=<rev>
+
+Testing and validation playbook (pre-incident preparation)
+--------------------------------------------------------
+Operators must perform the following quarterly checklist:
+1. Verify safemode artifacts exist and checksums match release manifest.
+2. Run a simulated canary in a staging cluster: deploy safemode image, run 10k synthetic inference requests with the production prompt set, measure latencies and failure rates.
+3. Test on-prem signing: ensure tarball signature verifies for at least two recent hardware/driver combinations declared in the customer requirements matrix.
+4. Run the traffic-split automation and assert that rollback completes within 8 minutes when invoked.
+
+Customer requirements crosswalk (minimum compatibility table)
+----------------------------------------------------------
+This table maps the minimum customer environment fields required for the escape-hatches to be viable.
+
+| Requirement | Minimum / Acceptable values | Notes |
+|---|---|---|
+| Kernel version | >= 5.15 (preferred) | Older kernels may lack required GPU driver features. |
+| NVIDIA driver | 525.105+ | For stable CUDA 12 kernels; if lower, safemode disables some opt paths. |
+| Container runtime | containerd 1.6+ or Docker 24+ | Must support immutable image tags and user namespace mapping. |
+| K8s version | 1.24 - 1.27 supported | We maintain compatibility matrix in related_pages. |
+| Entitlements | Operator account with cluster-admin or curated role | Required for node drain and rollout operations. |
+
+Operational responsibilities and ownership
+-----------------------------------------
+- Incident commander: on-call platform lead (engineering) — coordinates canary and cohort decisions.
+- Operator: SRE performing the kubectl/agent operations.
+- Customer Success: responsible for customer notification templates and post-incident QBR.
+- Security: audits any binary switching and confirms signatures/attestations.
+
+Communication templates
+-----------------------
+Use the following minimal template for customer notification when initiating a cohort fallback: 
+
+Subject: Planned emergency fallback for Redwood runtime affecting [TENANT]
+Body: We are experiencing a runtime instability affecting inference traffic for [TENANT]. We will enact an emergency fallback to a validated safe-mode binary to restore availability. Expected impact: transient latency increase and temporary loss of advanced optimization features. Estimated ETA for full recovery: 60-120 minutes. We will provide updates every 15 minutes.
+
+Post-incident checklist and evidence capture
+------------------------------------------
+1. Preserve snapshots and kube events: kubectl get events -n redwood --since=2h > /var/incident/events-<ts>.log
+2. Export telemetry window covering 30 minutes pre-incident to 60 minutes post-fallback.
+3. Attach signed artifact and checksum used for fallback to incident ticket.
+4. Perform RCA and update the validation matrix with lessons learned and new kernel/driver combinations.
+
+Appendix A: Sample safemode-canary-deployment.yaml (minimal)
+-----------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redwood-safemode-canary
+  namespace: redwood
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: redwood-serving
+      cohort: safemode-canary
+  template:
+    metadata:
+      labels:
+        app: redwood-serving
+        cohort: safemode-canary
+    spec:
+      containers:
+      - name: redwood-serving
+        image: registry.redwood.internal/redwood-safemode:v2026.01
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+
+Appendix B: Related pages and artifacts
+--------------------------------------
+- Deployment conformance matrix: CONFLUENCE-DEP-CONF-2026 (related_pages)
+- Release manifest (artifact store): s3://redwood-release/manifest/2026-01.json
+- Incident evidence template: CONFLUENCE-INC-EVIDENCE-TEMPLATE
+
+Notes and warnings
+------------------
+- Do not perform full cohort fallback unless canary validation has passed, unless the incident meets the severity triggers above.
+- Always collect signed artifact checksums and timestamps prior to changing images; these are required for compliance for some enterprise customers.
+- If the customer environment lacks the minimum kernel or driver version, fallbacks will reduce feature parity and may require a coordinated maintenance window.
+
+Revision history
+----------------
+- 2026-01-12: Draft (Aisha Patel)
+- 2026-02-20: Added canary validation checklist and customer crosswalk (reviewers: Marco, Lina)
+
+Owners and contacts
+-------------------
+- Primary owner: Platform SRE (on-call rotation)
+- Secondary owner: Private Deployments team lead
+- Pager: #redwood-oncall (Slack)

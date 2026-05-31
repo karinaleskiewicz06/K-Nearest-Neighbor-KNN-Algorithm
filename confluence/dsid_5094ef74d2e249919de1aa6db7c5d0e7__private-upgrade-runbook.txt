@@ -1,0 +1,436 @@
+Runbook: Redwood Private upgrade + rollback (Day-2 Operations)
+
+## Purpose
+This runbook describes the operator procedure for upgrading **Redwood Private** (VPC and on-prem/air-gapped) using the **redwood-private-installer**. It covers:
+- End-to-end upgrade flow (plan → prechecks → backups → apply → verify)
+- What “upgrade success” means (verification gates)
+- Common failure modes and mitigations
+- How to execute rollback safely and what rollback can/can’t guarantee
+
+This doc is written for on-call SREs, customer operators, and Solutions Engineers assisting upgrades.
+
+---
+
+## Scope and guarantees
+### Supported upgrade paths
+- **Default supported path:** N-1 → N (single hop).
+- Multi-hop (e.g., N-3 → N) is **not automated** in the initial release; follow Support guidance.
+- Installer enforces a **version compatibility policy** and will block unsupported paths.
+
+### Key invariants (do not bypass)
+- **Prechecks must pass** for all blocking checks before apply.
+- **A backup must complete** successfully prior to any irreversible step (DB migrations, control-plane schema bumps).
+- **Control plane upgrades complete before data plane changes**.
+- All steps are recorded as an **auditable upgrade state** (plan + execution + results).
+
+### Definitions
+- **Control plane (CP):** Redwood Private control services (API, auth integrations, orchestration, metadata DB migrations).
+- **Data plane (DP):** Model-serving components and worker pools.
+- **Upgrade plan:** Versioned artifact produced by the installer describing staged steps and rollback hooks.
+
+---
+
+## Roles and escalation
+- Primary on-call: **SRE** (Rafael Mendes)
+- Release gating / approvals: **Release Engineering** (Connor O’Brien)
+- Backup/storage escalation: **Infrastructure Eng** (Irene Choi)
+- Compatibility policy questions: **Quentin Harris**
+- Security/compliance (audit logs, backup encryption): **Naomi Feldman / Marcus Lin**
+- Customer comms & coordination: **Markus Klein / Rachel Kim**
+
+If the upgrade impacts customer traffic or a rollback is invoked in production, open an incident channel and follow the upgrade-alerts runbook.
+
+---
+
+## Preconditions checklist (operator)
+### Change-management checklist
+1) Confirm maintenance window is approved per policy:
+   - Customer notified (if customer-operated)
+   - SRE + Release Eng approval recorded for production Private environments
+2) Confirm target versions:
+   - Current Private version: <CURRENT>
+   - Target Private version: <TARGET>
+   - Installer version: <INSTALLER>
+3) Confirm rollback strategy agreed:
+   - Rollback via installer hooks (best effort)
+   - Backup restore available (authoritative fallback)
+
+### Environment prerequisites (must be true)
+- Kubernetes cluster is healthy (no failing nodes; control-plane API stable)
+- Storage headroom available (PVC/volume capacity and snapshot headroom)
+- Artifact access works:
+  - VPC: registry/chart repo reachable
+  - On-prem/air-gapped: bundle present, checksums/signatures valid
+- DB connectivity healthy; migration lock timeouts set to safe defaults
+- OIDC/SSO endpoints reachable (if configured)
+- KMS/HSM integration healthy (if configured)
+
+---
+
+## Required inputs
+Collect and confirm these before starting:
+- **Cluster context** and namespace(s)
+  - Namespace defaults: `redwood-system` (CP) and `redwood-serving` (DP) (confirm per deployment)
+- **Artifact source**
+  - VPC: registry URL, chart repo URL
+  - On-prem: local path to upgrade bundle, offline registry endpoints
+- **Target version** (platform + charts + installer compatibility)
+- **Backup target**
+  - Snapshot mechanism: EBS/CSI snapshots OR logical dump (per environment)
+  - Retention policy (default 7 days unless overridden)
+
+---
+
+## Recommended workflow (high level)
+1) Generate and review upgrade plan
+2) Run prechecks and remediate failures
+3) Execute backup and verify restore-ability signals
+4) Apply upgrade (CP first, then DP)
+5) Post-upgrade verification (functional + metrics)
+6) If needed, rollback (hook-based), otherwise restore from backup
+
+---
+
+## Commands (installer)
+Command names may differ by installer minor version; confirm with `--help`.
+
+Common patterns used in this runbook:
+- `redwood-private upgrade plan --to <TARGET> [--bundle <PATH>]`
+- `redwood-private upgrade precheck --plan <PLAN_PATH>`
+- `redwood-private upgrade backup --plan <PLAN_PATH>`
+- `redwood-private upgrade apply --plan <PLAN_PATH>`
+- `redwood-private upgrade status --last`
+- `redwood-private rollback --upgrade-id <ID>`
+- `redwood-private support-bundle --include-upgrade-trace`
+
+All commands should be run from a machine with:
+- kubeconfig access
+- network access to artifact sources (or on-prem bundle mounted)
+- permission to create snapshots/backups
+
+---
+
+## Step-by-step: standard upgrade (VPC)
+### Step 0 — Confirm current state
+1) Confirm cluster and node health:
+   - `kubectl get nodes`
+   - `kubectl -n redwood-system get pods`
+2) Confirm current deployed version(s):
+   - `helm list -n redwood-system`
+   - `helm list -n redwood-serving`
+3) Capture baseline metrics (for later comparison):
+   - Error rate, p95 latency, DB CPU, migration queue (if applicable)
+
+### Step 1 — Generate upgrade plan
+1) Generate plan:
+   - `redwood-private upgrade plan --to <TARGET> --output ./upgrade-plan.json`
+2) Review plan summary (must include):
+   - Source and target versions
+   - Stages: prechecks → backup → CP upgrade → CP verify → DP upgrade → DP verify → final postchecks
+   - Rollback entry points and conditions
+3) Store plan in ticket/attachment (required for auditability).
+
+### Step 2 — Run prechecks
+1) Run prechecks:
+   - `redwood-private upgrade precheck --plan ./upgrade-plan.json`
+2) Interpret results:
+   - **BLOCKER:** must fix; apply is not permitted
+   - **WARN:** proceed only with explicit acknowledgement in change record
+3) Common prechecks to verify manually if WARN is present:
+   - DNS/TLS validity for internal endpoints
+   - OIDC reachability (token endpoint)
+   - Disk headroom for snapshots and DB growth
+
+### Step 3 — Execute backup
+1) Start backup orchestration:
+   - `redwood-private upgrade backup --plan ./upgrade-plan.json --wait`
+2) Ensure backup success criteria:
+   - Snapshot/backup job completed successfully
+   - Backup metadata recorded (snapshot IDs / dump object keys)
+   - Encryption confirmed (KMS key ID where applicable)
+3) If backup fails:
+   - Do not proceed to apply
+   - Resolve and re-run backup step
+
+### Step 4 — Apply control-plane upgrade
+1) Apply upgrade (installer will sequence CP before DP):
+   - `redwood-private upgrade apply --plan ./upgrade-plan.json --stage control-plane --wait`
+2) Watch CP rollout:
+   - `kubectl -n redwood-system rollout status deploy/<cp-deploy-name>`
+   - `kubectl -n redwood-system get pods -w`
+3) If a DB migration runs:
+   - Monitor migration job logs and duration
+   - If lock timeout occurs, follow “DB migration lock timeout” troubleshooting below
+
+### Step 5 — Verify control plane
+Minimum CP verification gates:
+- All CP pods Ready, no CrashLoopBackOff
+- CP API health endpoint returns OK (per environment configuration)
+- Audit log shows upgrade stage transitions (start, prechecks pass, backup complete, CP upgraded)
+
+Recommended spot checks:
+- Auth integration (OIDC) still works
+- Control-plane can read/write config state
+
+### Step 6 — Apply data-plane upgrade
+1) Apply DP upgrade:
+   - `redwood-private upgrade apply --plan ./upgrade-plan.json --stage data-plane --wait`
+2) Watch DP rollout:
+   - `kubectl -n redwood-serving get pods -w`
+   - Confirm readiness gates are satisfied before continuing
+
+### Step 7 — Post-upgrade verification (definition of success)
+Declare upgrade successful only after all are true:
+1) Installer reports success:
+   - `redwood-private upgrade status --last` shows state `COMPLETED`
+2) No elevated error rates or sustained latency regression:
+   - Compare p95 latency and 5xx/4xx vs baseline for at least 15–30 minutes
+3) DB health:
+   - No blocked migrations
+   - CPU/memory stable; connection saturation not observed
+4) Canary functional test:
+   - Execute an internal “smoke” request for chat/completions and embeddings (as applicable)
+5) Artifacts and auditability captured:
+   - Upgrade plan attached to ticket
+   - Execution logs retained
+   - Support bundle can be generated including upgrade trace
+
+If any gate fails, pause and follow troubleshooting; rollback may be appropriate depending on failure class.
+
+---
+
+## Step-by-step: on-prem / air-gapped upgrade
+### Additional prerequisites
+- Upgrade bundle present on operator host (or mounted path)
+- Offline registry endpoints configured and reachable from cluster
+- Bundle verification passes (checksums/signatures)
+
+### Step 1 — Verify bundle
+1) Verify the bundle:
+   - `redwood-private upgrade bundle verify --bundle <PATH_TO_BUNDLE>`
+2) If verification fails:
+   - Do not proceed
+   - Confirm you have the correct bundle for <TARGET>
+   - Confirm no proxy rewriting / file truncation
+
+### Step 2 — Generate plan using bundle
+- `redwood-private upgrade plan --to <TARGET> --bundle <PATH_TO_BUNDLE> --output ./upgrade-plan.json`
+
+### Step 3 — Continue with prechecks/backup/apply
+Follow the standard upgrade steps, ensuring artifact pulls resolve against offline mirrors.
+
+---
+
+## Troubleshooting: common failure modes
+### 1) Precheck BLOCKER: insufficient storage headroom
+Symptoms:
+- Precheck fails with “insufficient storage headroom” for one or more PVCs or snapshot targets
+
+Actions:
+1) Identify affected volumes:
+   - `kubectl get pvc -A | grep redwood`
+2) Remediation options:
+   - Expand PVC/volume capacity (preferred)
+   - Clean up non-critical caches (only if approved)
+   - Increase snapshot repository capacity (if using logical dumps)
+3) Re-run prechecks and ensure the check transitions to PASS.
+
+Escalate to Infrastructure Eng if storage expansion is non-trivial in the environment.
+
+### 2) Precheck BLOCKER: DB connectivity or credentials
+Symptoms:
+- Precheck fails DB connection test or secret reference validation
+
+Actions:
+- Verify DB endpoint reachability (network policy/security group)
+- Confirm secret references exist in the expected namespace
+- If rotating credentials, complete rotation before upgrade window
+
+### 3) Precheck WARN/BLOCKER: OIDC/SSO reachability
+Symptoms:
+- Precheck cannot reach token endpoint / JWKS URI
+
+Actions:
+- Confirm DNS and egress rules
+- If OIDC is temporarily unavailable, do not proceed unless customer explicitly accepts auth risk (rare); record approval
+
+### 4) Artifact verification errors (air-gapped)
+Symptoms:
+- “checksum mismatch”, “signature invalid”, or “manifest missing artifact”
+
+Actions:
+- Confirm bundle matches target version exactly
+- Confirm bundle was transferred in binary-safe manner
+- Verify operator host time is correct (signature validation)
+- Re-download/re-export bundle from trusted mirror
+
+### 5) Helm hook timeouts / jobs not completing
+Symptoms:
+- Upgrade apply fails during pre-upgrade or migration jobs
+
+Actions:
+1) Identify blocking job:
+   - `kubectl -n redwood-system get jobs`
+2) Review job logs:
+   - `kubectl -n redwood-system logs job/<job-name> --tail=200`
+3) Typical causes:
+   - Image pull failures (offline mirror misconfig)
+   - RBAC missing for job service account
+   - DB migration waiting on lock
+
+Do not “force” Helm upgrades by skipping hooks unless Release Eng explicitly approves.
+
+### 6) DB migration lock timeout / long-running migration
+Symptoms:
+- Migration job reports lock timeout, deadlock, or exceeds expected duration
+
+Actions:
+- Check active DB sessions/locks (DB-specific tooling)
+- Confirm migration settings use safe defaults (lock timeouts enabled)
+- If safe to do so, retry migration step after reducing load
+- If migration has partially applied changes, consult rollback semantics (rollback may require restore from backup)
+
+Escalate to Control-plane engineering (Ethan Park / Michael Nguyen) for repeated or unclear migration failures.
+
+### 7) Control plane up but data plane failing to become Ready
+Symptoms:
+- DP pods CrashLooping; readiness gates never pass
+
+Actions:
+- Inspect pod events and logs:
+  - `kubectl -n redwood-serving describe pod <pod>`
+  - `kubectl -n redwood-serving logs <pod> --previous`
+- Common causes:
+  - Config schema mismatch (CP/DP version skew)
+  - Runtime GPU plugin issues (node-level)
+  - Registry access issues (on-prem mirrors)
+
+If the failure is isolated to DP and CP is stable, rollback may be appropriate (see below).
+
+---
+
+## Rollback: decision guide
+### Prefer rollback when
+- CP upgrade succeeded but DP cannot become Ready and impact is high
+- A new version introduces a regression and immediate mitigation is needed
+- Pre-upgrade state is known-good and backup is confirmed
+
+### Prefer manual mitigation (do not rollback immediately) when
+- A single pre-upgrade hook/job is stuck due to transient artifact pull issues
+- Minor misconfiguration can be corrected without reversing schema
+
+### Rollback limitations (read carefully)
+- Some DB migrations are **not safely reversible** via hook-based rollback.
+- If rollback is blocked due to irreversible migration, the authoritative path is **restore from backup**.
+
+---
+
+## Step-by-step: rollback (installer hook-based)
+### Step 0 — Stabilize and capture evidence
+1) Pause further changes.
+2) Capture logs and current status:
+   - `redwood-private upgrade status --last`
+   - `redwood-private support-bundle --include-upgrade-trace --output ./support-bundle.tgz`
+3) Snapshot critical state if possible (depends on environment and incident severity).
+
+### Step 1 — Confirm rollback eligibility
+- Check the upgrade state indicates a valid rollback entry point.
+- Confirm whether DB migration stage is marked reversible.
+
+If the installer indicates rollback is unsafe/blocked, stop and move to “Restore from backup”.
+
+### Step 2 — Execute rollback
+1) Run rollback:
+   - `redwood-private rollback --upgrade-id <ID> --wait`
+2) The rollback will:
+   - Execute rollback hooks in reverse order
+   - Reconcile Helm releases to previous pinned versions
+   - Perform post-rollback health checks
+
+### Step 3 — Verify rollback success
+Minimum rollback success gates:
+- All core services Ready in CP and DP namespaces
+- Error rate returns to baseline
+- Audit log includes “rollback invoked” and “rollback completed/failed” events
+
+### Step 4 — Communicate and follow-up
+- Update incident/ticket with:
+  - Upgrade plan
+  - Failure point
+  - Rollback result
+  - Support bundle link
+- Notify Release Eng and Product owner for regression tracking.
+
+---
+
+## Restore from backup (authoritative fallback)
+Use backup restore when:
+- Rollback is blocked/unsafe due to irreversible DB changes
+- Rollback completes but system remains unhealthy
+
+High-level steps (details vary by backup type):
+1) Stop/scale down affected control-plane services to prevent writes
+2) Restore DB (snapshot restore or logical dump)
+3) Restore config/state as specified by backup strategy
+4) Reconcile Helm releases to the pre-upgrade pinned versions
+5) Bring services back up and run verification gates
+
+Always involve Infrastructure Eng + Control-plane engineering for production restore events.
+
+---
+
+## Observability and alerts during upgrade
+### What to watch
+- API error rate and saturation
+- p95/p99 latency (if serving live traffic)
+- DB CPU, connection pool utilization, lock waits
+- Migration duration and failures
+- Pod readiness and restart counts
+
+### Recommended annotations
+- Annotate dashboards with upgrade window start/end and upgrade ID (when supported by your observability stack).
+
+---
+
+## Post-upgrade actions (required)
+1) Generate support bundle and attach to change record:
+   - `redwood-private support-bundle --include-upgrade-trace --output ./support-bundle-post-upgrade.tgz`
+2) Record final versions:
+   - Helm release versions, installer version, bundle ID (on-prem)
+3) Confirm audit log retention meets customer requirements (if applicable)
+4) File follow-ups:
+   - Any WARN prechecks encountered
+   - Any timeouts/flaky behaviors
+   - Any manual steps performed
+
+---
+
+## Appendix A — “Go / No-Go” checklist (copy/paste)
+GO if:
+- [ ] Plan generated and reviewed
+- [ ] All precheck BLOCKER items are PASS
+- [ ] WARN items explicitly accepted and documented
+- [ ] Backup completed successfully and metadata recorded
+- [ ] Control plane upgraded and verified
+- [ ] Data plane upgraded and verified
+- [ ] Error rates and latency stable vs baseline
+- [ ] Upgrade status = COMPLETED
+
+NO-GO if:
+- [ ] Backup failed or unverified
+- [ ] Any BLOCKER precheck remains
+- [ ] Artifact integrity cannot be confirmed (air-gapped)
+- [ ] DB migration appears stuck/unsafe without escalation
+
+---
+
+## Appendix B — Quick commands
+- Current rollout:
+  - `kubectl -n redwood-system get deploy,pods`
+  - `kubectl -n redwood-serving get deploy,pods`
+- Job logs:
+  - `kubectl -n redwood-system logs job/<job> --tail=200`
+- Installer status:
+  - `redwood-private upgrade status --last`
+- Support bundle:
+  - `redwood-private support-bundle --include-upgrade-trace`

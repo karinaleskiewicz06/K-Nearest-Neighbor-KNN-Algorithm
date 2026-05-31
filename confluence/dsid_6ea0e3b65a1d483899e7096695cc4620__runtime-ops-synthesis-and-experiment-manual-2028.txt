@@ -1,0 +1,372 @@
+Title: Runtime Operations Synthesis and Experiment Manual
+
+Overview
+
+This document codifies a single, operationally-oriented reference that synthesizes runtime architecture intent, kernel-scheduler policy patterns, profiling procedures, benchmark experiment templates, release-note instrumentation requirements, common triage matrices for known issues, and runbook steps for critical runtime incidents. The target audience is SREs, runtime engineers, and applied ML engineers running end-to-end performance experiments and rollouts. This is intentionally cross-cutting: use it when designing experiments that touch serving, scheduling, telemetry, and model rollout safety.
+
+Scope
+
+- Cross-layer guidance for runtime architecture and scheduling decisions
+- Profiling playbook for reproducible micro- and macro-benchmarks
+- A canonical benchmarking experiment matrix and CLI examples
+- Release note checklist specific to kernel/scheduler/quantization changes
+- Known-issues triage matrix and emergency runbooks
+- Links to team wiki pages and owners for deeper dives
+
+1. Architecture intent summary
+
+- Goal: Keep 99th-percentile token-latency predictable for mixed short/long request surfaces while minimizing per-token cost and preserving model fidelity.
+- Execution model: hierarchical execution cohorts -> kernel pipeline -> device-level executor -> KV-cache layer -> network ingress.
+- Decision contracts:
+  - Scheduler must expose: priority, preemption_policy, batch_shaping_hint, affinity_hint.
+  - Runtime must preserve KV-cache continuity across model swaps or shard remapping with no user-visible token duplication.
+
+Diagram (textual)
+
+[diagram]
+Node: Frontend router (route/policy) -> Admission controller (SLO gating) -> Scheduler (cohort classification) -> Kernel dispatcher -> GPU executor (per-device) -> KV cache store -> Response aggregator
+[/diagram]
+
+2. Scheduler policy grammar (reference)
+
+- Policies are declared as YAML fragments in experiments and ingested by the scheduler-reconciler. Example:
+
+```yaml
+name: slo-tiered-fastpath
+priority: high
+preemption_policy: best-effort
+batch_shaping_hint:
+  max_tokens_per_batch: 4096
+  preferred_sequence_length: [8, 64, 512]
+affinity_hint:
+  allow_cross_gpu: true
+  numa_preference: node-local
+```
+
+- Notes:
+  - priority: low|normal|high|critical
+  - preemption_policy: none|best-effort|aggressive
+  - batch_shaping_hint drives kernel-selection heuristics; mismatches create fallback logs under runtime.kernels.fallback
+
+3. Profiling playbook (reproducible experimental protocol)
+
+Objective: produce a causal attribution between observed latency regressions and kernel/scheduler changes with <5% false-positive rate for alerting.
+
+Preconditions:
+- Snapshot the serving traffic sample (10k requests representative surface) and pin model_version + quant_profile.
+- Reserve a quiet maintenance fleet (min 3 homogeneous GPUs) and enable full tracing for the trace-id range.
+
+Step-by-step:
+1. Prepare trace corpus: run shadow-replay against local harness with --preserve-headers --sticky-session.
+2. Baseline run (A): run the microbenchmark suite (see CLI below) for 30 minutes, collect kernel latency histograms, occupancy, NVLink errors.
+3. Change under test: apply scheduler or kernel patch to canary worker group.
+4. Treatment run (B): repeat the microbenchmark with identical seed and traffic replay.
+5. Compare: use the profiler diff tool to generate causal attribution report. Look for increases in kernel-tail (>95th) and shifts in batch-size distributions.
+6. If >10% regression in 99th latency or >5% drop in throughput, abort rollout and follow rollback runbook.
+
+Profiling CLI examples
+
+- Shadow replay harness (developer machine):
+  ./harness/replay --corpus=~/trace-corpus/production-2027-11-07 --target=scheduler-canary --duration=30m
+
+- Microbenchmark command (30m):
+  ./bench/run --suite=mixed-short-long --seed=42 --gpu-pool=homogeneous-4
+
+Telemetry to capture (minimum):
+- kernel.exec_time_histogram
+- scheduler.batch_size_distribution
+- kvcache.hits_per_session
+- device.occupancy_percentile
+- network.rtt_ms
+
+4. Benchmarking suite: canonical experiments
+
+Table: Experiment templates
+
+| name | intent | workload shape | duration | success metric |
+|---|---:|---|---:|---|
+| mixed_burst | realistic customer mix | 60% short, 40% long | 60m | 99p latency < 250ms |
+| convoys_stress | long-sequence dominated | 100% long | 120m | throughput > baseline * 0.95 |
+| small_shortpath | low token per req | 95% < 20 tokens | 30m | median latency < 30ms |
+
+Example orchestration (K8s job YAML snippet for bench-runner):
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bench-mixed-burst
+spec:
+  template:
+    spec:
+      containers:
+      - name: bench-runner
+        image: registry/redwood/bench:2028-01
+        args: ["--suite=mixed_burst","--duration=60m","--report=/artifacts/report.json"]
+      restartPolicy: Never
+```
+
+5. Release note and signoff checklist (for runtime/kernel/scheduler changes)
+
+- Summary of change and expected behavioral impact
+- Benchmarks: mixed_burst and convoys_stress results attached
+- Telemetry dashboards updated: kernel-latency, batch-distribution, cost-per-token
+- Rollout plan: canary group size, measurement windows, rollback thresholds
+- Owners: runtime-team, scheduler-team, SRE
+- Compliance signoffs (if quantization affecting fidelity): applied by research/QA
+
+Release-template (bulleted):
+- Change-id: RRT-XXXX
+- Authors: <names>
+- Canary plan: 5% traffic for 1h -> 20% for 4h -> full
+- Abort criteria: 99p latency > +10% OR error-rate increase > 0.1%
+
+6. Known-issues triage matrix (short catalog)
+
+| Issue | Symptoms | Quick mitigation | Owner | Status |
+|---|---|---|---|---|
+| kernel-lockup-on-batch-split | GPU stuck >60s, watchdog alerts | restart process, drain cohort | runtime-oncall | investigating |
+| kvcache-eviction-race | elevated cold-start errors when remapping | reduce eviction aggressiveness, force warmup | infra-cache | mitigated |
+| scheduler-favors-large-batches | tail latency regressed for short requests | apply temporary cohort mislignment filter | scheduler | triaged |
+
+7. Emergency runbooks
+
+A. Kernel slowdown / tail-latency spike
+1. Identify cohort: query runtime.cohort.latency by tag
+2. Isolate canary: route 100% of affected traffic to fallback model variant or lower-fidelity quantized model
+3. Scale: increase worker count for the cohort (scale-out) for short burst window
+4. Collect traces and produce a 'kernel-slowdown' incident package (logs, kernel traces, device counters)
+5. If persistent, revert kernel or scheduler change via automated rollback job
+
+B. KV cache corruption detection and recovery
+1. Detect: kvcache.error_rate > 0.5% for 5m OR KV checksum mismatch logs
+2. Quarantine node: mark node out_of_service in resource manager
+3. Warm restart: start a new node and run 'kvcache-warmup --source=peer-healthy --session-window=30m'
+4. Rebalance: allow scheduler to rebind sessions once kvcache.hits per session > 0.8
+
+8. Experiment notebook & artifact conventions
+
+- Always include: input corpus id, model_version, quant_profile, scheduler_policy_yaml (attached), machine image hash, and bench-runner report.json
+- Artifact layout recommended:
+  artifacts/<experiment-id>/{report.json,profiles/*.pb,server-logs/*.log,tooling/compare.html}
+
+9. Team wiki pointers & ownership
+
+- Runtime architecture deep-dive: /confluence/eng-serving-runtime/runtime-architecture/execution-stitching-and-fallback-orchestration-2026
+- Scheduler policy language: /confluence/eng-serving-runtime/kernel-and-scheduling/scheduler-policy-language-declarative-profiles-2026
+- Profiling tools and diff runner: /confluence/eng-serving-runtime/profiling-playbook/causal-latency-attribution-and-signal-enrichment-playbook-2026
+
+Owners:
+- runtime architecture: runtime-platform@redwood.com (Runtime team)
+- scheduler policy: scheduler-core@redwood.com
+- bench automation: infra-bench@redwood.com
+
+Appendix: Telemetry thresholds (operational)
+
+- SLOs:
+  - 99th token latency (hosted API): 250ms - target
+  - 95th kernel exec time (device): < 45ms for short-path kernels
+  - KV cache hit ratio (hot sessions): > 0.90
+- Alert thresholds:
+  - latency.99p increased beyond 10% for 15m -> severity P2
+  - kernel.exec_time.p99 > 75ms for 5m -> severity P1
+
+Revision history
+
+- 2026-11-03: initial draft (Asha Patel)
+- 2027-02-14: expanded profiling playbook and added benchmark matrix (reviewed by Marcus Nguyen, Elena Ruiz)
+
+Related pages
+
+- /confluence/eng-serving-runtime/profiling-playbook/runtime-experiment-lab-protocols-and-kernel-fuzz-suite-2026
+- /confluence/eng-serving-runtime/runbooks/runtime-deployment-circuit-breakers-and-sla-fallback-playbook-2026
+- /confluence/eng-serving-runtime/benchmarking-and-perf-suite/runtime-deployment-sanity-and-benchmark-suite-acceptance-2026
+
+End of document.
+
+
+Title: Runtime Operations Synthesis and Experiment Manual
+
+Overview
+
+This document codifies a single, operationally-oriented reference that synthesizes runtime architecture intent, kernel-scheduler policy patterns, profiling procedures, benchmark experiment templates, release-note instrumentation requirements, common triage matrices for known issues, and runbook steps for critical runtime incidents. The target audience is SREs, runtime engineers, and applied ML engineers running end-to-end performance experiments and rollouts. This is intentionally cross-cutting: use it when designing experiments that touch serving, scheduling, telemetry, and model rollout safety.
+
+Scope
+
+- Cross-layer guidance for runtime architecture and scheduling decisions
+- Profiling playbook for reproducible micro- and macro-benchmarks
+- A canonical benchmarking experiment matrix and CLI examples
+- Release note checklist specific to kernel/scheduler/quantization changes
+- Known-issues triage matrix and emergency runbooks
+- Links to team wiki pages and owners for deeper dives
+
+1. Architecture intent summary
+
+- Goal: Keep 99th-percentile token-latency predictable for mixed short/long request surfaces while minimizing per-token cost and preserving model fidelity.
+- Execution model: hierarchical execution cohorts -> kernel pipeline -> device-level executor -> KV-cache layer -> network ingress.
+- Decision contracts:
+  - Scheduler must expose: priority, preemption_policy, batch_shaping_hint, affinity_hint.
+  - Runtime must preserve KV-cache continuity across model swaps or shard remapping with no user-visible token duplication.
+
+Diagram (textual)
+
+[diagram]
+Node: Frontend router (route/policy) -> Admission controller (SLO gating) -> Scheduler (cohort classification) -> Kernel dispatcher -> GPU executor (per-device) -> KV cache store -> Response aggregator
+[/diagram]
+
+2. Scheduler policy grammar (reference)
+
+- Policies are declared as YAML fragments in experiments and ingested by the scheduler-reconciler. Example:
+
+```yaml
+name: slo-tiered-fastpath
+priority: high
+preemption_policy: best-effort
+batch_shaping_hint:
+  max_tokens_per_batch: 4096
+  preferred_sequence_length: [8, 64, 512]
+affinity_hint:
+  allow_cross_gpu: true
+  numa_preference: node-local
+```
+
+- Notes:
+  - priority: low|normal|high|critical
+  - preemption_policy: none|best-effort|aggressive
+  - batch_shaping_hint drives kernel-selection heuristics; mismatches create fallback logs under runtime.kernels.fallback
+
+3. Profiling playbook (reproducible experimental protocol)
+
+Objective: produce a causal attribution between observed latency regressions and kernel/scheduler changes with <5% false-positive rate for alerting.
+
+Preconditions:
+- Snapshot the serving traffic sample (10k requests representative surface) and pin model_version + quant_profile.
+- Reserve a quiet maintenance fleet (min 3 homogeneous GPUs) and enable full tracing for the trace-id range.
+
+Step-by-step:
+1. Prepare trace corpus: run shadow-replay against local harness with --preserve-headers --sticky-session.
+2. Baseline run (A): run the microbenchmark suite (see CLI below) for 30 minutes, collect kernel latency histograms, occupancy, NVLink errors.
+3. Change under test: apply scheduler or kernel patch to canary worker group.
+4. Treatment run (B): repeat the microbenchmark with identical seed and traffic replay.
+5. Compare: use the profiler diff tool to generate causal attribution report. Look for increases in kernel-tail (>95th) and shifts in batch-size distributions.
+6. If >10% regression in 99th latency or >5% drop in throughput, abort rollout and follow rollback runbook.
+
+Profiling CLI examples
+
+- Shadow replay harness (developer machine):
+  ./harness/replay --corpus=~/trace-corpus/production-2027-11-07 --target=scheduler-canary --duration=30m
+
+- Microbenchmark command (30m):
+  ./bench/run --suite=mixed-short-long --seed=42 --gpu-pool=homogeneous-4
+
+Telemetry to capture (minimum):
+- kernel.exec_time_histogram
+- scheduler.batch_size_distribution
+- kvcache.hits_per_session
+- device.occupancy_percentile
+- network.rtt_ms
+
+4. Benchmarking suite: canonical experiments
+
+Table: Experiment templates
+
+| name | intent | workload shape | duration | success metric |
+|---|---:|---|---:|---|
+| mixed_burst | realistic customer mix | 60% short, 40% long | 60m | 99p latency < 250ms |
+| convoys_stress | long-sequence dominated | 100% long | 120m | throughput > baseline * 0.95 |
+| small_shortpath | low token per req | 95% < 20 tokens | 30m | median latency < 30ms |
+
+Example orchestration (K8s job YAML snippet for bench-runner):
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bench-mixed-burst
+spec:
+  template:
+    spec:
+      containers:
+      - name: bench-runner
+        image: registry/redwood/bench:2028-01
+        args: ["--suite=mixed_burst","--duration=60m","--report=/artifacts/report.json"]
+      restartPolicy: Never
+```
+
+5. Release note and signoff checklist (for runtime/kernel/scheduler changes)
+
+- Summary of change and expected behavioral impact
+- Benchmarks: mixed_burst and convoys_stress results attached
+- Telemetry dashboards updated: kernel-latency, batch-distribution, cost-per-token
+- Rollout plan: canary group size, measurement windows, rollback thresholds
+- Owners: runtime-team, scheduler-team, SRE
+- Compliance signoffs (if quantization affecting fidelity): applied by research/QA
+
+Release-template (bulleted):
+- Change-id: RRT-XXXX
+- Authors: <names>
+- Canary plan: 5% traffic for 1h -> 20% for 4h -> full
+- Abort criteria: 99p latency > +10% OR error-rate increase > 0.1%
+
+6. Known-issues triage matrix (short catalog)
+
+| Issue | Symptoms | Quick mitigation | Owner | Status |
+|---|---|---|---|---|
+| kernel-lockup-on-batch-split | GPU stuck >60s, watchdog alerts | restart process, drain cohort | runtime-oncall | investigating |
+| kvcache-eviction-race | elevated cold-start errors when remapping | reduce eviction aggressiveness, force warmup | infra-cache | mitigated |
+| scheduler-favors-large-batches | tail latency regressed for short requests | apply temporary cohort mislignment filter | scheduler | triaged |
+
+7. Emergency runbooks
+
+A. Kernel slowdown / tail-latency spike
+1. Identify cohort: query runtime.cohort.latency by tag
+2. Isolate canary: route 100% of affected traffic to fallback model variant or lower-fidelity quantized model
+3. Scale: increase worker count for the cohort (scale-out) for short burst window
+4. Collect traces and produce a 'kernel-slowdown' incident package (logs, kernel traces, device counters)
+5. If persistent, revert kernel or scheduler change via automated rollback job
+
+B. KV cache corruption detection and recovery
+1. Detect: kvcache.error_rate > 0.5% for 5m OR KV checksum mismatch logs
+2. Quarantine node: mark node out_of_service in resource manager
+3. Warm restart: start a new node and run 'kvcache-warmup --source=peer-healthy --session-window=30m'
+4. Rebalance: allow scheduler to rebind sessions once kvcache.hits per session > 0.8
+
+8. Experiment notebook & artifact conventions
+
+- Always include: input corpus id, model_version, quant_profile, scheduler_policy_yaml (attached), machine image hash, and bench-runner report.json
+- Artifact layout recommended:
+  artifacts/<experiment-id>/{report.json,profiles/*.pb,server-logs/*.log,tooling/compare.html}
+
+9. Team wiki pointers & ownership
+
+- Runtime architecture deep-dive: /confluence/eng-serving-runtime/runtime-architecture/execution-stitching-and-fallback-orchestration-2026
+- Scheduler policy language: /confluence/eng-serving-runtime/kernel-and-scheduling/scheduler-policy-language-declarative-profiles-2026
+- Profiling tools and diff runner: /confluence/eng-serving-runtime/profiling-playbook/causal-latency-attribution-and-signal-enrichment-playbook-2026
+
+Owners:
+- runtime architecture: runtime-platform@redwood.com (Runtime team)
+- scheduler policy: scheduler-core@redwood.com
+- bench automation: infra-bench@redwood.com
+
+Appendix: Telemetry thresholds (operational)
+
+- SLOs:
+  - 99th token latency (hosted API): 250ms - target
+  - 95th kernel exec time (device): < 45ms for short-path kernels
+  - KV cache hit ratio (hot sessions): > 0.90
+- Alert thresholds:
+  - latency.99p increased beyond 10% for 15m -> severity P2
+  - kernel.exec_time.p99 > 75ms for 5m -> severity P1
+
+Revision history
+
+- 2026-11-03: initial draft (Asha Patel)
+- 2027-02-14: expanded profiling playbook and added benchmark matrix (reviewed by Marcus Nguyen, Elena Ruiz)
+
+Related pages
+
+- /confluence/eng-serving-runtime/profiling-playbook/runtime-experiment-lab-protocols-and-kernel-fuzz-suite-2026
+- /confluence/eng-serving-runtime/runbooks/runtime-deployment-circuit-breakers-and-sla-fallback-playbook-2026
+- /confluence/eng-serving-runtime/benchmarking-and-perf-suite/runtime-deployment-sanity-and-benchmark-suite-acceptance-2026
+
+End of document.

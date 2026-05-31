@@ -1,0 +1,166 @@
+Cross-layer Observability & Diagnostics Playbook — Burst and Degradation Incidents
+
+Summary
+-------
+This playbook describes a cross-layer, repeatable approach for detecting, diagnosing, and mitigating short-duration bursts and progressive degradation in the Serving Runtime. It bridges runtime architecture, kernel scheduling signals, profiling playbooks, and benchmarking checks so oncall and runtime engineers can quickly restore SLOs and reduce mean time to innocence (MTTI).
+
+Scope and audience
+------------------
+- Scope: Hosted + Dedicated runtime clusters and the operator-facing control-plane paths (Dispatcher, SlotAllocator, KernelRunner, KVCache, and Runtime Router).
+- Audience: Serving runtime oncall, runtime engineers, release owners, and performance SREs.
+
+Goals and SLO references
+------------------------
+- Primary detection SLOs: 95th token-latency < 100ms, 99th token-latency < 300ms for default small-model profile. (See per-model SLO sheet.)
+- Operational goals: initial triage within 5 minutes, mitigation (fallback or ramp) within 15 minutes, restore to within 10% of baseline P95 within 60 minutes.
+
+How this playbook fits with other docs
+-------------------------------------
+This is an operational layer that references: profiling playbooks for telemetry sampling, kernel-scheduler design docs for decision points, benchmarking suite for reproducible load, and existing runbooks for fallback and warmstart. Use this playbook when alerts indicate sudden tail-latency or progressive throughput drop.
+
+Key concepts and system components
+----------------------------------
+- Dispatcher: user-facing ingress that performs request classification and route affinity. Primary source of request-level traces.
+- SlotAllocator: assigns execution slots (cohort/priority) used by the scheduler. Tracks queue lengths and admission metrics.
+- KernelRunner: GPU process pool executing kernels. Emits kernel_latency_hist, kernel_qps, kernel_error_rate, and kernel_memory_pressure.
+- KVCache: per-session prefix cache. Key signals: hit_rate, eviction_rate, and warmup_latency.
+- Runtime Router / Graceful Fallback: orchestrates model variant fallbacks and cross-region routing.
+
+Signal catalog and quick thresholds
+----------------------------------
+(Use these to prioritize initial checks.)
+
+| Signal (metric)                      | Type         | Quick threshold (when to escalate) |
+|--------------------------------------|--------------|------------------------------------|
+| dispatch.request_p95_ms              | latency      | > baseline * 1.2 or > 200ms       |
+| kernel_latency_p95_ms                | latency      | > 1.5x baseline                   |
+| kernel_queue_depth                   | gauge        | > 80% of max slots                |
+| slot_allocator.queue_wait_time_p95   | latency      | > 50ms                            |
+| kvcache.hit_rate                     | ratio        | drop > 15 percentage points       |
+| grpc.reconnect_rate                  | rate         | sustained > 5/min                 |
+| node_gpu_utilization                 | utilization  | > 95% (thermal risk)              |
+| infra.network_rtt_p95                | latency      | > baseline + 20ms                 |
+
+Note: baseline is the rolling 7-day median for the service and model profile.
+
+Triage checklist (first 5 minutes)
+----------------------------------
+1) Validate alert and scope
+   - Confirm alert: check Alerting UI + trace sample in the last 2 minutes.
+   - Determine scope: single node, single pool, entire region, or global. Use the Dispatcher topology view.
+2) Quick telemetry pull
+   - Pull P95/P99 for dispatch.*, kernel_*, kvcache.* and slot_allocator.* for last 30m vs 3h.
+   - Commands (on the runbook box):
+     ```bash
+     rmetric query --service=dispatcher --metrics="dispatch.request_p95_ms,dispatch.request_p99_ms" --range=30m
+     rmetric query --pool=kernerrunner --metrics="kernel_latency_p95_ms,kernel_queue_depth" --range=30m
+     rlog fetch --trace-id $(rmetric top-traces --service=dispatcher --limit=1) --follow=1m
+     ```
+3) Fast isolation heuristics
+   - If kernel_queue_depth high and kernel_latency rising: likely kernel scheduling or admission.
+   - If kvcache.hit_rate collapsed and kernel P95 is higher: consider cache warmup cascade.
+   - If node_gpu_utilization is low but kernel queue depth is high: investigate scheduler admission/NUMA balance.
+
+Isolation procedures (15–30 minutes)
+-----------------------------------
+A. Kernel scheduling checks
+   - Check scheduler decision log: `rkctl scheduler inspect --pool <pool> --window 10m`
+   - Look for recent policy changes (priority weights, admission caps). If there was a rollout in the last hour, rollback to the previous scheduler config.
+   - Check GPU mismatch signals: `rkctl node inspect --node <id>` -> note nvlink errors, thermal events.
+B. Admission and backpressure
+   - Validate admission thresholds: `SlotAllocator.admit_rate` vs observed arrival rate.
+   - If admission is overly conservative, temporarily increase soft-cap by +10% and monitor.
+   - If admission is broken, flip to the safe fallback profile: `rkctl route set-fallback --route <route> --profile reduced-memory`
+C. KV cache warmup cascade
+   - If kvcache.eviction_rate spiked, trigger a targeted prefetch job for the affected sessions:
+     ```yaml
+     apiVersion: redwood.io/v1
+     kind: KVPatchJob
+     spec:
+       model: <model-name>
+       sessions: [session-ids-file]
+       concurrency: 4
+     ```
+
+Mitigation patterns (approved temporary actions)
+------------------------------------------------
+- Short term (minutes): route to warm fallback model variant in-region; increase admission soft-cap by 5–10%; reduce batch size target to lower per-call kernel time.
+- Medium term (hours): evict peaky low-util priority cohorts; initiate rolling restart of KernelRunner pool if drivers show instability; apply kernel restart mitigation which drains pending short calls first.
+- Long term (post-incident): schedule simulation in the benchmarking suite to reproduce the burst, add synthetic traffic signature to the mixed-workload SLO test, and create a scheduler policy change with canary and rollout plan.
+
+Diagnostic playbook for kernel-level regressions
+------------------------------------------------
+1) Reproduce with a targeted microbenchmark
+   - Use the perf harness: `bench-run --profile kernel-latency --model <model> --sequence 256 --concurrency 8 --duration 5m`
+   - Collect kernel traces: `kerntrace collect --pool <pool> --out /tmp/kerntrace.pb`
+2) Compare kernel signature to baseline
+   - Run diff against golden: `kerntrace diff /tmp/kerntrace.pb gs://benchmarks/kernel-gold/<model>.pb`
+3) If reproducible, tag as kernel-regression and create a hotfix branch with kernel config rollback. Include the diff and perf artifacts in the PR.
+
+Benchmarks and quick acceptance tests
+------------------------------------
+Use the standard benchmarking suite to validate mitigations before full rollout. Minimum test matrix:
+- Mixed workload replay (30m): baseline QPS, 30% long sequences, 20% high-concurrency short sequences.
+- Kernel microbench: 1–8 batch sizes, sequence 16/128/512.
+- Admission and fallback test: inject synthetic saturating arrival and assert fallback triggers within 10s.
+
+Sample benchmark run (CLI)
+```bash
+benchctl run --suite mixed-workload --tag incident-capture-$(date +%s) --params "qps=500,duration=30m,seqmix=0.3:512,0.5:128,0.2:16"
+benchctl collect --artifact incident-capture-1234 --to gs://bench-results/incident-capture-1234
+```
+
+Release notes and change correlation
+-----------------------------------
+- Always check the Deployment Log (release-control) for any scheduler or kernel config changes in the 60 minutes before incident start.
+- Use the release correlation query: `rctl releases list --since 1h --component scheduler,kernerrunner,kvcache`
+- If a canary rollout is present, pause or rollback the canary immediately and re-evaluate.
+
+Known issues to consider (fast checks)
+------------------------------------
+- NVLINK flapping on a subset of nodes causes intermittent kernel stalls (workaround: cordon nodes with nvlink_errors > 0 and drain after cooldown).
+- Kernel memory fragmentation causing soft OOMs under interleaved batches (mitigation: apply compacting GC in 2.3.1-hotfix and restart KernelRunner).
+- GRPC connection recycling leading to small head-of-line stalls at the Dispatcher (workaround: increase connection pool size temporarily).
+
+Runbook appendices and artifacts to collect
+-------------------------------------------
+Collect these during the incident and attach to the postmortem:
+- Top 20 traces (dispatch) during incident window.
+- kernel_trace.pb files for affected KernelRunner nodes.
+- SlotAllocator decision log for the interval.
+- Bench artifacts if a reproduction was run (benchctl outputs).
+- Release correlation snapshot (release-control export).
+
+Post-incident actions (owner: runtime-performance squad)
+-------------------------------------------------------
+1) Assign postmortem owner within 24h.
+2) Reproduce incident in bench lab with identical traffic signature within 72h.
+3) Create follow-up tickets: scheduler policy change, kernel tuning, KVCache prefetch improvements, or infra remediation (if hardware).
+4) Add a synthetic SLO probe to the mixed-workload suite for future detection.
+
+Operational contacts and escalation
+----------------------------------
+- Oncall (runtime): #runtime-oncall Slack, Pager schedule in PagerDuty
+- Kernel squadra: kern-team@redwood.com
+- Infra hardware: infra-hw@redwood.com
+
+Maintenance checklist (for release owners)
+-----------------------------------------
+- Before rolling scheduler changes: run the canary matrix (3% traffic) for 60 minutes against mixed workload.
+- Attach bench artifacts and kernel diffs to the PR.
+- Notify SRE and runtime performance reviewers 24h prior to rollout.
+
+Revision history
+----------------
+- 2025-11-12: initial draft (Aisha Kapoor)
+- 2026-01-18: added KVCache warmup cascade procedures and benchmark commands (reviewers: Marco Ruiz)
+- 2026-03-01: expanded kernel-level diagnostics and known issues section; published (reviewers: Evelyn Park, Daniel Kim)
+
+Related resources and links
+-------------------------
+- Dispatcher traces dashboard: /dashboards/dispatcher/traces
+- Mixed-workload bench suite: /tools/benchctl/doc
+- Scheduler policy language reference: confluence/eng-serving-runtime/kernel-and-scheduling/scheduler-policy-language-declarative-profiles-2026
+- Kernel tracing guide: confluence/eng-serving-runtime/profiling-playbook/kernel-observability-sla-profiling-cadence-2024
+
+If you have questions or need a walkthrough, ping the runtime-performance squad in #runtime-performance and request a live lab replication session.

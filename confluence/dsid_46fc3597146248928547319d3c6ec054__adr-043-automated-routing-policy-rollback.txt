@@ -1,0 +1,224 @@
+ADR-043: Automated Routing Policy Rollback Semantics (Anti-flap, Rate Limits, Auditability)
+
+## Summary
+This ADR defines rollback semantics for Redwood’s automated regional failover routing policies. It answers:
+- When automation should revert a previously applied routing policy change (rollback / fail-back).
+- How we prevent oscillation (“flapping”) under noisy or partial signals.
+- Safe-rate limits for policy flips (global, per-route, per-tenant) to constrain blast radius.
+- How the system records/audits decisions so on-call and post-incident reviews can reconstruct who/what/why.
+
+This ADR is complementary to **ADR-042 (Failover Trigger Signal Hierarchy)**. ADR-042 defines *when to fail over*; ADR-043 defines *how to safely reverse those changes* and how to keep the system stable.
+
+## Status
+**Accepted** (effective for Hosted API and Dedicated multi-region routing under the Reliability Program).
+
+## Context
+Today, regional failover is a mix of manual and partially automated routing actions. During recent staging rehearsals we observed:
+- False-positive triggers leading to unnecessary traffic shifts.
+- Oscillation after initial failover: signals improve briefly, rollback occurs, then re-failover occurs as load shifts back.
+- Poor auditability of “why did routing change” and “who approved/overrode it.”
+
+We need rollback that is:
+- **Safe:** avoids cascading overload and minimizes customer-visible errors.
+- **Predictable:** deterministic evaluation and clear invariants.
+- **Bounded:** rate limited with per-tenant/tier controls.
+- **Auditable:** every recommendation/execution/rollback is recorded with evidence.
+
+## Definitions
+- **Policy flip:** A routing policy change that materially changes the selected region for a route/model/tier (e.g., weighted shift, hard exclude, priority change).
+- **Failover action:** Any policy flip that reduces traffic to an impaired primary region and increases traffic to a secondary region.
+- **Rollback action / fail-back:** A policy flip that moves traffic back toward the original primary region (or removes an exclusion).
+- **Hold-down timer:** Minimum time after a flip during which rollback is not allowed (unless explicit safety escape hatches are met).
+- **Hysteresis:** Rollback thresholds are stricter than failover thresholds to avoid bouncing.
+- **Route:** A specific routing key (e.g., Hosted API: model family + endpoint + tier; Dedicated: pool + tenant + region set).
+
+## Decision
+### 1) Rollback is governed by three gates
+Automation may roll back a failover only when **all** the following are true:
+
+1. **Signal Recovery Gate (Health):** The original region is considered “Recovered” by the Region Health Service.
+2. **Stability Gate (Time):** The hold-down timer has elapsed since the last flip for the affected route.
+3. **Capacity Gate (Headroom):** The original region can accept returned traffic without violating capacity safety thresholds.
+
+If any gate fails, the system remains in failover posture and continues monitoring.
+
+### 2) Recovery gate: “Recovered” requires sustained improvement and corroboration
+The Region Health Service will compute a per-region **recovery state** used by the controller.
+
+**Recovered state requirements (default; may be tuned per route class):**
+- **Reachability:** cross-region probes and service-to-service reachability for the region are passing for **>= 10 minutes**.
+- **Error burn:** 5xx burn rate below recovery threshold for **>= 15 minutes**.
+- **Tail latency burn:** p99 latency burn below recovery threshold for **>= 15 minutes**.
+- **Control plane dependency sanity:** control plane actions (policy reads/writes, config distribution) are not degraded in a way that would make rollback unsafe.
+
+**Hysteresis (key):** recovery thresholds MUST be stricter than failover thresholds. Example defaults (illustrative; exact numbers live in config):
+- Failover triggers may fire on 2-minute fast burn (e.g., 14x) with corroboration.
+- Recovery requires sustained low burn (e.g., < 1x slow burn) for 15 minutes.
+
+If a region is in “Recovered” but capacity is constrained (Capacity Gate fails), rollback is postponed.
+
+### 3) Stability gate: hold-down timers and minimum dwell time
+After any policy flip for a route:
+- **Minimum dwell (hold-down): 20 minutes** before rollback is allowed.
+- **Minimum dwell after rollback: 30 minutes** before another failover is allowed (stronger anti-flap after reintroducing primary).
+
+Rationale: these timers allow traffic patterns, caches, batching behavior, and autoscaling to stabilize. They also reduce the chance that transient improvements immediately cause a rollback.
+
+### 4) Capacity gate: “safe to return traffic” criteria
+Rollback must not overload the original region.
+
+Rollback requires:
+- **GPU headroom:** at least **N% headroom** for the impacted pool(s) after accounting for expected returned traffic (Dedicated pools are assessed per tenant/pool; Hosted is assessed per tier/model family).
+- **Autoscaling safety:** autoscaler is healthy and not rate-limited; scale-up backlog within normal bounds.
+- **Queueing / shed rate:** load shedding (retry-after / circuit breaker opens) below configured thresholds.
+
+If capacity is insufficient, rollback is deferred and the controller emits an audit event with `blocked_reason=capacity_gate`.
+
+### 5) Rollback execution is phased, not immediate
+To avoid sudden load steps, rollback proceeds in phases (per route):
+1. **Phase A (probe return):** return a small fraction (e.g., 5%) to primary for 10 minutes.
+2. **Phase B (ramp):** increase in increments (e.g., +15% every 10 minutes) while monitoring error/latency and shed rate.
+3. **Phase C (restore):** restore default policy weights/exclusions.
+
+If any monitored metric regresses past rollback abort thresholds during phases A–C, the controller stops the ramp and may re-apply failover posture (see Escape Hatches below).
+
+### 6) Anti-oscillation: rate limits + flip budgeting
+Automation is subject to rate limits at multiple scopes.
+
+**Global limits (controller instance / environment):**
+- Max executed flips: **30 per hour** (production), **10 per hour** (staging).
+
+**Per-route limits:**
+- Max executed flips per route: **2 per hour**.
+- Max rollback attempts per route: **1 per hour**.
+
+**Per-tenant limits (safety limits):**
+- For Dedicated tenants: max flips affecting a tenant: **2 per hour**.
+- For Hosted enterprise tier tenants (where tenant-aware routing exists): max flips affecting a tenant: **2 per hour**.
+
+If a limit is hit, the controller enters **route safe-mode**: it stops executing changes for the route and only emits recommendations + audit events. On-call can override with explicit acknowledgement.
+
+### 7) Deterministic evaluation + single source of truth
+To avoid divergent behavior across replicas:
+- Policy evaluation and rollback eligibility are computed deterministically from:
+  - Region Health Service snapshot (time-stamped)
+  - Routing config (versioned)
+  - Controller state (last flip time, last action, counters)
+- Only the controller leader (or a single-writer mechanism) can execute policy flips.
+- All executed changes must carry a monotonic `decision_id` and a config `policy_version` reference.
+
+### 8) Escape hatches (explicit rollback override and safety re-failover)
+Automation may bypass Stability Gate (hold-down) only for explicit safety conditions:
+- **Hard failure / reachability loss in secondary:** If the failover target region degrades severely (e.g., reachability failure), the controller may reroute again even within hold-down.
+- **Severe overload in secondary:** If overload responses exceed a critical threshold (sustained shed rate) and the primary is at least partially healthy, partial return may be allowed.
+
+These escape hatch actions are flagged as `exception_path=true` in audit logs and should page the on-call.
+
+### 9) Manual control, approvals, and dry-run
+- The controller supports **dry-run mode** that emits recommendations without execution.
+- In production, routes/tier groups may be configured to require **approval hooks** (on-call acknowledgement) for:
+  - First-time enablement
+  - Any rollback (fail-back) actions, until confidence is established
+  - Any action that affects enterprise Dedicated tenants
+
+Approval decision (who approved and when) is recorded in audit logs.
+
+## Audit & Observability Requirements
+### Audit event types
+The controller must emit structured audit events for each route decision cycle and action:
+- `failover.recommended`
+- `failover.executed`
+- `rollback.recommended`
+- `rollback.executed`
+- `action.blocked` (rate limit, capacity gate, hold-down)
+- `action.aborted` (during phased rollback ramp)
+- `override.approved` / `override.denied`
+- `safe_mode.entered` / `safe_mode.exited`
+
+### Required audit fields (minimum)
+Each event must include (names are canonical; implementation may include additional fields):
+- `timestamp`
+- `environment` (staging|prod)
+- `decision_id` (unique)
+- `route_id` (stable identifier)
+- `tenant_id` (if applicable; hashed for Hosted where needed)
+- `tier` (hosted_free|hosted_pro|hosted_enterprise|dedicated)
+- `action` (failover|rollback|abort|block)
+- `from_region` / `to_region`
+- `policy_version_before` / `policy_version_after`
+- `reason_primary` (e.g., reachability, 5xx_burn, latency_burn, capacity)
+- `signals_evidence` (compact summary string; links to dashboards are preferred)
+- `hold_down_remaining_seconds`
+- `rate_limit_state` (counters summary)
+- `exception_path` (true|false)
+- `actor` (automation|oncall_user) and `actor_id` (for humans)
+- `change_ticket` / `incident_id` (if present)
+
+**Privacy:** Do not include request payloads, prompts, or customer content. Tenant identifiers must comply with internal privacy guidance; for Hosted, use stable hashed IDs in logs exported outside restricted systems.
+
+### Retention and access
+- Audit events must be queryable for **>= 90 days** for operational investigations.
+- For enterprise audit requests, the system must support generating a redacted report of actions taken affecting a specific tenant (see Support workflows).
+
+### Dashboards and alerting
+Dashboards must include:
+- Flip counters and rate-limit blocks
+- Time in failover posture per route
+- Rollback phase progress (A/B/C) and abort reasons
+- Annotated timeline markers for every executed flip
+
+Alerts:
+- Page on repeated flaps (e.g., > 3 executed flips for a route within 2 hours)
+- Page on escape hatch actions
+- Page when safe-mode is entered for a high-value route/tier
+
+## Configuration (Defaults)
+The following defaults apply unless overridden per route class:
+- Hold-down after any flip: 20m
+- Hold-down after rollback: 30m
+- Recovery observation window: 15m (errors/latency), 10m (reachability)
+- Per-route max flips: 2/hour
+- Per-tenant max flips: 2/hour
+- Rollback phased ramp: 5% → +15% per 10m → restore
+
+All values are stored in versioned configuration and changes require review from Routing + SRE.
+
+## Consequences
+### Positive
+- Lower risk of oscillation and customer-visible instability during partial outages.
+- Clear, testable semantics for rollback that can be validated in game days.
+- Strong auditability for postmortems, support inquiries, and enterprise expectations.
+
+### Trade-offs / Costs
+- Fail-back will be slower than naive immediate rollback due to sustained recovery windows and phased return.
+- Additional complexity in controller state management and config.
+- Potential for prolonged failover posture if capacity does not recover, even when health signals do.
+
+## Rollout Plan
+1. Implement audit event schema and dashboard annotations (required before production enablement).
+2. Enable dry-run in production for a limited set of Hosted routes (non-enterprise) to validate recommendation quality.
+3. Enable execution with approval hooks for rollback actions.
+4. Expand to Dedicated tenants with strict per-tenant limits and explicit CS comms coverage.
+5. Remove approval hooks for rollback only after two successful game days with no flapping and acceptable SLO outcomes.
+
+## Testing / Validation
+- Unit tests: deterministic evaluation, hold-down logic, rate limiting counters, phased ramp behavior.
+- Simulation tests: replay recorded signal streams through the controller and verify actions.
+- Game day success criteria (subset relevant to this ADR):
+  - No route flaps more than once during the test window.
+  - Rollback does not cause secondary overload or a spike in shed responses.
+  - Audit events fully reconstruct the timeline of decisions and approvals.
+
+## Open Questions
+- Whether Dedicated rollback should support tenant-defined “preferred primary” region constraints in the controller (vs. routing config only).
+- Whether to treat control plane degradation as an automatic blocker for rollback even when data plane is healthy.
+
+## Appendix: Example Decision Narrative (Audit-Friendly)
+Example (condensed):
+- 12:04: region us-east reachability failed (corroborated by perf-canary + control plane health) → `failover.executed` to eu-west.
+- 12:18: us-east signals improved but hold-down remaining 6m → `action.blocked` (hold-down).
+- 12:25: us-east recovered for 15m and capacity headroom 22% → `rollback.recommended`.
+- 12:26: on-call approved rollback for Hosted Pro route group → `override.approved`.
+- 12:27: rollback Phase A (5%) executed; monitoring ok.
+- 12:37: rollback Phase B ramp to 20% executed; monitoring ok.
+- 12:57: rollback Phase C restore executed; `rollback.executed`.

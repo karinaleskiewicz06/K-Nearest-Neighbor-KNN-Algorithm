@@ -1,0 +1,138 @@
+CI/CD GPU eval pipeline: tenant isolation and IaC patterns
+
+Overview
+
+Purpose: This document describes the recommended CI/CD patterns, Terraform/IaC module layout, networking constraints, and operational runbook for running GPU-backed evaluation pipelines while enforcing tenant isolation. It targets infra engineers and platform owners responsible for safe, reproducible evaluation runs and low-risk CI promotion into shared GPU fleets.
+
+Goals
+- Provide reproducible, auditable GPU eval pipelines that do not leak data or credentials across tenants.
+- Minimize blast radius from noisy evals by enforcing network, compute, and storage separation.
+- Offer Terraform module patterns and CI gating steps that prevent accidental promotion of unsafe runtime images.
+- Define clear runbook steps for common failure modes (quota exhaustion, eviction, image signing failures).
+
+Scope
+- Applies to evaluation workloads (model accuracy/e2e tests, benchmark harnesses, offline eval batches) that run on shared GPU pools managed by eng-infra.
+- Does NOT cover hosted inference production endpoints or customer-visible dedicated pools (those have separate private-deploy runbooks).
+
+Architecture summary
+- CI system: Buildkite for long-running GPU jobs and image promotion; GitHub Actions for lightweight gating and IaC plan checks.
+- Artifact registry: signed container images stored in internal ECR/GCR repository with immutable tags and SBOM attached.
+- Provisioning: Terraform modules orchestrate ephemeral GPU namespaces (K8s namespaces + nodeSelectors), private VPC subnets, egress proxy, and per-tenant S3 buckets.
+- Isolation controls: network ACLs + egress proxy, IAM role per-tenant for storage and KMS, and enforced Terraform remote-state workspaces per-tenant.
+
+High-level flow
+1) Developer opens PR that updates eval harness or container spec.
+2) GitHub Actions runs lint, unit tests, and terraform fmt/validate for module changes.
+3) Buildkite job builds the GPU container image in a restricted builder cluster, runs smoke tests on a tiny GPU job (1-2 minutes).
+4) If smoke test passes, image is signed and published to the artifact registry with immutable tag (sha).
+5) Terraform plan is generated against a per-tenant workspace; plan must pass an OPA policy check.
+6) Promotion to ephemeral eval cluster happens via Buildkite pipeline: a job requests a GPU lease from the allocator API and runs the full eval.
+7) Results are stored to the tenant's S3 bucket and the audit log is recorded to the central audit index.
+
+Tenant isolation patterns (network and compute)
+- VPC segmentation: each tenant evaluation runs in a logically isolated VPC namespace (or isolated subnet with strict routing). Cross-tenant traffic is blocked by default.
+- Egress proxy: all eval workloads route outbound through the company egress proxy with allowlisting and TLS inspection for telemetry endpoints only.
+- IAM/KMS separation: per-tenant IAM roles and dedicated KMS key aliases are required. Terraform module enforces required KMS alias input.
+- Storage scoping: every tenant must provide an S3 prefix or separate bucket; bucket policies restrict access to the tenant IAM role only.
+- Node affinity and taints: eval pods use nodeSelectors for the ephemeral GPU pool. Pools are labeled by tenant type (ephemeral-eval, ci-longrun) to reduce noisy neighbor interference.
+
+IaC module layout and patterns (recommended)
+- modules/gpu-lease (responsible for allocating a lease resource that records requested gpus, duration, and owner). Inputs: tenant_id, gpus, region, max_duration_seconds. Outputs: lease_id, lease_endpoint.
+- modules/network/tenant-subnet (creates subnet, routetables, and egress-proxy route). Inputs: tenant_namespace, allowed_cidr_outbound.
+- modules/registry-image (wraps artifact signing and SBOM attestation hooks). Inputs: image_name, build_sha, sbom_blob.
+- Remote state: one backend per-tenant workspace (S3 bucket with a DynamoDB lock table). Use enforced naming convention: rs-tenant-<tenant_id>-infra.
+- Policy-as-code: integrate OPA check-run into pre-merge CI; common rules include requiring KMS alias input, forbidding public S3 ACLs, and disallowing wide-open security groups.
+
+Minimal Terraform example
+```
+module "gpu_lease" {
+  source = "git::ssh://git@repo/internal-modules.git//gpu-lease?ref=v1.3.0"
+  tenant_id = var.tenant_id
+  gpus      = 2
+  region    = var.region
+}
+
+module "tenant_network" {
+  source = "git::ssh://git@repo/internal-modules.git//tenant-subnet?ref=v2.1.0"
+  tenant_namespace = var.tenant_id
+  allowed_cidr_outbound = ["10.5.0.0/16", "sso.company-internal:443"]
+}
+```
+
+CI/CD safety controls
+- Mandatory image signing: build pipeline must call the signing service and attach signature artifact to the container in the registry. Promotion jobs must verify signature and SBOM before scheduling.
+- Pre-flight quota checks: every promotion job calls the GPU allocator API (see sample below) and fails fast if insufficient capacity.
+- Canary/test size limits: by policy, long-running evals must declare expected max_gpus and fail if the allocator grants fewer than 80% of requested.
+- Timebox enforcement: long evals are started with a TTL. The lease service auto-evicts after TTL and the pipeline must implement checkpointing to resume later.
+
+Allocator API sample (curl)
+```
+curl -X POST "https://allocator.internal/api/v1/request" \
+  -H 'Authorization: Bearer $ALLOCATOR_TOKEN' \
+  -H 'Content-Type: application/json' \
+  -d '{ "tenant_id": "team-ml", "gpus": 4, "region": "us-west-2", "max_duration_seconds": 14400 }'
+
+# example response
+{
+  "status": "granted",
+  "lease_id": "lease-abc123",
+  "node_selector": "pool=ephemeral-eval-usw2-1"
+}
+```
+
+Operational runbook: common failure modes and remediation
+1) Image build fails in builder cluster
+   - Symptoms: Buildkite shows non-zero exit during container build; logs indicate dependency fetch errors or CVE scan rejection.
+   - Immediate steps: 1) Re-run the Buildkite job with DEBUG=1; 2) Inspect builder host disk and network metrics (owner: ci-platform); 3) If the failure is SBOM/CVE rejection, open a vuln exception request with security and include SBOM.
+2) Promotion blocked by OPA policy
+   - Symptoms: Terraform plan fails pre-merge OPA check.
+   - Steps: Review OPA policy failure message in CI. Common fixes: set kms_alias, tighten security group rules, add explicit s3_prefix. If policy is wrong, ping infra-policy@ and include plan output.
+3) Lease request denied (quota exhausted)
+   - Symptoms: Allocator API returns status=denied or pending.
+   - Steps: 1) Check current pool utilization dashboard (link below); 2) If pool is saturated, consider requesting preemption credits or scheduling into a later window; 3) For urgent evals, escalate to oncall-gpu with subject "urgent-lease-request".
+4) Eviction during run (preempt/spot or thermal event)
+   - Symptoms: Job abruptly terminates, cloud preempt log or node OOM/power event appears.
+   - Steps: 1) Capture pod logs and kube events; 2) If node preempted, lease service will mark lease as evicted—inspect checkpoint store and reschedule from last checkpoint; 3) If systemic (multiple nodes), open incident and follow GPU Fleet incident playbook.
+5) Network egress blocked
+   - Symptoms: Eval process stalls on downloading dataset or contacting telemetry; logs show TLS/connection timeouts to external host.
+   - Steps: 1) Confirm egress proxy allowlist includes the endpoint; 2) If absent, request temporary allowlist via network-requests channel with owner: cloud-networking.
+
+SLOs and alerts (CI metrics)
+- Build success rate (per week): target >= 98% for smoke builds.
+- Artifact promotion latency: median < 12 minutes from signed-image->lease-granted.
+- Lease request failure rate: target <= 1% due to allocator errors.
+- Alerts: failed-signature-verification, allocator-500, buildkite-agent-crash. All should page infra-oncall when triggered.
+
+Ownership and rollout plan
+- Module owners: modules/gpu-lease -> @Marcus Green; modules/tenant-subnet -> @Lina Zhao; CI pipelines -> ci-platform team.
+- Rollout steps for new module version: 1) Create PR in internal-modules repo with changelog and RFC link; 2) Run canary promotion in a sandbox tenant; 3) Monitor utilization and error budgets for 72 hours; 4) Graduate to default module version.
+
+Appendix: useful snippets and links
+- Buildkite job snippet (GPU builder)
+```
+steps:
+  - label: ":docker: build & smoke"
+    command:
+      - scripts/build-image.sh
+      - scripts/smoke-test.sh
+    agents:
+      queue: gpu-builders
+      gpu: 1
+    timeout_in_minutes: 60
+```
+- Example IAM policy enforcement table:
+| Requirement | Rationale | Enforcement |
+|------------:|-----------|------------|
+| KMS alias required | Prevent key reuse across tenants | Terraform validate + OPA |
+| S3 prefix only | Avoid bucket-level cross-tenant reads | Policy + bucket policy |
+| No public SGs | Avoid internet-exposed builders | OPA + pre-merge gating |
+
+Contacts and related pages
+- IR: oncall-gpu@redwood.com (pager duty)
+- Dashboard: GPU allocator dashboard (internal link)
+- Related: eng-infra/runbooks/kv-cache-reconstruction-and-eviction-resilience-runbook.json, eng-infra/ci-cd-and-build/ci-gpu-eval-quarantine-and-ci-throttling-policy.json
+
+Revision history
+- 2024-05-10: created by Aisha Patel
+- 2024-11-02: added allocator API examples and signed-image promotion policy (reviewers: Diego Morales)
+- 2025-02-14: updated runbook steps for eviction and added SLO targets (reviewers: Marcus Green)

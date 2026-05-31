@@ -1,0 +1,367 @@
+Shadow Traffic Policy Service (STPS) — Control Plane Service Overview
+
+## Overview
+Shadow Traffic Policy Service (STPS) is the control-plane service responsible for storing, validating, versioning, and distributing **shadow traffic policies** that mirror a sampled subset of production requests to one or more shadow targets.
+
+STPS does **not** run inference and does **not** participate on the user request path directly. It produces a compiled policy artifact that the data plane (Smart Routing / Edge Router) consumes to make mirroring decisions deterministically and safely.
+
+This document covers:
+- Service responsibilities and boundaries
+- API surface (internal + Console backend)
+- Validation rules and guardrails
+- Storage model and versioning
+- Migrations and rollout considerations
+- Integration points (routing, rollouts, telemetry, audit)
+
+---
+
+## Responsibilities
+### In scope
+- Persist shadow traffic policy configs attached to:
+  - **Routes** (e.g., /v1/chat/completions, /v1/embeddings)
+  - **Rollouts / experiments** (canary and A/B objects)
+- Provide deterministic **bucketing parameters** used by data plane (sampling %, hashing inputs, salts)
+- Validate policies against platform guardrails (sampling limits, timeouts, target constraints, data handling flags)
+- Version policies and enable safe rollback (immutability of historical versions)
+- Distribute policy updates via the config distribution system
+- Emit audit log events for create/update/disable actions
+
+### Explicitly out of scope
+- Running shadow requests (handled by routing/data plane)
+- Storing prompts/responses or scoring outputs (telemetry + scoring pipeline)
+- Customer-defined arbitrary code execution for eval/scoring
+
+---
+
+## Service interfaces
+### Upstream callers
+- **Console backend (Rollouts service)**: creates/updates policies as part of experiment/rollout configuration.
+- **CLI/automation (internal)**: used by SRE and internal dogfood enablement flows.
+
+### Downstream consumers
+- **Smart Routing / Edge Router**: reads compiled shadow policy bundles and enforces fail-open mirroring.
+- **Telemetry ingestion**: consumes policy IDs/versions for joinability and debugging (no prompt content from STPS).
+- **Audit log service**: records configuration changes.
+
+---
+
+## API surface
+STPS exposes an internal HTTP API (and gRPC in Private deployments where required) with a stable resource model.
+
+### Resource model
+- `shadow_policy`: attaches to either a `route_id` or a `rollout_id` (mutually exclusive).
+- Policies are **versioned**. Any update produces a new immutable version.
+
+### Endpoints (internal)
+1) Create policy
+- `POST /v1/shadow-policies`
+- Creates version `1`.
+
+2) Update policy (creates new version)
+- `POST /v1/shadow-policies/{policy_id}/versions`
+- Creates version `N+1`.
+
+3) Get policy (latest)
+- `GET /v1/shadow-policies/{policy_id}`
+
+4) Get specific version
+- `GET /v1/shadow-policies/{policy_id}/versions/{version}`
+
+5) Resolve effective policy for a route/rollout
+- `GET /v1/shadow-policies:resolve?route_id=...` or `...:resolve?rollout_id=...`
+- Applies precedence rules (see Integration with Rollouts).
+
+6) Validate only (dry-run)
+- `POST /v1/shadow-policies:validate`
+- Returns validation results and computed derived fields (e.g., normalized weights).
+
+7) Disable policy (soft-disable)
+- `POST /v1/shadow-policies/{policy_id}:disable`
+- Produces a new version with `enabled=false`.
+
+### Permissions and RBAC
+Authorization is enforced via the shared Control Plane Auth middleware.
+- Required scopes:
+  - `routes.write` to attach/update route-level policies
+  - `rollouts.write` to attach/update rollout-level policies
+  - `shadow_traffic.admin` for override operations (e.g., raising sampling cap for internal tenants)
+- Policies are tenant-scoped; cross-tenant access is blocked.
+
+### Idempotency
+- `POST` endpoints accept `Idempotency-Key`.
+- STPS stores request hashes to avoid duplicate versions on retries.
+
+---
+
+## Policy schema (v1)
+STPS stores the policy as JSON (schema-validated) and also produces a **compiled bundle** for routing consumption.
+
+### Canonical fields
+Required/typical fields (non-exhaustive):
+- `enabled`: boolean
+- `mode`: `"shadow"` (reserved for future modes)
+- `sample_rate`: float in [0, 1]
+- `bucketing`:
+  - `strategy`: `"consistent_hash"` (v1)
+  - `hash_inputs`: ordered list (e.g., `tenant_id`, `route_id`, `user_fingerprint`)
+  - `salt_ref`: reference to a tenant-scoped secret salt stored in KMS (Hosted/Dedicated) or local secret store (Private)
+- `targets`: list of shadow targets
+  - Each target references a *variant* (model version, quant profile, routing policy, prompt template)
+  - `weight`: integer, normalized at compile time
+  - `timeout_ms`: per-target shadow timeout (must be <= global cap)
+- `request_mutations`:
+  - `add_headers_allowlist`: list of allowed headers to pass to shadow path
+  - `drop_headers`: list of headers to remove
+  - `metadata_behavior`: `"copy" | "minimal"` (minimal is default)
+- `fail_open`: required true in v1 (shadow path failures must not affect control path)
+- `limits`:
+  - `max_shadow_qps`: optional clamp
+  - `max_shadow_inflight`: optional clamp
+- `data_handling`:
+  - `redaction_profile`: `"default" | "strict" | "none"` (tenant-dependent; Private may permit different defaults)
+  - `retention_class`: `"short" | "extended"` (enforced downstream; stored here for joinability)
+- `telemetry`:
+  - `dimensions_allowlist_profile`: `"shadow_v1_safe"` (ties to cardinality controls)
+
+### Example payload (illustrative)
+```json
+{
+  "enabled": true,
+  "mode": "shadow",
+  "sample_rate": 0.02,
+  "bucketing": {
+    "strategy": "consistent_hash",
+    "hash_inputs": ["tenant_id", "route_id", "user_fingerprint"],
+    "salt_ref": "kms://shadow-bucketing-salt/tenant/tn_9f2c..."
+  },
+  "targets": [
+    {
+      "target_id": "variant:mdl_llama3_70b_q4_kvopt_v2",
+      "weight": 100,
+      "timeout_ms": 1200
+    }
+  ],
+  "request_mutations": {
+    "add_headers_allowlist": ["x-request-id", "x-tenant-tag"],
+    "drop_headers": ["authorization"],
+    "metadata_behavior": "minimal"
+  },
+  "fail_open": true,
+  "limits": {
+    "max_shadow_qps": 50
+  },
+  "data_handling": {
+    "redaction_profile": "default",
+    "retention_class": "short"
+  },
+  "telemetry": {
+    "dimensions_allowlist_profile": "shadow_v1_safe"
+  }
+}
+```
+
+---
+
+## Validation and guardrails
+STPS performs strict validation at write-time (create/update) and at compile-time (bundle generation). Invalid policies are rejected.
+
+### Validation categories
+1) Sampling and cost control
+- `sample_rate` must be within `[0.0, 0.10]` by default.
+  - Higher caps require `shadow_traffic.admin` and an allowlisted tenant flag.
+- If both `sample_rate` and `max_shadow_qps` are set, STPS verifies `max_shadow_qps` is <= tenant cap.
+
+2) Target constraints
+- At least 1 target required when `enabled=true`.
+- Max targets (v1): 3.
+- Target IDs must reference existing variant objects (validated via Rollouts/Variants registry).
+- `timeout_ms` per target must be within `[200, 1500]` ms (default caps; may vary by deployment mode).
+
+3) Fail-open enforcement
+- `fail_open` must be `true` (v1). Any attempt to set `false` is rejected.
+- Circuit breaker behavior is configured in routing; STPS only stores policy intent and caps.
+
+4) Header/metadata safety
+- Only allowlisted headers can be forwarded to shadow path.
+- Sensitive headers are always dropped: `authorization`, `cookie`, `x-api-key` (non-overridable).
+- `metadata_behavior=minimal` is default; `copy` requires an allowlisted tenant flag due to downstream cardinality risk.
+
+5) Data handling flags
+- `redaction_profile` must be compatible with tenant classification:
+  - Regulated Dedicated/Private tenants may require `strict`.
+  - `none` is only available for internal tenants and explicitly approved sandboxes.
+
+6) Telemetry cardinality compliance
+- Policy must reference an approved `dimensions_allowlist_profile`.
+- Any attempt to add free-form dimensions in the policy is rejected (dimensions are defined centrally in telemetry standards; policy only selects a profile).
+
+### Validation output
+The `:validate` endpoint returns:
+- `valid: true|false`
+- list of errors with machine-readable codes (e.g., `SAMPLE_RATE_TOO_HIGH`, `TARGET_UNKNOWN`, `HEADER_NOT_ALLOWED`)
+- derived normalized fields (e.g., weights normalized to sum=1000)
+
+---
+
+## Storage model and versioning
+STPS uses Postgres (Hosted/Dedicated control plane) and supports a local Postgres/SQLite option in Private deployments.
+
+### Tables (logical)
+1) `shadow_policies`
+- `policy_id` (ULID)
+- `tenant_id`
+- `attachment_type` (`route` or `rollout`)
+- `attachment_id` (route_id or rollout_id)
+- `created_at`
+- `created_by`
+- `current_version`
+
+2) `shadow_policy_versions`
+- `policy_id`
+- `version` (int)
+- `state` (`active`, `disabled`)
+- `spec_json` (JSONB)
+- `compiled_bundle_json` (JSONB)
+- `schema_version` (int)
+- `created_at`, `created_by`
+- `change_note` (string; required for Console updates, optional for automation)
+
+3) `shadow_policy_idempotency`
+- `tenant_id`
+- `idempotency_key`
+- `request_hash`
+- `policy_id`, `version`
+- TTL-based cleanup
+
+### Version immutability
+- Spec and compiled bundle for a version are immutable.
+- Rollback is implemented by setting `current_version` pointer (or creating a new version identical to a prior version, depending on the caller’s preference). Console uses “create new version” to preserve auditability.
+
+---
+
+## Compilation and distribution
+STPS generates a compiled bundle that the routing layer can consume efficiently.
+
+### What compilation does
+- Normalizes and validates weights
+- Resolves target references into routing-ready identifiers
+- Computes derived caps (e.g., effective timeout, clamped QPS)
+- Attaches a `policy_fingerprint` used for cache keys and debugging
+
+### Distribution mechanism
+- STPS publishes compiled bundles to the Config Distribution System (CDS):
+  - Keyed by `tenant_id` + `route_id` (for route policies) and by `tenant_id` + `rollout_id` (for rollout policies)
+  - Routing subscribes and caches bundles in-memory with short TTL
+
+### Consistency model
+- Control plane is eventually consistent to data plane.
+- Target: 99% of policy updates visible in routing within **60 seconds**.
+- During propagation delays, routing continues using the last known good bundle.
+
+---
+
+## Integration points
+### Smart Routing / Edge Router
+- Routing pulls compiled bundle and enforces:
+  - Deterministic bucketing
+  - Mirroring timeouts
+  - Backpressure/circuit breakers
+  - Fail-open semantics
+- Routing emits telemetry events that include:
+  - `shadow_policy_id`
+  - `shadow_policy_version`
+  - `policy_fingerprint`
+
+### Rollouts / Experiments
+Precedence rules for `:resolve`:
+1) If a request is under an active rollout with an attached shadow policy, use rollout policy.
+2) Else if the route has an attached shadow policy, use route policy.
+3) Else shadowing is disabled.
+
+Notes:
+- Rollout-level policies are the primary mechanism for canary comparisons.
+- Route-level policies are intended for continuous monitoring (e.g., always shadow 0.5% to a safety-tuned variant).
+
+### Telemetry and scoring
+- STPS does not store prompts/responses.
+- STPS must stay consistent with telemetry standards by only allowing selection of pre-approved allowlist profiles.
+
+### Audit logs
+STPS writes audit events for:
+- Create policy
+- Update policy (new version)
+- Disable policy
+- Attach/detach to route/rollout
+
+Audit event fields include tenant, actor, policy id/version, attachment id, and change note.
+
+---
+
+## Migrations and backward compatibility
+### Schema versioning
+- Policy specs include `schema_version`.
+- STPS supports reading older versions and re-compiling to current compiled format where safe.
+
+### Migrating existing route configs
+- Initial rollout adds `shadow_policy_id` as an optional reference on route and rollout objects.
+- Default behavior for existing routes: no shadow policy attached.
+
+### Safe rollout plan (control plane)
+1) Deploy STPS with read-only endpoints and compile pipeline enabled.
+2) Add support in Console backend to call `:validate` and display errors.
+3) Enable write endpoints behind a feature flag for internal tenants.
+4) Gradually allow Dedicated beta tenants.
+
+### Downgrade strategy
+- If STPS is rolled back, routing continues operating without shadowing (no effect on control path).
+- Existing policies remain in DB; re-enable after forward deploy.
+
+---
+
+## Operational considerations
+### SLO targets (control plane)
+- API availability (STPS): 99.9% monthly
+- P95 latency:
+  - `GET` endpoints: < 150 ms
+  - `POST` validate/create/update: < 400 ms
+- Policy propagation to routing: 99% < 60 seconds
+
+### Metrics
+- `stps_requests_total{endpoint,code}`
+- `stps_validation_errors_total{code}`
+- `stps_policy_publish_latency_seconds`
+- `stps_compilation_failures_total`
+- `stps_idempotency_replay_total`
+
+### Alerts (high signal)
+- Publish failures > 0 for 10m (ticket)
+- Compilation failures > 1% for 10m (page when impacting production tenants)
+- P95 latency regression > 2x baseline for 15m (ticket)
+
+### Oncall and ownership
+- Primary: Eng Platform (Control Plane)
+- Escalation: Smart Routing on data plane symptoms; SRE for broad control plane degradation
+
+---
+
+## Security and compliance notes
+- Tenant isolation is enforced at the DB and service layer.
+- Bucketing salt references must point to approved secret stores (KMS/HSM in Hosted/Dedicated; local secret store in Private).
+- Header forwarding is allowlist-based with non-overridable drops for sensitive headers.
+- Change notes are required for Console-driven edits to improve auditability.
+
+---
+
+## Known limitations (v1)
+- No customer-defined custom dimensions in policy (must use allowlist profiles).
+- No time-based scheduling in policy (e.g., “shadow only during business hours”). Use Rollouts scheduling.
+- No per-segment sampling in policy (e.g., by geography); segmentation is handled in routing policies/rollout assignment.
+
+---
+
+## Contacts
+- Control plane / STPS: Benji Okafor (implementation lead), Ethan Park (engineering lead)
+- Policy engine: Jordan Lee
+- Smart Routing integration: Ravi Menon, Mina Haddad
+- Telemetry constraints: Nadia Rahman
+- Security review: Marcus Lin

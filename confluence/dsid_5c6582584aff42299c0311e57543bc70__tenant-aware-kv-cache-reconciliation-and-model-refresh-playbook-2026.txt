@@ -1,0 +1,141 @@
+Tenant-aware KV-cache reconciliation and model refresh playbook
+
+Summary:
+This playbook describes an operator-run procedure for reconciling tenant-scoped KV caches while performing a model artifact refresh on private (VPC or on-prem) deployments. It is intended for field operators and SREs supporting tenant-aware runtimes where model swaps, quantized artifact refreshes, or model-version rollouts must avoid cross-tenant pollution and preserve SLOs.
+
+Why this exists:
+- KV caches are large, stateful, and may be keyed by model-variant + tenant. Incompatible cache formats or stale keys cause correctness and latency regressions.
+- Model refreshes (e.g., new weights, quantization profiles, kernel-change) must coordinate with cache migration to avoid token misalignment or silent inference errors.
+
+Scope and applicability:
+- Applies to Redwood Private deployments with per-tenant KV namespaces (multi-tenant or single-tenant) that use local in-memory and distributed cache backends (Redis/etcd/local-shared-file).
+- Not for hosted (managed) API runs. For Dedicated deployments with shared GPU pools, follow dedicated-specific migration playbooks.
+
+Owners and contacts:
+- Primary owner: eng-private-deployments / Runtime Operations (oncall@redwood.example.com)
+- Secondary contact: Model Onboarding (applied-ml@redwood.example.com)
+- Escalation: Eng SRE lead (pager: #sre-pager)
+
+Definitions and key concepts:
+- KV namespace: a tenant+model scoped logical keyspace (e.g., tenant:acme-corp/model:gpt-7b-q4-2026)
+- Cache schema version: small integer embedded in cache keys to detect compatibility
+- Warm-warm swap: model swap where both old and new model artifacts are active and routed with a canary percentage
+- Cold-swap: model swap that requires clearing KV cache due to incompatible tokenization/format
+
+Preconditions (must be satisfied before starting):
+1) A validated new model artifact available in the artifact-store (S3 or onprem-proxy) with signed checksum and provenance record.
+2) Runbook and maintenance window approved by customer for private deploys that require operator interaction.
+3) Observability: traces, token-level latencies, cache hit-rate panels configured for the tenant.
+4) Backups: snapshot of KV namespace and model-serving state stored with timestamped name.
+5) Operator has access to tenant-specific operator credentials and can perform safe routing changes.
+
+Risk categories and mitigation:
+- Silent quality regression: mitigation -> run small prompt-set evals in staging and/or shadow traffic.
+- Latency spike due to full cache warm-up: mitigation -> staged canary rollout with request mirroring + pre-warm synthetic workloads.
+- Memory exhaustion on node: mitigation -> verify OOM headroom, scale compute pool prior to migration.
+
+High-level procedure (step-by-step):
+1. Preparation (Preflight checks)
+   - Verify artifact checksums and provenance: run `rwd-artifact verify --artifact s3://bucket/new-model.tar.gz --sig sha256:...`
+   - Ensure KV snapshot exists: `kvctl snapshot create --tenant acme-corp --model gpt-7b-q4-2026 --out s3://snapshots/acme/2026-05-04`
+   - Confirm telemetry dashboards show baseline (p50/p95 latency, cache hit-rate, token-error-rate).
+
+2. Dry-run in staging (mandatory for regulated tenants)
+   - Deploy new artifact to a staging tenant clone using the same cache backend and schema.
+   - Run the tenant-specific prompt-set (10–50 queries) and compare embeddings/hallucination metrics.
+
+3. Choose rollout strategy
+   - Warm-warm canary (recommended when cache schema compatible): route 5–10% of traffic to new model; keep old model active.
+   - Cold-swap (required when schema incompatible): perform a coordinated cache-reconcile then cutover during maintenance window.
+
+4. Warm-warm canary steps
+   a) Create a new KV namespace for the new model artifact: `kvctl namespace create --tenant acme-corp --name gpt-7b-q4-2026-v2`
+   b) Enable mirrored writes for a configurable window (default 5m) so both namespaces are populated: `kvctl mirror enable --from existing --to new --duration 5m`
+   c) Start routing 5% traffic to new model (control plane change): `rwd-ctl routes update --tenant acme-corp --route default --traffic-splits old:95 new:5`
+   d) Monitor: p95 latency change <+30ms, cache hit-rate on new namespace trending upward, token-consistency pass on canary prompt-set.
+   e) Incrementally increase to 25% over 30m if metrics stable, then 50% / 100% following stability gates.
+
+5. Cold-swap with reconciliation steps
+   a) Notify customer and open maintenance communication channels.
+   b) Quiesce new writes to old namespace and create immutable snapshot.
+   c) Run schema migration script to transform keys where possible. Example (pseudocode):
+      - `kv-reconcile --from ns_old --to ns_new --transform-key 'if prefix=="tok_v1" -> rename tok_v2' --batch-size 1000`
+   d) For entries that cannot be transformed, mark as tombstone to avoid incorrect reuse.
+   e) After reconciliation, enable atomic traffic switch for the tenant: `rwd-ctl routes update --tenant acme-corp --route default --target gpt-7b-q4-2026-v2`
+
+6. Post-cutover validation and warm-up
+   - Run smoke tests and the tenant prompt-set. Expect initial cold-cache latency bump; track warm-up curve.
+   - Validate per-token correctness using deterministic prompts.
+   - Observe memory usage on serving nodes; if >85% stable, scale up or throttle.
+
+Rollback decision matrix:
+- Immediate rollback triggers:
+  - Token-error-rate > 0.5% above baseline within 10 minutes of canary traffic
+  - p95 latency degradation > 2x baseline for >5 minutes
+  - Customer reports functional failure
+- Rollback procedure (warm-warm): shift traffic back to old model and keep new namespace for postmortem.
+- Rollback procedure (cold-swap): if reconciliation introduced corruption, restore KV namespace from snapshot and re-route to previous model artifact.
+
+Operator safety gates (automated checks):
+- Checksum and signature match for artifact before activation.
+- Cache schema compatibility check returns OK or list of incompatible keys.
+- Telemetry health probe: health = (p95 < threshold AND token-error-rate < threshold AND cache-hit-rate > threshold).
+
+Observability and queries (examples to copy into Grafana/Exploration):
+- Cache hit-rate by tenant: `sum(rate(kv_cache_hits_total{tenant=\"acme-corp\"}[5m])) / sum(rate(kv_cache_requests_total{tenant=\"acme-corp\"}[5m]))`
+- Token error rate: `rate(model_token_errors_total{tenant=\"acme-corp\"}[1m]) / rate(model_tokens_generated_total{tenant=\"acme-corp\"}[1m])`
+- Canary latency p95: `histogram_quantile(0.95, sum(rate(request_duration_seconds_bucket{route=~\".*canary.*\"}[5m])) by (le))`
+
+Configuration and sizing knobs (recommended defaults):
+| Component | Default | Notes |
+|---|---:|---|
+| Mirror write window | \"5m\" | Short window to populate new namespace without prolonged duplication |
+| Reconcile batch size | \"1000\" | Tunable to trade off throughput and memory pressure |
+| Warmup synthetic qps | \"0.1 * steady-state qps\" | Start small to avoid spiky cold-cache load |
+| Memory headroom trigger | \"85%\" | Scale threshold for operator safety |
+
+Artifacts and CLI snippets:
+- Create snapshot (kvctl):
+```
+kvctl snapshot create --tenant acme-corp --model gpt-7b-q4-2026 --output s3://snapshots/acme/2026-05-04
+```
+- Start namespace reconcile (dry-run):
+```
+kv-reconcile --from ns_old --to ns_new --dry-run --batch-size 1000 --log-level INFO
+```
+- Traffic switch (atomic):
+```
+rwd-ctl routes update --tenant acme-corp --route default --target gpt-7b-q4-2026-v2 --atomic
+```
+
+Postmortem and evidence capture checklist:
+1. Preserve KV snapshots and reconcile logs (retain for 90 days for audits).
+2. Export canary traces and prompt set results.
+3. Record exact artifact checksums, control-plane route versions, and operator actions.
+
+Known limitations and open issues:
+- Cross-tenant cache spills: rare but observed when namespace tagging missing; mitigation: enforce tenant tag at the agent level and validate in CI.
+- Large-scale reconciliation time: extremely large namespaces may require operator partitioning. Consider staged tenant-by-tenant reconciliation.
+- Some quantization changes require full cold-cache and cannot be reconciled.
+
+Related pages and references:
+- Model onboarding: applied-ml-and-evals/model-onboarding (run staging validation harness)
+- KV cache migrations (legacy): day-2-ops/kv-cache-migrations-and-runtime-state-migration-playbook-2025
+- Observability: eng-platform/dashboards-and-alerts/serving-kpi-templates
+
+Appendix A — example reconciliation transform (explanatory):
+- Input key: `tenant:acme|model:gpt-7b-v1|tok_v1:...`
+- Rule: `tok_v1 -> tok_v2` and adjust stored token metadata; otherwise tombstone.
+
+Appendix B — quick QA checklist for customers (example communication template):
+- What we will do: \"We will run a staged model refresh with mirrored cache writes and a canary for 30m.\"
+- Expected impact: \"Temporary p95 latency increase of up to 150ms during first 30 minutes; subsequent warm-up should return to baseline.\"
+- Fallback plan: \"We can revert traffic instantly to the previous artifact and restore KV snapshot within the maintenance window.\"
+
+Revision history:
+- 2026-03-15: First draft (Mariana Ortega)
+- 2026-04-06: Added automated telemetry probes and rollback matrix (Connor Li)
+- 2026-05-04: Clarified reconcile transform guidance and updated CLI snippets (Mariana Ortega)
+
+Document ownership and maintenance:
+- This page is owned by eng-private-deployments and should be reviewed quarterly or whenever KV schema changes are introduced.

@@ -1,0 +1,161 @@
+GPU Burst Fairshare Lattice: Allocator & Eviction Playbook
+
+h1. GPU Burst Fairshare Lattice: Allocator & Eviction Playbook
+
+Summary
+
+This document describes the "Burst Fairshare Lattice": an allocator and eviction framework that blends contractual priority, runtime cost signals, tenant credit accounting, and SLO urgency to make deterministic placement and preemption decisions for GPU pools. It covers the scoring model, Terraform interface, telemetry, runbooks for operational incidents, and a safe rollout path. Intended audience: infra engineers, SREs, and platform product owners.
+
+Motivation
+
+- Issue observed: short, high-intensity bursts (ad-hoc evals, load tests) cause unpredictable preemption and cost spikes that harm SLA customers and increase unit economics.
+- Objective: give reserved customers predictable performance while allowing elastic consumers to use spare capacity in a fair, cost-sensitive manner.
+- Scope: scheduling and eviction decisions inside the GPU allocator service only. Quotas, billing enforcement, and customer contracts are outside this runtime scope.
+
+Core concepts
+
+- Lattice dimensions: contract_tier, realtime_cost, credit_balance, slo_label, and temporal_recency.
+- Credit ledger: per-tenant decaying credit that grows from committed spend and admin grants; decays with configurable half-life.
+- Cost proxy: node annotations that indicate effective per-minute cost (spot factor, egress multiplier, GPU SKU).
+- SLO labels: critical / latency_sensitive / best_effort which map to protection multipliers.
+
+Scoring model (high level)
+
+Compute a composite score for each scheduling candidate and tenant:
+
+score = A*tier_score + B*credit_score + C*slo_multiplier + D*(1 - normalized_node_cost) + E*recency_bonus
+
+- tier_score: integer derived from contract (e.g., platinum=1.0, gold=0.7, silver=0.4, sandbox=0.0).
+- credit_score: credit_balance / credit_window_max (clamped 0..1).
+- slo_multiplier: discrete weight per SLO label (critical=1.0, latency_sensitive=0.6, best_effort=0.0).
+- normalized_node_cost: node_cost mapped to [0..1] within current cluster price distribution.
+- recency_bonus: small boost to tenants that have not been scheduled recently (prevents starvation).
+
+Weights (A..E) are runtime-configurable and live in a Terraform module and the allocator's policy store. Default suggestion: A=0.5, B=0.2, C=0.2, D=0.08, E=0.02.
+
+Placement and fallback behavior
+
+1) Primary placement: allocator evaluates score across eligible nodes and selects the highest-score node that satisfies constraints.
+2) Soft fallback: if placement fails due to contention, allocator issues a timed reservation (reservation TTL) and attempts to route the request to a lower-cost compatible variant (e.g., quantized or smaller-seq-length model) if the tenant has burst credits.
+3) Observable queueing: queued reservations expose a queue_position metric that downstream routers use to stream partial responses or decline early.
+
+Eviction and preemption policy
+
+- Soft actions (preferred): reduce concurrency, throttle pending tokens, and gracefully drain KV caches. Soft actions are applied first for a configurable grace window (default 30s).
+- Hard preempt: after soft grace, lowest-score workloads are preempted. Preemption ranking is ascending score; tie-breakers: oldest burst age, then lowest credit_balance.
+- Forced-protect: workloads marked with "force_protect=true" (admin flag for SLA customers) skip standard preemption; using it requires a documented exception and billing sync.
+
+Terraform module interface (canonical variables)
+
+- allocator_weight_tier: string (HCL list string syntax expected) - default: "[0.5,0.2,0.2,0.08,0.02]"
+- credit_window_minutes: string - default: "10080"
+- credit_half_life_hours: string - default: "72"
+- soft_grace_seconds: string - default: "30"
+- hard_grace_seconds: string - default: "60"
+- spot_cost_multiplier: string - default: "0.35"
+
+Example HCL snippet (for repo usage)
+
+module "burst_lattice" {
+  source = "git::ssh://git.redwood/company/terraform/terraform-aws-gpu-allocator.git//modules/burst-lattice"
+  allocator_weight_tier   = var.allocator_weight_tier
+  credit_window_minutes  = var.credit_window_minutes
+  credit_half_life_hours = var.credit_half_life_hours
+  soft_grace_seconds     = var.soft_grace_seconds
+  hard_grace_seconds     = var.hard_grace_seconds
+}
+
+Runtime policy JSON example (stored in allocator KV store)
+
+{
+  "weights": {"tier": 0.5, "credit": 0.2, "slo": 0.2, "cost": 0.08, "recency": 0.02},
+  "grace": {"soft_s": 30, "hard_s": 60},
+  "credit": {"window_minutes": 10080, "half_life_hours": 72},
+  "safelist": {"force_protect_tenants": []}
+}
+
+Telemetry and dashboards
+
+Instrument these primary metrics (names are suggestions compatible with Prometheus/OTel):
+- allocator_score_bucket{tenant,region,sku} (histogram)
+- allocator_allocs_total{tenant,node,score_bucket} (counter)
+- allocator_evictions_total{tenant,reason} (counter)
+- tenant_credit_balance{tenant} (gauge)
+- cluster_cost_per_minute{region} (gauge)
+- queued_reservations{tenant} (gauge)
+
+Suggested dashboards:
+- "Burst Lattice: Health": score distribution, credit burn, queued_reservations heatmap.
+- "Eviction Investigation": top evicted tenants, preemption reasons, latency before/after preempt.
+
+Alerts (examples)
+
+- HighEvictionRate: sum(rate(allocator_evictions_total[5m])) by (cluster) > 4 for 5m -> page SRE.
+- CostSurge: increase(cluster_cost_per_minute[10m]) > baseline*2 -> notify FinOps and capacity team.
+- CreditImbalance: >25% of reserved_tenants with credit_balance < 0.15 for 1h -> capacity review.
+
+Runbook: "Eviction storm, soft-first approach"
+
+1) Triage: accept page and open "Eviction Investigation" dashboard.
+2) Top-k: identify the top 5 tenants by allocator_evictions_total in the last 10m.
+3) Classification: mark which of those tenants are reserved (binding contracts) vs best_effort.
+4) Immediate mitigation (soft-first):
+   a) Increase runtime weight for tier (temporary) via policy API to protect reserved customers.
+   b) Extend soft_grace_seconds from 30s -> 90s to allow graceful throttling.
+   c) If warm pools exist, trigger warm-pool scaling: infra-tools warm-pool-scale --cluster <region> --delta 15
+5) If hard preemptions already in progress and reserved customers are impacted, perform emergency rollback of weight changes and escalate to capacity-oncall.
+6) Post-incident: within 72h open a postmortem doc with timeline, graphs, and recommended policy updates.
+
+CLI and debug commands
+
+- Policy update (curl):
+  curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+    https://allocator.internal.redwood/v1/policy -d '@policy.json'
+
+- Emergency warm-pool scale helper (local wrapper):
+  ./infra-tools/warm-pool-scale --cluster eu-west-1 --delta 20
+
+- Query allocations (example SQL in Postgres):
+  SELECT tenant_id, count(*) AS alloc_count, avg(score) AS avg_score
+  FROM allocator_allocations
+  WHERE ts > now() - interval '15 minutes'
+  GROUP BY tenant_id
+  ORDER BY alloc_count DESC
+  LIMIT 100;
+
+Simulation and testing guidance
+
+- Unit-level: run allocator simulation harness with synthetic tenants (reservation-heavy, bursty, long-tail). Aim for 95% test coverage on scoring code.
+- Integration: create two synthetic tenants (reserved + burst) on canary cluster and validate: fairness (no reserved SLA regressions), cost trending, and recovered preemption ordering.
+- Chaos tests: inject node cost spikes (simulate forced on-demand fallback) and ensure preemption respects cost penalties.
+
+Rollout plan
+
+1) Dev & unit tests -> CI verification including static analysis and allocator harness.
+2) Canary: deploy to a non-critical eval cluster for 48h. Run controlled traffic experiments: multiple bursters vs reserved workloads.
+3) Measure guardrails: no eviction_rate_alert, reserved latency SLOs met for 7 days.
+4) Staged regional rollouts in 3 waves; monitor alerts for 72h per wave.
+
+Governance and change control
+
+- All permanent weight changes (>24h) require two reviewers: GPU Platform lead + Capacity owner. Temporary emergency changes <=24h require SRE oncall + post-hoc review.
+- Credit grants: must include rationale and expiration; tracked in billing-owner audit log.
+
+Ownership
+
+- Primary: GPU Platform (gpu-platform@redwood)
+- Secondary: Capacity & FinOps (capacity-finops@redwood)
+- Reviewers: infrastructure-arch, SRE lead
+
+Appendix: tuning knobs and recommended defaults
+
+- Defaults: weights = [0.5,0.2,0.2,0.08,0.02], credit_half_life_hours = 72, soft_grace_seconds = 30, hard_grace_seconds = 60.
+- When to favor cost: increase D to 0.2 and lower A to 0.35.
+- When to favor latency protection: increase C and A.
+
+Change log
+
+- 2025-03-12: Created by Jamison Lee
+- 2025-07-01: Updated credit half-life guidance after lab experiments
+- 2025-11-05: Added governance and canary measurement thresholds
+

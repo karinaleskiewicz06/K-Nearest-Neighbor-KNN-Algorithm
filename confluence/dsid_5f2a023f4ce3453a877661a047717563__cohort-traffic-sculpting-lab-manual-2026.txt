@@ -1,0 +1,131 @@
+Cohort Traffic Sculpting Lab Manual
+
+Overview
+
+This manual describes the lab protocol for "cohort traffic sculpting" — a reproducible experiment set used to measure how the serving runtime (kernel scheduler, KV cache, and fallback routing) behaves when we apply controlled traffic perturbations across named cohorts. The goal is to produce deterministic signals for scheduler tuning, fidelity transitions, and fallback policies before making config changes in production.
+
+Goals
+- Produce repeatable performance and quality deltas for: latency P50/P95/P99, token throughput, kernel switch frequency, KV cache hit-rate per-cohort, and request-level quality (BLEU/embedding-similarity or domain-specific evals).
+- Validate scheduler heuristics (priority decay, preemption thresholds) against realistic mixed workloads.
+- Exercise fidelity transitions: quantization fallback, model swap, and degraded-routing modes.
+- Provide a signed-off experiment matrix and a playbook for rolling safe runtime changes.
+
+Scope and audience
+- Audience: runtime engineers, performance SREs, and applied ML teams onboarding model variants.
+- Scope: lab-run on the sandbox cluster (dev-fleet or sandbox-accelerator pool). DO NOT run these experiments directly on production clusters.
+
+Prerequisites
+1) Access: membership in group "runtime-lab" and SSH access to sandbox bastion.
+2) Environment: sandbox GPU pool with at least 6 nodes of heterogeneous capacity (2x A100-40GB + 4x A10).
+3) Artifacts: model bundles for three fidelity variants (full_fp16, int8_q, small_embed_quant) uploaded to /artifacts/lab/2026/cohort-sculpt.
+4) Simulator: the operational workload simulator (owsim) installed at /opt/owsim/owsim-cli v0.9.1 or later.
+5) Metrics: temporary Grafana board "lab/cohort-sculpt" and Prometheus scrape job for sandbox.
+
+Experiment matrix
+- Cohorts: baseline, premium, dev. Each cohort has a named traffic profile and SLA target.
+- Shapes: steady, spike-10m, ramp-1h, bursty-5x.
+- Fidelity transitions: off (no fallback), graceful (quantization fallback), aggressive (model swap to smaller variant).
+- Scheduler knobs: preemption_threshold = [0.65, 0.8, 0.95], priority_decay_window = [30s, 120s, 600s].
+
+Run each combination for 30 minutes (warmup 5m + measure 25m). For matrix coverage prioritize (premium -> baseline -> dev) ordering so premium path is warmed first.
+
+Experiment config example (owsim YAML)
+```yaml
+version: 1
+experiment_name: cohort-sculpt-ramp-2026-03
+cohorts:
+  - name: premium
+    rate_qps: 120
+    shape: ramp-1h
+    token_length_dist: {p10:8, p50:32, p90:256}
+    policy: {priority: 100, fallback: graceful}
+  - name: baseline
+    rate_qps: 60
+    shape: steady
+    token_length_dist: {p10:4, p50:16, p90:64}
+    policy: {priority: 60, fallback: off}
+  - name: dev
+    rate_qps: 8
+    shape: bursty-5x
+    token_length_dist: {p10:2, p50:8, p90:32}
+    policy: {priority: 10, fallback: aggressive}
+scheduler_overrides:
+  preemption_threshold: 0.8
+  priority_decay_window_s: 120
+metrics:
+  - name: latency_p95
+  - name: kv_hit_rate
+  - name: kernel_switch_rate
+  - name: model_swap_count
+output: /tmp/owsim-results/cohort-sculpt-ramp-2026-03
+```
+
+Important configuration table (recommended lab defaults)
+
+| Setting | Lab default | Description |
+|---|---:|---|
+| preemption_threshold | 0.8 | Fraction of kernel time at which preemption is permitted |
+| priority_decay_window_s | 120 | How long strong priorities persist |
+| kv_prefetch_enabled | true | Whether async KV prefetch hints are honored |
+| cache_warmup_seconds | 300 | Warmup period for KV cache measurement |
+| fidelity_transition_mode | graceful | Controls rollback/quality-first vs cost-first |
+
+Runbook: executing a lab run
+1) Prepare lab cluster: ensure node labeling for sandbox (kubectl label nodes --selector=pool=sandbox run=owsim).
+2) Upload experiment artifacts and config to /tmp and validate checksums: sha256sum artifacts/* | tee checksums.txt.
+3) Start the Prometheus scrape and Grafana board (scripts/lab/start-metrics.sh).
+4) Start owsim: /opt/owsim/owsim-cli run --config config.yaml --dry-run to validate.
+5) Execute with real run: /opt/owsim/owsim-cli run --config config.yaml --output /tmp/out --concurrency 4 &> /tmp/owsim.log &
+6) Monitor: open Grafana "lab/cohort-sculpt" and Loki logs for owsim and runtime-exporter. Verify no node OOMs or GPU thermal events.
+7) During run: capture kernel traces (trace-capture -o /tmp/trace-$(date +%s).pcap -t 1800) and scheduler debug snapshots via endpoint /debug/scheduler/snapshot.
+8) Post-run: run analysis script scripts/lab/aggregate_metrics.py /tmp/out -> /tmp/analysis.json and upload to artifact store (gs://redwood-lab/experiments/).
+
+Acceptance criteria and pass/fail rules
+- Pass if for premium cohort: latency_p95 <= 200ms, kv_hit_rate >= 0.72, kernel_switch_rate <= 0.05 switches/sec per-kernel, model_swap_count == expected for fidelity policy.
+- Fail if any node reports GPU memory > 92% for > 60s, or if scheduler enters preemption storm (>= 50 preemptions/min across cluster).
+- Quality regression threshold: if reference eval on sample payloads shows > 2.5% drop in similarity metric for premium cohort relative to baseline model, mark as failed for rollout.
+
+Telemetry and dashboards
+- Provided Grafana panels: cohort_p95_by_priority, kv_hit_rate_by_cohort, kernel_switch_rate_heatmap, model_swap_timeline, per-node_gpu_memory.
+- Tags to include in traces: experiment_id, cohort, request_priority, fidelity_variant, kernel_id. Ensure trace sampling rate is 100% for premium cohort during lab runs.
+
+Troubleshooting and common failure modes
+- Symptom: elevated kernel_switch_rate with small request sizes. Remediation: increase preemption_threshold by +0.1 and re-run a 10m smoke test.
+- Symptom: KV hit-rate low for premium despite warmup. Remediation: verify session affinity and check prefix cache key construction; run tools/lab/kv-key-audit.py.
+- Symptom: model_swap_count unexpected (too frequent). Remediation: check model health probes and disable aggressive fallback for a canary. Also examine runtime logs for version mismatch errors.
+
+Safety and rollback guidance
+- Never apply lab-derived scheduler changes straight to prod. Use the dedicated canary cluster flow: 1) apply to canary pool (10% traffic), 2) monitor 6 hours, 3) escalate to prod only after 3 successful canary windows. Document canary IDs and feature flags in the release ticket.
+
+Ownership and contacts
+- Lab owner: Aisha Patel (runtime experiments). Pager: #runtime-lab on Slack.
+- Scheduler SME: Marcus Liu (kernel team).
+- SRE contact: Sofia Ortega.
+
+Appendix: sample commands and scripts
+- Start a minimal smoke run:
+  /opt/owsim/owsim-cli run --config smoke-config.yaml --output /tmp/smoke --duration 600
+
+- Capture scheduler snapshot curl:
+  curl -sS "http://runtime-sandbox:8080/debug/scheduler/snapshot" -H "X-Experiment-ID: sclpt-2026" > /tmp/snapshot.json
+
+- Aggregate example (Python):
+  python3 scripts/lab/aggregate_metrics.py /tmp/out --output /tmp/summary.json
+
+Appendix B: expected artifact layout
+/tmp/owsim-results/cohort-sculpt-ramp-2026-03/
+  - run-001/ (raw traces and owsim output)
+  - analysis.json (aggregated metrics)
+  - scheduler_snapshots/
+  - traces/
+
+Related reading and links
+- See also: Operational Workload Simulator guide (../benchmarking-and-perf-suite/operational-workload-simulator-and-signature-guide-2026)
+- See scheduler observability contract (../kernel-and-scheduling/scheduler-observability-contract-and-simulated-injector-2026)
+
+Document change history
+- 2025-11-12: initial draft by Aisha Patel.
+- 2026-02-09: added acceptance criteria and runbook commands (review: Marcus Liu).
+- 2026-03-02: updated lab defaults and example configs after sandbox infra changes (review: Sofia Ortega).
+
+If you plan to run a long experiment that could affect shared sandbox capacity, please coordinate with #runtime-lab at least 48 hours in advance.

@@ -1,0 +1,180 @@
+GPU Capacity Runway and Auto‑Sinking Playbook
+
+Summary
+
+This playbook defines the GPU capacity runway model, the automated "auto-sinking" policy to proactively downscale warm/standby pools when project spending runway is threatened, and the required Terraform/CI gating, monitoring, and rollback controls. It is intended for infra owners, SRE oncall, and finance partners.
+
+Motivation
+
+- Reduce idle GPU costs without violating tenant SLOs.
+- Provide deterministic, audit-able actions that map capacity decisions to financial runway (days-of-runway).
+- Ensure safety: changes must pass IaC and smoke tests, be canaryed, and have an immediate rollback path.
+
+Definitions
+
+- Runway (days): projected days before committed budget plus forecasted revenue cannot cover expected spend at current utilization.
+- Warm pool: pre-provisioned GPU instances (or pods) kept ready for fast start (<90s).
+- Auto‑sinking: automated reduction of warm pool target sizes driven by runway thresholds.
+- Conservative mode: limits burst and enforces strict preemption/fallback policies.
+
+Key services and components
+
+- gpu-allocator-svc (internal): matches requests to pools; exposes metrics: warm_pool_fill_time_seconds, unused_gpu_minutes_total.
+- capacity-sentry (cron service): computes runway daily and emits runway_days gauge.
+- burst-orchestrator: coordinates cross-region burst when warm pools are reduced.
+- billing-bridge: reconciles infra usage to finance forecasts (exported daily CSV to s3://billing-bridge/runway/).
+
+Metrics and sources
+
+Primary signals used to compute runway: 
+1) Committed budget remaining (finance API): finance.commit_remaining_usd
+2) Recent spend rate (30d trailing average): billing-bridge.spend_usd_30d_avg
+3) Effective utilization: sum(request_token_seconds)/sum(allocated_gpu_seconds) from gpu-telemetry
+4) Logistic safety buffer: defaults to 3 days to account for forecast error
+
+Runway calculation (simplified):
+runway_days = (commit_remaining_usd) / (spend_usd_30d_avg / 30) - logistic_buffer_days
+
+Policy thresholds and actions (table)
+
+Threshold | Action | Safety constraints
+---|---|---
+> 60 days | No action | Maintain default warm pool targets
+30-60 days | Reduced warm pool by 10% | CI gated change, non-disruptive deallocation
+14-30 days | Reduce warm pool by 25% & enable conservative mode | Can trigger burst fallback if warm pool drains
+<14 days | Auto-sink aggressive: reduce warm pool 50% + pause non-critical eval jobs | Immediate paging to SRE and Finance; canary rollback enabled
+
+SLOs and constraints
+
+- Warm pool fill time target: 95th percentile <= 90s.
+- Provisioning failure rate must remain <= 1% per hour.
+- Tenant availability SLO: 99.9% for hosted API tier; any policy must not drop this below 99.7% for more than 15 minutes.
+
+Runbook: sequence to enable Auto‑Sinking (operator steps)
+
+1) Review automated runway report (capacity-sentry) in #infra-runway Slack channel.
+2) Confirm finance.commit_remaining_usd and billing-bridge.spend_usd_30d_avg match expectations. If mismatch, escalate to Finance.
+3) If runway_days < configured threshold, open an incident with tag type: cost-runway and set priority = P2.
+4) Trigger terraform plan via infra pipeline (see CI section) with variable auto_sink_proposal = true to preview changes.
+5) Run integration smoke tests against canary region (see CI test matrix).
+6) If smoke tests pass, merge plan into canary workspace (region=europe-west1) with roll_percent=10.
+7) Monitor for 30 minutes; if metrics (warm_pool_fill_time_seconds, provisioning_failure_rate) remain within SLO, continue rollout to additional regions (increment by 25% every 30 minutes).
+8) If any SLO breach occurs, immediately run terraform apply with revert_auto_sink = true in affected workspace and notify SRE/owner.
+
+Terraform / IaC requirements
+
+- All changes must be implemented via the module: modules/gpu_warmpool (registry version pinned in tfworkspaces).
+- Required input variables added: auto_sink_enabled (bool), auto_sink_policy (string), runway_threshold_days (number).
+- A sample HCL snippet (to be included in PRs):
+
+```hcl
+module "gpu_warmpool" {
+  source = "git::ssh://git@repo.internal/infra/modules//gpu_warmpool?ref=v2025.02"
+
+  region                   = var.region
+  target_size              = var.target_size
+  auto_sink_enabled        = true
+  auto_sink_policy         = "runway-v2"
+  runway_threshold_days    = 30
+}
+```
+
+- State separation: use dedicated Terraform workspace per region. Plan outputs must include a cost_delta_estimate (see module output). Any plan with cost_delta_estimate > 3000 USD requires a finance approver.
+
+CI/CD gating and tests
+
+Pipeline: infra/gpu-auto-sink (Buildkite) steps:
+- step: terragrunt:terraform-plan (variables: auto_sink_proposal=true)
+- step: terratest:unit (fast)
+- step: post-plan-smoke (kitchen-style) -> spins up 2 ephemeral gpus in canary workspace and runs 10 synthetic inference requests
+- step: cost-approval-check (if cost_delta_estimate > 3000 USD)
+- step: manual-approval (for initial rollout) -> for subsequent automated rollouts, use automatic gating after 7 successful canaries
+
+Required tests for PRs touching modules/gpu_warmpool:
+- Unit: hcl-lint and module contract tests (must cover outputs: cost_delta_estimate, expected_rollback_plan).
+- Integration: terratest (runs in sandbox account) verifying scaling up/down and idempotency.
+- Chaos test (nightly): simulate provisioning failure and ensure automatic rollback retains at least 50% of previous warm pool capacity.
+
+Alerting and dashboards
+
+Alerts (Prometheus style rules):
+- ALERT: RunwayCritical
+  IF capacity_sentry_runway_days < 14
+  FOR 10m
+  LABELS: severity=critical, team=infra
+  ANNOTATIONS: summary = "GPU runway below 14 days"
+
+- ALERT: WarmPoolFillLatencyHigh
+  IF gpu_allocator_warm_pool_fill_time_seconds{quantile="0.95"} > 90
+  FOR 5m
+  LABELS: severity=high
+
+Dashboards: "Runway Overview" (grafana) showing: runway_days, spend_30d_avg, warm_pool_target_vs_actual, provisioning_failure_rate, cost_delta_estimate.
+
+Emergency rollback procedure
+
+1) From the incident runbook page, click the quicklink to Canary workspace (link: https://terraform.console/workspaces/gpu-canary-europe-west1).
+2) Run `terraform apply -var='revert_auto_sink=true'` and confirm the apply. Sample CLI: `TFC_WORKSPACE=gpu-canary-europe-west1 terragrunt apply --auto-approve -var='revert_auto_sink=true'`.
+3) If Terraform fails, use the allocator API to set warm_pool_target via: `curl -X POST https://internal-api/gpu-allocator/v1/warmpool/target -H "Authorization: Bearer $TOKEN" -d '{"region":"europe-west1","target": 120}'`.
+4) Notify #oncall-infra and #finance with incident id and attach plan logs.
+
+Ownership and escalation
+
+- Primary owner: infra-capacity (team alias). Responsible for module maintenance, alert tuning, and CI pipelines.
+- Secondary owner: cost-ops (Finance/SRE cross-functional). Responsible for runway model accuracy and approving high-impact changes.
+- Escalation matrix: owner -> infra-eng lead -> SRE director -> CFO (if runway falls < 7 days).
+
+Rollout plan and guardrails
+
+- Week 0: Dry-run in sandbox account; no auto-sinking, only alerts.
+- Week 1: Enable auto-sink in canary region with manual-approval gate.
+- Week 2-3: Gradual rollout to 3 production regions at 10%-35%-100% with 30-minute observation windows.
+- Guardrails: automatic interrupts if any region's tenant availability SLO dips below 99.8% for 10 minutes.
+
+Observability and audit trail
+
+- Every automated action emits an audit event to audit-log-cluster with fields: actor=capacity-sentry, policy=runway-v2, before_targets, after_targets, runway_days, commit_id.
+- Daily runway report stored at s3://infra-runway/reports/YYYY-MM-DD.json and surfaced to Finance via scheduled BigQuery ingestion.
+
+Appendix A: Example Prometheus alert rule
+
+```yaml
+groups:
+- name: capacity.rules
+  rules:
+  - alert: RunwayCritical
+    expr: capacity_sentry_runway_days < 14
+    for: 10m
+    labels:
+      severity: critical
+      team: infra
+    annotations:
+      summary: "GPU runway below 14 days"
+```
+
+Appendix B: Minimal terraform plan checker (bash)
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+plan_json="$1"
+cost_delta=$(jq '.cost_delta_estimate' < "$plan_json")
+if (( $(echo "$cost_delta > 3000" | bc -l) )); then
+  echo "Cost delta > 3000 USD -> requires finance approval"
+  exit 2
+fi
+echo "Plan within threshold"
+```
+
+Notes and future work
+
+- Replace static logistic buffer with ML-backed forecast error model (Q2 2025).
+- Integrate warm-pool scheduling with heterogenous GPU topology (MIG-aware placements).
+
+Related documents
+
+- See related pages list for forecasting and provisioning DR docs.
+
+Contact
+
+- For questions: elena.marquez@redwood.com, @elena on Slack.

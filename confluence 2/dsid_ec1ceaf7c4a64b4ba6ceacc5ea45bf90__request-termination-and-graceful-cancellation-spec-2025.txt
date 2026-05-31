@@ -1,0 +1,125 @@
+Request termination and graceful cancellation specification
+
+Overview
+
+This page defines Redwood's cross-stack specification for request termination and graceful cancellation. It standardizes client and server behaviors across HTTP/1.1, HTTP/2, gRPC, and streaming transports (server-sent, websockets, and tokenized streaming used by Redwood). The goal is to reduce resource leakage, avoid inconsistent model state, and enable predictable observability and billing when requests are cancelled or aborted.
+
+Audience
+- API designers and backend engineers
+- Runtime and serving teams
+- SDK and client library owners
+- SREs responsible for request lifecycle, billing, and tracing
+
+Goals
+1. Define precise cancellation semantics across transports.
+2. Ensure server-side work is either deterministically aborted or completed with a well-known finalization path.
+3. Ensure user-facing clients can signal intent (soft cancel vs force cancel).
+4. Make cancellation visible in telemetry and cost accounting.
+5. Provide rollout and compatibility guidance for both hosted and private deployments.
+
+Out of scope
+- Application-level rollback strategies for side effects (see related pattern doc).
+- Language-specific SDK ergonomics beyond canonical examples.
+
+Key concepts and terminology
+- soft_cancel: Client indicates it no longer needs additional tokens/results but allows the server to finish the current token batch and emit a best-effort finalization record. Should be low-cost and non-destructive.
+- force_cancel: Client requires immediate stop; server attempts to abort execution ASAP and return cancellation acknowledgement. May still incur in-flight compute costs.
+- termination_grace_window: Configurable window (default 250ms) for runtime to clean up incremental state after receiving cancellation before forcibly tearing down the worker.
+- finalization_record: Small structured payload produced when a request transitions to terminal state after cancellation. Contains: request_id, final_status, tokens_returned, compute_ms, model_variant, trace_id.
+
+Transport semantics (by protocol)
+1) HTTP/1.1 (non-streaming) - Client behavior: If a client closes the connection before receiving response headers, this is treated as force_cancel. Clients should, when possible, send a POST with a ‘X-Redwood-Cancel: soft’ header if they want soft_cancel semantics before closing.
+- Server behavior: On connection close before headers, server must: mark request as aborted in tracing, attempt to stop token generation, emit finalization_record with status=force_cancel, and attribute any compute cost to the request's cost center.
+
+2) HTTP/2 + gRPC - Both transports support in-band cancellation: gRPC CANCEL, HTTP/2 RST_STREAM. Client may send a metadata header (x-redwood-cancel: soft|force) before sending the cancellation frame.
+- Server behavior: On in-band cancel, server attempts graceful stop using termination_grace_window. If soft_cancel and the server can quickly finalize (<=termination_grace_window), emit finalization_record with status=soft_cancel. Otherwise escalate to force_cancel. Always record reason in trace.
+
+3) Streaming (chunked / server-sent / websocket / token streaming) - Soft cancel: client sends a control message `{\"type\":\"cancel\",\"mode\":\"soft\"}` on the control channel. Server may finish the current token chunk and then send finalization_record.
+- Force cancel: client closes socket or sends `{\"type\":\"cancel\",\"mode\":\"force\"}`. Server must prioritize releasing accelerator resources.
+
+Common server obligations
+- Deterministic finalization: Every request that begins execution must result in exactly one finalization_record written to the request-observability stream (irrespective of cancellation mode). This guarantees downstream consumers (billing, QA, trace-aggregator) can reason about terminal state.
+- Idempotency: Finalization records are idempotent. Runtimes should use a request_id namespace and deduplicate by request_id when ingesting finalization events.
+- Resource accounting: Record compute_ms, memory_peak_mb, and estimated_flops in finalization_record.
+- Escalation: If termination_grace_window elapses without stopping, runtime must force free GPU memory and mark finalization_record.status = "force_killed".
+
+Observability and SLOs
+- Tracing: Cancellation must create a span event: `event=cancellation, mode=soft|force, initiator=client|server, reason=...`. Trace must correlate to request_id and model_variant.
+- Metrics:
+  - `requests.cancellations_total{mode}` (counter)
+  - `requests.cancellation_latency_ms{mode}` (histogram) measured from cancel signal to finalization_record emission
+  - `requests.grace_window_expirations_total` (counter)
+  - `requests.force_killed_total` (counter)
+
+- SLO guidance: For hosted API, strive for 99% of soft_cancel finalizations within 500ms of cancel signal; 95% within 250ms preferred. Force_killed should be <0.1% of cancels.
+
+Billing and cost attribution
+- Billing model: Cancels do not grant cost refunds. All compute consumed before finalization_record emission is billable. Documented exceptions for explicit preempt signals and scheduled free-cancel windows for customer promos.
+- Attribution: finalization_record must include `billing_key` that maps to org/account. Billing ingestion deduplicates by request_id.
+
+Compatibility and client migration strategy
+1. Phase 1 (SDK patch): Add `x-redwood-cancel` header and control-channel cancel message support in SDKs. Default behavior: absence of header = implicit force semantics when connection closes.
+2. Phase 2 (runtime rollout): Runtimes will recognize soft_cancel and honor termination_grace_window for supported model variants. Gradually enable for 50% traffic, monitor cancellation_latency_ms and grace_window_expirations_total.
+3. Phase 3 (policy): Make soft_cancel the default for interactive routes; provide admin toggle for strict force behavior in latency-critical, cost-sensitive routes.
+
+Testing and verification checklist
+1. Unit tests for runtime components that simulate cancel events at each protocol layer.
+2. Integration test harness: replay 10k synthetic cancels at varying request sizes to verify finalization record correctness and deduplication.
+3. Load test: inject cancels under 3x production token throughput to measure grace window exhaustion and force_killed ratios.
+4. Chaos runbook: randomly drop control channel messages and assert no memory leaks after 1h of run.
+
+Operational runbook (on-call steps)
+1. Alert: `requests.grace_window_expirations_total` > threshold for 10m.
+2. Pager duty: runtime-core SRE.
+3. Immediate checks:
+  - Examine traces for recent cancellation events (filter event=cancellation).
+  - Check agent logs for stuck workers and GPUs with >90% utilization but no active requests.
+  - Query finalization_record stream for missing records (requests that started but have no finalization in 60s).
+4. Short-term mitigation:
+  - Increase termination_grace_window to 1s for affected service if memory allows.
+  - Reclaim idle worker pools and rotate GPUs.
+5. Post-incident: create a runbook addition with root cause and remediation steps.
+
+Configuration example (yaml)
+```
+service: text-generation
+termination_grace_window_ms: 250
+allow_soft_cancel: true
+soft_cancel_default_routes:
+  - "/v1/chat"
+  - "/v1/generate"
+```
+
+Ownership and rollout
+- Owner: Ava Chen (runtime-api)
+- Shared owners: runtime-scheduling, eng-sre, sdk-maintainers
+- Rollout owner: Diego Martinez (runtime-rollouts)
+
+References and links
+- API cancellation patterns (internal): /confluence/architecture-and-standards/api-standards/request-semantics-and-cost-aware-payload-guidelines-2026
+- Observability finalization schema: /confluence/eng-platform/dashboards-and-alerts/finalization-record-schema
+- Related ADR: graceful-model-deprecation-and-session-drain-adr-2024 (see decision-records folder)
+
+Appendix: example finalization_record (JSON)
+```
+{
+  "request_id":"r-1234abcd",
+  "status":"soft_cancel",
+  "tokens_returned":42,
+  "compute_ms":130,
+  "memory_peak_mb":3412,
+  "model_variant":"redwood-2-8b-quant-v2",
+  "billing_key":"acct-6789",
+  "trace_id":"t-9876",
+  "timestamp":"2025-01-08T14:22:11Z"
+}
+```
+
+Notes and rationale
+- We use an explicit soft_cancel concept to optimize for interactive UX: many clients cancel after a satisfactory token, and allowing the server a bounded window avoids duplicated tail effects and inconsistent partial outputs.
+- Deterministic finalization enables downstream systems (billing, QA, regressions) to reason about the terminal state for every request.
+
+Change history
+- 2024-11-12: Initial draft (Ava Chen).
+- 2024-12-20: Added streaming control-channel syntax and metrics (Priya Kapoor).
+- 2025-01-08: Clarified billing guidance and added operational runbook (Diego Martinez).

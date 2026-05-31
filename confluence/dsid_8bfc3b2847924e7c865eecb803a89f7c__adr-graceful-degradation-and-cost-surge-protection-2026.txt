@@ -1,0 +1,137 @@
+ADR: Graceful Degradation and Cost‑Surge Protection for Inference Paths
+
+Overview
+
+Purpose:
+This ADR defines a company‑wide standard for graceful degradation behavior and cost‑surge protection across inference request paths (hosted, dedicated, and private). The goal is to protect SLOs and customer experience during sudden cost pressure or capacity constraints while preserving outbound correctness and traceability for regressions.
+
+Scope:
+Applies to all services that expose Redwood inference endpoints (text generation, chat, embeddings, reranking). It impacts edge proxies, request routers, the serving runtime, and policy evaluators. It does NOT change model training or dataset behavior.
+
+Problem Statement
+
+We have observed three classes of operational events where naive fallback behavior caused customer impact or runaway cost:
+1) sudden model serving price spikes (external spot interruptions or GPU price anomalies) causing autoscaler thrash and token cost amplification;
+2) long‑running requests (excessive sequence lengths) that push per‑request cost far above profile and bust budgeted latency buckets;
+3) cascade of retries from client SDKs when service returns ambiguous errors.
+
+Existing ad‑hoc strategies vary per service: some teams abruptly reroute to smaller models, some drop requests, and others allow unlimited retries. We need a unified, audited approach that balances cost, latency, and correctness.
+
+Decision
+
+We adopt a graded degradation policy combined with a cost‑surge guard and a visibility envelope. Key points: 
+
+1) Request Classification and Tagging (edge/router)
+- Every incoming request must be annotated with a degradation_profile tag: "latency_sensitive", "cost_sensitive", "balanced". SDKs default to "balanced". Customers can opt in/opt out via header X-Redwood-Degradation: latency|cost|balanced.
+- The router also produces runtime annotations: sequence_length_estimate, client_tier (free|standard|enterprise), and origin_region.
+
+2) Graded Fallback Policy (router + orchestration layer)
+- Define ordered fallback tiers per model family: full_model -> quantized_variant -> distilled_variant -> cached_prefix_response -> controlled_error.
+- For each tier we specify a degradation_budget (allowed % of routed requests per minute). Default budgets: full_model 100%, quantized_variant 15%, distilled_variant 5%, cached_prefix_response 10%. Controlled_error reserved for safety cases only.
+- Router makes a deterministic selection using (priority_score, available_budget, past_error_rate). Priority_score = tier_weight * client_tier_multiplier * (1 - recent_error_rate).
+
+3) Cost‑Surge Guard (control plane)
+- A cluster‑level controller computes a rolling 5‑minute cost_rate (USD/min) and a token_rate (tokens/min) per model family. When cost_rate exceeds configured threshold (default: 2x forecasted baseline) the guard triggers a soft reduction: (a) reduce full_model budget by 20% per 30s, (b) increase routing to quantized and distilled variants.
+- If overrun persists > 10 minutes, enter escalated mode: apply hard caps (full_model <= 50% of pre‑incident baseline) and enable cached_prefix_response for repeat prompts.
+
+4) Retry and Hedging Rules
+- Clients must not retry on 429 or 503 without exponential backoff and jitter. Client SDKs will implement: initial_backoff=100ms, multiplier=2, max_backoff=5s, max_attempts=3.
+- Server side: for latency_sensitive requests, allow single hedged duplicate to a different backend shard if p95 latency > configured SLO. Hedged requests must be tagged and deduplicated by inference_id.
+
+5) Observable Contracts and Telemetry
+- Every decision must be logged to the decision‑event stream with keys: inference_id, client_tier, degradation_profile, selected_tier, reason_code, policy_version, controller_cost_rate, model_latency_ms.
+- SLI set: availability (success within 95th percentile latency), latency p50/p95/p99, correctness regressions by prompt_set (quality delta), and cost_per_token moving average.
+- Mandatory dashboards: Degradation Dashboard (per model family), Cost Surge Heatmap (rolling 1h/24h), and Fallback Correlation (cause ↔ selected_tier).
+
+6) Rollout, Policy Versioning and Governance
+- Policies are stored in YAML and versioned in the infra repo with semantic versioning (major.minor.patch). Field example: 
+
+  # example policy fragment
+  policy_version: 2026-02-01-v1
+  model_family: redwood-rlhf-7B
+  tiers:
+    - name: full_model
+      budget_pct: 100
+    - name: quantized_variant
+      budget_pct: 15
+    - name: distilled_variant
+      budget_pct: 5
+    - name: cached_prefix_response
+      budget_pct: 10
+  cost_guard:
+    baseline_usd_per_min: 12.5
+    soft_trigger_multiplier: 2.0
+    hard_trigger_duration_min: 10
+
+- Changes to the policy require: authoring PR -> automated sim check (predictive cost/latency simulation) -> staged canary (2% traffic for 2 hours) -> safety review by SRE + Applied ML -> production rollout.
+
+Consequences
+
+Positive:
+- Predictable, auditable degradation behavior that reduces surprise bills and improves uptime during stress.
+- Better signal for model quality regressions due to explicit correctness tracking per fallback tier.
+
+Tradeoffs and Risks:
+- Increased routing complexity and slightly higher control plane CPU for decision evaluation.
+- Risk of customer surprise if defaults are too aggressive; mitigated by telemetry and per‑customer opt‑outs.
+- Distilled/quantized variants may exhibit small quality regressions; require continuous eval sets and regression alerts.
+
+Operational Playbook (high level)
+
+1) Detection:
+- Alert: cost_rate > soft_trigger_multiplier * baseline OR p95 latency > SLO for 5m.
+2) Automated response (0–5m):
+- Controller reduces budgets per policy; switch routing percentages; create incident with severity S1 if customer impact observed.
+3) Investigation (5–30m):
+- Run cost attribution by tag (model_family, origin_region, customer_id).
+- If root cause is GPU preemption/spot churn, trigger temporary scale‑up of dedicated capacity for enterprise customers.
+4) Remediation (30m–6h):
+- Roll policy tweaks (must follow policy governance). If policy change is urgent, use emergency policy workflow: quick PR -> manual approval by oncall SRE + oncall ML eng -> patch deployed to controller with audit.
+
+Metrics and SLOs (example defaults)
+
+- Availability SLO (global, per model_family): 99.9% success for requests <= 1.5x expected sequence length.
+- Degradation correctness SLO: <0.2% unintended fallback to controlled_error per 24h per tenant.
+- Cost surge detection latency: detect and enter soft mode within 3 minutes of threshold breach.
+
+Implementation Notes and Examples
+
+- Policy evaluation library: a small, deterministic engine will live in the router process (C++/Go). Policies are downloaded as signed YAML blobs from the control plane.
+- Decision event schema (example keys): inference_id | timestamp | selected_tier | decision_reason | policy_version | controller_cost_rate_usd_min | chosen_model | output_quality_score.
+- Example CLI to inspect active policy for a model family:
+  redwoodctl policy get --model-family redwood-rlhf-7B --env prod --output yaml
+
+Ownership and SLAs
+
+- Policy authoring: Applied ML + Eng-Platform (joint).
+- Runtime implementation and router enforcement: Eng-Serving-Runtime.
+- Alerting and dashboards: Eng-SRE + Observability Platform.
+- Rollout approvals: oncall SRE + ML privacy/quality reviewer.
+
+Related decisions and references
+
+- See related ADRs on continuous fallback orchestration and adaptive quantization. This ADR complements those by adding cost‑surge guard behavior and explicit default degradation_profile semantics.
+- Reference: internal simulation harness (internal link) used to validate policy impact on cost and latency.
+
+Open Questions
+
+- Per‑tenant custom budgets: should enterprise tenants be allowed higher full_model budgets during surge? (proposal: yes with charged override and separate burst SLA).
+- Automated rollback thresholds: define an automated rollback if correctness delta > 1% within 1h after rollout.
+
+Appendix: Example policy table
+
+| field | example value | notes |
+|---|---|---|
+| policy_version | 2026-02-01-v1 | semantic versioning |
+| model_family | redwood-rlhf-7B | family id |
+| full_model_budget_pct | 100 | baseline |
+| quantized_variant_budget_pct | 15 | default |
+| hard_trigger_duration_min | 10 | escalation window |
+
+Document History
+
+- 2026-02-15 — created by Sofia Alvarez (draft)
+- 2026-02-22 — reviewed by Marcus Lee and Priya Nambiar (in_review)
+- 2026-03-01 — updated to include policy YAML example and published
+
+Questions or feedback? Comment on this page or ping @sofia.alvarez on Slack.

@@ -1,0 +1,221 @@
+Workload-to-Hardware Fit & Scheduler Evaluation Manual
+
+Overview
+=======
+
+This manual describes a repeatable process for characterizing production inference workloads, mapping them to appropriate accelerator classes, and evaluating scheduler/kernel policies to meet SLOs while minimizing cost. It consolidates profiling playbook steps, benchmark harness configuration, acceptance criteria for rollouts, common failure modes, and lightweight runbook actions for operational teams.
+
+Goals
+-----
+- Produce a deterministic workload fingerprint (latency shape, token density, sequence distribution, KV-cache affinity).
+- Map fingerprints to a small set of hardware classes (e.g., H100-80GB, A100-80GB, L40s-48GB, T4-16GB) with expected cost and tail-latency envelopes.
+- Evaluate scheduler knobs (batching, slotting, preemption, kernel hints) and quantify their impact on per-token cost, p50/p95/p99 latency, and GPU utilization.
+- Provide a decision checklist for model-variant selection and fallback policies.
+
+Scope and audience
+------------------
+This doc targets SREs, runtime engineers, and applied ML engineers responsible for: model onboarding, canary design, Dedicated capacity sizing, and private deployment sizing. It assumes familiarity with the runtime tracing tooling (trace-proxy, kernel-hint annotations) and the benchmarking harness in tools/perf-harness.
+
+Key definitions
+---------------
+- Request shape: immutable properties of a request — prompt tokens, expected response token cap, streaming vs non-streaming.
+- Sequence distribution: histogram of input+output lengths across a sample window.
+- Affinity: the probability that successive requests share KV cache entries (session/conv affinity).
+- Fidelity class: mapping of model/quantization/profile that yields a certain output quality and cost.
+
+1) Workload fingerprinting (profiling playbook)
+------------------------------------------------
+Step-by-step (safe for production):
+1. Identify a representative capture window (3–6 hours of typical traffic or per-release 24h). Prefer business-hours and a 24h weekend slice for consumer apps.
+2. Shadow-capture requests using trace-proxy with disabled side-effects. Capture fields: timestamp, user/session id, model, route, seq_len_in, seq_len_out_cap, kv_cache_hit_estimate, tokens_generated, latency_ms, error_code, kernel-hints. Use JSONL at 1k/s sampling for high-volume routes.
+
+Recommended capture command:
+```
+trace-proxy capture --router $ROUTE --write /tmp/captures/$ROUTE-2026-02-01.jsonl --sample-rate 0.01 --fields timestamp,request_id,session_id,model,route,seq_in,seq_out_cap,kv_hint,latency_ms,error
+```
+
+Normalization and derived signals:
+- tokens_per_request = seq_in + median(seq_out_observed if available else seq_out_cap)
+- burstiness = count(requests within 1s windows) distribution
+- continuity_index = fraction(session_id consecutive requests share model/version)
+
+Output artifact: workload-profile.json (canonical format used by perf-harness). Example snippet:
+```
+{
+  "route": "search-completions",
+  "time_window": "2026-02-01T08:00:00Z/2026-02-01T12:00:00Z",
+  "seq_len_p50": "48",
+  "seq_len_p95": "224",
+  "tokens_p_request_avg": "132",
+  "kv_affinity": "0.72",
+  "burst_percentile_99": "34"
+}
+```
+
+2) Benchmark matrix & experiment design
+---------------------------------------
+Design an experiment that spans: hardware classes, model variants (fp16, q4_k, q8_0), kernel configurations (continuous batching on/off, slot size, preemption policy), and traffic shapes (steady, microburst, session-affine).
+
+Minimum matrix entries for a production acceptance test:
+- Hardware: {H100-80GB, A100-80GB, L40s-48GB}
+- Model variants: {fp16, q4_k, q8_0}
+- Scheduler presets: {latency-tilt, throughput-tilt, balanced}
+- Traffic shapes: {baseline-day, microburst-peak, long-seq-synth}
+
+For each run collect: p50/p90/p95/p99 latency, throughput (tokens/s), GPU utilization (SM%, mem%), kernel queue length, kernel dispatch time histogram, energy-per-token estimate.
+
+Acceptance criteria (example):
+- p99 <= declared SLO + 15% (safety buffer) on latency-tilt config for baseline-day shape.
+- tokens/sec per GPU meets committed reserve for Dedicated customers within 10%.
+- model-quality regression: automatic eval set must show BLEU/ROUGE/semantic-similarity delta < defined threshold.
+
+3) Scheduler & kernel evaluation checklist
+-----------------------------------------
+Primary knobs to sweep and why:
+- batch_size_max: affects amortized kernel overhead and tail latency. Sweep 1, 4, 8, 16 for short sequences.
+- batch_wait_ms: tradeoff between latency and throughput for bursty traffic.
+- preemption_policy: eager | cooperative | disabled. Use cooperative on multi-tenant pools.
+- slot_quota / tenant_credits: enforces fairness under contention.
+- kernel_hint: prefer fused_attention | sharded_attention | memory_opt; used to surface specialized kernels.
+
+Evaluator actions:
+1. Run low-load baseline to establish kernel latency floor per kernel_hint.
+2. Inject mixed-priority synthetic load to measure priority inversion and starvation risk.
+3. Toggle preemption to gauge warm-start cost vs p99 improvement.
+4. Measure KV-cache warmup curve: cold -> 30m -> 2h to estimate steady-state cost savings.
+
+Suggested result table (example lines):
+"Hardware | Kernel_hint | batch_size | p50 | p95 | p99 | tokens/s | SM% | Notes"
+"H100 | fused_attention_v2 | 8 | 22ms | 48ms | 120ms | 4200 | 73% | Best for long seqs"
+
+4) Profiling recipe (trace to remediation)
+-----------------------------------------
+Trigger: p99 regression or new kernel rollout.
+
+Rapid triage steps (first 20 minutes):
+1. Confirm scope: route(s) affected, time window, customer impact. Use kibana/route-dashboard.
+2. Pull canonical workload-profile for the route. If production profile changed >10% on seq_len_p95 or burstiness, mark as traffic-shift.
+3. Enable detailed trace-proxy sampling for the affected route (raise sample rate to 1%).
+4. Correlate trace IDs with runtime kernel traces (kernel-trace tool) to determine slow kernels.
+  - kernel-trace aggregate --start TS1 --end TS2 --group-by kernel_hint --metric mean_dispatch_ms,p95_dispatch_ms
+5. If kernel dispatch time increased but SM% unchanged -> suspect kernel regression (new codepath or compilation change).
+6. If SM% spiked and memory pressure rose -> suspect increased concurrency or larger batch sizing; check eviction logs.
+
+Common remedial actions:
+- Rollback kernel rollout via feature-flag: runtime-flag set kernel_selector=stable
+- For memory pressure: reduce batch_size_max and enable eager-eviction for ephemeral caches
+- For priority inversion: temporarily raise tenant_credits for affected route or enable emergency quota-exemption for critical traffic
+
+5) Cost & capacity guidance (back-of-envelope models)
+-----------------------------------------------------
+Unit economics inputs:
+- tokens_per_request (from fingerprint)
+- tokens_per_second_per_GPU (measured in benchmark)
+- cloud GPU $/hr (from procurement table)
+- target utilization (70–80% for Dedicated pools)
+
+Example calculation (string form):
+"Provisioned GPUs = ceil(peak_tokens_per_sec / tokens_per_second_per_GPU / target_utilization)"
+
+Quick example: average tokens/sec required = 500k -> tokens_per_gpu = 4k -> target_util 0.75 -> GPUs = ceil(500000 / 4000 / 0.75) = 167 GPUs
+
+6) Canary and rollout matrix for scheduler/kernel changes
+--------------------------------------------------------
+Principles:
+- Small fast canaries: 0.5–1% traffic for 30 minutes with full traces enabled.
+- Gradual ramp: 1% -> 5% -> 20% -> 50% -> 100%, validate p99/p95 and per-route cost after each step.
+- Safety gates: automatic rollback if p99 increases >20% or tokens/sec drops >15% vs baseline.
+
+Recommended telemetry to watch during canary:
+- route-p99, route-error-rate, kernel-dispatch-p95, gpu-eviction-rate, kv-warmup-slope.
+
+Canary checklist (playbook):
+1. Start at 0.5% for 30m, inspect traces and run the profiling recipe.
+2. If all checks pass, extend to 5% for 1h, run full benchmark matrix for that period.
+3. If any safety gate trips, rollback to previous kernel_selector and escalate to runtime-oncall.
+
+7) Known issues inventory (operational notes)
+-------------------------------------------
+- Large-LLM microbursts causing slot exhaustion: mitigate with per-route burst_alloc and smaller batch windows.
+- KV-cache skew across shards: drains during scale-up cause increased cold hits; schedule staggered warms on scale events.
+- GPU memory fragmentation after quantization rollouts: periodic compaction job recommended during maintenance windows.
+- Kernel regression from clang update: always run the hidden-kernel-regression-probe-suite before rollout.
+
+8) Runbook extracts (for Pager/Slack responders)
+------------------------------------------------
+Symptom: sudden p99 increase for route X
+- Pager owner: runtime-oncall
+- Initial actions (within 10m):
+  1. Confirm impact (dashboard p99 spike > configured alert threshold).
+  2. Identify whether spike correlates with deployments or traffic-shift: check deploy-log and trace-capture.
+  3. If deployment correlates, flip kernel_selector to previous stable tag and monitor for 10m.
+  4. If traffic-shift, apply emergency throttles or temporary scaling policy to Dedicated pool.
+  5. Open incident ticket with kernel traces attached and assign to oncall-engineer.
+
+Symptom: elevated GPU OOMs during rollout
+- Steps:
+  1. Suspend rollout.
+  2. Reduce batch_size_max by 50% across affected pool.
+  3. Kick maintenance compaction job: gpu-mem-compact --pool $POOL --max-run 2h
+  4. If OOMs persist, escalate to infra-gpu team.
+
+9) Release notes template for runtime changes
+-------------------------------------------
+Use this compact template for each runtime release (kernel/scheduler/runtime binary):
+- Release tag: x.y.z
+- Owners: runtime-team
+- Summary: one-sentence summary of user-facing impact
+- Benchmarks run: matrix summary (hardware, routes, model variants)
+- Canary plan: percentages + safety gates
+- Known limitations: e.g., issues with T4 under long sequences
+- Rollback steps: clear commands and feature-flag names
+- Relevant artifacts: links to workload-profile(s) and perf-harness logs
+
+10) Operational ownership and links
+--------------------------------
+- Primary owners: runtime-team (oncall rotation), perf-engineering for benchmark harness, infra-gpu for hardware incidents.
+- Related pages and artifacts:
+  - perf-harness repo: //git.internal/redwood/perf-harness
+  - trace-proxy runbook: /confluence/eng-serving-runtime/runbooks/runtime-trace-correlator-and-event-reconciliation-playbook-2025
+  - canonical workload storage: s3://redwood-perf/workloads/
+
+Appendices
+----------
+A. Example scheduler policy (YAML)
+```
+policy_name: latency-tilt-small-batches
+batching:
+  max_batch_size: 8
+  batch_wait_ms: 6
+preemption:
+  policy: cooperative
+  preempt_check_interval_ms: 50
+quota:
+  tenant_credit_mode: burstable
+  default_quota_tokens_per_minute: 60000
+kernel_hints:
+  preferred: [fused_attention_v2, sharded_attention]
+```
+
+B. Quick commands (profiling)
+- Pull kernel traces for window:
+```
+kernel-trace aggregate --route search-completions --start 2026-02-01T08:00:00Z --end 2026-02-01T09:00:00Z --out /tmp/kt.json
+```
+- Run synthetic microburst generator:
+```
+perf-harness loadgen --profile workload-profile.json --shape microburst --duration 15m --out /tmp/run-01
+```
+
+C. Contact list
+- Runtime oncall: runtime-oncall@redwood.com
+- Perf engineering: perf-eng@redwood.com
+- Infra GPU: infra-gpu@redwood.com
+
+Change history
+--------------
+- 2025-09-14: Document created by Priya Nair (initial draft)
+- 2025-11-03: Added canary checklist and cost model example (review: Ethan Kim)
+- 2026-02-12: Expanded profiling recipe and known issues, added example YAML policy (review: Sofia Martins)
+
+End of document

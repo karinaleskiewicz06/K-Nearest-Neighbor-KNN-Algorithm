@@ -1,0 +1,154 @@
+Seamless model swap and KV consistency guide
+
+Summary:
+This playbook describes a prescriptive, low-risk procedure for swapping active model variants and migrating KV cache shards without violating session consistency guarantees or significantly degrading tail latency. It combines a verified orchestration recipe, telemetry checks, and rollback criteria suitable for Hosted, Dedicated, and Private deployments.
+
+Scope & audience:
+- Audience: runtime engineers, release engineers, SRE on-call, platform integrators.
+- Applies to: model binary swaps, kvcache layout migrations, topology changes that rebind session affinity (shard moves, NUMA rebinds).
+- Not covered: full cluster reboots, GPU firmware upgrades, application-layer prompt changes.
+
+Goals & success criteria:
+- Zero user-visible correctness regressions for in-flight sessions (consistency goal).
+- No more than 2x degradation of P95 latency during controlled canaries.
+- Automatic, deterministic rollback path on defined error thresholds.
+
+Key definitions and guarantees:
+- Strong session consistency: a session's KV prefix and cache must remain readable for the lifetime of a conversation until explicit eviction.
+- Live-swap: replacing the active model binary for a shard without terminating incoming connections.
+- Drain-and-rebind: moving session ownership by draining new requests from a source shard, replaying KV as needed, and binding to a destination shard.
+
+Architecture overview (concise):
+- Orchestration layer (Orch): issues swap commands, coordinates canaries, and sets routing policies.
+- Shard controller (SC): enacts bind/unbind, coordinates KV replication, and performs drain.
+- KV layer: multi-tiered prefix cache with ephemerality flags and fast-lookup index.
+- Frontdoor router: routes requests by session token -> shard map; can be flipped to prefer new shard when canary progresses.
+
+Consistency models and tradeoffs:
+- Option A (Strong): Synchronous KV snapshot+handshake with two-phase commit. Guarantees no missing keys at cost of higher latency during swap windows.
+- Option B (Eventually consistent): Shadow-replication with read-fallback to source shard. Lower latency, but requires careful time-bounded fallbacks and observability.
+
+Recommended default for production: hybrid approach. Start with Option B during canary periods with strict telemetry; for full rollout switch to Option A for final cutover when load is predictable.
+
+Preflight checklist (automatable):
+1) Validate model artifact checksum and signature: sha256sum and k8s image signature present.
+2) Confirm destination shard has >= 1.5x memory headroom for KV warmup.
+3) SLO budget check: current error budget >= planned swap budget (default 0.5%).
+4) Open on-call window and post runbook link to #runtime-ops.
+5) Gather baseline telemetry (P50/P95/P99 tokens/latency, error-rates, kv-miss-rate).
+
+Step-by-step migration playbook (operational steps):
+1) Prepare canary routing rule:
+   - Orch: create canary route rule (1% traffic) mapped to destination shard with "shadow-read: true" and "write-back: false".
+   - Confirm no destructive flags set.
+2) Warmup and shadow replication (10-30 minutes typical):
+   - Trigger KV prefetch: SC issues async prefetch for top-10% hottest prefixes via background task.
+   - Monitor kv-warmup-progress: expect >80% hot prefix residency within window.
+3) Telemetry gating during canary (continuous):
+   - p50/p95 latency delta <= +30% and p99 delta <= +60% vs baseline.
+   - kv-miss rate on destination <= 2x baseline.
+   - error-rate increase <= 0.2% absolute.
+   - No functional anomalies in downstream evals (sampled prompts).
+   - If any gate trips, abort canary and rollback to previous routing.
+4) Incremental ramp (phased percentages):
+   - 1% -> 5% -> 20% -> 50% -> 100% over multiple verification steps (15-60m between steps).
+   - At each step, run automated smoke tests and fuzzed prompt validation against responses to detect semantic drift.
+5) Final cutover (atomic rebind):
+   - Switch routing map atomically: Orch flips session token assignment and marks source shard for graceful deprecation.
+   - If Option A chosen: perform synchronous KV handshake before flipping (blocking window).
+   - Wait 3x observed median warmup latency before marking migration complete.
+6) Post-cutover validation and tidy-up:
+   - Mark source shard as "standby" for 1 hour to serve any read-fallbacks and then evict.
+   - Run integrity-check job to confirm no missing session prefixes.
+   - Update catalog/version metadata and notify product/clients if required.
+
+Rollback criteria and steps:
+- Auto-rollback triggers (any one):
+  * sustained p99 latency > 2x baseline for 15m.
+  * error-rate spike > 1% absolute for 5m.
+  * kv-miss rate on destination > 5x baseline for 10m.
+  * semantic-eval failures (failing >3 out of 20 sampled prompts).
+- Rollback procedure:
+ 1) Orch reassigns routing map back to source shard (atomic).
+ 2) Destination shard switches to read-only and begins cache eviction.
+ 3) Post-rollback alerting: tag incident and capture traces for triage.
+
+Operational knobs and configuration examples:
+- CanaryRoute YAML example:
+  ---
+  kind: CanaryRoute
+  metadata:
+    name: model-swap-canary-1
+  spec:
+    percent: 1
+    shadow_read: true
+    write_back: false
+    metrics_gates:
+      - latency_p95_delta_ms: 100
+      - kv_miss_rate_ratio: 2.0
+
+- Shard binding config snippet:
+  shard_bind_timeout_ms: 30000
+  kv_sync_mode: "shadow_async" # options: shadow_async | synchronous_two_phase
+  max_prefetch_prefixes: 2000
+
+Observability & required dashboards:
+- Canary health panel: p50/p95/p99 latency, ingest QPS, kv-miss-rate, error-rate, session-affinity-violations.
+- Integrity panel: orphaned-prefix-count, prefix-staleness-hrs, fallback-read-count.
+- Tracing: ensure spans include orch.request_id, shard_id_old, shard_id_new, kv_sync_mode.
+- Logs: structured event for steps (canary-start, warmup-complete, cutover-inflight, rollback).
+
+Alerting thresholds (recommended):
+- Sev1: p99 > 3x baseline for 10m OR sustained error-rate > 2% for 5m.
+- Sev2: p99 > 2x baseline OR kv-miss > 5x baseline for 10m.
+- Sev3: p95 > 1.5x baseline OR smoke-test failures during ramp.
+
+Troubleshooting matrix (common symptoms -> checks -> mitigation):
+- Symptom: sudden p99 spike after 20% ramp.
+  Checks: inspect kv-miss-rate, kernel queue depth, GPU memory pressure.
+  Mitigation: pause ramp, reduce percent, initiate partial rollback, increase destination shard headroom.
+- Symptom: session-level 500s and missing responses.
+  Checks: trace request lifecycle for missing KV reads, check for deserialization errors on new model.
+  Mitigation: roll back routing, tag failing model artifact for analysis.
+- Symptom: high fallback-read-count from frontdoor.
+  Checks: verify prefix ingestion pipeline on destination, examine network egress errors between shards.
+  Mitigation: restart prefetch workers, rerun KV replay on subset of prefixes.
+
+Diagnostics commands and snippets:
+- Show current canary rules:
+  # rctl canary list --namespace prod
+- Force a single-session rebind for testing:
+  # rctl session rebind --session-id <SID> --to-shard shard-42 --mode dry-run
+- Inspect shard health and kv stats:
+  # shardctl status shard-42 --format json | jq '.kv_stats | {miss_rate,hot_prefixes,mem_used}'
+
+Postmortem data collection (prescribed):
+1) Export span traces for the migration window +/- 15 minutes.
+2) Export kv-metrics timeline and compare hot-prefix residency before/after.
+3) Snapshot sample requests and responses for semantic regression testing.
+4) Correlate scheduler/kernel metrics (GPU occupancy, kernel latency) with tail latency spikes.
+
+Ownership and escalation:
+- Primary owner: runtime-serving-team@redwood.com (oncall rotation in #runtime-oncall).
+- Secondary owner: infra-sre@redwood.com.
+- Escalation path: oncall -> runtime tech lead -> SRE manager -> Eng Director.
+
+Appendix A: example smoke tests (automated):
+- Test 1: top-20 prompts from prod anonymized corpus; assert token-level edit distance < 5% vs baseline.
+- Test 2: prefix read/write roundtrip: perform 100 session-rewind operations, assert no missing keys.
+
+Appendix B: known-risk checklist before private deployments:
+- KMS key ACLs validated for destination host.
+- Network egress rules between shards in VPC are permissive for replay channels.
+- HSM-backed signing available if two-phase commit is used.
+
+Related runbooks and docs:
+- /confluence/eng-serving-runtime/runbooks/runtime-upgrade-validation-and-canary-matrix-2026
+- /confluence/eng-serving-runtime/kernel-and-scheduling/preemption-aware-batch-slicing-spec-2026
+
+Revision history:
+- 2025-03-12: initial draft by Riley Chen.
+- 2025-06-18: added telemetry gating thresholds and CLI snippets (Asha Menon).
+- 2025-10-08: expanded rollback criteria and appended private deployment checklist (Diego Alvarez).
+
+Contact for questions: Riley Chen (riley.chen@redwood.ai)

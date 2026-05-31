@@ -1,0 +1,173 @@
+Predictive Prefetch Orchestrator — Design & Validation
+
+Summary
+-------
+This document defines the Predictive Prefetch Orchestrator (PPO): a runtime component that predicts future token or KV-cache accesses and prefetches required KV pages / model artifacts into local memory or a warm cache tier. The goal is to reduce tail latency and cold-KV misses while preserving cost and fidelity SLOs. It describes architecture, scheduling interactions, configuration, validation tests, rollout plan, and incident runbooks.
+
+Scope and goals
+----------------
+- Primary goal: reduce 99th/99.9th percentile token latency for long-context and multi-turn workloads by reducing on-path cache-miss stalls.
+- Secondary goals: keep incremental cost per useful token < 6% of baseline; avoid fidelity regressions and avoid noisy eviction patterns that increase GPU OOM risk.
+- Out of scope: model quantization decisions, model selection routing. PPO only orchestrates prefetch hints and local memory priming.
+
+High-level architecture
+-----------------------
+Components (logical):
+1) Predictor service (stateless microservice): serves a lightweight sequence predictor that emits prefetch hints per request. Implements a rate limit and confidence score.
+2) Prefetch coordinator (in-runtime agent): receives hints, applies admission control, schedules prefetch work to worker threads or a background prefetch pool.
+3) KV-cache manager (existing component): accepts explicit prefetch requests (page ids) and reports outcomes (hit, miss, duration).
+4) Observability adapter: enriches traces with prefetch provenance and metrics (prefetch_count, prefetch_success, prefetch_cost_us).
+5) Admission controller and scheduler hook: integrates with kernel scheduler to avoid prefetch storms and respects SLO-driven credit accounting.
+
+Data flow (textual diagram):
+- API request -> request classifier -> predictor service (async call) -> emits N prefetch hints (page_id, score, lookahead_ms) -> prefetch coordinator applies policy -> enqueues prefetch -> KV-cache manager fetches/warms pages -> request proceeds using possibly warmed KV/cache.
+
+Predictor model and signals
+---------------------------
+- Predictor is intentionally small (few hundred KB parameters) to keep inference cheap and fast. It operates in two modes: deterministic rule-based (fallback) and statistical scoring (ML).
+- Features used: session token histogram, user agent, route, model variant, recent completion lengths, last-k page access sequence, request timestamp, and cohort id.
+- Labels for training: subsequent page access within lookahead window (e.g., 200ms) derived from production traces (shadow mode).
+- Retraining cadence: weekly for high-change routes; monthly for stable routes.
+
+Admission control & scheduler integration
+-----------------------------------------
+Admission policy is the safety layer that prevents prefetch work from interfering with on-path kernels. Key levers:
+- Prefetch budget per-GPU per-second (pages/sec). Default: 50 pages/sec per GPU.
+- Prefetch priority class: BACKGROUND_LOW, BACKGROUND_HIGH. Background_low is throttled under any kernel contention.
+- Kernel credit check: prefetch pool only consumes credits from a separate prefetch bucket; if runtime kernel load > 70% or tail latency SLO is threatened, prefetches are suspended.
+
+Configuration table (recommended defaults)
+-----------------------------------------
+| key | default | description |
+| prefetch.enabled | true | master switch |
+| prefetch.lookahead_ms | 200 | max lookahead window to consider access relevant |
+| prefetch.max_pages_per_request | 6 | cap per prediction |
+| prefetch.gpu_budget_pages_per_sec | 50 | budget enforced by admission controller |
+| prefetch.min_score_threshold | 0.55 | predictor confidence cutoff |
+| prefetch.priority_mode | BACKGROUND_LOW | default priority class |
+| prefetch.shadow_mode | true | if true, metrics are collected but prefetches aren't applied to on-path traffic |
+
+Example runtime YAML config
+---------------------------
+```yaml
+prefetch:
+  enabled: true
+  lookahead_ms: 200
+  max_pages_per_request: 4
+  gpu_budget_pages_per_sec: 50
+  min_score_threshold: 0.6
+  priority_mode: BACKGROUND_HIGH
+  shadow_mode: false
+```
+
+Observability & KPIs
+--------------------
+Minimum dashboards (per-cluster and per-route):
+- Prefetch hit rate (prefetch_success / prefetch_attempts) — target > 70% for routes with high sequentiality.
+- Delta tail latency (p99, p999) before vs after prefetch action — target p99 reduction >= 10ms for targeted routes.
+- Prefetch-induced kernel wait time — should be < 1% of total kernel time.
+- Cost delta per-useful-token — target < +6%.
+- False-positive prefetch ratio (pages prefetched but not accessed in lookahead) — target < 30% for production routes.
+
+Metric naming suggestions:
+- runtime.prefetch.attempts
+- runtime.prefetch.success
+- runtime.prefetch.latency_ms
+- runtime.prefetch.evictions_caused
+- runtime.prefetch.cpu_time_ms
+- runtime.prefetch.provenance (predictor_rule/modelid)
+
+Validation and testing strategy
+-------------------------------
+1) Offline validation: train predictor on historical shadow traces and compute precision/recall w.r.t. lookahead windows. Generate cohort-level charts (by route/model/sequence-length).
+2) Synthetic replay: use the operational workload simulator to replay requests and run PPO in shadow mode. Collect metrics: predicted pages, accessed pages, cost.
+3) Shadow-canary: enable shadow_mode=false only for a small set of pods (5% traffic) but with prefetch priority = BACKGROUND_LOW and fast rollback toggle. Monitor KPIs for 48h.
+4) Canary with adaptive throttle: increase active prefetch traffic to 20% and enable dynamic budget. Continue validation for 7 days and run A/B analysis for latency and cost.
+
+Shadow experiment commands (examples)
+------------------------------------
+- Toggle shadow mode (kubectl):
+  kubectl patch deployment/runtime-pool -p '{"spec":{"template":{"metadata":{"annotations":{"runtime.prefs.prefetch-shadow":"true"}}}}}'
+- Query prefetch metrics (promql):
+  sum(rate(runtime_prefetch_attempts_total[5m])) by (cluster, route)
+  sum(rate(runtime_prefetch_success_total[5m])) / sum(rate(runtime_prefetch_attempts_total[5m]))
+
+Rollout checklist
+------------------
+1) Offline precision >= 0.65 and recall >= 0.35 for target routes.
+2) Shadow-mode pilot: prefetch_success >= 50% and false_positive <= 40%.
+3) Canary: no >25% regression in p99SLO and prefetch_cost_delta within budget for 48h.
+4) Gradual ramp: 5% -> 20% -> 50% -> 100% with 24–72h stabilization windows and automated rollback on SLA breaches.
+
+Safety & fallback patterns
+-------------------------
+- Automatic suspend: if runtime.p99_latency increases by >10% over 15m or prefetch_eviction_events > threshold, suspend prefetch globally and notify oncall.
+- Degraded planner: switch predictor to deterministic rule-based prefetch (e.g., last-2-pages prefetch) if model confidence drops.
+- Eviction-aware prefetch: track prefetch-caused evictions and deprioritize prefetches that historically caused cross-tenant memory pressure.
+
+Incident runbook (cache-thrash loop)
+------------------------------------
+Trigger: sudden spike in cache evictions correlated with prefetch.activity and rising p99 latency.
+1) Pager routes to PPO-oncall.
+2) Run quick inspection: check metrics
+   - pref_attempts = curl "http://metrics/api?query=rate(runtime_prefetch_attempts_total[5m])"
+   - evictions = curl "http://metrics/api?query=rate(runtime_prefetch_evictions_total[5m])"
+3) If evictions / attempts > 0.2 and p99 latency > SLO, execute emergency suspend:
+   curl -XPOST http://runtime-admin/api/prefetch/suspend
+4) If suspend is successful, monitor p99 for 10m. If stable, adjust GPU budget down (e.g., -50%) and re-enable with BACKGROUND_LOW.
+5) Postmortem steps: collect traces, predictor inputs, and candidate root causes (miscalibrated score, dataset shift, route misclassification).
+
+Operational playbooks and experiments
+------------------------------------
+- Periodic prefetch audit (weekly): run the Audit Script (see below) to estimate wasted pages and correlation with evictions.
+- Controlled stress test: synthetic-burst profile to measure prefetch behavior under admission constraints.
+- KPI drift detector: daily job that surfaces routes with falling prefetch precision or rising false positives.
+
+Audit script (pseudo-CLI)
+-------------------------
+# Download 24h shadow traces for route X and compute metrics
+redwood traces extract --route X --since 24h | redwood prefetch-audit --lookahead 200 --output /tmp/audit.json
+redwood prefetch-audit-report /tmp/audit.json --format html --out /tmp/prefetch-audit-routeX.html
+
+Developer guidelines for contributors
+------------------------------------
+- Prefer simple predictors and keep feature sets stable for production routes.
+- Annotate predictor versions in metric provenance (predictor:v2).
+- Add unit tests for admission controller thresholds and an end-to-end shadow-mode integration test.
+- Keep retraining dataset windows (e.g., last 14 days) configurable per-route.
+
+Ownership and contacts
+----------------------
+- PPO feature owner: Sasha Nguyen (runtime team) — oncall: runtime-pgo@redwood.ai
+- Predictor ML owner: Arjun Mehta (applied-ml)
+- Observability owner: Leila Gómez (eng-sre)
+
+Appendix: small example of prefetch hint JSON
+--------------------------------------------
+{
+  "request_id": "abcd-1234",
+  "route": "/chat/gpt-extended",
+  "hints": [
+    {"page_id": "kv:mdl:1234:page:42", "score": 0.78, "lookahead_ms": 180},
+    {"page_id": "kv:mdl:1234:page:43", "score": 0.61, "lookahead_ms": 180}
+  ],
+  "predictor_version": "v2025-09-03",
+  "timestamp": "2025-11-20T16:23:04Z"
+}
+Notes and migration considerations
+---------------------------------
+- Start with read-heavy routes and long-context chat routes that have high sequential locality. Avoid bursty short-completion routes for early pilots.
+- Coordinate with kernel-scheduler owners to add the prefetch priority class to the scheduling credit model.
+- Expected incremental infra cost: small CPU overhead for predictor service + network egress to KV tier. Estimate: ~0.5–2% increase in infra cost for routes where prefetch is enabled.
+
+Related documents
+------------------
+- KV prefetch audit guide (profiling-playbook) — required reading prior to pilot.
+- Scheduler credit model and admission controller (kernel-and-scheduling) — integration notes.
+
+Change log
+----------
+- 2025-03-11: initial draft (Sasha Nguyen).
+- 2025-06-02: added synthetic replay protocol and YAML examples (Arjun Mehta review).
+- 2025-11-20: added incident runbook and audit CLI (Leila Gómez review).
+- 2026-01-15: published with updated thresholds and rollout checklist (Sasha Nguyen).

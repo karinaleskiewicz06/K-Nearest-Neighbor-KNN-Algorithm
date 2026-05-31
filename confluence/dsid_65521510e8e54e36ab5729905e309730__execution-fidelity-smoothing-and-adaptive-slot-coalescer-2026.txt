@@ -1,0 +1,144 @@
+Execution Fidelity Smoothing and Adaptive Slot Coalescer
+
+Summary:
+This doc describes the design, operational guidelines, and measurement recipes for the Execution Fidelity Smoothing system and the Adaptive Slot Coalescer (ASC). The ASC is a scheduler-layer component that dynamically merges short-lived slots to improve packing efficiency while the fidelity smoother ensures gradual changes to numerical execution fidelity (quantization/precision and batch size) to avoid abrupt quality regressions in production.
+
+Who should read this:
+- Runtime scheduler engineers (ownership for ASC)
+- Profiling and benchmarking team (validation and SLO tuning)
+- Oncall and SRE (runbook and dashboards)
+
+Goals and motivation:
+- Reduce per-token cost by 6–20% for bursty, short-sequence workloads without increasing p95 latency beyond SLOs.
+- Avoid sudden fidelity drops visible to customers by smoothing transitions across quantization levels or hybrid-kernel fallbacks.
+- Make coalescing decisions observable and recoverable with minimal blast radius.
+
+Design overview:
+1) Adaptive Slot Coalescer (ASC)
+   - Coalescing window: ASC observes slot lifetimes and merges adjacent idle/short slots when the projected latency impact is within a configurable budget.
+   - Decision inputs: slot occupancy distribution, model-variant latency profile, KV cache hit ratio, tenant priority, inferred tail-sensitivity.
+   - Safety checks: predicted p95 delta threshold, memory headroom check, kernel-compatibility matrix.
+
+2) Fidelity Smoother
+   - Purpose: when the scheduler or the economic governor recommends a lower-fidelity execution (e.g., int8 quantized kernel or smaller max-seq trim), the smoother phases the change across N requests or T seconds to detect quality regressions early.
+   - Modes: time-based ramp, quantile-based ramp (by model output distribution), request-count ramp.
+
+Key algorithm (pseudocode):
+```
+function consider_coalesce(slot_a, slot_b):
+  if not same_device(slot_a, slot_b): return false
+  predicted_p95 = predict_p95_after_merge(slot_a, slot_b)
+  if predicted_p95 > p95_budget: return false
+  if memory_usage_after_merge() > memory_limit: return false
+  if kernel_compatibility(slot_a.model, slot_b.model) == false: return false
+  return true
+
+function apply_fidelity_smooth(node, target_fidelity):
+  stage_count = config.smoothing_stages
+  for stage in 1..stage_count:
+    apply_partial_fidelity(node, stage / stage_count, target_fidelity)
+    wait(config.stage_interval_seconds)
+    if quality_regression_detected(node):
+      rollback_to(node, previous_safe_fidelity)
+      alert("fidelity-regression", node)
+      break
+```
+
+Configuration matrix (recommended defaults):
+| Parameter | Default | Notes |
+|---|---:|---|
+| p95_budget | 1.10 (10% headroom) | Multiplier over baseline p95 per model-profile |
+| smoothing_stages | 4 | Number of discrete steps when ramping fidelity |
+| stage_interval_seconds | 15 | Wait time between stages |
+| coalesce_max_slot_gap_ms | 20 | Max difference in start times to consider merge |
+| memory_limit_fraction | 0.85 | Prevent merges reducing free memory below this fraction |
+
+Operational playbook (step-by-step):
+1) Preflight (development & staging):
+   - Enable ASC in simulator mode for 48h using shadow traffic capture. Validate predicted cost reduction and p95 impact.
+   - Run fidelity-smoother experiments against a curated prompt set (see 'Benchmarking' below).
+2) Canary rollout (small % of production tenants):
+   - Release to 5% tenants (low-latency-tolerance cohort). Monitor: p95, p99, error-rate, logical-output-quality (BLEU/ROUGE or task-specific metric).
+   - Criteria to proceed to 25%: no >5% relative increase in p99 and automated quality checks passing for 1h window.
+3) Full rollout:
+   - Increase gradually to 100% with staged toggles and rollout-exempt list for known-sensitive tenants.
+
+Runbook (incident scenarios):
+- Symptom: p95 rises above SLA after ASC enabled
+  1) Inspect ASC decision logs: find merges executed in last 5m. Query: \"asc_decisions{outcome=\"merged\"}\".
+  2) If merged slots correlate with p95 spikes, toggle config: coalesce_enabled=false for affected pool.
+  3) If toggling not immediately available, increase p95_budget by +0.05 to relax merging aggressiveness.
+  4) Rollback fidelity-smoother staged transitions if they coincide with quality alerts.
+  5) Post-incident: capture traces and run local simulation with the exact sequence distribution.
+
+Profiling & benchmarking recipes:
+- Synthetic microbenchmarks:
+  - Sequence-length sweep: 8, 16, 32, 64 tokens; run 60s at 200 qps each; measure packing delta with and without ASC.
+  - Burst packing: 1s microbursts at 500% baseline qps; measure tail amplification.
+- Real traffic shadowing:
+  - Shadow 24h production traffic into a sandbox runtime with ASC_enabled toggled; compare per-tenant cost and fidelity metrics.
+- Quality guard prompts (suggested set):
+  - 200 prompts: generation (open-ended), code-completion, summarization, instruction-following. Evaluate automated metrics and a 5-person human panel for edge cases.
+
+Data and dashboards to create (Grafana / Explore queries):
+- asc_coalesce_rate = sum(asc_decisions{outcome=\"merged\"}) / sum(asc_decisions_total)
+- asc_predicted_p95_delta (histogram) by model_variant
+- fidelity_smoother_stage_{0..N} counts and rollback rate
+- cost_saved_by_coalescer = baseline_token_cost - observed_token_cost (rolling 1h)
+
+Configuration table (YAML example to apply per-pool):
+```
+asc:
+  enabled: true
+  p95_budget: 1.10
+  coalesce_max_slot_gap_ms: 20
+  smoothing:
+    enabled: true
+    stages: 4
+    stage_interval_seconds: 15
+  safety:
+    memory_limit_fraction: 0.85
+    disable_for_tenant_labels: [\"sensitive\", \"real-time\"]
+```
+
+Quality validation (automated checks added to CI):
+1) For each smoothing experiment run, CI must compute a quality delta for the benchmark set; fail the experiment if any metric regresses beyond threshold (default 1.5%).
+2) Synthetic latency regression simulation using the observed distribution; fail if p99 grows by >10%.
+
+Known interactions and edge cases:
+- KV cache warmup: aggressive coalescing may reduce effective prefix-sharing and temporarily lower KV-hit rates; include a hysteresis timer to avoid oscillation.
+- Mixed-variant coalescing: merging slots executing different model variants can trigger kernel fallbacks. ASC uses the kernel_compatibility matrix to avoid cross-variant merges unless safe_fallback is configured.
+- On-prem GPU fragmentation: ASC merges can increase fragmentation if coalesced groups exceed allocator soft caps; monitor allocator.fragmentation by node.
+
+Testing checklist before enabling in production:
+- Unit tests for coalescer decision logic under random distributions.
+- Integration tests with runtime telemetry injection (trace+metrics).
+- End-to-end shadow-run against production traffic for 72h.
+
+Rollout and kill-switch knobs:
+- Per-pool config switch asc.enabled (fast toggle via config service).
+- Global emergency-toggle feature flag: runtime.asc.global_mode = OFF.
+- Per-tenant exemption labels: runtime.asc.safelist_labels.
+
+Ownership and contacts:
+- Primary: Marina Kovács (scheduler team) — owner for design and code.
+- Secondary: Daniel Park (profiling) — benchmarking and validation.
+- Oncall escalation: eng-sre team (pager on-call) — for incidents caused by p95/p99 regressions.
+
+Postmortem guidance (if a rollout causes customer-visible degradation):
+1) Capture decision traces and sampled payloads for all merges in the incident window.
+2) Re-run simulation locally with identical slot timelines.
+3) Iterate on smoothing_stages and p95_budget, prefer more conservative ramps.
+
+Appendix: example Grafana panel queries and CLI toggles
+- Toggle ASC for pool 'us-west-asc' via CLI:
+  curl -X POST https://control-plane.internal/api/pools/us-west-asc/config -d '{\"asc\":{\"enabled\":false}}' -H 'Authorization: Bearer $ADMIN_TOKEN'
+
+- Example Prometheus query for ASC rollback rate:
+  sum(rate(asc_smoother_rollbacks_total[5m])) / sum(rate(asc_smoother_attempts_total[5m]))
+
+References and related reading:
+- See the scheduler decision provenance spec for how ASC appends decision metadata to trace spans.
+- Cross-reference: predictive-slotting-and-quota-orchestration-2026 (decision heuristics) and sequence-runway-sampling-and-batch-fidelity-playbook-2026 (profiling recipes).
+
+This doc will be updated as we collect more production evidence. For feature requests or to join the profiling study, ping @marina.kovacs on Slack.

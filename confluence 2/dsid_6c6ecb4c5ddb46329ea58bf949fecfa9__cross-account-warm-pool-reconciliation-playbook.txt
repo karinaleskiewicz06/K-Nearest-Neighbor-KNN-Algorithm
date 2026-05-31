@@ -1,0 +1,157 @@
+cross-account-warm-pool-reconciliation-playbook
+
+h1. Cross-account warm-pool reconciliation playbook
+
+Summary
+This playbook describes the processes, Terraform/IaC patterns, monitoring signals and operational procedures we use to detect and repair warm-pool entropy (mismatched state, leaked leases, or under-provisioned pools) across multiple cloud accounts and regions. It targets the warm-pool subsystem used by inference-serving (service: warm-pool-service) and the cross-account lease broker (service: lease-broker-operator). The goal is to restore pool availability quickly while preserving tenant fairness and billing integrity.
+
+Scope
+- Applies to: warm-pool-service, lease-broker-operator, egress-shim and capacity-sentry operator across AWS and GCP accounts.
+- Not covered: on-prem private deployments (see eng-private-deployments).
+- Audience: infra oncall, SREs, terraform authors, platform engineers.
+
+Background and motivation
+Warm pools keep GPU nodes pre-initialized with kernel images, network routes and tokenized credentials to reduce cold-start latency for inference workloads. Cross-account orchestration (bursting and warm handoffs) can produce state divergence: leaked leases, double-assigned nodes, or pools that are warm but not visible to the scheduler (entropy). These failures degrade latency SLOs and inflate cost.
+
+Architecture (text diagram)
+- lease-broker-operator: central reconciliation controller deployed in the control account; writes lease objects to account-specific queues.
+- warm-pool-service: per-account service that maintains pool state and exposes /health, /metrics, and a gRPC reconciliation endpoint.
+- capacity-sentry: telemetry exporter that annotates metrics with tenant-id and billing tags.
+- egress-shim: multi-account proxy used for cross-account KV cache replication.
+
+Preflight / prerequisites
+1) Read-only access to target account(s) (AWS assume-role / GCP impersonation) and the central control account.
+2) CLI tooling: aws-cli >= 2.10, gcloud SDK, rwpctl (our warm-pool toolkit) 1.3.0+.
+3) Grafana/Tempo access and the 1m/5m warm-pool dashboards.
+4) Terraform workspace names for the accounts present in the iac repo.
+
+Key signals that indicate warm-pool entropy
+- PoolAvailability drop: pool_availability{pool="gpu-warm-1"} < 0.995 for 5m.
+- LeaseAge skew: lease_age_p99 (central) - lease_age_p99 (account) > 30s consistently.
+- Double-assignment metric: node_assignment_conflicts > 0.
+- Stale KV replication lag: kv_replication_lag_seconds > 120.
+- Billing anomaly: burst_cpu_hours spikes while scheduler_throughput stable.
+
+SLOs and thresholds
+- Pool availability SLO: 99.9% per region, measured per 1h window.
+- Reconciliation completion: 95% of detected inconsistent leases repaired within 10 minutes (target).
+- Observability freshness: metrics ingestion delay < 30s.
+
+Runbook: detection -> machine triage -> reconciliation
+1) Detection and first-response (pager)
+   a) Pager triggers when PoolAvailability < 0.995 for >5m or node_assignment_conflicts > 0.
+   b) Oncall obtains required cross-account creds: aws sts assume-role -r arn:aws:iam::123456789012:role/WarmPoolOpsRole --duration-seconds 3600
+   c) Record the alert id and create an incident channel (Slack #inc-warm-pool-<region>-<time>).
+
+2) Quick triage (5–10 minutes)
+   - Check warm-pool-service /health endpoint in each affected account: curl -sS https://warm-pool-service.internal/health
+   - Inspect metrics: Grafana panels -> PoolAvailability, LeaseAge distribution, node_assignment_conflicts, kv_replication_lag_seconds
+   - Run rwpctl diagnose --account <account-id> --pool <pool-name> to collect state snapshot (JSON) and attach to the incident channel.
+
+3) Reconciliation strategy selection
+   - If node_assignment_conflicts > 0: perform safe-evict (step 4).
+   - If kv_replication_lag_seconds > 120: trigger a replication flush (step 5).
+   - If leases are leaked (central shows lease, account missing): run lease broker resync (step 6).
+   - If PoolAvailability is low due to under-provisioning: trigger controlled warm-pool scale-up (step 7).
+
+4) Safe-evict procedure (use when conflicts detected)
+   1. Mark node read-only in scheduler: rwpctl mark-readonly --node <node-id> --account <account-id>
+   2. Drain active sessions with 60s grace: rwpctl drain --node <node-id> --grace 60
+   3. Reconcile assignments: lease-broker-operator reconcile --node <node-id> --force
+   4. Wait for node_assignment_conflicts metric to reach 0 and PoolAvailability to stabilize.
+
+5) KV replication flush (use when lagging)
+   1. In control account: lease-broker-operator flush-kv --target-account <account-id> --pool <pool>
+   2. Verify kv_replication_lag_seconds falls below 5s and confirm via rwpctl diagnose output.
+
+6) Lease broker resync (use when central shows leases not present locally)
+   1. Start a dry-run: lease-broker-operator resync --account <account-id> --pool <pool> --dry-run > /tmp/resync-dry.json
+   2. Review the dry-run output with an SRE peer. If changes are safe, run without --dry-run.
+   3. After resync, confirm lease_age_p99 realigns with central and no double-assignments remain.
+
+7) Controlled warm-pool scale-up (use when under-provisioned)
+   - Follow the terraform run below to create temporary capacity with pre-warmed instances and attach them using the lease-broker-operator. Do not exceed account quota limits.
+
+Terraform / IaC patterns and safe guards
+- Use the account-scoped module: modules/warm_pool/aws with the following constraints:
+  | key | required value | notes |
+  | pool_name | string | unique per account |
+  | max_burst | integer | must be <= account quota - 10 |
+  | prewarm_image | ami-xxxx | bake via gpu-image pipeline |
+- Implement precondition checks in Terraform using external data checks (script: iac/sanity/check-account-quotas.sh) to avoid quota exhaustion. Example snippet:
+
+  # terraform snippet (literal)
+  module "warm_pool" {
+    source = "git::ssh://git@github.com/redwood/iac-modules.git//modules/warm_pool/aws"
+    account_id = var.account_id
+    pool_name = var.pool_name
+    max_burst = var.max_burst
+    prewarm_image = data.aws_ami.gpu.id
+  }
+
+- Workspace promotion policy: any change that increases max_burst must have a signed approval in PR and a smoke-test plan that validates pool boot times < 90s.
+
+CI/CD safety checklist for warm-pool related changes
+1) Unit tests for module variables and precondition scripts.
+2) Integration tests in ephemeral sandbox account.
+3) Canary promotion: deploy to a shadow account and run rwpctl smoke --pool <pool> 50x to ensure no double-assignment.
+4) Gate: changes that touch lease-broker-operator must pass chaos injection test that simulates a 2-minute KV partition.
+
+Automation tools and scripts (reference)
+- rwpctl: central CLI for warm-pool operations (diagnose, drain, mark-readonly).
+- lease-broker-operator: kubectl control plane (kubectl -n control get pods -l app=lease-broker)
+- iac/sanity/check-account-quotas.sh: shell script used by Terraform precondition external data provider.
+
+Alert to remediation mapping (quick view)
+- PoolAvailability < 99.5% (5m): follow steps 1–3, then 7 if under-provisioned.
+- node_assignment_conflicts > 0: follow steps 1–4.
+- kv_replication_lag_seconds > 120: follow steps 1–3, then 5.
+
+Post-action audit and tickets
+- After reconciliation, create a post-action ticket in the incident tracker with: incident id, timeline, commands run, resync output, and cost impact estimate.
+- Run rwpctl collect-audit --incident <id> and upload the artifact to the ticket.
+- Schedule follow-up terraform change if the root cause was IaC drift.
+
+Ownership and escalation
+- Primary: PoolSRE (pager rotation). Secondary: FleetOps. Tertiary: Infra Eng leads.
+- If cross-account ACL or IAM issues are suspected escalate to Cloud Accounts team (chime -> #cloud-accounts-escalation).
+- Legal/compliance: if customer data residency or HSM keys were touched, set confidentiality to restricted and involve security@redwood.com.
+
+Safety and rollback notes
+- Never run lease-broker-operator resync --force without a dry-run unless agreed with a second SRE.
+- When scaling up, prefer short-lived prewarmed instances tagged with transient=true to avoid long-term billing leakage.
+- Maintain an immutable changelog for prewarm images.
+
+Appendix A — CLI examples
+- Assume role (AWS):
+  aws sts assume-role --role-arn arn:aws:iam::000111222333:role/WarmPoolOpsRole --role-session-name reconcile-session
+- rwpctl diagnose example:
+  rwpctl diagnose --account 000111222333 --pool gpu-warm-1 > /tmp/gpu-warm-1-snapshot.json
+- Dry-run resync example:
+  lease-broker-operator resync --account 000111222333 --pool gpu-warm-1 --dry-run > /tmp/resync-dry.json
+
+Appendix B — Terraform precondition example (external data provider script outline)
+- Script: iac/sanity/check-account-quotas.sh (pseudo):
+  1) aws quotas get-service-quota --service-code ec2 --quota-code L-1216C47A | jq '.Quota.Value'
+  2) compare with var.max_burst + reserved_safe_margin
+  3) exit 0 if OK, exit 1 if violates quota
+
+Appendix C — Observability and dashboards
+- Grafana dashboards: warm-pool-overview (1m resolution), cross-account-lease-latency, node-assignment-conflicts.
+- Traces: Tempo span name: warm-pool.reconcile.<account>.<pool>.
+- Logs: Loki stream labels {job=\"warm-pool-service\", account=\"000111222333\"}.
+
+Change log
+- 2024-09-12: Created initial playbook (Ava Martinez).
+- 2024-11-06: Added Terraform precondition snippet and CI checklist (Liam Chen).
+- 2025-02-18: Updated thresholds for kv replication lag and added rwpctl automation flags (Priya Kapoor).
+
+Related pages and references
+- See: /confluence/eng-infra/gpu-fleet-and-capacity/gpu-warm-pool-replenishment-and-iac-sync for warm pool lifecycle.
+- See: /confluence/eng-infra/terraform-and-iac/preempt-aware-burst-provisioning-iac-playbook for burst provisioning patterns.
+
+Contact
+- PoolSRE oncall: pager rotation (see oncall roster).
+- Infra slack: #infra-ops, Cloud Accounts: #cloud-accounts-escalation.
+
+End of document

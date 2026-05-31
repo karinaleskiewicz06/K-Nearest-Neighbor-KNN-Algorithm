@@ -1,0 +1,257 @@
+Egress Lease Manager — spec and CI/CD adapter
+
+Overview
+========
+
+This document specifies the Egress Lease Manager (ELM): a small control plane service + Terraform/CI-CD adapters that orchestrate short-lived "egress leases" to guarantee tenant egress capacity across multi-account GPU pools. The ELM prevents noisy-tenant egress storms, enables predictable cross-account bursting, and provides a simple CI/CD integration for automated allocation and failover during deploys.
+
+Key goals
+---------
+
+- Provide per-tenant egress capacity reservations with timeboxed leases (default: 10m, configurable).
+- Enable programmatic lease acquisition from CI/CD pipelines and runtime orchestrators (e.g., burst orchestrator, canary deploy pipelines).
+- Integrate with Terraform modules to map leases to NAT gateways / egress proxies and enforce IAM/egress controls.
+- Expose telemetry, SLOs, and alerts for egress exhaustion and lease contention.
+- Offer safe fallback policies when leases cannot be granted (queueing, degrade-to-throttled-egress).
+
+When to use ELM
+----------------
+
+- Tenant needs predictable large-volume egress (model downloads, checkpoint replication, dataset syncs).
+- Canaries or mass rollout jobs that can overwhelm shared NATs or egress proxies.
+- Private deployments where VPC egress capacity must be accounted against a budget or billing center.
+
+System components
+-----------------
+
+1) Egress Lease Manager service (ELM-core)
+   - REST API (JSON over HTTPS) and gRPC endpoints
+   - Lease store: DynamoDB / Spanner (configurable) for single-source-of-truth
+   - Leader election for multi-region HA
+   - Plugin interface for enforcement (Terraform, cloud-provider quotas, egress-proxy API)
+
+2) Terraform adapter (terraform-elm)
+   - Terraform module + provider wrapper that reads lease assignments and binds NAT / proxy routes and tags
+   - Generates IAM bindings for temporary service principals used during the lease
+
+3) CI/CD integration (elm-ci-adapter)
+   - CLI utility and Buildkite / GitHub Actions steps to request/renew/release leases
+   - Idempotent behavior for retrying acquisitions during pipeline restarts
+
+4) Observability layer
+   - Prometheus metrics + Grafana dashboards
+   - Audit logs streamed to centralized logging (Stackdriver/CloudWatch/ELK)
+
+SLOs and limits
+---------------
+
+- Lease acquisition latency: 99th perc <= 150ms (regional LB + ELM-core)
+- Lease decision accuracy: 100% (no overcommit) — leases are conservative by default
+- Lease renewal jitter: <= 50ms
+- Global concurrent leases per region: configurable (default 500)
+
+API contract (summary)
+----------------------
+
+POST /v1/leases
+Request body (JSON):
+{
+  "tenant_id": "string",
+  "requested_bandwidth_mbps": 100,
+  "duration_seconds": 600,
+  "purpose": "canary-deploy"
+}
+
+Responses:
+- 201 CREATED: {"lease_id":"...","granted_bandwidth_mbps":100,"expires_at":"2025-02-20T12:34:56Z"}
+- 202 ACCEPTED: queued (with ETA)
+- 409 CONFLICT: cannot satisfy (includes suggested fallback: throttle 10mbps)
+
+PUT /v1/leases/:lease_id/renew
+DELETE /v1/leases/:lease_id
+GET /v1/leases?tenant_id=...
+
+Terraform module design
+-----------------------
+
+The terraform-elm module has two responsibilities:
+- Materialize infrastructure attachments (NAT gateway route, egress-proxy config) for an acquired lease
+- Create short-lived credentials (service account / role) scoped to the lease duration
+
+Example usage (pseudo-Terraform)
+
+module "elm_lease_attach" {
+  source = "git::ssh://git@github.com/redwood/terraform-elm.git//modules/attach"
+
+  lease_id                 = var.lease_id
+  region                   = var.region
+  nat_gateway_resource_id  = aws_nat_gateway.shared.id
+  egress_proxy_endpoint    = module.egress_proxy.endpoint
+  lease_tag_key            = "elm-lease"
+}
+
+Module variables table
+| Name | Type | Description | Default |
+|------|------|-------------|---------|
+| lease_id | string | ELM lease UUID | (required) |
+| region | string | Cloud region for attachment | (required) |
+| nat_gateway_resource_id | string | NAT resource id to attach rule | (required) |
+| egress_proxy_endpoint | string | Optional proxy control-plane endpoint | null |
+
+CI/CD integration examples
+--------------------------
+
+Buildkite pipeline step (shell):
+
+- name: "Acquire Egress Lease"
+  command: |
+    elmctl acquire --tenant $TENANT --bandwidth 200 --duration 600 --purpose deploy > lease.json
+    export LEASE_ID=$(jq -r .lease_id lease.json)
+
+Canary rollout sequence (recommended):
+1. Acquire lease with --duration 600
+2. Run canary deploy traffic scoped to granted_bandwidth_mbps
+3. Renew lease for another 600s if canary passes
+4. Release lease after canary completes
+
+CLI semantics
+-------------
+
+- elmctl acquire: idempotent, returns existing lease if same tenant/purpose is active
+- elmctl renew: extends expiry; fails fast if allocation impossible
+- elmctl release: returns resources; Terraform module observes release and tears down attachments
+
+Enforcement patterns
+--------------------
+
+We support two enforcement backends (pluggable):
+
+A) Cloud-native NAT tagging
+- Terraform writes a short-lived tag on NAT resources mapping to lease_id
+- Egress dataplane periodically reads active tag list and enforces token bucket policing
+
+B) Egress-proxy token-based routing
+- Egress proxy (Envoy cluster with rate-limiter filter) accepts per-connection lease tokens
+- Terraform registers token with proxy control-plane during attach
+
+Fallback policies
+-----------------
+
+If a lease request cannot be satisfied immediately:
+- If request has purpose=best-effort: return 202 with ETA in seconds
+- If purpose=strict: return 409 with suggested alternate bandwidth
+- For CI/CD jobs: the pipeline step should implement exponential backoff with max retries 5
+
+Metrics and alerts
+------------------
+
+Recommended metrics (Prometheus names):
+- elm_lease_requests_total{status}
+- elm_lease_granted_gbps
+- elm_lease_denied_total
+- elm_active_leases_gauge
+- elm_lease_queue_length
+
+Alerting rules (examples)
+1) High denial rate: if rate(elm_lease_denied_total[5m]) > 5/min and elm_lease_requests_total[5m] > 20 -> Pager
+2) Exhausted capacity: elm_active_leases_gauge == region_capacity -> Pager + auto-throttle mode
+3) Long queue: elm_lease_queue_length > 50 -> Ops channel and QBR review
+
+Runbook: Lease acquisition fails during deploy
+--------------------------------------------
+
+1) Check ELM-core health page: https://elm.redwood.internal/health
+2) Inspect logs for 409 / 202 responses (trace_id header forwarded by pipeline)
+3) If denial due to capacity, either:
+   a) Wait until a running lease expires (default) or
+   b) Escalate to SRE to increase region_capacity (see emergency scaling section below)
+4) For CI/CD: mark pipeline step soft-fail vs hard-fail based on purpose tag
+5) If ELM-core is unhealthy: fail open -> pipelines should fall back to throttled-egress profile
+6) Post-incident: add tenant to backfill queue and run retrospective to tune defaults
+
+Emergency scaling (SRE procedure)
+---------------------------------
+
+1) Validate increased capacity will not violate cross-tenant fairness.
+2) Use the admin UI (ELM Admin) or the admin API to increase region_capacity by 10-20%.
+   - POST /v1/admin/regions/:region/adjust_capacity {"delta":100} (requires admin-token)
+3) Notify billing and security teams of transient capacity change.
+4) Observe metrics for 10 minutes; roll back if contention appears.
+
+Security and IAM notes
+----------------------
+
+- All acquisition/renewal API calls require mTLS + short-lived bearer tokens obtained via the internal STS.
+- Terraform adapter creates and destroys a short-lived role binding for the lease; expiry aligns with lease expiry.
+- Audit logs must include: actor, tenant_id, lease_id, requested_bandwidth_mbps, decision, trace_id.
+
+Rollout plan
+------------
+
+Phase 0 — Canary (internal tenants only)
+- Deploy ELM-core in us-west-2, enable terraform-elm in a single staging org.
+- Run 20 synthetic lease acquisitions at 50/100/200mbps.
+
+Phase 1 — Beta (select customers / infra teams)
+- Onboard infra CI pipelines (canary/promote) to opt-in to ELM via elmctl.
+- Validate Terraform attach/teardown across failovers.
+
+Phase 2 — GA
+- Open tenant enrollment, expose usage dashboard, add billing tags and cost attribution.
+
+Testing matrix
+--------------
+
+- Unit tests for allocation algorithm (edge cases: rounding, time skew)
+- Integration test: terraform-elm attaches NAT rules and performs e2e egress enforcement in dry-run
+- Chaos test: simulate NAT failure and verify lease rebind to fallback proxy
+
+Operational ownership
+---------------------
+
+- Primary owner: infra-networking team (oncall rotation)
+- Backup owner: gpu-fleet-capacity team
+- SLO/alert steward: eng-sre
+
+Appendix A — Terraform example (provider shim)
+----------------------------------------------
+
+# provider block (pseudo)
+provider "elm" {
+  endpoint = "https://elm-admin.redwood.internal"
+  token    = data.aws_iam_role.terraform_session.credentials.token
+}
+
+resource "elm_lease_binding" "canary" {
+  lease_id = var.lease_id
+  nat_id   = aws_nat_gateway.shared.id
+}
+
+Appendix B — Troubleshooting checklist
+--------------------------------------
+
+- If lease shows granted but traffic isn't using bandwidth: check egress-proxy token binding and NAT route tags
+- If multiple tenants starve: inspect tenant priorities and run the fairness audit script
+- If renewals unexpectedly fail: verify clock skew on CI runners and the ELM-core cluster
+
+Appendix C — Dashboards and links
+---------------------------------
+
+- Grafana: Cluster -> ELM Overview (internal link)
+- Kibana: query: "source:elm AND level:ERROR"
+- Admin UI: https://elm-admin.redwood.internal
+
+Change log
+----------
+- 2024-09-15: Draft spec created
+- 2024-11-02: Added Terraform adapter details and CI/CD examples
+- 2025-02-20: Updated SLOs and emergency scaling procedure
+
+Related decisions
+-----------------
+- Decision: conservative allocation to avoid cross-tenant overcommit (see: /confluence/eng-infra/decision-records/elm-conservative-allocation-2024)
+
+Contact
+-------
+
+For questions or rollout requests, ping #infra-egress on Slack or contact the owner: evan.li@redwood.com

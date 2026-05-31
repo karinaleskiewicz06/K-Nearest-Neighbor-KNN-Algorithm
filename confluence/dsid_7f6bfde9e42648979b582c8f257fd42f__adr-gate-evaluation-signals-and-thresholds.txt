@@ -1,0 +1,222 @@
+ADR: Gate evaluation signals and thresholds (Dedicated staged rollouts)
+
+## Summary
+This ADR defines (1) the signal sources used to evaluate staged rollout gates for **Dedicated** reserved pools, (2) the **default gate thresholds** by SLA tier, (3) the standard **aggregation windows / sample size requirements**, and (4) the required behavior when signals are **noisy** or **missing**.
+
+The intent is to make gate evaluation deterministic, auditable, and consistent across regions and failure modes while minimizing false positives.
+
+## Status
+**Accepted** for v1 of Dedicated staged rollouts.
+
+## Context / problem
+Dedicated staged rollouts promote changes (model versions, runtime builds, routing policies, configuration) through explicit stages. Each promotion must be guarded by objective signals so that:
+- We do not jeopardize Dedicated customer SLOs.
+- Operators can understand *why* a gate passed/failed.
+- Evaluation works in low-traffic stages (e.g., 1%) without being overly noisy.
+- Behavior during telemetry degradation is safe and consistent.
+
+We need a single set of “standard gate templates” so product/console can present consistent evidence, and SRE can align promotion policy to error budgets.
+
+## Decision
+### 1) Gate signal sources (authoritative inputs)
+Gate evaluation uses a small, explicit allowlist of sources. All gate computations must be reproducible from stored query + time window + filters.
+
+**A. Request/response metrics (Redwood Metrics / Prometheus-backed)**
+Stage-tagged, region-tagged counters and histograms emitted by the data plane and gateway:
+- `requests_total{pool_id, stage_id, region, route, model_id, status_class}`
+- `request_latency_ms_bucket{...}` (histogram)
+- `streams_aborted_total{...}`
+- `rate_limited_total{...}` (429)
+- `dropped_total{...}` (explicit drops/circuit-break)
+- `queue_wait_ms_bucket{...}` (where available)
+
+**B. Error classification (Redwood error taxonomy)**
+Gate computations MUST use standardized classification to avoid double counting:
+- Server errors: 5xx excluding known benign categories
+- Timeouts: gateway timeout vs upstream timeout counted as server error
+- Client cancellations (e.g., disconnects) are excluded from error-rate gates by default
+
+**C. Fleet / GPU health signals (Fleet Health service + node exporter summaries)**
+Used as “hard stop” gates:
+- Critical Xid/ECC errors (double-bit ECC, repeated Xid in window)
+- Thermal throttling sustained beyond threshold
+- Node taints / quarantine state
+
+**D. OOM / runtime instability signals (runtime logs aggregated to metrics)**
+- `oom_events_total{pool_id, stage_id, region, model_id}`
+- `restarts_total{...}` for runtime container restarts (crash loops)
+
+**E. Quality regression signals (optional in v1)**
+Where available for a rollout plan, quality gates may be enabled using Redwood’s eval harness summaries:
+- `eval_score{prompt_set_id, model_id, stage_id}`
+Quality gates are not mandatory for v1; if enabled, they follow the same missing-data semantics as other gates (see below).
+
+### 2) Default gate set (v1)
+A rollout stage is eligible for promotion only if all **required** gates are in PASS and none are in FAIL/UNKNOWN.
+
+**Required gates (v1):**
+1. **Server error rate** (5xx + timeouts)
+2. **Latency** (p95 and p99)
+3. **Rate limiting / drops** (429 + explicit drop)
+4. **Saturation/headroom** (GPU utilization + queue wait/queue depth when available)
+5. **OOM / crash-loop**
+6. **GPU health**
+
+**Optional gates (v1):**
+- Quality regression
+- Token efficiency regression (cost) (tracked, not a promotion blocker for v1)
+
+### 3) Thresholds by Dedicated tier
+Thresholds below are defaults and are aligned with Dedicated SLO tiering. They are intentionally conservative for early stages; operators can use **force-promote** with audit logging when warranted.
+
+#### 3.1 Absolute thresholds (must be met)
+All thresholds are computed per **pool_id + stage_id**, evaluated **per region**, and then rolled up to a global gate status (see §4).
+
+| Gate | Dedicated Standard (default) | Dedicated Premium (default) | Notes |
+|---|---:|---:|---|
+| Server error rate (5xx + timeouts) | \<= 0.50% | \<= 0.20% | Excludes client cancellations; includes gateway + upstream timeouts |
+| 429 rate (rate limited) | \<= 0.20% | \<= 0.10% | Protects against capacity starvation during partitioning |
+| Drop rate (explicit drops / circuit-break) | \<= 0.10% | \<= 0.05% | Drops are treated as more severe than 429 |
+| Latency p95 | \<= 1.15 × baseline OR \<= tier ceiling | \<= 1.10 × baseline OR \<= tier ceiling | Baseline is control partition (preferred) or pre-rollout window |
+| Latency p99 | \<= 1.25 × baseline OR \<= tier ceiling | \<= 1.20 × baseline OR \<= tier ceiling | p99 is noisier; requires min samples |
+| GPU utilization (avg) | \<= 85% | \<= 80% | Averaged across the stage partition; see §3.3 |
+| Queue wait p95 (if available) | \<= 50 ms | \<= 25 ms | If metric not available, use queue depth proxy and saturation index |
+| OOM events | 0 in window (hard fail) | 0 in window (hard fail) | Any OOM indicates mis-sizing or regression |
+| Crash-loop/restarts | \<= 1 restart per replica per 15m | \<= 1 restart per replica per 30m | Exceeding indicates instability |
+| GPU health critical events | 0 critical events in window | 0 critical events in window | Hard fail on critical health |
+
+**Tier ceilings for latency (used when baseline is unavailable):**
+- Dedicated Standard: p95 \<= 900 ms; p99 \<= 1800 ms
+- Dedicated Premium: p95 \<= 700 ms; p99 \<= 1400 ms
+
+> Rationale: baselines are preferred (relative regressions) but ceilings prevent promotion when baseline is missing or artificially low.
+
+#### 3.2 Baseline definition (relative comparisons)
+When computing “× baseline” thresholds:
+- **Preferred baseline:** the immediate prior stable stage (control partition) measured over the same evaluation window.
+- **Fallback baseline:** the last 60 minutes immediately before the current stage began (stage start timestamp) for the same pool/region/route/model.
+- Baseline must meet minimum sample requirements (§3.4). If baseline is invalid, the evaluator must fall back to absolute ceilings only and mark evidence accordingly.
+
+#### 3.3 Saturation / headroom computation
+To reduce reliance on any single metric, saturation is evaluated as:
+- Primary: `gpu_utilization_avg` threshold (per region)
+- Secondary (if available): `queue_wait_ms_p95` threshold
+- Tertiary (proxy): `inflight_requests` and/or `queue_depth` against a per-pool capacity model
+
+If GPU utilization is below threshold but queue wait is above threshold, the gate fails (we treat sustained queueing as customer-visible pain).
+
+#### 3.4 Minimum sample sizes (to avoid noisy pass/fail)
+Gates are only evaluated when the stage has sufficient traffic in the window.
+
+**Minimum samples per region (per evaluation window):**
+- Error/429/drop gates: **\>= 500 requests**
+- Latency p95: **\>= 500 requests**
+- Latency p99: **\>= 2,000 requests** (or mark p99 as UNKNOWN; see §5)
+
+If the minimum samples are not met, the gate status is **UNKNOWN** and promotion is blocked unless an override is used.
+
+### 4) Aggregation windows and evaluation cadence
+Gate evaluation is performed by the policy engine on a fixed cadence:
+- **Cadence:** every 60 seconds
+- **Default evaluation window:** trailing 10 minutes (Standard), trailing 15 minutes (Premium)
+- **Stability requirement:** 2 consecutive PASS evaluations required before “eligible to promote” is displayed
+
+**Stage-size adjustments (to reduce flakiness):**
+- Canary stage (\<= 1% traffic or smallest replica partition): minimum window 15 minutes and min samples must be met
+- Mid stages (10%–50%): default window
+- Final stage (100%): window may be shorter (5 minutes) for completion, but only after earlier stages have passed
+
+> Note: Stages defined as replica partitions often have burstier traffic distributions; the minimum sample requirements protect against false confidence.
+
+### 5) Multi-region evaluation rules
+Dedicated pools may span regions. Gate status is computed in two steps:
+
+1) **Per-region gate status** (PASS/FAIL/UNKNOWN) computed independently.
+
+2) **Global stage gate status** computed as:
+- FAIL if **any region** is FAIL on a required gate
+- UNKNOWN if **any region** is UNKNOWN on a required gate (and none are FAIL)
+- PASS only if **all regions** are PASS on all required gates
+
+**Region weighting is not used** for v1. A single impaired region blocks promotion by default because Dedicated customers expect consistent behavior across their reserved footprint.
+
+### 6) Missing data, telemetry lag, and partial outages
+We standardize missing-data behavior to prevent ambiguous promotions.
+
+**Definitions:**
+- A signal is considered **stale** if its last datapoint is older than **3 minutes**.
+- A window is considered **insufficient** if it does not meet minimum sample sizes (§3.4).
+
+**Behavior (v1):**
+- Required gates with stale/insufficient data → **UNKNOWN**
+- UNKNOWN blocks promotion and (if configured) triggers an automatic **HOLD** after 30 minutes in unknown state
+- Operators may **force-promote** or **force-rollback** with elevated RBAC and mandatory reason; these actions are audit logged (see audit ADR)
+
+**Why not fail-open?**
+Fail-open allows promotion during observability impairment, which is risky for Dedicated SLOs and makes post-incident reconstruction difficult.
+
+### 7) Noisy metrics handling / debouncing
+To reduce false failures:
+- Percent-based gates use rate calculations over the full evaluation window (not instantaneous 1m spikes).
+- Latency gates use histogram quantiles over the full window.
+- Promotion eligibility requires **two consecutive PASS** evaluations.
+- A single FAIL evaluation immediately makes the gate FAIL (no consecutive requirement), but the UI must display the specific sub-signal and observed values.
+- Client-side cancellations are excluded from error-rate; a separate “cancellation rate” is recorded as evidence but not a blocker.
+
+For extremely bursty traffic patterns (common in small Dedicated pools), operators should consider:
+- Larger canary partitions (replica-based) rather than 1% traffic splits
+- Longer windows (via plan configuration) when approved by SRE
+
+### 8) Configurability / overrides
+**Default:** thresholds are fixed per tier and not customer-editable in v1.
+
+**Allowed configuration (v1, limited):**
+- Stage-level evaluation window (bounded: 5m–30m)
+- Enabling/disabling optional gates (quality)
+- Selecting whether p99 is required (default: required for Premium, optional for Standard when traffic is low)
+
+Any change to default thresholds or to required-gate set requires SRE + Platform sign-off and must be rolled out like a policy change (auditable).
+
+## Options considered
+### Option A: Per-customer fully configurable gate thresholds
+- Pros: maximum flexibility
+- Cons: hard to support/operate; inconsistent customer outcomes; makes console UX and on-call playbooks non-standard
+
+Rejected for v1.
+
+### Option B: Only absolute ceilings, no baseline comparisons
+- Pros: simplest, deterministic
+- Cons: does not catch regressions for already-fast workloads; ceilings are either too lax (miss regressions) or too strict (block legitimate workloads)
+
+Rejected for v1; we use baseline when available plus ceilings as safety net.
+
+### Option C: Fail-open on missing metrics
+- Pros: fewer blocks due to telemetry issues
+- Cons: encourages risky promotions during impaired visibility; undermines trust in “gated rollout” promise
+
+Rejected; we use UNKNOWN + hold + override.
+
+## Consequences
+### Positive
+- Consistent gate behavior across Dedicated pools and regions.
+- Deterministic, auditable evidence (query + window + filters + observed values).
+- Lower risk of capacity-starvation regressions (explicit 429/drop + saturation gates).
+
+### Negative / trade-offs
+- Low-traffic canaries can sit in UNKNOWN until enough samples accumulate.
+- Telemetry issues can block promotions (mitigated by hold + force-promote with audit logging).
+
+## Implementation notes (non-normative)
+- Gate evaluation must be pure and idempotent: same inputs yield same output.
+- Evidence objects returned to Console should include: query text (or query id), window, observed values, thresholds, baseline values (if used), and a reason string.
+- Metrics labeling must control cardinality: stage_id is allowed only on a fixed allowlist of metrics.
+
+## Follow-ups
+1. Validate thresholds against beta customers; adjust if we see systematic false FAIL/UNKNOWN due to traffic patterns. Owner: **Rafael Mendes**.
+2. Add explicit “telemetry degraded” banner + guidance in Console when UNKNOWN is due to staleness vs insufficient samples. Owner: **Chloe Martin**.
+3. Define quality gate defaults and required prompt-set hygiene for Dedicated model upgrades (v2). Owner: **Selene Huang**.
+
+## Appendix: Gate evaluation state meanings
+- **PASS:** observed values meet thresholds and baseline rules; sufficient samples.
+- **FAIL:** threshold violated; promotion blocked; may trigger auto-abort depending on rollout plan.
+- **UNKNOWN:** missing/stale/insufficient data; promotion blocked; may trigger auto-hold after timeout.

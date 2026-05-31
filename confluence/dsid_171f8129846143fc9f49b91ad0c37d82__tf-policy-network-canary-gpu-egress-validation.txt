@@ -1,0 +1,142 @@
+Terraform policy + network canary: GPU egress validation harness
+
+Summary:
+This document describes a repeatable, policy-driven validation harness we use during GPU tenant onboarding to ensure Terraform modules, VPC/subnet/network ACLs, and egress controls meet Redwood Inference networking and security requirements before production promotion. The harness combines: Terraform plan validation, OPA/Rego policy checks, a CI/CD canary stage that deploys lightweight network probes, and synthetic inference traffic checks to validate egress, routes, and KV cache behavior under bounded load.
+
+Goals:
+- Prevent misconfigured network paths that would allow uncontrolled egress or violate tenant isolation SLOs.
+- Automate policy-as-code checks early in CI to fail unsafe changes pre-merge.
+- Provide a canary runtime test that validates real network behavior and telemetry before full rollout.
+- Provide clear rollback/mitigation actions and owner escalation for failures.
+
+Scope and non-goals:
+- In scope: Terraform modules that provision tenant VPCs, subnets, NAT/Egress gateways, route tables, security groups, private link endpoints, and GPU host attachments. Also CI/CD pipelines that push these modules to staging.
+- Out of scope: downstream application-level authentication (handled by app teams) and tenant billing reconciliation flows.
+
+Context and motivation:
+On several past onboardings, tenants experienced unexpected outbound flows (via misconfigured NAT or route misattachments) and intermittent latency due to cross-account egress routing. We implemented a structured harness so network configuration errors are caught automatically and observable artifacts (probe traces, flow logs) are available to owners.
+
+High-level architecture:
+1) Git push -> Terraform plan stage (ci).
+2) Run policy-as-code (OPA/Rego) over plan JSON (terraform show -json) to assert invariants.
+3) If policy passes, CD creates a temporary canary workspace in the target account and deploys:
+   - a probe pod/instance (Linux microVM) with tcpdump, curl, iperf3 and our probe agent
+   - ephemeral test routing (route table entries that mirror production target path but isolated to canary)
+4) The probe agent executes network checks, synthetic L2/L3 validation, and application-layer synthetic token generation to simulate inference (short prompt generation).
+5) Gather telemetry: VPC flow logs, probe logs, cloud NAT / gateway metrics, and Redwood telemetry (egress bytes by tenant, latency percentiles).
+6) Decision gate (pass/fail/promote) based on policy thresholds; auto-destroy on pass or alert and rollback on fail.
+
+Terraform module contract (developer checklist):
+- Module must expose: vpc_id, public_subnet_ids (for NAT gateways), private_subnet_ids (for GPU hosts), egress_nat_config (object), route_table_tags (list), and optional egress_mirror_endpoint.
+- Module must include tagging policy: environment, tenant_id, owner_team, compliance_level.
+- Module must include outputs for: gateway_ids, route_table_ids, and network_acl_ids.
+
+Policy-as-code rules (examples):
+- No module may create an internet-facing route for private_subnet_ids.
+- NAT gateways must be tagged with allowed_burst_accounts.
+- Route tables attached to GPU host subnets must reference approved transit gateway attachments or private link endpoints; direct 0.0.0.0/0 on these route tables is disallowed.
+- Security groups for probe instances allow egress only to validated telemetry endpoints during canary (list provided).
+
+Example Rego snippets (for illustration - place in policies/egress):
+package redwood.iac.egress
+
+# disallow 0.0.0.0/0 on private subnets
+deny[msg] {
+  input.resources[_].type == "aws_route"
+  route := input.resources[_].values
+  route.route_table_id == input.private_route_table
+  route.destination_cidr_block == "0.0.0.0/0"
+  msg = sprintf("private subnet route table %v has 0.0.0.0/0", [route.route_table_id])
+}
+
+# require nat gateway tagging
+deny[msg] {
+  input.resources[_].type == "aws_nat_gateway"
+  nat := input.resources[_].values
+  not nat.tags["allowed_burst_accounts"]
+  msg = "nat gateway missing allowed_burst_accounts tag"
+}
+
+Canary test scenarios (run in CI job: canary-network-probe):
+1) Basic reachability: probe pings expected internal endpoints (model store, config services) and fails if > 5% packet loss in 30s window.
+2) Egress policy validation: probe attempts outbound TCP connect to three classes: allowed telemetry endpoints, blocked Internet host, and unauthorized external IP. Allowed connections must succeed; blocked must be rejected within 3s with TCP RST or no route.
+3) Simulated inference: probe posts a 128-token prompt to a local inference stub behind the same VPC path to validate latency <= 250ms p50 for small prompts.
+4) Bursty KV load: run 30s of KV cache warmup with synthetic keys to ensure egress flow stabilization (monitor NAT connection churn and ephemeral port usage).
+5) Flow-log audit: ensure VPC flow logs contain only expected endpoints and annotate suspicious flows for manual review.
+
+Pass/fail thresholds (canary gate):
+- Reachability packet loss < 5% (fail otherwise)
+- No unauthorized outbound connections observed in flow logs or probe logs
+- Synthetic inference p50 latency <= 250ms and p95 <= 800ms
+- NAT connection churn (new connections/min) below configured baseline (default: 120/min per canary instance)
+- All policy-as-code checks returned zero denies
+
+CI/CD pipeline (recommended GitHub Actions & Cross-account runner):
+1) terraform fmt && terraform validate
+2) terraform plan -out=plan.tfplan && terraform show -json plan.tfplan > plan.json
+3) opa test --fail-on-external --data policies plan.json (use conftest or opal if desired)
+4) if opa OK -> trigger ephemeral canary workspace (cd terraform apply -var-file=canary.tfvars) in staging account
+5) deploy probe artifacts (container image built by CI) and wait for health
+6) run canary-network-probe suite (script in ./ci/scripts/canary_probe.sh)
+7) gather artifacts and post to the PR: probe logs, flow log digest, metric snapshot
+8) decision: auto-approve/promote or fail and open incident ticket with owners
+
+Sample ci command (can be copied into GHA job):
+- name: Run policy and canary
+  run: |
+    terraform init -backend-config="workspace=canary-${{ github.sha }}"
+    terraform plan -out=plan.tfplan
+    terraform show -json plan.tfplan > plan.json
+    conftest test plan.json --policy policies/egress
+    if [ $? -ne 0 ]; then exit 1; fi
+    ./ci/scripts/trigger-canary.sh --workspace canary-${{ github.sha }}
+
+Observability and artifacts to collect:
+- VPC flow logs (1 minute aggregation for canary runs)
+- Probe stdout/stderr, tcpdump captures (pcap), and curl/iperf outputs
+- NAT/gateway metrics: active connections, bytes_out, error_rate
+- Terraform plan JSON and OPA/Rego evaluation result (policy logs)
+- Redwood per-tenant egress counters and trace ids for synthetic inference requests
+
+Ownership and escalation:
+- Module author: primary contact for Terraform module changes and first responder for policy failures.
+- Network oncall: secondary owner for canary network failures and flow log anomalies.
+- SRE infra owner: responsible for CI runner, ephemeral workspace cleanup, and automation reliability.
+
+Rollback and remediation playbook (fast-path):
+1) If canary fails policy checks: block merge, tag author, and require policy fix.
+2) If canary fails runtime probes (egress/latency): disable promotion, destroy canary workspace, and open a P1 with network-oncall.
+3) Apply temporary circuit-breaker: attach a deny-egress security group to the tenant or remove route attachments (manual runbook steps documented in runbooks/oncall).
+4) If suspected code regression in TF module: revert to last known-good module tag and re-run harness.
+
+Cost and cleanup considerations:
+- Canary workspace is ephemeral and should be auto-destroyed within 30 minutes of test completion (success or failure).
+- Limit concurrent canaries per account to 4 by default to avoid NAT/Egress billing spikes; increase only with SRE approval.
+
+Operational run cadence and metrics to track:
+- Weekly: number of PRs blocked by OPA rules and top 5 policy violations.
+- Per-onboarding: canary pass rate and median time to remediation.
+- Monthly: upstream false positives in policy rules (policy churn) and probe flakiness rate.
+
+Appendix A: sample minimal terraform output contract (text):
+outputs = [
+  { name = "vpc_id", value = "vpc-xxxx" },
+  { name = "private_subnet_ids", value = ["subnet-1","subnet-2"] },
+  { name = "egress_gateway_id", value = "nat-xxx" }
+]
+
+Appendix B: quick troubleshooting checklist for network-oncall:
+- Verify the canary workspace exists and terraform apply completed without errors.
+- Check probe pod health and logs (kubectl logs).
+- Pull and inspect pcap from probe; grep for unexpected destinations.
+- Cross-reference flow logs for unexpected elastic IPs or transit attachments.
+- If NAT connection churn is high, escalate to infra owner to inspect connection tracking and possible port exhaustion.
+
+References and related pages:
+- See related Terraform module conventions: /confluence/eng-infra/terraform-and-iac/tf-module-compatibility-and-deprecation-plan
+- Canary runner implementation examples: internal repo redwood-infra/canary-runner (link in repo index)
+- Policy library: policies/egress in git infra-policy repo
+
+Contact and next steps:
+- For implementation questions or to onboard a module into this harness, contact author (Priya Natarajan) or reviewers listed above.
+- Roadmap items: integrate Opal for real-time plan gating, add automated remediation playbooks for common policy violations, and surface canary artifacts in the Redwood Console onboarding checklist.

@@ -1,0 +1,188 @@
+Prompt Drift Detection and Augmentation Pipeline
+
+Overview
+
+Purpose: This document specifies Redwood's production pipeline for detecting prompt drift and automatically generating candidate augmentations to preserve model quality across evolving real-world inputs. It covers detection signals, augmentation heuristics, safety gating, integration with the eval harness, and an operational runbook for on-call teams.
+
+Motivation
+
+- Prompts observed in production evolve over time (format changes, new entity types, user intent shifts).
+- Left unchecked, prompt drift causes degradations that manifest as higher latency (due to more complex completions), lower quality metrics, or increased safety/regression alerts.
+- We need an automated, auditable way to surface drift, generate candidate prompt variants, and evaluate them against regression/eval suites before recommending deployment.
+
+Scope and assumptions
+
+- Applies to text generation and instruction-style chat endpoints backed by Redwood models (hosted + dedicated).
+- Not intended for closed, customer-specific prompt templates that are governed under customer change control; those are handled via Private deployment change processes.
+- Assumes token-level telemetry and request/response text retention (redacted per data-retention policy).
+
+Architecture summary
+
+1) Telemetry ingestion: streaming samples (1:1000 downsample by default) from production routes into the Prompt Drift Topic (Kafka).
+2) Drift detector: nightly job that computes embedded-space distribution shifts and rule-based feature shifts.
+3) Candidate generator: corpus-aware paraphrase and slot-filling augmentation service that proposes variants.
+4) Eval harness integration: candidate variants are scored against the Production Prompt Catalog, stress bench, and targeted regression prompt sets.
+5) Safety & gating: candidates must pass automated safety filters and a minimal regression delta threshold before being surfaced to SRE/ML owners.
+6) Human review + rollout: triaged candidates go into a canary trial (1% traffic) with automated metrics comparison and rollback hooks.
+
+Detection pipeline (detailed)
+
+Input: sample stream of request prompts and metadata: route, model_id, customer_tier, timestamp. Data is normalized (strip PII, anonymize tokens).
+
+Signals computed nightly: 
+- Embedding drift (cosine): average cosine distance between embeddings of the 7-day window and baseline (30-day rolling baseline).
+- Slot frequency change: sudden changes (>5x) in regex-captured slot counts (dates, numbers, product IDs).
+- Prompt length distribution shift: Kullback-Leibler divergence threshold 0.08 triggers alert.
+- Intent classifier shift: fraction of prompts whose predicted intent class switches compared to historical mode > 12%.
+- Overt error spike: increase in bad_response_rate (defined below) by > 30% relative.
+
+Bad_response_rate definition: percent of responses that trigger one or more of {safety_flag, eval-fallback, high-repetition, hallucination heuristic} within a 24-hour bucket.
+
+Configuration table
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| sample_rate | 1/1000 | Fraction of incoming prompts sampled for drift detection |
+| embed_model | text-embed-sim-003 | Model used for prompt embeddings |
+| embed_threshold_cosine | 0.18 | Mean cosine distance over baseline to consider embedding drift |
+| kl_threshold | 0.08 | KL divergence threshold for length distribution shift |
+| intent_shift_pct | 12 | Percent intent-change threshold |
+| slot_change_multiplier | 5 | Multiplier for slot frequency anomalies |
+| bad_response_spike_pct | 30 | Percent increase to consider error spike |
+
+Candidate generation and augmentation heuristics
+
+- Goals: produce small set (<= 10) candidate prompt variants per drift cluster that preserve user intent while improving robustness to new inputs.
+- Methods: 
+  - Paraphrase via model-conditioned rephrasing (temperature 0.2) with semantic constraints to maintain intent label.
+  - Slot-filling expansions: insert canonical slot examples (from FAQ/production-catalog) to handle new entity types.
+  - Template normalization: unify numeric/date formats and remove brittle phrasing.
+  - Contextual prompting: add short clarifying context sentences when user input becomes more ambiguous (detected via low intent-confidence).
+
+Example candidate generation config (YAML snippet):
+
+#!/bin/bash
+cat <<'YAML' > /etc/redwood/prompt-augment.yaml
+augment:
+  max_candidates: 8
+  paraphrase_model: text-gen-003-rewrite
+  paraphrase_temp: 0.2
+  preserve_intent_confidence_min: 0.85
+  slot_examples_source: production-prompt-catalog
+  apply_template_normalization: true
+  safety_checks: ["safety-lexicon", "toxicity-check", "pii-scrub"]
+YAML
+
+Evaluation & scoring
+
+Each candidate variant is evaluated by the eval-harness against three tiers:
+1) Baseline regression set (must not worsen > 0.5% on primary metrics).
+2) Targeted stress bench (must meet or exceed baseline performance for stress-specific metrics).
+3) Safety/evasion suite (zero critical safety regressions).
+
+Metrics computed per-candidate (examples):
+- Accuracy / BLEU / BLEURT where ground truth exists
+- Per-route latency P50/P95
+- Token efficiency (tokens_out / tokens_in) and cost delta
+- Safety score (0..1, 1 = safest)
+- User-facing failure rate (defined by downstream validators)
+
+Acceptance criteria (automated gate):
+- Regression delta (primary_quality_metric) <= +0.5% (no degradation)
+- Safety_score >= baseline - 0.01 and no critical safety flags
+- Latency P95 increase <= 10% absolute
+- Cost per 1k tokens increase <= 5%
+
+Safety & human-in-the-loop review
+
+- Any candidate failing safety checks is quarantined and assigned to Applied ML for forensics.
+- Candidates that pass automated gates are batched weekly into a triage queue for ML owners and SRE review.
+- Triage checklist for reviewers: intent-preservation, failure mode analysis, dataset provenance of generated examples, privacy concerns.
+
+Canary rollout procedure (numbered steps)
+
+1. Create augmentation bundle and register in Prompt Aug Registry: `rwctl prompts register --bundle <bundle-id>`
+2. Run synthetic evaluation job: `rw-eval run --bundle <bundle-id> --suites baseline,stress,safety`
+3. If job passes automated gates, schedule canary: `rw-traffic route update --route <route> --augment-bundle <bundle-id> --canary 0.01 --duration 24h`
+4. Monitor SLO dashboards and the canary report for 24 hours. Key checks: quality_delta, safety_flags, latency_p95_delta, error_budget_consumption.
+5. Approve rollout (gradually increase to 10%, 25%, 50%) or rollback if any prespecified alarm fires.
+
+Predefined alarms (trigger immediate rollback):
+- safety_flag_rate increase > 0.2% absolute
+- primary_quality_metric degradation > 1.5%
+- latency_p95 increase > 25%
+
+Operational runbook (on-call steps)
+
+- Pager route: prompt-drift-alerts -> applied-ml-oncall (primary) then eng-sre (secondary).
+- Triage steps: 
+  1. Confirm sampling and data retention windows.
+  2. Review drift cluster examples from the alert.
+  3. If drift is caused by a config change (client upgrade, API change), coordinate with customer success; otherwise trigger candidate generation.
+  4. Kick off candidate generation job and monitor eval-harness job logs.
+  5. If automated gates fail, open a regression triage ticket and follow the model-regression-forensics-playbook.
+
+Observability and dashboards
+
+- Dashboards: Prompt Drift Overview, Per-Route Drift Heatmap, Candidate Evaluation Summary, Canary Health.
+- Alerts: embedding-drift, prompt-length-kl, intent-shift, bad-response-spike. Each alert page includes links to sampled prompts and the candidate generation job.
+
+Integration points
+
+- Eval harness: uses `rw-eval` job definitions and the continuous safety eval pipeline. Candidates are submitted as a `candidate_bundle` artifact.
+- Quality guardrails: safety filters are shared with the runtime guardrail layer; blocked candidates are triaged into the safety review workflow.
+- Quantization profiles: when augmentation changes tokenization patterns noticeably (token-length delta > 8%), notify Model Onboarding for quantization re-evaluation.
+- Regression triage: failing candidates automatically create a regression ticket with reproducible harness config and sample IDs.
+
+Metrics, SLOs and reporting cadence
+
+- Target: detect major prompt drift (embedding distance > threshold) within 72 hours of onset.
+- SLOs: false positive alert rate <= 12% (monthly), mean time from alert to candidate surfaced <= 48 hours (business days).
+- Weekly report: counts of drift clusters, accepted augmentations, rejected candidates, and canary outcomes. Monthly executive summary includes cost savings and quality impact.
+
+Ownership & escalation
+
+- Primary owner: Applied ML (prompt-infra squad).
+- Secondary owner: Eng-SRE (monitoring + alerting).
+- Safety & policy reviewer: Trust & Safety.
+
+Appendices
+
+A. Example embedding-drift query (SQL-like pseudocode)
+```
+SELECT cluster_id, AVG(cosine_distance(embed, baseline_embed)) AS mean_dist
+FROM prompt_embeddings
+WHERE timestamp BETWEEN \"{{start}}\" AND \"{{end}}\"
+GROUP BY cluster_id
+HAVING mean_dist > 0.18;
+```
+
+B. Minimal reproducible eval job snippet (rw-eval JSON payload)
+```
+{
+  "job_name": "candidate-eval-<bundle-id>",
+  "suites": ["baseline", "stress", "safety"],
+  "artifacts": {"candidate_bundle": "s3://redwood-eval/candidates/<bundle-id>.tgz"},
+  "timeout": "2h"
+}
+```
+
+C. FAQ (short)
+- Q: How frequently do we run generation?
+  A: Candidate generation is on-demand after a drift cluster passes thresholds; nightly background suggestions are queued weekly.
+- Q: Can augmentations change customer-visible wording?
+  A: Only if intent preservation is validated and no privacy concerns exist; customer-specific templates are handled separately.
+- Q: What if drift is caused by upstream parser changes?
+  A: Coordinate with the owning infra/service and treat the cause as a config change; do not auto-deploy augmentations without human approval.
+
+Contacts
+
+- Applied ML owner: Maya Patel (maya@redwood.ai)
+- Eng-SRE oncall: see oncall rotation page
+- Trust & Safety: trust-safety@redwood.ai
+
+Revision history
+
+- 2025-11-15: Created (Maya Patel)
+- 2026-01-12: Added KL/intent-shift thresholds and canary alarms (reviewers: Daniel Ortiz, Priya Nair)
+- 2026-02-10: Expanded integration section with quantization notification rules (Liam O'Connor)

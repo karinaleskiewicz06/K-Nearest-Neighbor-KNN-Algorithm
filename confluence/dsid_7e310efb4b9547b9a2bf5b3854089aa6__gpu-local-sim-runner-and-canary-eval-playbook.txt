@@ -1,0 +1,184 @@
+GPU local sim-runner and canary eval playbook
+
+Overview
+========
+This playbook describes the "GPU Local Sim-Runner" used by Redwood Inference engineering teams to generate realistic synthetic inference traffic for capacity testing, canary evaluation, and local debug. The goal is to provide a repeatable, low-cost way to validate scheduling, batching, KV cache behavior, and cost signals before touching production GPU pools. It covers architecture, CI integration, example workload specs, Terraform/IaC snippets, SLOs to validate, and an incident checklist.
+
+Scope
+-----
+- Intended audience: infra engineers, SREs, runtime engineers, and QA where GPU behavior matters.
+- Environments: developer laptop devbox (cpu-only), ephemeral CI GPU pool (Buildkite/GHA runner), on-prem test-cluster, and sandbox cloud GPU account.
+- Not covered: full production rollout steps for Dedicated customers. See related product docs for that.
+
+Goals and acceptance criteria
+-----------------------------
+- Validate queue/backpressure and eviction behavior under realistic inferencing patterns.
+- Surface regressions in latency tail (P95/P99) and token-cost changes ahead of release.
+- Run nightly and pre-deploy canaries that mimic tenant mixes (short-chat, long-context, streaming).
+- Cost guardrails: any simulated run that exceeds budget triggers an automatic teardown and Slack alert.
+
+SLOs and metrics we check
+-------------------------
+- P50/P95/P99 latency (ms) for simulated single-request and multi-request workloads.
+- Token cost delta (simulated estimated tokens) vs baseline (should not increase > 6% for patch releases).
+- Batch size distribution and percent of requests batched > target (target: 65% for throughput mode).
+- GPU util and memory headroom (keep < 92% sustained utilization during canaries).
+
+Architecture (logical)
+---------------------
+- Sim-Runner CLI: accepts workload spec (JSON/YAML) and emits request traces to the test endpoint.
+- Orchestrator: CI job or local runner that provisions ephemeral test targets (via Terraform module) and collects artifacts to object storage.
+- Metrics exporter: lightweight sidecar/agent that scrapes runtime metrics and pushes to our Prometheus/Grafana test cluster.
+- Analysis job: converts traces to canary report and uploads to the Canary Dashboard.
+
+Testbed components and ownership
+--------------------------------
+| Component | Purpose | Owner |
+|---|---|---|
+| sim-runner (bin/sim-runner) | Generate requests, control QPS, sequence length, jitter | eng-serving-runtime |
+| tf-module/gpu-sandbox | Create ephemeral GPU nodes, node pool, VPC peering | eng-infra |
+| ci/jobs/canary | Orchestrate provisioning, run sim, collect metrics | eng-infra/ci |
+| metrics-exporter | Export local metrics to test Prometheus | eng-sre |
+
+Local developer quickstart
+-------------------------
+1. Pull the repo: git clone git@github.com:redwood-inference/gpu-sim-runner.git
+2. Install: make install (creates virtualenv and installs bin/sim-runner)
+3. Start a local test target (CPU devbox): ./bin/sim-runner --serve-local --port 8080 &
+4. Run a short workload: ./bin/sim-runner run --spec examples/short-chat.json --target http://localhost:8080 --qps 50 --duration 2m
+5. Inspect logs and artifacts in ./artifacts/<timestamp>
+
+Example workload spec (short-chat.json)
+---------------------------------------
+{
+  "name": "short-chat-50qps",
+  "mix": [
+    {"type": "chat", "prompt_length": 16, "response_length": 32, "weight": 0.8},
+    {"type": "embed", "size": 512, "weight": 0.2}
+  ],
+  "qps": 50,
+  "duration_seconds": 120,
+  "jitter_pct": 10
+}
+
+CI integration (Buildkite / GitHub Actions)
+-------------------------------------------
+- We run two classes of CI jobs: quick smoke (on CPU runners) and full canary (on ephemeral GPU sandboxes).
+- Full canary triggers: merges to main for runtime, quantization, or kernel selection changes; scheduled nightly for critical branches.
+
+Example Buildkite job snippet (gpu-sandbox canary)
+--------------------------------------------------
+steps:
+  - label: "gpu-canary: provision"
+    command: |
+      scripts/provision-sandbox.sh --tf-module tf-module/gpu-sandbox --env canary-$BUILDKITE_BUILD_NUMBER
+  - label: "gpu-canary: run sim"
+    command: |
+      ./bin/sim-runner run --spec ci/workloads/sha-mix.json --target $SANDBOX_ENDPOINT --qps 200 --duration 900 --report artifacts/report.json
+    plugins: [docker#v3.7.0]
+  - wait
+  - label: "gpu-canary: analyze & teardown"
+    command: |
+      scripts/analyze-report.sh artifacts/report.json || echo 'analysis failed'
+      scripts/teardown-sandbox.sh --env canary-$BUILDKITE_BUILD_NUMBER
+
+Terraform / IaC example (ephemeral sandbox module)
+--------------------------------------------------
+- Module name: tf-module/gpu-sandbox
+- Intent: small, short-lived clusters for canaries (1-4 nodes), preconfigured with sandbox subnet and minimal IAM.
+- Minimal variables table:
+| variable | type | default | description |
+|---|---:|---|---|
+| cluster_name | string | "sim-canary" | name of GKE/EKS cluster or instance group |
+| node_count | number | "2" | default node count for canary runs |
+| gpu_type | string | "nvidia-a10" | accelerator SKU |
+| preemptible | bool | "true" | allow preemptible/spot nodes to save cost |
+
+Snippet (HCL):
+module "gpu_sandbox" {
+  source = "git::ssh://git@github.com:redwood-inference/terraform-modules.git//gpu-sandbox?ref=v1.2.0"
+  cluster_name = "${var.env}-canary"
+  node_count = 2
+  gpu_type = var.gpu_type
+  preemptible = true
+}
+
+Cost and safety controls
+------------------------
+- Budget limit: $30 per canary by default. If provisioning estimate > budget, the job fails fast.
+- Max runtime: 30 minutes for ephemeral clusters; CI job has a hard timeout of 45m.
+- Auto-teardown: scripts/teardown-sandbox.sh must run even on analysis failure (use Buildkite hooks or GHA always:).
+
+Canary evaluation procedure (step-by-step)
+------------------------------------------
+1. Create unique env id: CANARY_YYYYMMDD_<build>.
+2. Provision terraform sandbox: scripts/provision-sandbox.sh --env $CANARY_ID.
+3. Wait for nodes ready (health check endpoint, expected time ~ 3-6m).
+4. Run sim-runner with canonical workload for the patch: ./bin/sim-runner run --spec ci/workloads/canary-core.json --qps 180 --duration 15m --report artifacts/report.json.
+5. Collect metrics: prometheus scrape, logs, and artifacts.
+6. Generate canary report: scripts/analyze-report.sh artifacts/report.json -> artifacts/canary-report.html.
+7. Gate policy: if P99 latency increases > 10% OR token-cost delta > 6% -> fail and open a blocker ticket on Phabricator/Jira with artifacts.
+8. Teardown sandbox regardless of pass/fail.
+
+Alerts and dashboards
+---------------------
+- Canary Dashboard: Grafana dashboard id 1203 (canary/sim-runner). Shows latency histograms, batch-size distribution, GPU util heatmap, and token-cost trend.
+- Slack channel: #infra-gpu-canaries receives pass/fail posts with a link to the artifacts archive.
+- Alert rules (Prometheus):
+  - canary_p99_regression: (increase >10% vs baseline) for 1 evaluation -> Severity: high, notify #infra-oncall and owner.
+  - canary_cost_spike: (token_cost_delta > 6%) -> Severity: medium, notify eng-infra and runtime owners.
+
+Runbook: when a canary fails
+----------------------------
+1. Triage the report: look at artifacts/canary-report.html and compare to last-green baseline.
+2. Identify root signal: increased batching? kernel change? quantization profile? memory swap?
+3. If root cause is infra (TF/driver/kernel), open an incident and page eng-sre.
+4. If root cause is runtime code: revert canary branch or trigger canary rollback.
+5. Run a reduced test locally to reproduce iteratively: low-qps with verbose logging.
+6. Once resolved, re-run the canary and attach a short postmortem to the original ticket.
+
+Troubleshooting checklist
+-------------------------
+- Provisioning failed: check Terraform plan logs, quota errors, and service account IAM (tf-module/gpu-sandbox/iam-policy).
+- Excessive P99 with low GPU util: likely small batch sizes or KV cache misses — enable profiling (./bin/sim-runner --profile) and capture NVTX traces.
+- OOM on node: reduce worker concurrency or choose larger GPU SKU; ensure preflight memory check is enabled in script.
+- Cost overruns: abort and tag test-run as "budget-exceeded"; examine workload spec for QPS/duration mistakes.
+
+Developer troubleshooting commands
+--------------------------------
+- Start sim-runner locally (verbose): ./bin/sim-runner --spec ci/workloads/debug-long.json --target $ENDPOINT --qps 10 --duration 300 --verbose
+- Collect NVTX traces: export SIM_NVTX=1 && ./bin/sim-runner run ... (then run nvprof on the node).
+
+Oncall escalation matrix
+------------------------
+- 1st: owning runtime engineer (pager duty team: runtime-eng)
+- 2nd: eng-sre lead oncall
+- 3rd: infra-eng manager
+
+Retention and artifacts
+-----------------------
+- Canary artifacts are retained for 14 days in S3://redwood-canary-artifacts/. Use scripts/fetch-artifacts.sh to pull them locally.
+
+Appendix A: canonical workload recipes
+-------------------------------------
+- short-chat: 50 QPS, 16 token prompts, 32 token responses (good for smoke tests).
+- long-context: 10 QPS, 2048 prompt tokens, 1024 response tokens (stress KV/cache and memory).
+- mix-tenant: multi-weighted mix of chat/stream/embed to exercise routing and batch formation.
+
+Appendix B: changelog
+----------------------
+- 2024-05-10: initial draft and prototype runner (Asha Patel).
+- 2024-09-12: added HCL tf-module snippet and budget guardrails (Marcus Lee).
+- 2025-11-02: moved to published, tightened cost-control defaults to $30 and reduced max runtime (Evelyn Chen).
+
+Contacts and ownership
+----------------------
+- Primary owner: eng-infra (oncall: #infra-oncall)
+- Runtime integration: eng-serving-runtime (runtime-eng@redwood.com)
+- CI ownership: eng-infra-ci
+
+Related pages
+-------------
+See related pages in page metadata for provisioning modules, GPU forecasting, and ephemeral GPU pools for additional reference.
+
+End of playbook

@@ -1,0 +1,148 @@
+Private Deploy Live-tail & Debugging Runbook
+
+Purpose:
+This runbook documents the standard operator procedures for live-tailing, real-time debugging, and safe mitigation of incidents in Private (VPC / on-prem) Redwood deployments. It is written for on-call SREs and field operators who need to quickly triage runtime issues, capture evidence, and perform controlled mitigations or rollbacks without breaching customer isolation guarantees.
+
+Scope:
+- Applies to all Private (VPC and on-prem) tenants running the Redwood runtime (services: ri-runtime, ri-operator, ri-control-plane)
+- Covers user-visible latency/regressions, quota saturation, model swap failures, KV-cache regressions, GPU / node degradation, and telemetry gaps
+- Does NOT cover long-term capacity planning or procurement activities (see tenant-capacity docs)
+
+Owner & Escalation:
+- Primary owner: Private Deployments Ops (oncall: private-deploy-sre)
+- Secondary: Runtime Engineering
+- Escalation path: oncall -> private-deploy-team lead -> service-owner (runtime@redwood.ai)
+
+SLOs and Detects (Reference thresholds):
+- Generation p95 latency (end-to-end): target < 350ms; alert if p95 > 700ms for 5m
+- Token throughput drop: alert if aggregate tokens/s drops > 60% vs baseline for 3m
+- KV cache hit ratio: target >= 0.65; alert if < 0.4 for 10m
+- Request error rate: alert if 5xx rate > 1% for 5m or 4xx surge indicating broken client integration
+- Telemetry heartbeat: control-plane heartbeat missing for > 3m -> page oncall
+
+Quick Triage Checklist (first 10 minutes):
+1) Validate page details & scope: tenant, region, time, customer impact (latency vs errors).
+2) Confirm incident on observability: check Prometheus, Grafana dashboards (Tenant / Model / Node breakdown).
+3) Live-tail runtime logs (ri-runtime) and operator logs (ri-operator) for the tenant.
+4) Check resource health: GPU (nvidia-smi), node disk, memory, and network queue depth.
+5) If issue is a model swap or deploy, verify artifact availability and model-serving logs (model-loader).
+6) If degradation persists after 15 min, escalate and open an incident channel; gather evidence (traces, tail logs, config snapshot).
+
+Primary Observability Sources (locations & metrics):
+- Prometheus metrics: ri_runtime_request_latency_seconds_bucket, ri_runtime_request_errors_total, ri_kvcache_hits_total / ri_kvcache_misses_total, ri_token_throughput_total, node_gpu_utilization_percent
+- Dashboards: Grafana -> "Private Deploy - Tenant Overview", "Runtime - Model Latency", "KV Cache - Health"
+- Tracing: Jaeger UI at https://jaeger.internal.redwood.ai (service: ri-runtime, operations: Generate/Stream/LoadModel)
+- Logs:
+  - Operator logs: /var/log/ri/ri-operator.log (or systemd journal: systemctl status ri-operator)
+  - Runtime logs: /var/log/ri/ri-runtime.log
+  - Model loader: /var/log/ri/model-loader.log
+- Field CLI: rictl (used to query tenant state, toggle safemode, fetch runtime snapshots)
+
+Common Commands (examples):
+- Tail runtime logs for tenant "tenant-acme":
+  sudo journalctl -u ri-runtime | grep tenant-acme -A 200 -n
+
+- Query Prometheus for current p95 for tenant (example):
+  curl -s 'https://prometheus.internal/api/v1/query?query=histogram_quantile(0.95, sum(rate(ri_runtime_request_latency_seconds_bucket{tenant="tenant-acme"}[5m])) by (le))' | jq
+
+- Check KV cache hit ratio:
+  curl -s 'https://prometheus.internal/api/v1/query?query=(sum(rate(ri_kvcache_hits_total{tenant="tenant-acme"}[5m])) / sum(rate(ri_kvcache_misses_total{tenant="tenant-acme"}[5m])) )' | jq
+
+- Get operator-managed deployment status: rictl tenant status tenant-acme --output json
+- Trigger safemode (see Safemode section): rictl tenant safemode enable tenant-acme --reason "oncall-latency-spike" --actor $USER
+
+Evidence Collection (required for any mitigation):
+- Capture 5m traces around incident start from Jaeger, include request ids.
+- Prometheus snapshot of relevant metrics (p95, errors, throughput, KV hit ratio, node GPU util).
+- Tail of the three logs above (operator/runtime/model-loader) covering -5m to +5m of incident window.
+- rictl tenant snapshot tenant-acme > snapshot-<timestamp>.json
+
+Detailed Playbook (by symptom):
+A) High latency (p95 > 700ms) with low error rate
+1) Check runtime CPU/GPU saturation: top / nvidia-smi on affected nodes. If GPU saturating (>95% utilization sustained), check for model inference loops or runaway requests.
+2) Inspect batching backlog: rictl tenant backlog tenant-acme --nodes. If backlog grows and latency increases, consider temporary increase of worker concurrency (rictl tenant scaling adjust --workers +1) or enable burst pool if configured.
+3) If KV cache hit ratio is low, check kvcached logs and warm by replaying hot prompts (see kvcache warmup below).
+4) If no resource issues, collect traces and escalate to runtime engineers for slow-path kernel debugging.
+
+B) Error spike (5xx)
+1) Identify error class in logs (OOM, model-mismatch, runtime panics).
+2) If OOM on GPU process: capture core dump (if enabled), reduce concurrency and trigger safemode to route to backup model variant.
+3) If model artifact load error: validate artifact integrity (sha256) on runtime: ls -l /srv/ri/models/<model-id> and compare against control-plane metadata. If mismatch, mark model unhealthy and initiate model rollback.
+4) If 5xx caused by model evaluation regressions, consult product/ML for golden prompt set regression test before model rollforward.
+
+C) Telemetry missing / heartbeat gap
+1) Check ri-operator connectivity to telemetry-bridge: sudo systemctl status ri-operator; check /var/log/ri/telemetry-bridge.log
+2) Validate network connectivity to control-plane endpoints (curl https://cp.internal.redwood.ai/health).
+3) If telemetry is down globally for tenant, enable local collection: rictl tenant local-telemetry enable tenant-acme --ttl 24h; this stores buffered metrics for later upload and prevents immediate alert storms.
+
+KV-cache warmup recipe (when cold-cache causes latency spikes):
+1) Fetch top 50 heavy prompt prefixes from recent traces: rictl tenant hot-prefixes tenant-acme --since 24h --top 50 > hot-prefixes.txt
+2) Replay prefixes against model-loader in read-only mode with low concurrency to populate prefix/KV: rictl kvcache warmup --tenant tenant-acme --file hot-prefixes.txt --concurrency 4
+
+Safemode (controlled mitigation)
+- Purpose: minimize customer-visible impact while preserving operational safety. Safemode disables non-essential features (autoscaling, aggressive batching changes, model swap) and optionally routes traffic to a fallback model variant.
+- Activation: only by oncall SRE or with authorization from private-deploy-team lead.
+- Command: rictl tenant safemode enable tenant-acme --reason "<brief-reason>" --actor $USER
+- Recommended safemode actions:
+  - Route to fallback: rictl routing set tenant-acme --model model-id:stable-quantized
+  - Disable autoscale: rictl tenant autoscale disable tenant-acme
+  - Reduce worker concurrency: rictl tenant scaling adjust tenant-acme --workers -2
+- Deactivation: rictl tenant safemode disable tenant-acme --actor $USER --note "recovered"
+
+Controlled Rollback Procedure (for runtime or model changes)
+1) Confirm rollback criteria met: recent deploy timestamp within 60 minutes and correlated error/latency spike.
+2) Gather artifacts to preserve: rictl tenant snapshot tenant-acme > rollback-evidence-<ts>.json; capture Prometheus snapshot.
+3) Rollback runtime image (example): rictl deployment rollback ri-runtime --tenant tenant-acme --image ri-runtime:v1.29.2 --wait 900s
+   - Monitor readiness: rictl deployment status --watch --deployment ri-runtime --tenant tenant-acme
+4) For model rollback: rictl model set tenant-acme --model-id model-123-stable --version v2026-05-04 --wait
+5) Verify post-rollback health for at least 15 minutes: p95 back within SLO, error rate normalized, KV cache stable.
+
+Emergency node evacuation (severe hardware / noisy neighbor):
+1) Mark node unschedulable: rictl node cordon <node-id> --reason "evacuation"
+2) Initiate tenant relocation for affected tenants: rictl node evacuate <node-id> --tenants tenant-acme --grace 300s
+3) Watch for safe handoff in operator logs. If evacuation stalls, contact field operator to power-cycle or attach serial console.
+
+Post-incident: Evidence preservation & review - Preserve all snapshots and logs in incident storage: /incidents/<incident-id>/ (runbook step: rictl incident create --id <incident-id> --source oncall)
+- File an incident review within 72 hours using the Incident Review Template (link below). Include root cause hypothesis, corrective actions (short and long term), and owners with timelines.
+
+Safety checks & guardrails (do NOT run unless authorized):
+- Do not manually delete model artifacts from /srv/ri/models unless instructed by runtime engineering.
+- Avoid simultaneous scaling and safemode toggles across multiple tenants unless coordinated.
+- For any rollback that touches customer data paths, notify security and legal (customer-impact evidence retention required).
+
+Playbook appendices:
+- Appendix A: Common rictl commands (cheat sheet)
+- Appendix B: Trace and query examples (PromQL snippets for p95, KV ratio)
+- Appendix C: Postmortem checklist and blameless review template
+
+Appendix A (cheat sheet):
+- rictl tenant status <tenant>
+- rictl tenant snapshot <tenant> > snapshot.json
+- rictl tenant safemode enable <tenant> --reason "..."
+- rictl deployment rollback <service> --image <image-tag> --wait 900s
+- rictl node cordon <node-id>
+- rictl kvcache warmup --tenant <tenant> --file hot-prefixes.txt --concurrency 4
+
+Appendix B (PromQL snippets):
+- p95 latency: histogram_quantile(0.95, sum(rate(ri_runtime_request_latency_seconds_bucket{tenant="tenant-acme"}[5m])) by (le))
+- kv cache hit ratio: sum(rate(ri_kvcache_hits_total{tenant="tenant-acme"}[5m])) / (sum(rate(ri_kvcache_hits_total{tenant="tenant-acme"}[5m])) + sum(rate(ri_kvcache_misses_total{tenant="tenant-acme"}[5m])))
+
+Appendix C (postmortem template):
+- Incident ID, Date
+- Summary (1-2 lines)
+- Timeline (Timestamps, actions)
+- Root cause hypothesis
+- Short-term mitigations completed
+- Long-term corrective actions (with owners & ETA)
+- Lessons learned
+
+Related pages and links:
+- Tenant onboarding and failover runbook: /confluence/eng-private-deployments/deployment-guides/private-deploy-onboarding-and-failover-runbook-2026.json
+- Cold-start mitigation playbook: /confluence/eng-private-deployments/day-2-ops/cold-start-latency-mitigation-for-private-deploys-2026.json
+
+Contact list (for escalation):
+- private-deploy oncall: private-deploy-sre@redwood.ai (pager)
+- runtime engineers: runtime@redwood.ai
+- product/ML contact for model regressions: mlops@redwood.ai
+
+This runbook is reviewed quarterly or after any major incident. For suggested edits, propose changes on the doc and notify the reviewers list.

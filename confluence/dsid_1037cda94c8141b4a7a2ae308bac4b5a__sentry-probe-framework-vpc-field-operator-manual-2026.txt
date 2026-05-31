@@ -1,0 +1,130 @@
+Sentry Probe Framework — VPC Field Operator Manual
+
+Summary
+This document defines the Sentry Probe Framework used by field operators to validate, monitor, and automatically gate VPC private deployments. It contains a prescriptive preflight checklist, probe configuration examples, continuous telemetry gating rules, and safe rollout / rollback procedures for model swaps and control-plane changes.
+
+Scope and audience
+- Audience: Field operators, SREs, and deployment engineers working on Redwood Private (VPC) installs.
+- Scope: tenant-facing VPC deployments and operator-visible control-plane changes. Not intended for hosted Redwood API (hosted inference) workflows.
+
+Terminology
+- Sentry probe: a lightweight synthetic or telemetry-driven check that asserts a deployment invariant (latency, KV cache consistency, model correctness indicators).
+- Gate: an automated policy that blocks or signals rollout continuation based on probe results.
+- Safety window: a configured time-window where gating policies are in effect (e.g., first 30 minutes after model swap).
+
+High-level architecture (text)
+Sentry probes are implemented as a small agent process that runs on the operator sidecar and as a set of managed rules ingested by the telemetry aggregator. A central probe controller (control-plane component) distributes probe manifests and gating policies; locally the agent executes probes (synthetic requests, KV-checks, telemetry queries) and reports a concise health tuple (ok/warn/fail) to the aggregator. The aggregator evaluates gates and emits roll-forward / roll-back decisions to the rollout orchestrator.
+
+Design goals
+1. Minimal field footprint: probes must be <=4MB binary, <100ms cold-start for synthetic checks, and emit <=1KB payload per check.
+2. Deterministic signals: probes should avoid noisy heuristics; prefer deterministic checks (latency percentiles, token-consumption deltas, KV hash comparisons).
+3. Operator control: manual override and human-in-the-loop pause is always available.
+
+SLOs and safety thresholds (operator-facing table)
+| Metric | Safety threshold | Gate action |
+|--------|------------------|-------------|
+| P50 inference latency (100-token prompt) | <= 120ms | pass |
+| P95 inference latency | <= 600ms | warning (evaluate) |
+| Token error-rate (model generation failures per 10k requests) | <= 5 | fail if > 20 |
+| KV cache consistency (hash delta) | 0 (no delta) | fail if delta != 0 |
+| Model-output-regression (BLEU/ROUGE delta against control) | >= -1.5 points | warn if <= -3 points |
+
+Note: thresholds are configurable per-customer in the deployment manifest. The default above is used for standard enterprise VPC on-boarding.
+
+Preflight checklist (step-by-step)
+1. Validate operator credentials and host connectivity:
+   - Confirm operator KMS provisioning: `redwoodctl auth status`
+   - Ensure control-plane reachability: `curl -sS https://controlplane.local/health` should return HTTP 200 and JSON {"status":"ok"}
+2. Verify artifact provenance and signature:
+   - Check model artifact signature: `signverify verify model-v2.tar.gz.sig`
+   - Confirm image digest pinned in manifest YAML (sha256)
+3. Deploy sentry agent in dry-run mode:
+   - Apply manifest: `kubectl apply -f sentry-agent-manifest.yaml --dry-run=client`
+   - Confirm agent starts: `kubectl wait --for=condition=ready pod -l app=sentry-agent --timeout=60s`
+4. Run baseline synthetic probes 
+   - Execute baseline matrix: `sentryctl probe-run --matrix baseline-matrix.json --sample 50`
+   - Collect baseline artifact: `sentryctl artifact collect --name baseline-{{timestamp}}`
+5. Confirm telemetry wire compatibility:
+   - Ensure telemetry sampler respects PII redaction policies (audit log)
+
+Continuous probe examples
+Below is a minimal probe manifest (YAML) passed to the agent. The manifest is illustrative and uses the Probe DSL supported by the agent.
+
+---- begin sentry-probe.yaml ----
+name: baseline-latency-check
+type: synthetic-inference
+interval_seconds: 15
+timeout_ms: 1000
+sample_size: 10
+request:
+  model: redwood-small-6b
+  prompt: "Summarize: The quick brown fox jumps over the lazy dog."
+assertions:
+  - p50_latency_ms <= 120
+  - max_token_error_rate <= 5
+outputs: [ "latency_ms", "tokens_consumed", "error_rate" ]
+---- end sentry-probe.yaml ----
+
+Operator note: the agent will report summarized metrics to the aggregator; raw traces are optional and subject to customer telemetry settings.
+
+Telemetry gating rules (executable pseudo-policies)
+- Rule 1 (Immediate fail): if KV cache hash delta != 0 for > 2 consecutive probes within a 60s window -> invoke orchestrator rollback with tag `kv-inconsistency`.
+- Rule 2 (Early warning): if P95 latency increases by > 2x compared to baseline and absolute P95 > 800ms -> pause rollout and open a canary incident for triage.
+- Rule 3 (Quality degrade): if model-output-regression <= -3 points on evaluation prompts -> block model promotion.
+
+Example gate expression (logical):
+  gate(\"safety-window\") = (kv_hash_delta == 0) AND (p95_latency <= 600 OR (p95_latency <= 1200 AND manual_override == true)) AND (token_error_rate <= 20)
+
+Rollout recipe (canary first, gated promotion)
+1. Canary slice: route 2% of traffic to new model variant for 30 minutes with sentry probes active.
+2. Evaluate probes and telemetry: aggregator evaluates gates every 60s and reports a composite status.
+3. Auto-promote: if composite status is pass for 30 consecutive minutes, promote to 25% traffic. Repeat increments (25 -> 50 -> 100) with 15 minute cool-down between steps.
+4. Auto-rollback: any composite fail with severity "fail" triggers a staged rollback to previous model and notifies oncall.
+
+Safe rollback checklist
+1. Pause incoming promotion jobs: `redwoodctl rollout freeze --id <rollout-id>`
+2. Trigger rollback command: `redwoodctl rollout rollback --id <rollout-id> --to prior-stable`
+3. Verify KV cache reconciliation: run `sentryctl kv-check --expected-hash <previous-hash>` until pass.
+4. Preserve forensic artifacts:
+   - Archive probe results: `sentryctl artifact collect --name rollback-evidence-{{timestamp}}`
+   - Snapshot control-plane logs and upload to secure evidence store.
+5. Customer communication: use template `templates/customer-rollback-notice.md` and include findings summary and expected remediation timeline.
+
+Operator runbook: triage flow for a failing gate
+1. Check composite gate status in console and timestamp of first fail.
+2. If gate = kv-inconsistency: immediately quarantine affected tenant and run targeted KV hash reconciliation. Escalate to runtime team if not resolved in 10 minutes.
+3. If gate = latency-regression: run synthetic trace for canary and baseline (attach traces). Confirm whether root cause is model (increase in token consumption) or infra (GPU queueing).
+4. If gate = model-quality: fetch latest evals for the canary prompts. If regression is reproducible, rollback and open a model review ticket.
+
+Operational metrics to monitor (recommended dashboard panels)
+- Composite gate status (per-rollout) — time-series, alert when status transitions to `fail`
+- Probe execution success rate — histogram by probe type
+- KV cache hash delta occurrences — bar by tenant
+- Rollout step latencies and promotion times — heatmap
+
+Implementation notes and considerations
+- Probe frequency vs. noise: for high-sensitivity probes use longer intervals and aggregate across multiple samples before gating.
+- PII and telemetry: ensure probes redact customer PII before logs leave the customer VPC. Follow `private-deploy-telemetry-data-classification-policy-2026`.
+- Resource budgeting: the sentry agent should be deployed with resource requests: cpu: 100m, memory: 128Mi, and limit: cpu: 500m, memory: 256Mi.
+
+Ownership and SLAs
+- Probe framework owner: eng-platform/inference-safety. Primary contact: ops@redwood.ai.
+- Oncall escalation: runtime-oncall -> inference-platform -> security (if data exposure suspected).
+- SLA for probe failures: operator must respond within 15 minutes for `fail` severity alerts during business hours; 1 hour for `warning` severity.
+
+FAQs
+Q: Can customers customize thresholds?
+A: Yes — thresholds are configurable via the deployment profile and stored in the customer's manifest. Changes require a signed manifest and a validated dry-run.
+
+Q: Are raw probe inputs stored outside the customer VPC?
+A: By default no. Only summarized metrics and signed artifacts (hashes, deltas) leave the customer's environment unless explicit consent is recorded.
+
+References
+- Template: `sentry-agent-manifest.yaml` (internal repo link)
+- Related runbooks: `/confluence/eng-private-deployments/day-2-ops/private-deploy-livetail-and-debugging-runbook-2026`
+- Telemetry policy: `/confluence/eng-private-deployments/customer-requirements-library/private-deploy-telemetry-data-classification-policy-2026`
+
+Revision history
+- 2026-03-15: Initial draft (Maya Chen)
+- 2026-11-02: Added gating expressions and rollout recipe (Arjun Patel)
+- 2027-01-10: Finalized operator resource guidance and SLAs (Sofia Martinez)

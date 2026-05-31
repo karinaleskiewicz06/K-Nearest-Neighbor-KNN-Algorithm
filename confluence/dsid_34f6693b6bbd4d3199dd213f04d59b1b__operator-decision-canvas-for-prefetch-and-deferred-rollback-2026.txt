@@ -1,0 +1,111 @@
+Operator decision canvas for prefetch and deferred rollback
+
+Summary:
+This document is an operator-focused decision canvas and runbook for safely performing predictive prefetch/prefix-warmup and executing deferred rollbacks when aggressive prefetch policies cause SLO regressions or cost spikes. It synthesizes dashboard signals, alert thresholds, and step-by-step actions to guide oncall and operator teams through detection, verification, mitigation, rollback, and retrospective capture.
+
+Scope and audience:
+- Scope: Redwood inference platform prefetch/prefix cache features, operator-level emergency escape hatches, and deferred (time-windowed) rollback workflow used across hosted and dedicated fleets.
+- Audience: platform operators, oncall engineers, ops SREs, release owners.
+
+Why this exists:
+Predictive prefetch improves tail latency and cold-starts for common prompts but can increase burst cost, saturate GPU memory, or cause downstream KV-cache thrashing. When that happens we need a fast decision canvas to decide whether to throttle prefetch, apply tenant-level smoothing, or perform a deferred rollback that preserves live traffic while preventing repeat regressions.
+
+Key owners and escalation:
+- Primary owner: runtime-operators team (pager: #runtime-operators)
+- Secondary owner: serving-runtime-oncall (pager: #serving-runtime-oncall)
+- Product stakeholder: Priya Nambiar (product liaison)
+- Escalation: follow the standard oncall escalation (see /eng-platform/runbooks/decision-support-board-and-escalation-runbook-2025)
+
+SLOs and thresholds (service-level signals to watch):
+| Signal | Goal / SLO | Operator threshold | Urgency | Alert name |
+|---|---:|---:|---|---|
+| P95 generation latency (tail) | <= 150ms | > 200ms for 5m | high | prefetch:P95-latency-burn |
+| Token cost per-minute (platform-level) | trend baseline | +35% sustained for 10m | medium | cost:prefetch-surge |
+| GPU memory eviction rate | 0 | > 0.5 evictions/min per node | high | gpu:kv-eviction-spike |
+| Prefix-cache miss ratio | < 12% | > 25% for 10m | medium | cache:miss-surge |
+| Error rate (5xx / client-facing) | < 0.1% | > 0.5% | critical | svc:error-rate-spike |
+
+Detection and verification checklist (fast triage):
+1) Confirm the alert(s) that fired and correlate time windows across dashboards. Check the last 15 minutes of: P95, token-cost, GPU memory eviction, and error rate.
+2) Identify scope: tenant(s) affected, region, model variant, and rollout cohort (canary/beta/all). Use query: `SELECT tenant_id, model, region, cohort FROM runtime.events WHERE event IN (\"prefetch:trigger\", \"serve:request\") AND ts >= now() - interval '15m'` (example analytics query).
+3) Verify whether a prefetch policy change or rollout finished in the last 60 minutes. Check deployment events: `/ops/deployments` and rollout logs in the rollout service.
+4) Determine whether the observed issue is cost-only (token spike) vs correctness/latency (error and tail). Cost-only can often be remediated with throttle and smoothing; correctness/latency requires immediate fallback.
+
+Decision canvas (high level):
+- If svc:error-rate-spike OR gpu:kv-eviction-spike -> IMMEDIATE MITIGATION (see Mitigate step A).
+- Else if prefetch:P95-latency-burn AND cost:prefetch-surge -> apply smoothing and tenant burst credits OR partial rollback (Mitigate B).
+- Else if cost:prefetch-surge alone AND no latency increase -> throttle prefetch aggressiveness and monitor for 30m (Mitigate C).
+
+Mitigation actions (numbered operator playbook):
+A) Immediate critical mitigation (error-rate or GPU evictions):
+  1. Set prefetch.global_enabled = false (global kill-switch) via admin API: `curl -XPOST -H \"Authorization: Bearer $ADMIN_TOKEN\" https://admin.internal/v1/configs/prefetch -d '{"global_enabled": false}'`
+  2. Trigger model-variant fallback policy to stable: `POST /admin/variant-fallback?reason=prefetch-eviction`
+  3. Pin high-priority tenants to warm-only routing: `POST /admin/route-overrides` with tenant list.
+  4. Notify product & customer-success for any impacted enterprise tenants.
+  5. Create incident channel and start timeline log.
+
+B) High latency + cost spike (non-critical errors):
+  1. Reduce prefetch aggressiveness by 50% for the offending cohort: `PATCH /admin/prefetch/policies/{policy_id}` with body `{"aggressiveness": "50%"}`.
+  2. Apply tenant smoothing window: `PATCH /admin/prefetch/smoothing` `{"window_seconds": 30}`.
+  3. Promote KV cache prefix-hotlist for top N prefixes: `POST /admin/cache/hotlist?top=100`
+  4. Enable temporary request-sampler tracing for 5% of affected traffic for 20m for debugging.
+  5. Monitor the SLO dashboards for 20–30 minutes. If no improvement, escalate to deferred rollback.
+
+C) Cost-only spike:
+  1. Enable cost throttle: `POST /admin/prefetch/throttle` `{"max_prefetch_tokens_per_min": 50000}`
+  2. Apply tenant-level burst credits to avoid customer-visible throttles.
+  3. Re-evaluate after 30 minutes; if cost remains > 25% above baseline, flag for product review.
+
+Deferred rollback (safe rollback with a waiting window):
+Purpose: allow a controlled rollback that does not interrupt live traffic while preventing repeated harmful prefetch behavior. Use when policy changes are tied to a deployment and immediate rollback is risky (e.g., large canary rollout).
+Prerequisites: incident timeline, deployment ID, and an owner assigned to the rollback.
+Steps: 
+1. Create a rollback plan object in the deployment service with `deferred=true` and a start window: `POST /ops/rollbacks` `{"deployment_id": "dep-1234", "deferred": true, "start_in_minutes": 10, "owner": "@oncall"}`
+2. Notify stakeholders with the rollback ribbon: provide start time, expected impact, and checklists.
+3. During the deferred window, monitor specific pre-check signals every 2 minutes: if no re-regression observed, cancel rollback before start time; else allow automated rollback to proceed.
+4. If rollback triggers, follow the standard rollback steps (service-specific) and mark the incident as a configuration rollback.
+
+Dashboard and alert mapping (what to open immediately):
+- Dashboard: Platform / Prefetch Health (tab: Regions) -> check P95, P99, eviction rate, prefixes heatmap.
+- Dashboard: Cost / Token Pumping -> filter by policy_id and tenant_id.
+- Alert pages to open: prefetch:P95-latency-burn, cost:prefetch-surge, gpu:kv-eviction-spike, svc:error-rate-spike.
+
+Operator CLI snippets and examples:
+- Query recent prefetch triggers (example):
+  curl -s -H \"Authorization: Bearer $ANALYTICS_TOKEN\" \\
+    'https://telemetry.internal/api/query?sql=SELECT+tenant_id,+policy_id,+count(*)+FROM+prefetch_events+WHERE+ts%3Enow()-interval+\'15m\'+GROUP+BY+tenant_id,policy_id'
+
+- Quick kill global prefetch switch (operator-friendly):
+  rctl config set prefetch.global_enabled false --reason=oncall-emergency
+
+Operational safety and guardrails:
+- All critical mitigations that change global or regional flags must be paired with an incident log entry and an owner.
+- Tenant-impacting actions require notifying the customer-success team within 10 minutes (see enterprise-contact list).
+- Deferred rollback requires a minimum 10 minute window to allow traffic to stabilize and avoid oscillation.
+
+Post-incident retrospective and follow-up actions:
+1. Create a postmortem within 72 hours in the platform incident tracker. Include causal chain, decision canvas choices, and mitigation timing.
+2. Add a regression test to the synthetic lab (prefetch aggressiveness vs token-cost) with expected guardrails.
+3. If root cause relates to model KV size or kernel memory pressure, file a bug for runtime team and include profiling artifacts.
+
+Runbook maintenance and ownership:
+- Author: Priya Nambiar (runtime product)
+- Owned by: runtime-operators team
+- Review cadence: quarterly review (at the start of Jan/Apr/Jul/Oct) or after any deferred rollback event.
+
+Appendix: Quick checklist for oncall (one-pager):
+1) Identify alerts and scope.
+2) Confirm recent rollout or policy change.
+3) Triage severity -> choose Mitigation A/B/C.
+4) Execute mitigation and create incident timeline.
+5) If applicable, schedule deferred rollback and monitor.
+6) Postmortem and synthetic test coverage update.
+
+Related reading and links:
+- /eng-platform/runbooks/cold-start-warmup-orchestration-runbook-2026
+- /eng-platform/how-tos/cache-prefetch-prioritization-for-llm-workloads-2026
+- /eng-platform/dashboards-and-alerts/token-cost-attribution-and-explainable-trace-playbook-2026
+
+Document history:
+- 2025-11-12: created (initial draft)
+- 2026-02-18: published, added deferred rollback workflow and safety guardrails

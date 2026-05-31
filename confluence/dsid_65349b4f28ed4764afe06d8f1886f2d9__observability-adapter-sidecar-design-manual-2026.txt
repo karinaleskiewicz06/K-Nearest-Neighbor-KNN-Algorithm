@@ -1,0 +1,191 @@
+Observability Adapter Sidecar: Design Manual and Onboarding Guide
+
+Overview
+
+This document describes the design, operational contracts, and onboarding checklist for the Observability Adapter Sidecar (OAS)—a lightweight per-node sidecar that attaches to serving runtime processes and provides production-safe, low-overhead instrumentation for per-request fidelity signals, adaptive sampling, and enriched traces. It is intended for runtime engineers, profiling owners, and SREs who will operate and extend the OAS.
+
+Goals
+
+- Provide a stable, low-latency mechanism for enriching requests with fidelity metadata (kernel hints, kv-cache hit/miss, quantization variant).
+- Support adaptive, policy-driven sampling that balances observability coverage with cost and privacy constraints.
+- Decouple heavy signal processing from the hot runtime path via asynchronous sinks and backpressure-aware queues.
+- Offer clear contracts so runtime teams can consume telemetry without coupling to probe implementations.
+
+Scope and Non-Goals
+
+- In scope: sidecar API contract, sampling controller protocol, configuration schema, rollout checklist, security constraints, and troubleshooting playbook.
+- Not in scope: changes to kernel scheduling heuristics, evaluation algorithms for model quality, or storage-side analytics pipelines (those are handled by telemetry-backend teams).
+
+Design Principles
+
+1. Non-blocking hot path: sidecar must not add synchronous latency to inference token emission or RPC response paths.
+2. Bounded memory & predictable cost: local queues have strict bounds; policies exist to drop or aggregate when saturated.
+3. Policy-driven behavior: sampling and enrichment governed by remote policy controller with health-fallback to cached defaults.
+4. Minimal privileges: run with least privilege; network egress only to approved telemetry endpoints.
+5. Observable and debuggable: expose health, queue-length, and sampling-rate metrics for immediate SLO correlation.
+
+Architecture (text diagram)
+
+- Serving process (runtime) <--> Local IPC socket (unix/grpc) <--> Observability Adapter Sidecar (OAS) 
+  
+  OAS components:
+  - Ingress listener: small sync layer to accept lightweight event envelopes (<= 1KB) over unix socket.
+  - Adaptive sampler: local policy engine + short-lived remote policy cache (refresh TTL 30s).
+  - Local aggregator & aggregator worker pool: batch events and flush asynchronously to sink.
+  - Backpressure manager: implements admission/drop + p99 tail guard for sync APIs.
+  - Telemetry sink: pluggable output (http/gRPC to telemetry backend, local file for debug).
+
+Component Contracts
+
+1) Ingress contract
+- Envelope format: JSON lines or protobuf-lite. Required fields: request_id, model_variant, shard_id, event_ts_iso, event_type, token_count, kernel_hint (optional), kvcache_status (hit/miss/partial), extra_tags (map).
+- Max envelope size: 1024 bytes. Larger events must be truncated and flagged.
+
+2) Sampling controller contract
+- Policy model: simple JSON with rules (matchers on route/model/metadata) and actions (sample_rate 0.0-1.0, aggregate:true/false, redact_fields:list).
+- Local behavior: if controller unreachable, fall back to baked-in policy at start-up and operate in degraded mode.
+
+3) Sink contract
+- Accept batched payloads via HTTP POST application/json with Authorization: Telemetry-Key header.
+- Retry policy: exponential backoff capped at 5 retries, then drop and increment metric oas.sink.drop_count.
+
+Configuration (example YAML)
+
+-- oas-config.yaml --
+listen: 
+  unix_socket: "/var/run/oas.sock"
+  max_concurrent_ingress: 64
+sampler:
+  policy_url: "https://telemetry-policy.internal/api/v1/policy"
+  refresh_interval_seconds: 30
+  default_policy: 
+    - matcher: "route == '/v1/completions' and model_variant =~ '.*-quant'"
+      action: 
+        sample_rate: 0.05
+        aggregate: false
+queue:
+  max_items: 20000
+  max_bytes: 50MB
+sink:
+  url: "https://telemetry-ingest.internal/v1/ingest"
+  auth_header: "Telemetry-Key: ${OAS_KEY}"
+  batch_max_size: 100
+  flush_interval_ms: 200
+security:
+  allowed_egress_hosts: ["telemetry-ingest.internal"]
+  run_as_user: "oas-agent"
+  restrict_capabilities: true
+
+Operational Signals and Metrics (as a text table)
+
+Metric name | Type | SLI indication | Alert threshold
+oas.health | gauge | service up | health == 0 for 3m
+oas.queue.length | gauge | admission pressure | queue.length > 80% for 5m
+oas.sampler.effective_rate | gauge | observability coverage | effective_rate < configured - 10%
+oas.sink.latency_p50/p95 | histogram | sink performance | p95 > 5s
+oas.sink.drop_count | counter | data loss | drop_count increase > 100/min
+
+Deployment and Rollout Checklist (numbered)
+
+1. Pre-flight validation:
+   a. Verify unix socket permissions and SELinux/AppArmor policy.
+   b. Confirm OAS container resource limits: CPU 200m, mem 128Mi to start.
+   c. Validate policy endpoint reachable from canary nodes.
+2. Canary (5% nodes):
+   a. Enable OAS in 'observe-only' mode (sample_rate=0, aggregate=true) and flow to debug sink.
+   b. Check oas.queue.length and oas.sink.latency_p95 for regressions.
+   c. Confirm no increase in serving p99 latency beyond 1%.
+3. Progressive ramp: 5% -> 25% -> 100% over 72h observing signals; adjust sample rates if sink latency increases.
+4. Enable adaptive sampling live with conservative initial policies (global sample_rate <= 0.02).
+
+Validation Tests (quick list)
+
+- Latency regression: run synthetic replay with representative token distributions and ensure p99 latency delta < 2%.
+- Failure injection: block sink and verify OAS backpressure behavior and that serving continues with bounded memory.
+- Policy mismatch: deploy an invalid policy payload and confirm OAS rejects it and reverts to cached default.
+
+Troubleshooting Runbook (step-by-step)
+
+1. Symptom: increased serving p99 at peak.
+   - Check oas.queue.length and oas.sink.p95. If both spike, scale sink or reduce sample_rate.
+2. Symptom: oas.health == 0 on node.
+   - Examine sidecar logs /var/log/oas/*.log for startup failures, permission errors, or TLS issues.
+   - If crashloop, isolate with strace and check for blocked socket binds.
+3. Symptom: high oas.sink.drop_count.
+   - Verify telemetry backend auth and rate limits. Rotate keys if auth failures are observed.
+4. Symptom: privacy violation flag from telemetry-backend.
+   - Immediately enable redact_fields in policy and trigger a 'flush-and-scrub' protocol (contact telemetry-backend runbook).
+
+Security and Data Protection
+
+- PII redaction: sidecar must support policy-driven redaction of fields and should never transmit raw user_prompt unless expressly allowed by customer config.
+- Egress controls: OAS must respect allowed_egress_hosts and refuse any unexpected DNS resolutions.
+- Keys & secrets: use instance-level KMS-wrapped keys, not environment-injected plaintext secrets.
+- Auditing: emit audit events for every policy change and policy fetch with timestamp and signature verification.
+
+Extension Points for Runtime Teams
+
+- Kernel hint schemas: runtime owners can add new kernel_hint keys but must submit a schema bump PR to runtime-telemetry contract repo and add mapping to the downstream ingest pipeline.
+- Aggregation plugins: teams can propose a custom aggregator (e.g., histogram summarizer) that implements the aggregator gRPC signature. These plugins must pass the plugin-safety CI suite.
+
+Onboarding Checklist for New Runtime Projects
+
+- Implement a small adapter client that serializes envelopes to the unix socket. Example snippet: 
+
+curl -s --unix-socket /var/run/oas.sock -X POST http://localhost/enqueue -d '{"request_id":"r1","model_variant":"redwood-7b","event_ts_iso":"2026-03-01T12:00:00Z","event_type":"response","token_count":24}'
+
+- Add OAS sidecar to your Pod spec with resource limits and a readiness probe:
+
+containers:
+  - name: oas-agent
+    image: registry.internal/infra/oas:2026-02-01
+    resources:
+      limits:
+        cpu: "200m"
+        memory: "128Mi"
+    readinessProbe:
+      exec:
+        command: ["/usr/bin/oasctl","health"]
+      initialDelaySeconds: 5
+      periodSeconds: 10
+
+Ownership and SLAs
+
+- Primary owner: runtime-observability team (pager: oncall-runtime-obsv).
+- Support escalation: send to infra-sre@redwood.ai and telemetry-backend oncall if sink outages exceed 5 minutes.
+- Operational SLO: OAS health >= 99.5% monthly and effective sampling coverage within 10% of policy target.
+
+Change Management and Policy Review
+
+- All policy schema changes must be reviewed by telemetry-backend and privacy team.
+- Major behavioral changes (e.g., switching to synchronous enrichments) require a canary plan and sign-off from runtime performance sig.
+
+Appendix: Example Sampling Policy JSON
+
+{
+  "version": "1",
+  "rules": [
+    {"matcher": "model_variant =~ '.*-quant'","action": {"sample_rate": 0.02,"aggregate": false}},
+    {"matcher": "route == '/v1/chat' and tenant in ['enterprise-a']","action": {"sample_rate": 0.2,"aggregate": false}},
+    {"matcher": "default","action": {"sample_rate": 0.005,"aggregate": true}}
+  ]
+}
+
+Frequently Asked Questions (short)
+
+Q: Will enabling OAS slow down my model?
+A: When configured per the rollout checklist, OAS is bounded to add <1% p99 latency. If you observe larger regressions, check queue saturation and sampler policies.
+
+Q: How do I add a new telemetry field?
+A: File a schema PR to the telemetry-contracts repo, include a migration plan for existing ingestion pipelines, and coordinate with telemetry-backend for parsers.
+
+Related pages and next steps
+
+- Implement the client adapter template in runtime-examples repo and submit for review.
+- Coordinate with telemetry-backend to register your model_variant mapping.
+
+Document history
+
+- 2026-01-12: Initial draft by Maya Patel.
+- 2026-02-10: Added rollout checklist and sink contract after SOC review.
+- 2026-03-01: Final edits and published.

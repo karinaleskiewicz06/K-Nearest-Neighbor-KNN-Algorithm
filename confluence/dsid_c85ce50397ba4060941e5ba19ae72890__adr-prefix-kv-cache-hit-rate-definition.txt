@@ -1,0 +1,300 @@
+ADR-0147: Prefix + KV Cache Hit-Rate Definitions, Partial-Hit Semantics, and Attribution
+
+## Summary
+This ADR defines the canonical semantics for **prefix/KV cache hit-rate** in the Redwood serving runtime, including:
+- What counts as a **hit** vs **miss** (token-level and request-level)
+- How to represent **partial hits** (reuse depth)
+- How hit/miss is attributed across **multi-turn chat**, **streaming**, and **retries**
+
+The goal is to make cache telemetry consistent across runtime, ingestion, dashboards, and the recommendations pipeline, while remaining privacy-safe and avoiding cardinality blowups.
+
+---
+
+## Status
+**Accepted** (effective for cache telemetry v2 rollout).
+
+---
+
+## Context and problem statement
+Historically, teams used “cache hit-rate” to mean different things:
+- “Was there a cache entry?” (lookup-level)
+- “How much of the prompt was reused?” (token-level)
+- “Did we avoid most prefill?” (latency/compute-level)
+
+These diverging definitions produced inconsistent dashboards and false positives during incident response (e.g., streaming retry double-counting, batched prefill mis-attribution, and model version mismatch being treated as generic misses).
+
+We need a definition that:
+1) Reflects **actual compute avoided** (prefill reuse),
+2) Works for chat where prompts grow each turn (partial reuse is normal),
+3) Remains stable under streaming/retries and continuous batching,
+4) Can be aggregated safely by model/route/region/deployment mode.
+
+---
+
+## Decision
+### Decision 1: “Hit-rate” is defined as token-weighted reuse of cacheable prefill tokens
+The primary hit-rate is **token-weighted**, computed over a window:
+
+**HitRate = sum(reused_prefill_tokens) / sum(eligible_prefill_tokens)**
+
+Where:
+- `eligible_prefill_tokens` are prompt tokens that the runtime would have had to prefill **if no cache reuse occurred**, restricted to the portion of the prompt considered cacheable (see Definitions).
+- `reused_prefill_tokens` are prompt tokens whose KV states were reused from cache (prefix cache / KV reuse) instead of recomputed.
+
+This hit-rate is **not** a lookup success rate, and it is **not** a boolean per-request metric. It is designed to answer: *“How much prefill compute did caching avoid?”*
+
+### Decision 2: Partial hits are represented by reuse depth (reused tokens), not a separate “partial hit-rate”
+Partial hits are expected for chat and any workload with shared prefixes.
+We represent partial hits by reporting `reused_prefill_tokens` (and optionally `reuse_depth_bucket`) so dashboards can show reuse distributions.
+
+### Decision 3: Request-level classifications are derived (full_hit / partial_hit / miss) but are secondary
+For triage and recommendations, we also derive request-level outcomes for sampled traces and low-cardinality counters:
+- **full_hit**: `reused_prefill_tokens == eligible_prefill_tokens` and `eligible_prefill_tokens > 0`
+- **partial_hit**: `0 < reused_prefill_tokens < eligible_prefill_tokens`
+- **miss**: `reused_prefill_tokens == 0` and `eligible_prefill_tokens > 0`
+- **not_eligible**: `eligible_prefill_tokens == 0` (e.g., caching disabled by policy)
+
+Token-weighted hit-rate remains the source of truth.
+
+### Decision 4: Streaming retries must not double count hit/miss
+For streaming retries (client reconnects, gateway retry-on-timeout), the runtime MUST ensure cache hit/miss counters are emitted **once per logical request**, not once per transport attempt.
+Implementation guidance is included below.
+
+---
+
+## Definitions and terminology
+### Request lifecycle terms
+- **prefill**: processing the prompt/context to produce initial KV states.
+- **decode**: iterative token generation after prefill.
+
+Caching impacts prefill compute; decode is not part of the cache hit-rate denominator.
+
+### Cache types (as used in telemetry)
+- **Prefix cache**: reuse keyed by a stable hash of a canonicalized token prefix, returning a handle to cached KV states.
+- **KV cache**: the underlying key/value state used during attention. In practice, “prefix cache hit” results in “KV reuse.”
+
+Telemetry uses the terms “prefix cache” and “KV reuse” to distinguish lookup/entry behavior from reuse depth and compute avoided.
+
+### Token counts
+All token counts are expressed in **model tokens** (post-tokenization).
+
+- `prompt_tokens_total`: total tokens in the request prompt/context.
+- `prompt_tokens_cacheable`: tokens in the prompt that are eligible for reuse under the active policy.
+  - This explicitly excludes non-cacheable segments if/when we introduce them (e.g., policy-based exclusions). If no exclusions exist, this equals `prompt_tokens_total` capped by policy limits.
+- `eligible_prefill_tokens`: the number of prompt tokens that would require prefill compute absent cache reuse.
+  - In v2, `eligible_prefill_tokens = prompt_tokens_cacheable` when caching is enabled; otherwise 0.
+- `reused_prefill_tokens`: number of eligible prefill tokens reused from cache (i.e., KV states loaded/referenced).
+
+### “Cache enabled” vs “eligible”
+A request is considered **eligible** for cache hit-rate if:
+- cache policy is enabled for the route, and
+- the runtime has caching enabled (feature flag), and
+- the request uses a model variant that supports caching (all standard decoder-only LLMs; exclusions must be explicit).
+
+If caching is disabled (policy or runtime), we record separate counters but do **not** include these requests in the hit-rate denominator.
+
+---
+
+## Metric semantics (normative)
+This ADR defines semantics; naming is governed by the cache metrics naming/cardinality policy.
+
+### Required counters (semantics)
+1) `eligible_prefill_tokens_total`
+- Increment by `eligible_prefill_tokens` for each logical request.
+
+2) `reused_prefill_tokens_total`
+- Increment by `reused_prefill_tokens` for each logical request.
+
+3) `requests_total` (optional but recommended for consistent rates)
+- Increment once per logical request.
+
+4) `requests_not_eligible_total`
+- Increment once per logical request where `eligible_prefill_tokens == 0`.
+
+### Derived time-series (query-time)
+- `hit_rate = sum(reused_prefill_tokens_total) / sum(eligible_prefill_tokens_total)`
+- `mean_reuse_depth = sum(reused_prefill_tokens_total) / sum(requests_with_eligibility_total)` where `requests_with_eligibility_total` counts requests with `eligible_prefill_tokens > 0`.
+
+### Request-level outcome counters (optional)
+If implemented, these MUST be derived from the token counts above:
+- `requests_full_hit_total`
+- `requests_partial_hit_total`
+- `requests_miss_total`
+
+---
+
+## Partial-hit semantics (examples)
+Assume cache enabled and prompt is cacheable.
+
+| Prompt tokens (eligible) | Reused tokens | Outcome | Notes |
+|---:|---:|---|---|
+| 800 | 800 | full_hit | Entire prompt KV reused (rare outside repeated identical calls). |
+| 800 | 600 | partial_hit | Common for chat history reuse; last user turn is new. |
+| 800 | 0 | miss | No matching prefix, or valid entry not found (reason recorded separately). |
+
+For dashboards, **token-weighted hit-rate** will reflect the 600/800 reuse even if request-level outcome is “partial_hit.”
+
+---
+
+## Miss reason attribution (normative taxonomy)
+When `eligible_prefill_tokens > 0` and `reused_prefill_tokens == 0`, the runtime SHOULD emit a miss reason from a stable low-cardinality enum.
+
+Approved miss reasons:
+- `policy_disabled`: route or tenant policy disabled caching (counts as not_eligible in v2; if emitted, must not be included in denominator)
+- `capacity`: cache had no available capacity / admission rejected
+- `ttl_expired`: matching entry existed but was expired
+- `evicted`: entry was evicted prior to use (often correlated with memory pressure)
+- `hash_mismatch`: prefix hash mismatch (includes canonicalization differences)
+- `version_mismatch`: model version/variant mismatch (includes quantization profile differences)
+- `unknown`: reserved for unexpected paths (must be monitored; not a permanent bucket)
+
+Notes:
+- `evicted` vs `capacity`: `capacity` is “could not admit/allocate now”; `evicted` is “was present, then removed.”
+- If multiple reasons apply, emit the **most actionable** reason in the order: `policy_disabled` > `version_mismatch` > `hash_mismatch` > `ttl_expired` > `evicted` > `capacity` > `unknown`.
+
+---
+
+## Attribution rules (labels/dimensions)
+### Primary slicing dimensions (approved)
+Hit-rate MUST be attributable by the following low/controlled cardinality labels:
+- `deployment_mode`: hosted | dedicated | private
+- `region`: cloud region / on-prem site identifier (allowlist)
+- `model_family` and/or `model_id` (allowlist)
+- `model_version` (bounded; see naming policy for how we bucket/shorten)
+- `route_id` (bounded; must use stable route identifiers, not raw URLs)
+
+### Tenant / customer attribution
+Tenant-level labels MUST NOT be added to raw metrics by default. Tenant slicing should be done via:
+- dedicated/private environment isolation, or
+- sampled analytics tables / batch aggregation with strict budgets.
+
+### Request shape attribution
+To support “actionable” recommendations without prompt logging, request shape MUST be bucketed:
+- `prompt_len_bucket`: fixed bins (see naming/cardinality policy)
+- optional: `input_tokens_bucket` if prompt_len is ambiguous in some modalities
+
+No raw prompt hashes, user IDs, or session IDs in metrics.
+
+---
+
+## Multi-turn chat semantics
+Each chat turn is treated as a separate logical request with its own token counts.
+
+Rules:
+1) `eligible_prefill_tokens` is computed from the **full serialized prompt** sent to the runtime for that turn (after canonicalization / templating as implemented by the product layer).
+2) `reused_prefill_tokens` is the length of the **longest reusable prefix** of that serialized prompt for the active model version.
+3) Because chat prompts typically grow, **partial hits are the expected steady state**. Dashboards should therefore focus on:
+   - token-weighted hit-rate trends
+   - reuse depth distributions by prompt_len_bucket
+
+Non-goal:
+- We do not attempt to “attribute” reuse back to a prior turn or conversation ID in metrics (cardinality + privacy). Conversation-level analysis belongs in sampled traces or offline analytics with explicit approvals.
+
+---
+
+## Streaming and retries
+### Streaming
+Streaming does not change cache semantics: reuse is determined at prefill start.
+
+### Retries (normative)
+A “logical request” may experience multiple transport attempts (e.g., stream reconnects). To prevent double counting:
+- The runtime MUST only increment `eligible_prefill_tokens_total` and `reused_prefill_tokens_total` once per logical request.
+- If prefill is re-executed due to retry, that additional compute SHOULD be tracked separately (e.g., via wasted-prefill metrics) but must not inflate hit/miss.
+
+Implementation guidance:
+- Use a stable `request_id` (propagated from gateway) and an `attempt` field.
+- Emit cache hit-rate counters only when `attempt == 1`.
+- If the runtime cannot reliably detect attempt==1, it MUST implement local de-duplication keyed by `request_id` over a bounded time window (in-memory, best-effort).
+
+Rationale:
+This ensures hit-rate reflects caching effectiveness, not network instability.
+
+---
+
+## Continuous batching / shared prefill
+With continuous batching, prefill work may be scheduled in a way that obscures per-request boundaries.
+
+Normative rule:
+- `eligible_prefill_tokens` and `reused_prefill_tokens` are attributed **per request**, regardless of batching.
+
+If a batch-level prefix lookup is performed, reuse depth MUST be computed per request’s prompt, not per batch. Any shared prefill accounting must be reconciled back to per-request increments to avoid:
+- over-crediting one request for another’s reuse,
+- inflating reuse tokens when multiple requests share a batch.
+
+---
+
+## Edge cases and clarifications
+### Model/version scoping
+Cache reuse is only valid when:
+- `model_id` matches, AND
+- `model_version` matches (includes quantization profile / weights revision), AND
+- any runtime-internal compatibility keys match (tokenizer revision, prompt template version if applicable).
+
+A mismatch should be recorded as `version_mismatch` (not `miss`).
+
+### “Not eligible” requests
+Requests where caching is disabled MUST NOT dilute hit-rate.
+We track them separately so recommendations can still surface: “Enable caching on route X” rather than showing low hit-rate.
+
+### Lookup success vs reuse
+A prefix cache “lookup hit” with `reused_prefill_tokens == 0` is treated as a miss for hit-rate purposes (because no compute avoided). If lookup-level metrics are emitted, they are separate and must not be conflated with hit-rate.
+
+---
+
+## Consequences
+### Positive
+- Dashboards become comparable across models/routes and across time.
+- Recommendations can safely use token-weighted hit-rate + miss reasons + reuse depth to propose actions (canonicalization, routing locality, TTL, cache bytes).
+- SRE can distinguish workload-driven changes (prompt mix shifts) from regressions (miss reason spikes).
+
+### Tradeoffs
+- Token-weighted metrics may under-emphasize small prompts; request-level derived metrics should be used alongside hit-rate where needed.
+- Conversation-level attribution is intentionally excluded from metrics (privacy + cardinality).
+
+---
+
+## Rollout and validation requirements
+Before enabling cache hit-rate v2 metrics broadly:
+1) Perf overhead: instrumentation must not regress p95 latency beyond agreed canary thresholds.
+2) Correctness tests:
+   - repeated identical prompts produce `full_hit` after warmup
+   - chat-like prompts produce stable partial-hit reuse depth patterns
+   - streaming retry does not change counters for a logical request
+   - version mismatch produces `version_mismatch` miss reason
+3) Data quality checks:
+   - denominators are non-zero only for eligible traffic
+   - no unexpected spike in `unknown` miss reason
+
+---
+
+## Appendix: Reference computation (pseudo-code)
+Inputs per logical request:
+- `cache_policy_enabled` (bool)
+- `runtime_cache_enabled` (bool)
+- `prompt_tokens_total` (int)
+- `max_cacheable_prompt_tokens` (int, policy/runtime)
+- `reuse_prefix_tokens` (int, computed by runtime lookup)
+
+Compute:
+1) `prompt_tokens_cacheable = min(prompt_tokens_total, max_cacheable_prompt_tokens)`
+2) If not (cache_policy_enabled && runtime_cache_enabled):
+   - `eligible_prefill_tokens = 0`
+   - `reused_prefill_tokens = 0`
+   - increment `requests_not_eligible_total`
+   - STOP
+3) Else:
+   - `eligible_prefill_tokens = prompt_tokens_cacheable`
+   - `reused_prefill_tokens = clamp(reuse_prefix_tokens, 0, eligible_prefill_tokens)`
+4) Increment counters:
+   - `eligible_prefill_tokens_total += eligible_prefill_tokens`
+   - `reused_prefill_tokens_total += reused_prefill_tokens`
+5) If `eligible_prefill_tokens > 0 && reused_prefill_tokens == 0`: emit miss reason from taxonomy.
+
+---
+
+## Owners
+- Runtime semantics and implementation: **Omar El-Sayed** (Runtime)
+- Metrics schema + ingestion conformance: **Nadia Rahman** (Telemetry)
+- Dashboards/alerts interpretation: **Allison Grant** (Observability/SRE)
+
+Questions or changes to this ADR require review from Runtime + Telemetry + SRE to avoid breaking dashboards and recommendation logic.

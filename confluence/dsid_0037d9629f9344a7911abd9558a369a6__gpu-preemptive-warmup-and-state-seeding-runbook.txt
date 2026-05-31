@@ -1,0 +1,233 @@
+GPU Preemptive Warmup and State-Seeding Runbook
+
+Summary
+-------
+This runbook describes Redwood's recommended automated GPU prewarming and state-seeding patterns to reduce first-token latency for cold hosts, improve deterministic throughput for batch-eval jobs, and mitigate spot/preemptible instance churn. It covers architecture, IaC integration, CI/CD hooks, operational metrics, alerting thresholds, step-by-step play for incidents, and a troubleshooting checklist.
+
+Goals and scope
+----------------
+- Reduce tail latency on cold-starts for generation/eval workloads by pre-initializing model weights, kernels, and KV-cache templates.
+- Seed common prefix KV cache and model-specific kernels so short-lived tasks see warm runtime state.
+- Provide Terraform and CI/CD patterns to manage warm pools and image priming as part of the GPU fleet lifecycle.
+- Applicable to: hosted evaluation clusters, dedicated tenant GPUs, and private on-prem pools. Not a replacement for long-running reserved capacity.
+
+Owned components and teams
+-------------------------
+- Runtime prewarm controller: eng-serving-runtime (primary oncall)
+- GPU fleet IaC modules and auto-scaler: eng-infra/tf (ownership: infra-terraform)
+- CI/CD image promotion and canary warm-pools: eng-ci (builds and release)
+
+Architecture overview
+---------------------
+1) Warm Pool Layer
+   - A pool of ephemeral GPU instances (VMs or pods) pre-initialized with:
+     - Latest approved runtime image
+     - Model shard weights cached on local NVMe or in-memory mapping
+     - Primed CUDA/cuDNN kernels and memory allocation reserved for expected context sizes
+   - Two warm pools per region: 
+     - "canary-warm" (small, always-on, for smoke and canary routing)
+     - "production-warm" (elastic, used to satisfy short-lived requests)
+
+2) Prewarm Controller (service)
+   - Responsibilities: track pool sizes, orchestrate priming tasks, manage lifecycle via IaC hooks, and participate in capacity decisions during scaling/eviction.
+   - Integrations: Terraform state tags, provisioning API, runtime handshake endpoint (POST /prewarm/seed), Prometheus metrics, and SLO service.
+
+3) State-seeding approach
+   - Model artifacts: prefetch model shards from object store to local cache using a deterministic path and checksum verification.
+   - KV-cache templates: for common prompt prefixes, store prepared KV segments as blobs and restore to runtime KV cache on startup.
+   - Kernel priming: run warm-run snippets that exercise common attention patterns and sequence lengths to JIT/compile kernels ahead of production traffic.
+
+IaC patterns (Terraform)
+------------------------
+- Provide a dedicated module: redwood_gpu_warm_pool with arguments: region, instance_type, pool_type (canary|production), min_size, max_size, priming_image_tag.
+- Sample usage snippet (terraform):
+
+```hcl
+module "warm_pool_eu" {
+  source          = "git::ssh://git@repo.redwood.ai/infra/terraform-modules.git//redwood_gpu_warm_pool"
+  region          = "eu-west-1"
+  instance_type   = "p4d.24xlarge"
+  pool_type       = "production"
+  min_size        = 2
+  max_size        = 20
+  priming_image_tag = "runtime:v2025-01-12"
+}
+```
+
+- Tagging conventions: terraform tags must include warm_pool=true, owner=eng-serving-runtime, stack=warmpool. These tags are used by cost allocation and preemption policies.
+
+CI/CD integration
+------------------
+- Image promotion pipeline must include a "prewarm-stage" after build: CI creates a canary warm VM/pod and executes priming jobs. Only on successful priming is runtime image promoted to production warm pools.
+- Example pipeline step (pseudo):
+  1) Build runtime image -> runtime:vYYYYMMDD
+  2) Deploy to canary warm pool (1-2 instances)
+  3) Run priming jobs (model load + sample generations + KV cache restore)
+  4) Validate Prometheus metrics: priming_success_rate == 1 and priming_latency < 45s
+  5) Promote image to production warm pools or roll back
+
+Priming job template (k8s job)
+------------------------------
+- The priming job should: pull model shards, run deterministic seed inference for N steps, then write state to /var/run/primed-cache/<model-id>.
+- Kubernetes YAML sample (snipped):
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: prewarm-priming-bert-001
+spec:
+  template:
+    spec:
+      containers:
+      - name: priming
+        image: registry.redwood.ai/runtime:v2025-01-12
+        command: ["/usr/local/bin/prewarm", "--model", "ops/bert-4b", "--seed-steps", "16"]
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+      restartPolicy: Never
+```
+
+Operational metrics and alerts
+------------------------------
+- Key metrics (Prometheus names):
+  - prewarm_pool_size{pool_type="production"} (gauge)
+  - priming_success_count_total (counter)
+  - priming_failure_count_total (counter)
+  - priming_latency_seconds (histogram)
+  - first_token_latency_ms (summary) by instance, region, model
+
+- Suggested alerts and thresholds (PagerDuty escalation):
+  - Alert: Priming failure rate high
+    - Expression: increase(priming_failure_count_total[10m]) / max(1, increase(priming_success_count_total[10m])) > 0.2
+    - Severity: high
+    - Runbook: check priming logs, S3 access, OOMs, and image mismatch
+  - Alert: First-token latency spike
+    - Expression: histogram_quantile(0.95, sum(rate(first_token_latency_ms_bucket[5m])) by (le, instance)) > 600
+    - Severity: critical
+    - Runbook: route a fraction of traffic to canary-warm and inspect kernel JIT counters
+  - Alert: Warm pool below min_size
+    - Expression: prewarm_pool_size < warm_pool_min_size
+    - Severity: medium
+    - Runbook: force scale or provision replacement VMs
+
+SLOs and operational targets
+---------------------------
+- Cold-start first-token baseline target with warm pools: 95th percentile < 600ms for standard generation endpoints.
+- Priming window target: image priming should complete on canary warm within 45s and on production warm within 120s.
+- Warm pool availability: production-warm pool should have >= 90% availability relative to requested capacity (rolling 24h).
+
+Incident play: Priming failures spike during a rollout
+-----------------------------------------------------
+1) Triage
+   - Acknowledge PagerDuty alert for priming_failure_rate > 20%
+   - Check the CI/CD promotion job run ID in the alert message and open the pipeline logs.
+
+2) Inspect
+   - kubectl logs job/prewarm-priming-<id> -n prewarm
+   - Check object storage access: aws s3 ls s3://redwood-models/<model-id>/sha256=<checksum>
+   - Confirm image tag matches deployed priming image: curl -s http://registry.redwood.ai/v2/runtime/tags/list
+
+3) Mitigate (choose one depending on root cause)
+   - If S3 throttling: temporarily increase canary cadence to lower concurrency and file a support ticket with storage provider.
+   - If OOM on priming job: reduce priming batch_size or increase instance type; add kernel-level cgroup limits.
+   - If image promotion bug: rollback image by setting terraform var priming_image_tag to last-stable and trigger an apply.
+
+4) Restore
+   - Once priming_success_rate recovers > 98% for 30m, re-enable normal promotion cadence.
+   - Run a focused smoke test by routing 5% traffic to canary-warm and measure first_token_latency.
+
+Quick troubleshooting checklist
+-------------------------------
+- Is the priming_job pod OOMKilled or CrashLoopBackOff? (kubectl describe pod)
+- Are model shards present locally? (ls /var/cache/models/<model-id>)
+- Are there kernel JIT compilation errors in runtime logs? (grep "jit" /var/log/runtime.log)
+- Is the host under memory pressure (node-exporter memory_utilization > 85%)?
+- Is NVMe wear or capacity causing evictions? (check /var/log/dmesg and SMART)
+- Network egress throttling to object store? (s3client transfer metrics)
+
+Rollback procedures
+-------------------
+- Image rollback: identify last-stable tag in CI/CD (promoted images table), update Terraform priming_image_tag and apply to warm pools.
+- Pool rollback: decommission new warm nodes via autoscaler: set module.redwood_gpu_warm_pool.max_size = previous value and apply.
+
+Table: Warm pool configuration recommended defaults
+---------------------------------------------------
+| Field              | Canary Default | Production Default | Note |
+|--------------------|----------------|--------------------|------|
+| instance_type      | p4d.24xlarge   | p4d.24xlarge       | high-memory models |
+| min_size           | 1              | 2                  | per region |
+| max_size           | 2              | 20                 | autoscaler scale limits |
+| priming_image_tag  | runtime:canary | runtime:stable     | promoted on success |
+| priming_timeout_s  | 45             | 120                | job timeout |
+
+Best practices and notes
+------------------------
+- Keep priming workloads deterministic and idempotent; incorporate checksums to avoid silent corruption.
+- Use smaller synthetic inputs for kernel priming; heavy production prompts may be slow and unnecessary.
+- Avoid seeding full KV caches for extremely large contexts; instead seed most-common prefixes and rely on on-demand cache fill.
+- For spot/interruptible instances: maintain a lower-bound min_size on production-warm so eviction doesn't fully starve traffic.
+
+Runbook play for network-related prewarm failures
+------------------------------------------------
+1) Symptom: S3 reads failing with 5xx during priming
+   - Check region egress: traceroute to s3 endpoint and verify VPC Egress/NAT gateway health.
+   - Verify IAM role used by priming job has not rotated credentials.
+   - If NAT gateway exhausted: create ephemeral NAT or switch to VPC endpoint (recommended).
+
+2) Symptom: Failed to pull runtime image
+   - Check registry rate limits and image pull secrets.
+   - Fallback: use cached local image if available (docker pull fallback) and mark instance as "degraded-warm" to avoid promoting image.
+
+Operational play for capacity events (spot eviction flood)
+---------------------------------------------------------
+- When cloud provider signals high spot eviction rates:
+  1) Temporarily increase warm_pool.min_size for production pools in unaffected zones and set autoscaler cooldown to 5m.
+  2) Drain newly evicted nodes and migrate primed cache snapshots to standby nodes (rsync from /var/run/primed-cache).
+  3) If cross-region fallback is needed, enable cross-region routing policy for low-priority traffic until capacity stabilizes.
+
+Maintenance and housekeeping
+---------------------------
+- Weekly: run a validation job that recreates each warm image in a staging pool and executes priming smoke tests.
+- Monthly: rotate priming artifacts and checksum list; archive stale primed caches after 30 days.
+- Quarterly: review instance types to ensure cost-performance parity and adjust terraform defaults.
+
+Templates and helper commands
+----------------------------
+- Force scale production warm pool (terraform):
+```bash
+terraform apply -var 'priming_image_tag=runtime:v2025-01-12' -var 'production_min=4' -target=module.redwood_gpu_warm_pool
+```
+- Check priming job logs quickly (k8s):
+```bash
+kubectl -n prewarm logs job/prewarm-priming-<id> --tail=200
+```
+- Prometheus query to see per-model priming latency (last 30m):
+```promql
+histogram_quantile(0.95, sum(rate(priming_latency_seconds_bucket[30m])) by (le, model_id))
+```
+
+Appendix: Typical failure modes and indicators
+---------------------------------------------
+- S3 throttling: elevated 5xx in s3client metrics and priming_errors with HTTP 503.
+- Kernel JIT stalls: long tail in priming_latency_seconds and repeated "compilation" log lines during priming.
+- OOMs: Pod status OOMKilled, dmesg shows OOM killer invoked.
+- Disk pressure: node-exporter node_filesystem_free_bytes shows low NVMe free space.
+
+Related runbooks and references
+------------------------------
+- GPU provisioning and disaster recovery (see related_pages above)
+- Warm pool cost allocation and chargeback (internal finance doc id: /confluence/finance-and-legal/budgeting-and-forecasting/warmpool-costs)
+
+Contact and escalation
+----------------------
+- Primary oncall: eng-serving-runtime rotation (pagerduty team: "runtime-prewarm")
+- Secondary: infra-terraform oncall
+- Slack channels: #eng-runtime-prewarm, #infra-gpu-ops
+
+Document history
+----------------
+- 2024-11-15: Created by Aisha Kapoor
+- 2025-01-10: Added spot-eviction mitigation steps (Marcus Li)
+- 2025-02-09: Added CI/CD promotion gating and updated Prometheus alert expressions (Sofia Martinez)

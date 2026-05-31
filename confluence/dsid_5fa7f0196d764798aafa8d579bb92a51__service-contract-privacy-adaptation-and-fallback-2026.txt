@@ -1,0 +1,146 @@
+Service contract privacy adaptation and safe-fallback policy
+
+Overview
+
+This decision record defines the privacy-adaptive service contract layer that mandates request payload sanitization, a graded response policy, and an automatic safe-fallback path for inference services. The goal is to reduce leakage of sensitive data (PII, credentials, secrets) from customer payloads while preserving low-latency inference and predictable unit cost. This doc specifies runtime requirements, API semantics, observability signals, rollout steps, and owner responsibilities.
+
+Why we need this
+
+- We operate multi-tenant hosted and private inference with a mix of customer-provided prompts and structured tool calls. Some payloads can contain high-risk fields (PII, PHI, secrets).
+- Past incidents show accidental exposure through model output and telemetry; we need an explicit, centralized contract enforcement and fallback mechanism to prevent recurrence.
+- Enforcement must be low-latency (<5ms median added per request for simple sanitization) and auditable.
+
+Decision summary
+
+We will adopt a Service Contract Privacy Adaptation Layer (SCPAL) implemented as:
+
+1) A lightweight request preprocessor that performs classification and sanitization at three levels (none, redact, transform).
+2) A policy engine that evaluates the contract hints and tenant config to select either: direct passthrough, sanitized passthrough, or safe-fallback to a gated, lower-fidelity model variant with deterministic output constraints.
+3) Telemetry and trace enrichment that records sanitized fields (hashes only), sanitization decisions, and fallback invocations.
+4) A throttled replay queue for requests that were transformed/fallbacked so product ops can review borderline decisions offline.
+
+Runtime contract and API requirements
+
+- New request header: X-RW-Contract-Hints (JSON string, max 512 bytes) — contains optional hints: expected_data_class, pii_risk, prefer_fallback. Clients may provide hints but the service must not trust them blindly.
+- Response header: X-RW-Sanitization-Decision = [none|partial|redacted|transformed|fallback].
+- Sanitization latency budget: 95th percentile <= 12ms, median <= 4ms for 99% of traffic under nominal load. Additive end-to-end SLO allowance: 10ms for contract enforcement on top of model latency budgets.
+- Fallback SLO: fallback path should serve at least 95% of fallback requests within configured model tier latency SLA (default: 300ms p95 for interactive workloads).
+
+Sanitization levels (config table)
+
+| level     | description                                          | runtime effect                                    | telemetry recorded |
+|-----------|------------------------------------------------------|---------------------------------------------------|--------------------|
+| none      | no modification                                       | passthrough                                       | decision = "none" |
+| partial   | mask high-risk tokens, preserve non-sensitive context | in-place token masking (e.g., email -> ****@example) | masked_fields_count |
+| redacted  | remove entire fields or spans                        | replaced with stable redaction token ([REDACTED]) | redacted_field_list (hashes) |
+| transformed| deterministic canonicalization for structured data   | transform (e.g., 1111-2222 -> CARD_TOKEN_1)      | transform_map_hash  |
+| fallback  | route to a safe, policy-gated model variant          | use lower-fidelity model with output filters     | fallback_reason_hash |
+(We store only hashed identifiers of fields/keys; plaintext is never persisted in logs or metrics.)
+
+Policy engine behavior
+
+- Input signals: tenant config (tenant_id), contract hints, model capability manifest, prompt classification classifier score (0-100), and request cost estimate.
+- Decision matrix (simplified):
+  - If classifier_score >= 90 and pii_risk == high -> redacted or transformed depending on data shape.
+  - If classifier_score between 60-90 -> partial.
+  - If classifier_score < 60 but tenant has prefer_fallback=true -> fallback.
+  - For structured tool calls with known schemas, apply schema-based transforms (see Prompt Data Classification playbook).
+
+Observability and telemetry
+
+Instrumentation must emit the following fields for every request (sample rates apply, see rollout):
+- sanitization.decision (enum)
+- sanitization.latency_ms (int)
+- sanitization.masked_count (int)
+- sanitization.redaction_hashes (list of short hashes, sampled)
+- fallback.invoked (bool)
+- fallback.duration_ms (int)
+- request.pii_classifier_score (int)
+- request.size_bytes (int)
+
+Sampling and privacy: by default redact-sensitive telemetry and only emit hashes; default sample rate for full payload hash emission = 0.05 (5%). Increase sample rate only with legal/security approval.
+
+Impact on other standards
+
+- API standards: Add the new headers to the canonical request schema and update client SDKs. Clients must tolerate the X-RW-Sanitization-Decision header and treat transformed tokens as opaque.
+- Coding standards: implement sanitization as a small, well-tested library with typed inputs/outputs and golden tests that assert no plaintext persists in logs or metrics. See tests guideline below.
+- Infra standards: the SCPAL runs as a horizontally-scalable sidecar in hosted and dedicated offerings; in private deployments it can be enabled as an optional sidecar or inline library depending on customer preference. Sidecar must be able to run on CPU-only nodes and be resource-capped (default 0.25 CPU, 128MiB).
+- Model-serving standards: fallback model variants must support deterministic output constraints and have a deterministic-output post-filter sidecar to remove hallucinated secrets.
+- Observability standards: ensure traces include anonymized decision IDs and are correlated to model traces for end-to-end debugging without leaking PII.
+- Performance standards: include sanitization in synthetic load tests and SLO budgets; regression gates will block model rollouts if sanitization increases p95 latency by >20%.
+
+Testing and CI requirements
+
+1) Unit tests for classifiers and transform logic with boundary cases (emails, SSNs, API keys, base64 blobs).
+2) Golden redaction tests verifying that given sensitive payloads, sanitized outputs never contain original sensitive substrings.
+3) Fuzz tests that generate edge-case structured payloads to ensure transformers do not crash or leak.
+4) Integration test in the staging runtime with controlled sampling to validate telemetry masking logic.
+
+Rollout plan
+
+1) Stage 0 (2 weeks): feature flagged sidecar deployed to canary fleet (1% traffic). Sample telemetry at 100% locally, but persist no payloads; only hashes. Verify latency budgets.
+2) Stage 1 (4 weeks): increase to 10% traffic; enable partial and redaction decisions; run manual evaluation of transformed outputs using replay queue.
+3) Stage 2 (4 weeks): enable fallback policy for tenants with prefer_fallback=true; monitor fallback.invoked rates and model fidelity.
+4) Stage 3 (8 weeks): global rollout for hosted API; private deployments opt-in. Create customer communication and migration notes.
+5) Post-rollout (ongoing): quarterly review of classifier thresholds, add new rules for new PII patterns, and maintain a suppression list for false positives.
+
+Operational runbook (high level)
+
+- Alert: sanitization.rate_of_fallbacks > 0.5% for 10m -> Severity P2. Owner: eng-sre -> run query to determine tenant(s) and request samples via replay queue.
+- Alert: sanitization.latency.p95 > 20ms for 10m -> Severity P1. Owner: eng-infra -> scale sidecar pool or investigate hot paths.
+- Incident steps:
+  1. Toggle feature flag to degrade to none or partial depending on impact.
+  2. Open a secure investigation channel (restricted) and avoid sharing raw payloads.
+  3. If leakage suspected, follow incident-response-security/ and contact the security on-call.
+
+Ownership and contacts
+
+- Product owner: Maya Chen (product -> model-platform).
+- Engineering owner: Aditi Rao (serving-runtime team).
+- SRE oncall: see eng-sre oncall roster.
+- Security reviewer: Priya Patel.
+
+Alternatives considered and reasons for rejection
+
+- Client-side only sanitization: rejected because clients are inconsistent and may not run across private deployments; server-side provides uniform guarantees.
+- Full payload logging with later redaction: rejected because risk of persistence of plaintext in backups and analytics systems.
+- Blocking requests with PII: rejected as too disruptive for customers; prefer transform/fallback for continuity.
+
+Consequences
+
+- Positive: improved incident surface reduction for data leakage, consistent privacy guarantees across hosted/dedicated/private offerings, auditable decision traces.
+- Negative: added complexity and cost; small added latency and operational overhead to tune classifier thresholds.
+
+Open questions and next steps
+
+- Determine legal-approved retention policy for replay queue (suggestion: 30 days, hashed-only unless explicit w/ customer consent).
+- Define a tenant-level override workflow for enterprise customers requiring different default policies.
+- Integrate a lightweight differential-privacy mode for analytics pipelines that rely on sanitized telemetry.
+
+Appendix: example headers and CLI examples
+
+- Example request header (curl):
+  curl -X POST https://api.redwood.ai/v1/generate \n     -H 'Authorization: Bearer <token>' \n     -H "X-RW-Contract-Hints: {\"expected_data_class\":\"chat\",\"pii_risk\":\"high\"}" \n     -d '{"input":"Please summarize: My credit card is 4111-1111-1111-1111 and my SSN is 123-45-6789"}'
+
+- Example response headers:
+  X-RW-Sanitization-Decision: redacted
+  X-RW-Sanitization-Version: 2026-01-01
+
+- Example config snippet (tenant policy):
+  tenant_policy: 
+    prefer_fallback: false
+    default_sanitization_level: partial
+    allowed_transformers: [credit_card_canonicalizer, email_masker]
+    telemetry_sample_rate: 0.05
+
+References
+
+- Prompt data classification and sanitization playbook (internal)
+- Observability: request-provenance-and-enrichment-standard-2025
+- API: request-semantics-and-cost-aware-payload-guidelines-2026
+
+Document history
+
+- Created by Aditi Rao 2025-09-11
+- Reviewed by Marcus Nguyen, Priya Patel 2025-10-05
+- Published 2026-01-15 after staging validation

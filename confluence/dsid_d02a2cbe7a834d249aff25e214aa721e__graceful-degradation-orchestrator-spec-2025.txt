@@ -1,0 +1,210 @@
+Graceful Degradation Orchestrator: Design, Telemetry Contract, and Validation
+
+Purpose
+
+This document defines the Graceful Degradation Orchestrator (GDO): the runtime subsystem that coordinates fidelity reduction, kernel variant switching, and routing fallbacks when capacity, thermal/power or kernel regressions threaten SLOs. It specifies the telemetry contract between the orchestrator and downstream subsystems (scheduler, kernel mapper, network router, kv-cache and model manager), describes configuration primitives, and provides a validation and incident-runbook for operators.
+
+Summary (short)
+
+- Why: Keep customer-facing latency and success-rate SLOs while minimizing cost and output-quality regression during resource-constrained events.
+- What: A declarative orchestrator that synthesizes signals and executes a prioritized set of mitigation actions (local kernel switch, model fidelity stepdown, prioritized admission, cross-region reroute).
+- Who: Owned by eng-serving-runtime (scheduler + runtime-ops collaboration).
+- When to use: automatically in production via policies; manually for targeted customers via orchestration console.
+
+Design goals
+
+1) SLO-first: Preserve p50/p95 latency objectives and success-rate (generation completion) where possible.
+2) Observable: Every mitigation must emit structured telemetry and be reversible.
+3) Progressive fidelity: Minimize perceptible quality regression by ordering mitigations from least-visible to most-visible.
+4) Safe and auditable: All policy changes are versioned and subject to canary gates.
+
+Key terms
+
+- Fidelity step: Discrete quality reduction (e.g., int8 quantized variant, sequence-length cap, sampling temperature clamp, max_tokens cap, offload to smaller model).
+- Kernel variant: Implementation variant of an operator (tensor-core optimized vs. scalar fallback).
+- Mitigation action: Single atomic change that the orchestrator can apply and revert.
+- Mitigation plan: Ordered list of mitigation actions with exit criteria.
+
+Architecture overview
+
+Components and interactions (high level)
+
+- GDO controller (stateless service)
+  - Receives aggregated signals and policy input.
+  - Plans and issues actions via runtime control-plane APIs.
+
+- Signal ingestion (streaming)
+  - High-frequency telemetry from scheduler, kernel telemetry, GPU power/thermal, model-serving trace.
+  - Low-frequency business signals: customer tier, active QBR or experiments.
+
+- Execution agents (on-node agents)
+  - Apply kernel switches, update config flags, trigger model variant swap, adjust admission tokens.
+
+- Audit & Reconciliation service
+  - Records planned vs applied actions, detects drift and attempts automated revert if mismatches persist.
+
+Sequence diagram (textual)
+
+1) Telemetry breach detected (p95 latency > 1.2x SLO for 30s)
+2) GDO evaluates candidate mitigations based on policy and current state
+3) GDO issues an optimistically-scoped mitigation (e.g., drop kernel launch priority; enable kernel low-latency codepath)
+4) Observability checks evaluate effect for 20s; if improved -> commit; else escalate to next mitigation (e.g., quantized model variant or sequence-length cap)
+5) If a mitigation causes quality regression beyond policy thresholds, revert and try alternative path or route to dedicated capacity tier.
+
+Policy primitives (JSON example)
+
+```json
+{
+  "policy_id": "gd-policy-2025-01",
+  "priority": 100,
+  "target_scope": {
+    "model_id": "redwood-llama-70b-cpu-fallback",
+    "tenant_ids": ["*"],
+    "region": "us-west-2"
+  },
+  "slo_constraints": {
+    "p95_latency_ms": 250,
+    "success_rate": 0.995
+  },
+  "mitigation_plan": [
+    {"action": "kernel_priority_tweak","params": {"kernel_id": "attn_v2","priority": "lower"},"exit_on": {"p95_latency_ms": 1.05}},
+    {"action": "enable_kernel_variant","params": {"kernel_id": "attn_v2","variant": "nvcc_fast_f32"}},
+    {"action": "fidelity_step","params": {"step": "quantize_int8"},"quality_guard": {"semantic-preservation": 0.92}},
+    {"action": "limit_sequence_length","params": {"max_tokens": 256}},
+    {"action": "route_to_dedicated","params": {"pool": "dedicated-500g"}}
+  ]
+}
+```
+Telemetry contract (signals, semantics, retention)
+
+Table: signal -> producer -> semantics -> recommended sampling
+
+| signal | producer | semantics | sampling |
+|---|---|---:|---:|
+| kernel_queue_depth | node-scheduler | number of pending kernel launches | 1s aggregated per node |
+| token_emit_latency_ms | kernel-runtime | per-token emit time (median/95) | 1s sliding, store 30d aggregated |
+| kernel_variant_switch_latency_ms | node-agent | time to move to variant and stabilize | report per switch (trace) |
+| gpu_power_watts | hw-metrics | instantaneous power draw | 5s avg, store 90d samples |
+| kvcache_hit_rate | kv-cache | fraction of requests served from persistent cache | 10s aggregate |
+| request_failure_rate | api-gateway | fraction of requests that failed before completion | 1s aggregate |
+
+Contract rules (plain language)
+
+- All signals must include: timestamp (RFC3339), node_id, shard_id (if applicable), model_id, request_cohort (experimental/dedicated/hosted).
+- Signal producers must maintain >= 30s retention in hot storage for high-frequency signals used by GDO decision window.
+- Each mitigation action must emit a START/END event with correlation_id and pre/post snapshot of the small set of signals (queue_depth, p95 token emit latency, kvcache_hit_rate).
+
+Mitigation action taxonomy and safe limits
+
+- Non-invasive (fast revert): kernel priority tweak, scheduler backpressure adjustments, queue preemption. (Immediate revert safe)
+- Moderate (short-term quality impact): change kernel variant to lower-latency optimized build, apply small quantization profile. (Guarded by sampling)
+- Invasive (visible quality impact): hard sequence-length cap, route significant traffic to smaller model. (Require reviewer approval when touching enterprise tiers)
+
+Table: action -> visible impact -> max duration (auto) -> revert criteria
+
+| action | impact | max_auto_duration | revert_criteria |
+|---|---:|---:|---:|
+| kernel_priority_tweak | none | 300s | no improvement in p95 after 30s |
+| enable_kernel_variant | low | 600s | token error rate > 0.1% or p95 worsens 10% |
+| fidelity_step (quantize) | medium | 900s | semantic_preservation_score < policy threshold |
+| limit_sequence_length | high | 1800s | business metric drop > 2% |
+
+Validation and preflight suite
+
+Preflight tests that must pass before enabling a mitigation policy in production:
+
+1) Canary microbenchmark: apply mitigation to a 1% shadow of production (shadow-not-serve) and evaluate p50/p95 and semantic-preservation (using an automated prompt set).
+2) Regression fuzz: run a synthetic workload shaped to the target tenant's recent traffic (sequence-length distribution, tokens per request) and measure kernel stability for 10 minutes.
+3) Stability soak: ensure no memory leaks or steady-state increased memory usage over 30 minutes.
+
+CLI snippets (examples for operators)
+
+- List active policies
+
+$ rdoctl policies list --region us-west-2 --format table
+
+- Trigger policy dry-run (canary 1%):
+
+$ rdoctl policies apply --policy gd-policy-2025-01 --canary 0.01 --dry-run
+
+- Force revert mitigation on node
+
+$ rdoctl nodes revert-mitigation --node node-15 --correlation-id abcd-1234
+
+Quality and semantic-preservation checks
+
+- Redwood uses an internal prompt-set for fidelity checks. For GDO policy changes that perform quantization or model swaps, require the semantic_preservation metric to be >= 0.90 for public tiers and >= 0.95 for enterprise-tier policies.
+- Semantic preservation is computed as: 1 - (normalized embedding distance between golden and mitigated outputs) aggregated across the prompt set.
+
+Observability & dashboards
+
+Minimum required dashboards for GDO operations:
+
+- Mitigation action timeline: list of START/END events with correlated latency and success_rate lines.
+- Quality delta panel: semantic_preservation over time split by tenant tier.
+- Signal heatmap: token_emit_latency_ms p95 across nodes with kernel variants annotated.
+
+Runbook: Incident triage (SRE playbook)
+
+1) Alert: GDO escalates with priority P1 if p95 latency > 1.3x SLO and mitigation plan reaches invasive actions.
+2) Immediate steps (0-5m):
+   - Verify alert in dashboards.
+   - Check GDO decision log (correlation_id) and list of applied mitigations.
+   - If mitigation was applied in last 60s, run quick revert for the latest action and observe impact.
+3) Next steps (5-20m):
+   - If revert improves latency, keep reverted state and schedule a targeted canary for alternatives.
+   - If revert does not help, escalate to runtime kernel leads and consider cross-region routing.
+4) Recovery and postmortem (post 2 hours):
+   - Record timeline events, include all START/END and signal snapshots.
+   - Run semantic-preservation audits for any automatic quantize actions.
+   - Publish RCA and update policy safe limits if necessary.
+
+Safety and governance
+
+- Enterprise customer exemptions: Policies that change model fidelity for enterprise customers must include an "exempt" flag in the policy or have an explicit allowlist.
+- Change control: All policy edits are audited and require a single-engineering approval and a product reviewer for changes that alter semantic thresholds.
+
+Testing & benchmarking guidance
+
+- Use the benchmarking suite to generate a representative request corpus (see service-profile builder). For each mitigation candidate:
+  - Measure delta_p95 and delta_semantic_preservation over 10k requests.
+  - Measure CPU/GPU utilization and memory delta for each node type.
+  - Produce a mitigation scorecard: {p95_delta_pct, sem_pres_mean, cost_delta_pct}.
+
+Appendix A: Example mitigation scorecard (table)
+
+| mitigation | p95_delta_pct | sem_pres_mean | cost_delta_pct |
+|---|---:|---:|---:|
+| kernel_priority_tweak | -8 | 0.99 | -0.5 |
+| enable_kernel_variant nvcc_fast_f32 | -12 | 0.995 | +1.2 |
+| quantize_int8 (aggressive) | -25 | 0.88 | -33 |
+
+Appendix B: Correlation IDs and event schema (example)
+
+Event payload (single line JSON for logs):
+
+{"ts":"2025-11-01T16:24:32Z","correlation_id":"gdo-7f4a","node_id":"node-15","action":"quantize","phase":"start","policy_id":"gd-policy-2025-01","snapshot":{"p95_token_ms":312,"kvcache_hit":0.62}}
+
+Appendix C: Ownership and contacts
+
+- Primary owner: eng-serving-runtime (runtime-ops subteam)
+- Oncall escalation: runtime-oncall -> runtime-kernel-rotation -> eng-sre
+- Design/approvals: Marco Reyes (kernel lead) and Jordan Kim (runtime infrastructure)
+
+Notes and future work
+
+- Integrate language-model-aware quality metrics (hallucination detection) to make quality_guard criteria more robust.
+- Add ML-driven mitigation ranking (currently rule-based) to reduce human tuning.
+- Expose a per-tenant simulation sandbox in the Console for product and CS to preview potential mitigations.
+
+Change log
+
+- 2025-03-12 initial draft by Aisha Patel
+- 2025-06-18 added validation suite and CLI snippets (review by Marco Reyes)
+- 2025-11-01 clarified telemetry contract and event schema; tightened revert criteria (review by Jordan Kim)
+
+Related artifacts and links
+
+- Runtime decision graph (internal): /confluence/eng-serving-runtime/runtime-architecture/runtime-decision-graph-and-observed-behaviour-catalog-2026
+- Scheduler telemetry synthesis: /confluence/eng-serving-runtime/kernel-and-scheduling/scheduler-telemetry-synthesis-and-proofing-2025
+- Mitigation test harness: git repo internal: git@code.redwood:redwood/runtime/gdo-harness.git

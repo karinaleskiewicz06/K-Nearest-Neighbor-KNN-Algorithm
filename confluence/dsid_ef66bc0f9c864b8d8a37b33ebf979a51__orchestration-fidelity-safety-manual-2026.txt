@@ -1,0 +1,162 @@
+Orchestration, Fidelity Fences, and Safety Contracts for Kernel Rollouts
+
+Overview
+
+Purpose: This document defines the operational contracts, safety fences, and validation procedures used when rolling out new kernel codepaths, scheduler policies, or execution-time optimizations into the Redwood serving runtime. It focuses on preserving customer-facing SLOs, preventing fidelity regressions, and enabling deterministic rollback.
+
+Scope: kernel patches, scheduling policy updates, kernel selection heuristics, quantization-aware execution paths, and any runtime change that alters the token emission path. Not in scope: model weights, client SDK changes, or unrelated infra (network/storage) updates.
+
+Audience: runtime engineers, SREs, release engineers, and applied ML owners who approve model-serving risk.
+
+Key Concepts and Definitions
+
+- Fidelity fence: a runtime-enforced boundary that keeps inference outputs within an acceptable quality envelope during transient kernel transitions (e.g., preserving top-k behavior, temperature semantics, or deterministic sampling seeds).
+- Kernel handshake: a short protocol (telemetry + state exchange) between scheduler and GPU dispatcher to confirm compatibility and resource accounting before activation.
+- Stitching window: the safe timeframe after a kernel switch where additional telemetry is collected (higher sampling rate) and aggressive fallbacks are enabled.
+- Contract version: semantic version tag for kernel behaviour guarantees (e.g., v1.2.0-contract-A) used in rollouts and tracing.
+
+Operational Contracts (must be satisfied before rollout)
+
+1) Observability contract
+   - All kernel releases must emit the following telemetry keys at INFO level: kernel.contract_version, kernel.handshake_latency_ms, kernel.activation_slot_id, kernel.fidelity_score_delta, kernel.fallback_trigger.
+   - Traces must include a correlation id (request.trace_id) and kernel.contract_version for every request that touches the new codepath.
+
+2) SLO preservation contract
+   - For any target model route, new kernels must demonstrate no more than +5% p99 latency and no more than +3% failure rate in canary traffic vs baseline.
+   - Fidelity regressions must be bounded: automated eval harness score delta <= configured threshold for that model route (see per-route fidelity thresholds).
+
+3) Rollback determinism contract
+   - A rollback path that restores previous contract_version must preserve kvcache consistency or declare a cache flush procedure. Rollbacks must complete within the configured rollback_timeout (default 90s).
+
+4) Resource accounting contract
+   - Kernel handshake must expose the kernel.resource_profile annotated with memory_peak_bytes, scratch_gpu_bytes, and compute_wave_estimate. Admission controller uses these to avoid overcommit.
+
+Validation and Canary Procedure (step-by-step)
+
+1) Preflight (local lab)
+   - Run unit + microbench: ./tooling/kernel-bench --kernel candidate.so --sequence-lengths 32,256 --concurrency 1,8
+   - Produce deterministic trace for a small corpus (use: test-corpus/fidelity-critical.jsonl).
+
+2) Canary experiment (staging cluster)
+   - Stage: deploy with kernel.contract_version set to candidate tag and the following release flags: --canary-weight=5 --stitching-window=300s --telemetry-sampling=100
+   - Monitor: p50/p95/p99 latency, 5xx rates, kernel.fidelity_score_delta, user-visible metric (per-route BLEU/ROUGE/embedding-cosine).
+
+3) Automated gating
+   - If any of these triggers fire, the system will auto-fail the canary and initiate rollback:
+     a) p99 latency increase > 5% for 10 consecutive minutes
+     b) request failure-rate delta > 3% vs baseline for 5 minutes
+     c) fidelity_score_delta > per-route-threshold for 1 minute
+     d) kernel.handshake_latency_ms > 1s for any activation
+
+4) Gradual ramp
+   - Ramp weights: 5% -> 20% -> 50% -> 100% with a minimum observation window of 15 minutes and metric stability check after each step.
+
+Validation Checklist (table)
+
+| Item | Requirement | Owner | Pass criteria |
+|------|-------------|-------|---------------|
+| Unit tests | Kernel unit-suite + scheduler compat tests | Author | All green on CI |
+| Perf microbench | Throughput & latency baseline | Perf owner | p99 <= +5% |
+| Fidelity eval | Eval harness run vs golden prompts | ML owner | score delta <= threshold |
+| Handshake telemetry | Contract fields present | Runtime SRE | Verified in traces |
+| Chaos dry-run | Simulated GPU eviction and kernel fallback | SRE | Recovery within rollback_timeout |
+
+(When rendered in Confluence, the above table should be a proper table. The stored JSON keeps ASCII table for searchability.)
+
+Safeguards and Automation
+
+- Safety tripwires: Per-cluster admission controller rejects activation of candidate kernels if aggregate memory_reservation + candidate.resource_profile.memory_peak_bytes > 0.95 * cluster_memory_budget.
+- Circuit breaker: If fallback_trigger fires more than 3 times in 1 minute across a shard group, that kernel version gets blacklisted for that shard group and remains in canary with 0% weight until manually approved.
+- Automatic KVCACHE reconciliation: When a rollback is initiated, a controlled cache drain occurs for affected sessions with the following CLI: 
+
+  # drain keys gracefully for a model route
+  redwoodctl cache drain --route product-recommendations --timeout 60s --mode graceful
+
+Benchmarking and Profiling Integration
+
+- Kernel microbench harness example (YAML):
+
+  benchmarks:
+    - name: small-context-latency
+      seq_len: 32
+      batch_shapes: [[1],[4]]
+      concurrency: 1
+    - name: long-context-throughput
+      seq_len: 1024
+      batch_shapes: [[1,16],[2,8]]
+      concurrency: 8
+
+  validation:
+    fidelity_corpus: test-corpus/fidelity-critical.jsonl
+    baseline_trace: traces/baseline-v1.1.jsonl
+
+- Example command to run an annotated profile and push to observability: 
+
+  ./tooling/kernel-bench --config=bench/kernel-ci.yaml --profile=perftrace --push-to=kusto --tag=candidate-2026-01
+
+- Profiling guidance: prioritize wandb-style sample IDs correlating kernel.handshake events with GPU SM counters. Collect top-down breakdown: scheduler_queue_ms, kernel_launch_ms, kernel_exec_ms, memcpy_ms.
+
+Runbook: Kernel-induced Latency Surge (operational playbook)
+
+1) Detection
+   - Alert: runtime.kernel.p99_delta > +5% AND rate(5xx) increased
+
+2) Immediate actions (0-2 minutes)
+   - Identify recent kernel.contract_version activations via trace query:
+
+     query: traces | where kernel.contract_version != "stable" | summarize count() by kernel.contract_version, shard_group
+
+   - If suspect contract_version found, execute controlled canary rollback: redwoodctl rollout rollback --contract <tag> --scope cluster:canary
+
+3) Short-term remediation (2-15 minutes)
+   - Engage perf on-call; increase telemetry sampling to 100% for affected routes: redwoodctl telemetry set-sampling --route <route> --rate 100
+   - Run targeted microbench on the staging copy of the shard (see Benchmarking section).
+
+4) Post-incident (15+ minutes)
+   - Produce timeline: include handshake_latency_ms, fallback_trigger counts, stitch-window duration, and kvcache-miss rates.
+   - Decide: revert and iterate, or patch and re-canary.
+
+Chaos and Validation Experiments (recommended patterns)
+
+- Eviction storm: simulate 10% random GPU evictions during canary to verify fallback correctness. Expected behaviour: fallback_trigger increased briefly; p99 remains < +8% and rollback_timeout not exceeded.
+- Kernel handshake timeouts: inject artificial 2s latency to kernel.handshake and verify admission controller blocks new activations.
+- Cross-tenant pressure: run a mixed workload where priority-synthetic traffic competes for memory; ensure tenant-aware resource_profile admission rejects candidate if headroom < 5%.
+
+Metrics and Dashboards to Monitor
+
+- runtime.kernel.contract_version (tag)
+- kernel.handshake_latency_ms (histogram)
+- kernel.fidelity_score_delta (gauge, per-route)
+- kernel.fallback_trigger (counter)
+- request.latency.{p50,p95,p99} (by route and contract_version)
+- kvcache.hit_rate (per-session)
+
+Example Dashboard Widgets
+
+1) Rollout summary: heatmap of p99 delta by contract_version and route.
+2) Handshake latency histogram with alarm band at 1s.
+3) Fidelity scatter: fidelity_score_delta vs latency delta per sample (helps detect tradeoffs).
+
+Ownership, Approvals, and Release Notes Requirements
+
+- Owners: kernel author (code), runtime SRE (rollout), applied ML owner (fidelity thresholds).
+- Approvals required: code review, perf sign-off, ML sign-off (if route is customer-facing), security scan clearance.
+- Release note template (short):
+
+  - Title: kernel update <contract_version>
+  - Summary: short description of optimization and intended effect
+  - Risk: list of routes impacted and fidelity gates
+  - Rollout plan: canary weights and ramp windows
+  - Contact: primary author + on-call SRE
+
+Appendix: Useful queries and commands
+
+- Trace query: traces | where kernel.contract_version == "candidate-2026-01" | summarize count() by outcome_code
+- blacklisting a kernel for a shard group: redwoodctl kernel blacklist --contract candidate-2026-01 --shard-group shard-17 --reason "fallback-rate-high"
+- run local synthetic evaluation: ./tooling/eval-harness --model-route product-recommendations --input test-corpus/fidelity-critical.jsonl --compare traces/baseline-v1.1.jsonl
+
+Revision history
+
+- 2025-02-03 (Sophie Chen) - initial draft
+- 2025-06-18 (Diego Alvarez) - added handshake resource_profile schema and admission checks
+- 2026-01-20 (Sophie Chen) - tightened canary gating thresholds, added chaos scenarios

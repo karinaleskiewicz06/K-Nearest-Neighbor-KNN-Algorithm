@@ -1,0 +1,181 @@
+runtime-load-synthesis-and-observable-signatures-2026
+
+Overview
+
+Purpose: This page documents a reproducible library of synthetic load shapes and the observable telemetry signatures they produce on the Redwood serving runtime. The goal is to provide engineers and SREs with a shared vocabulary for diagnosing anomalies, designing targeted alerting, and tuning scheduler/kernel knobs.
+
+Audience: runtime engineers, performance SREs, profiling team, and product teams running closed-loop experiments.
+
+Summary of deliverables on this page:
+- Catalog of canonical load shapes (definitions + generator commands)
+- Observable signature matrix (metric patterns to expect)
+- Fault-injection templates to augment load shapes (latency, NVLink, cache eviction)
+- Experiment matrix and acceptance criteria for validating kernel/scheduler changes
+- Quick triage playbook and ownership map
+
+1) Canonical load shapes
+
+Each shape is parameterized by: concurrency distribution (clients), typical sequence length, prompt entropy (deterministic vs high-entropy), and inter-arrival distribution. We provide the recommended stress generator (loadkit) commands and expected runtime flags to enable consistent runs.
+
+A. Steady-state throughput (baseline)
+- Definition: Constant QPS with uniform sequence length; used to calibrate nominal per-token overhead and bandwidth.
+- Parameters: qps=50, seq_len=128, concurrency=25 clients, token_gen_model=llamav2-13b
+- Generator example:
+  loadkit run --shape steady --qps 50 --seq-len 128 --clients 25 --duration 15m --model llamav2-13b 
+- Runtime flags: --kv-cache=on --batching=continuous --batch-max-tokens=8192
+
+B. Bursty microspikes
+- Definition: Short (30s-2m) bursts at 5–10x baseline QPS; tests kernel preemption and queue admission.
+- Parameters: baseline_qps=50, burst_multiplier=8, burst_period=90s
+- Generator example:
+  loadkit run --shape bursty --qps 50 --burst-mult 8 --burst-period 90s --seq-len 64 --duration 10m
+
+C. Ramp-and-hold (scale events)
+- Definition: Linear ramp from low to high QPS (1x to 10x) over 10 minutes, hold for 5 minutes, then decay. Useful for scaling/autoscaler validation.
+- Generator example:
+  loadkit run --shape ramp --start-qps 5 --end-qps 500 --ramp-duration 10m --hold 5m --seq-len 256
+
+D. Tail-heavy (sporadic large sequences)
+- Definition: Mix of short (32 tokens) and long (2048 tokens) requests, with long requests at 2% frequency. Validates sequence-length-dependent kernel breakpoints.
+- Generator example:
+  loadkit run --shape tail-heavy --short 32 --long 2048 --long-rate 0.02 --qps 80 --duration 20m
+
+E. Cold-fanout (many cold model initializations)
+- Definition: Many clients create new sessions without sharing KV cache. Designed to exercise warmup/warmstart paths and model load latency.
+- Generator example:
+  loadkit run --shape cold-fanout --clients 500 --session-duration 10s --seq-len 64 --duration 15m
+
+F. Mixed-tenant blend (multi-tenant interference)
+- Definition: Two synthetic tenants with orthogonal SLOs: tenant-A (low-latency p99 < 150ms), tenant-B (high-throughput). Run with quota split and observe scheduler isolation.
+- Generator example:
+  loadkit run --shape mixed --tenant-a-qps 40 --tenant-b-qps 160 --seq-len 128 --duration 30m
+
+2) Observable signature matrix (metrics -> patterns)
+
+This table maps common runtime metrics to the signatures you should expect under each load shape. Use this when triaging a regression or validating a kernel/scheduler change.
+
+Metric names (Prometheus / runtime telemetry):
+- runtime_request_latency_seconds_bucket (histogram buckets)
+- runtime_request_duration_seconds_count
+- runtime_kernel_queue_depth
+- runtime_kernel_preemptions_total
+- runtime_gpu_kernel_execute_time_seconds_sum
+- runtime_kvcache_miss_rate
+- runtime_batch_size_distribution (histogram)
+- runtime_dispatch_retries_total
+- runtime_gpu_memory_fragmentation_ratio
+- runtime_dispatch_backpressure_events_total
+
+Signature examples (human-readable)
+- Steady-state: stable p50/p95, batch_size_distribution mode ~ batch-max configured, kernel_queue_depth small and steady, kvcache_miss_rate low (<1%).
+- Bursty spikes: p99 jumps, kernel_queue_depth spikes ahead of backpressure events, preemptions_total increases during burst, batch size distribution briefly collapses to single-digit sizes as slicing occurs.
+- Ramp-and-hold: linear growth in dispatch_retries_total if admission control thresholds are too low; expected backpressure events at ramp inflection if autoscaler lag is present.
+- Tail-heavy: p99/p999 driven by long sequences; per-token GPU utilization may remain steady but kernel_execute_time_seconds_sum climbs non-linearly and memory fragmentation_ratio may rise.
+- Cold-fanout: increased model_load_latency (custom metric), kvcache_miss_rate ~ 100% for new sessions, p50 increases until caches warm.
+- Mixed-tenant: tenant isolation failure shows as tenant-A p99 elevated while tenant-B throughput unchanged; kernel_credit accounting metrics will display negative drift if quota misapplied.
+
+PromQL examples to surface signatures:
+- p99 latency (overall): histogram_quantile(0.99, sum(rate(runtime_request_latency_seconds_bucket[1m])) by (le))
+- kernel queue depth per node: max(runtime_kernel_queue_depth) by (node)
+- kvcache miss rate: sum(rate(runtime_kvcache_miss_total[2m])) / sum(rate(runtime_kvcache_request_total[2m]))
+- preemption spike detector (alert candidate): increase(runtime_kernel_preemptions_total[5m]) > 5
+
+3) Fault-injection templates
+
+Inject faults in a controlled way to see how system signatures change. We use two layers: network-level (tc/netem) and runtime-level (chaos injector). Below are JSON templates for the chaos injector used in staging.
+
+Example: NVLink degradation (chaos template)
+
+{
+  "name": "nvlink-degrade-15pct-60s",
+  "target": "node-pool-gpu-1",
+  "duration": "60s",
+  "actions": [
+    {"type": "nvlink-fault", "severity": "degrade", "rate": "15%"}
+  ]
+}
+
+Example: artificial scheduler pause (runtime-level)
+
+{
+  "name": "scheduler-pause-500ms-30s",
+  "target": "scheduler-instance-*",
+  "duration": "30s",
+  "actions": [
+    {"type": "pause-loop", "delay_ms": 500, "scope": "dispatch"}
+  ]
+}
+
+Notes on safe practice: always run fault injection in a staging cluster isolated from production telemetry ingestion. Each template must have a linked kill-switch and ownership assigned (see ownership map below).
+
+4) Experiment matrix and acceptance criteria
+
+Use this matrix when validating a scheduler or kernel change. The matrix is the canonical checklist for feature rollouts and performance PRs. Run each cell and record metric deltas.
+
+Experiment columns: change-id, kernels toggled, scheduler flag, test-shape, measurement window, acceptance criteria
+
+Example rows (text table):
+- CHG-3821 | per-request-kernel-hedging=on | priority-synthesis=v2 | bursty | 30m | p99 delta <= 10% at baseline; preemptions not increased by >20%
+- CHG-3914 | simplified-quant-kernel | batch-max-tokens=8192 | tail-heavy | 1h | token throughput +/- 5%; memory fragmentation ratio decrease >= 5%
+- CHG-4070 | kvcache-warmup-prefetch=experimental | -- | cold-fanout | 20m | model_load_latency median reduced by >= 30%
+
+Recording: attach standardized CSV export with columns: timestamp, node, metric, baseline_value, experimental_value, delta_pct, notes. Store results in the runtime-experiments bucket with naming convention experiments/{change-id}/{date}.csv
+
+5) Quick triage playbook (when you see a signature)
+
+- Symptom: sudden p99 spike across nodes during bursty test
+  1. Check kernel queue depth and preemptions: PromQL provided above. If queue depth > configured_batch_capacity for >30s, open runbook "kernel-contention-throttling-and-backpressure-playbook".
+  2. Verify batch size distribution collapsed: run query on runtime_batch_size_distribution. If yes, escalate to kernel team and reference CHG-3821 test results.
+  3. Restart path: if a node shows sustained high queue depth and memory pressure, follow runbook: sigmoid drain -> graceful pod restart -> warmstart prefetch.
+
+- Symptom: increased kvcache_miss_rate during mixed-tenant runs
+  1. Confirm session affinity header in request provenance trace. If missing, trace request path to frontend.
+  2. If affinity is present but miss rate high, inspect kvcache-shard-mapping indices and run shard rebalancer in dry-run.
+
+6) Ownership and contacts
+
+- Runtime telemetry & dashboards: SRE Observability (owner: Connor Blake)
+- Kernel scheduling experiments and rollouts: Serving Runtime Kernel Team (owner: Marina Liu)
+- Load generator & experiment infra: Perf Tools team (owner: Rashmi Verma)
+- Chaos / Fault injection approvals: Safety Council (owner: Leila Ortega)
+
+7) Dashboards and queries to add to shared boards
+
+- Load Shape Overview: per-shape panes with qps, p50/p95/p99, batch_size_mode, kvcache_miss_rate
+- Node Health pane: kernel_queue_depth heatmap, gpu_memory_fragmentation_ratio, dispatch_retries_total
+- Experiment delta pane: precomputed delta panels for each active change-id
+
+8) Known caveats and interpretations
+
+- Kernel queue depth can transiently overshoot during admission-control recalculation; only treat >30s sustained increase as actionable.
+- Large sequence tails will skew histogram-based aggregates; prefer quantile over sliding window and inspect per-sequence-length segments.
+- Batch size distribution collapse is often a downstream symptom (e.g., kernel slicing), not a root cause — correlate with preemption and dispatch_retry metrics.
+
+9) Templates and artifacts (links)
+
+- Experiment CSV template: experiments/template-experiment-csv-v1.csv
+- Loadkit repo: git@github.com:redwood/loadkit.git
+- Telemetry queries: /dashboards/runtime-load-signatures
+
+Appendix A — Sample experiment checklist (short)
+1) Create experiment directory experiments/{change-id}/{date}/
+2) Ensure staging cluster is isolated and telemetry ingestion tagged with label: experiments/{change-id}
+3) Run baseline steady-state for 20 minutes and store CSV
+4) Run target shape(s) per matrix and store CSVs
+5) Run fault-injection template if applicable (single template per run)
+6) Aggregate and compare metrics, fill out acceptance criteria form
+7) Present findings at the weekly kernel-change sync and attach results to the PR
+
+Appendix B — Useful CLI snippets
+
+- Start a steady baseline and stream telemetry to CSV:
+  loadkit run --shape steady --qps 50 --seq-len 128 --clients 25 --duration 15m | tee baseline.csv
+\- Apply chaos template (staging only):
+  chaosctl apply -f nvlink-degrade-15pct-60s.json --env staging --wait 10s
+
+- Export Prometheus query to CSV (example p99):
+  promql-to-csv "histogram_quantile(0.99, sum(rate(runtime_request_latency_seconds_bucket[1m])) by (le))" --from now-30m --to now --step 15s > p99.csv
+
+Document change history: initial publish 2025-11-12 by Marina Liu; added fault-injection templates and mixed-tenant guidance 2026-02-08 by Marina Liu.
+
+End of document

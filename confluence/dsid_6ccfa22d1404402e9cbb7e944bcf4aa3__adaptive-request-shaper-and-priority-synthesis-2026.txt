@@ -1,0 +1,186 @@
+Adaptive Request Shaper and Priority Synthesis - Runtime Guide
+
+Overview
+
+This document defines the Adaptive Request Shaper and Priority Synthesis subsystem: a runtime-layer component that shapes incoming inference traffic, synthesizes per-request priority scores, and coordinates with kernel scheduling and batching to meet latency SLOs while minimizing cost. It covers high-level architecture, scheduling interactions, telemetry and profiling guidance, integration with the benchmarking suite, release and rollout checklist, and an operational runbook.
+
+Why this exists
+
+- Problem: production LLM workloads exhibit widely varying sequence lengths, cold prefixes, and priority semantics (interactive vs background). Static admission controls either waste GPU cycles or violate latency SLOs.
+- Goal: provide a predictable, transparent shaping layer that maps business intents (user-facing vs background, deadline, cost-sensitivity) to runtime actions (admit, delay, throttle, reroute) and exposes deterministic knobs for SRE/product to tune.
+
+Scope and non-goals
+
+- In-scope: admission control, token-budget-aware shaping, deadline-aware batching hints, priority score synthesis and annotation, integration points to kernel scheduler and batcher, relevant telemetry and dashboards.
+- Out-of-scope: model optimizer internals, KV cache replication, network-level routing across regions (handled by Smart Routing).
+
+Design overview
+
+1) Request API annotations
+- New optional fields the API accepts (internal header or SDK metadata):
+  - priority_hint: {"interactive"|"standard"|"background"}
+  - deadline_ms: integer (soft deadline relative to request arrival)
+  - cost_sensitivity: {"low"|"medium"|"high"} (guides quantization/cache preference)
+  - work_token_budget: integer (max tokens allowed for request)
+
+2) Priority synthesizer
+- Consumes API annotations, historical per-identity tail-latency distribution, and a local cost estimator to compute a normalized priority_score in [0.0, 1.0].
+- Score semantics: closer to 1.0 = higher admission and preference for low-latency kernels and smaller batches. Scores are deterministic given inputs for reproducibility in benchmarking.
+
+3) Adaptive shaper / admission controller
+- Core responsibilities:
+  - Admit immediately to active queue (fast-path)
+  - Place in delay queue with per-client backoff (soft-hold)
+  - Reject with structured error or reroute to cheaper model variant (fallback mapper)
+  - Annotate requests with batch hints (min_batch_size, max_wait_ms) for the batcher
+- Local policy uses dynamic thresholds computed from target SLO utilization and observed kernel queue lengths.
+
+4) Scheduler interaction points
+- Kernel scheduler accepts requests annotated with priority_score and batch hints. The scheduler maps high priority requests onto preemptible GPU lanes or hot-shard contexts; lower priority requests are eligible for cooperative preemption.
+
+5) Cost estimator
+- Lightweight model that provides per-request expected token-cost given current quantization profile and KV cache hit probability. Used in priority synthesis when cost_sensitivity is set.
+
+Configuration (defaults and critical knobs)
+
+Configuration table (values represent recommended defaults for hosted tier):
+
+| parameter | default | description | operational range | unit |
+|-----------|---------|-------------|-------------------|------|
+| global_target_p99_ms | 200 | target p99 latency for interactive route | 50-1000 | ms |
+| fastpath_queue_depth | 256 | max parallel requests admitted to fast-path | 64-2048 | requests |
+| delay_queue_base_ms | 30 | base delay for soft-hold queue | 10-200 | ms |
+| priority_decay_half_life_s | 120 | half-life for historical tail influence | 30-600 | s |
+| min_batch_hint | 1 | minimum suggested batch size to batcher | 1-16 | tokens/requests |
+| max_batch_wait_ms | 30 | maximum batch wait the shaper suggests | 5-200 | ms |
+| cost_weight | 0.3 | weight on cost_sensitivity in score calc | 0.0-1.0 | fractional |
+
+Example runtime config (YAML fragment):
+
+shaper:
+  enabled: true
+  global_target_p99_ms: 200
+  fastpath_queue_depth: 256
+  delay_queue_base_ms: 30
+  priority_decay_half_life_s: 120
+  cost_weight: 0.3
+
+CLI snippets (admin):
+- Toggle shaper on a node pool: rwdctl runtime shaper set --nodepool=pred-hosts --enabled=false
+- Inspect queues: rwdctl runtime shaper stats --node=runtime-23
+- Force a request to background priority (test): rwdctl runtime simulate --priority=background --seq-len=512
+
+Telemetry and dashboards
+
+Essential metrics (all exported with request tagging):
+- shaper.request_admitted_total{route,priority_hint} (counter)
+- shaper.request_delayed_total{route,delay_bucket} (counter)
+- shaper.request_rejected_total{reason} (counter)
+- shaper.priority_score_distribution (histogram)
+- shaper.estimated_cost_hist (histogram)
+- shaper.delay_queue_depth (gauge)
+- shaper.fastpath_queue_depth (gauge)
+- shaper.slo_breach_by_priority (counter)
+
+Suggested dashboards:
+- Per-route priority breakdown (pie + timeseries)
+- Delay-queue depth vs p99 latency (scatter)
+- Cost-sensitivity impacts: cost per token vs p99 by priority group
+
+Profiling and evaluation guidance
+
+1) Micro-profiling the shaper itself
+- Goal: ensure shaper logic adds <1ms median overhead in critical path.
+- Procedure:
+  1. Use runtime-profiling harness: rwd-bench profile --module=shaper --workload=interactive-1000 --samples=5000
+  2. Measure: CPU time per request, lock contention, GC pauses.
+  3. If median >1ms, capture flamegraph and file an issue with kernel-and-scheduling.
+
+2) End-to-end profiling (shaper + scheduler + batcher)
+- Run the mixed workload suite (see benchmarking integration below) and compare:
+  - Baseline: shaper disabled, default scheduler
+  - Candidate: shaper enabled with current thresholds
+- Key traces to collect: kernel queue latency, batch sizes, preemption events, tail-latency percentiles per priority.
+
+Benchmarking suite integration
+
+- Add a dedicated scenario to the mixed_workload_slo_simulation_suite named shaper_mixed_priority_v1. Scenario characteristics:
+  - 60/30/10 split interactive/standard/background
+  - Sequence length distribution: {short: 45%, medium: 35%, long: 20%}
+  - Inter-arrival CV (coefficient of variation): 1.2
+- Success criteria:
+  - interactive p99 <= global_target_p99_ms
+  - cost per 1k tokens reduced or unchanged vs baseline
+  - no >2% increase in rejected requests from synthetic product tests
+
+Release and rollout checklist
+
+- Unit and integration tests covering synth logic and boundary conditions.
+- Staging run: 12h continuous run against mixed_workload_shaper with telemetry pushed to staging dashboards.
+- Canary: enable shaper for 5% of traffic for 24 hours in a single region. Monitor:
+  - shaper.slo_breach_by_priority (must not exceed historical by more than 0.5%)
+  - user-visible error rate (SLOs); rollback if >3x baseline for >5 minutes
+- Gradual expansion: 5% -> 20% -> 50% -> 100% with automated health gating.
+
+Operational runbook (page on-call should follow)
+
+Alerts that should page (examples):
+1) shaper.delay_queue_depth > fastpath_queue_depth for > 5m AND interactive p99 rising > 20% -> page oncall_runtime_primary
+2) shaper.request_rejected_total unexpectedly increases by > 1% of traffic in 10m -> page runtime-owner.
+
+On-call initial steps:
+1) Check the shaper dashboard: queue depths, p99 by priority, priority_score_distribution.
+2) If interactive p99 is high and delay queue deep: scale up fastpath_queue_depth or temporarily disable shaper for affected route: rwdctl runtime shaper set --route=search --enabled=false
+3) If rejections rise: inspect reject reasons (capacity vs policy). If policy misconfiguration suspected, apply rollback: rwdctl runtime shaper rollback --config-version=previous
+4) If CPU saturation on shaper process observed: escalate to eng-platform to allocate additional CPU or isolate the shaper to a dedicated control-plane CPU pool.
+
+Known issues and mitigations
+
+- Issue: Priority oscillation with bursty clients
+  - Symptom: requests flip rapidly between fast-path and delay queue, causing spiky preemption.
+  - Mitigation: increase priority_decay_half_life_s to 300s or apply per-client smoothing.
+
+- Issue: Overly aggressive cost-driven demotion for long-sequence requests
+  - Symptom: long-running generation tasks get rerouted to fallback model and produce degraded outputs.
+  - Mitigation: cap cost influence for sequences with deadline_ms set; use a separate routing profile.
+
+- Issue: Telemetry gaps after autoscaler events
+  - Symptom: delay_queue_depth and priority distributions reset after scale-down events.
+  - Mitigation: ensure shaper state persists in the shard metadata store (config flag: persist_shaper_state = true).
+
+Implementation notes and file locations
+
+- Core service: rwd-shaper-service (repo: infra/rwd-shaper)
+- Priority synthesizer library: infra/rwd-shaper/pkg/priority (unit tested)
+- Cost model: infra/estimators/request-cost (offline training harness in perf/estimators)
+- Kernel hooks: runtime/kernel-adapter/shaper-integration.md
+
+Related pages
+
+- /eng-serving-runtime/kernel-and-scheduling/priority-driven-kernel-scheduler-spec-2026
+- /eng-serving-runtime/benchmarking-and-perf-suite/mixed-workload-slo-simulation-suite-2026
+
+Appendix: example scoring function (pseudo)
+
+priority_score = clamp(\
+  w_annot * annotated_score + w_history * historical_score + w_cost * (1 - normalized_estimated_cost), 0.0, 1.0\)
+
+Where:
+- annotated_score maps priority_hint: interactive=1.0, standard=0.6, background=0.2
+- historical_score derived from empirical tail-latency (higher if client historically meets SLO)
+- normalized_estimated_cost is cost estimate normalized to [0,1]
+- weights (w_annot, w_history, w_cost) are tunable; default = (0.5, 0.2, 0.3)
+
+Contact and ownership
+
+- Primary owner: Nikhil Rao (eng-serving-runtime)
+- Secondary: Leah Patel (eng-sre)
+- Slack channel: #rwd-runtime-shaper
+
+Document history
+
+- 2025-11-02: Draft created (N. Rao)
+- 2025-12-15: Added profiling checklist and telemetry (L. Patel)
+- 2026-02-10: Updated rollout gating and known-issues (M. Diaz)
+
+End of document

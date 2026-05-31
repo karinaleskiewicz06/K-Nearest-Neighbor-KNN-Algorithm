@@ -1,0 +1,470 @@
+Design Spec: Optimization Config Versioning + Safe Apply/Rollback
+
+## Summary
+This document specifies the end-to-end design for **Optimization Config versioning** and **safe apply/rollback workflows** across Hosted, Dedicated, and Private deployments.
+
+Optimization Configs control runtime optimization behavior such as:
+- batching heuristics
+- caching toggles and parameters
+- quantization profile selection
+
+The design introduces immutable config versions, scoped rollouts with gating signals, and one-click rollback with strong auditability.
+
+## Goals
+1. **Immutable version history** for all optimization changes (who/what/when, diffable).
+2. **Safe apply** via staged rollout (tenant/model/region scope) with gates:
+   - SLO gates (5xx + p95/p99 latency)
+   - saturation/capacity signals (GPU utilization, queueing)
+   - eval/quality gates for quantization changes
+3. **One-click rollback** (Console + API), with well-defined semantics in a distributed runtime.
+4. **Idempotent runtime config applier** and protections against apply/rollback race conditions.
+5. **Works across deployment modes**:
+   - Hosted + Dedicated (managed by Redwood control plane)
+   - Private (same version model + operator-friendly pin/rollback integration)
+
+## Non-goals (initial release)
+- Fully automatic rollback for all customers without human confirmation.
+- Cross-subsystem transactional rollback (e.g., simultaneous rollback of unrelated routing policies).
+- Replacing existing general “deployment” rollouts; this system is specific to optimization configs.
+
+## Terminology
+- **Optimization Config (logical)**: The conceptual configuration for a scope (e.g., tenant A + model X + region us-east).
+- **Version**: An immutable snapshot of the Optimization Config payload plus metadata.
+- **Active version**: The version currently targeted for a scope.
+- **Rollout**: A staged transition from one version to another, with monitoring and gate evaluation.
+- **Promotion**: Marking a version as “known-good” for a broader scope or as a recommended baseline.
+- **Scope**: A tuple defining where the config applies.
+
+## High-level architecture
+Components:
+1. **Optimization Config Service (control plane)**
+   - Stores immutable versions
+   - Computes diffs
+   - Validates schema + semantics
+   - Orchestrates rollouts and rollbacks
+   - Emits audit events
+2. **Canary/Rollout Controller**
+   - Progresses staged rollout
+   - Evaluates gating signals
+   - Pauses, fails, or completes rollout
+3. **Serving Runtime (data plane)**
+   - Fetches active config version for a scope
+   - Applies config idempotently on workers
+   - Exposes metrics tagged with config_version
+4. **Console UX**
+   - Version history + diff view
+   - Safe apply flow and progress view
+   - Rollback button with blast radius summary + confirmation
+
+### Data/control flow (Hosted/Dedicated)
+1. Operator creates a new version (draft) in Console/API.
+2. Service runs validation (schema + semantic).
+3. Operator starts safe apply: creates a Rollout from current active version → target version.
+4. Rollout Controller stages traffic exposure (canary percent or shard selection).
+5. Gates read metrics and eval results. If pass, rollout progresses; otherwise pauses/fails.
+6. When complete, the service sets the scope’s Active pointer to the target version.
+7. Rollback sets Active pointer back to prior version and triggers the same apply pipeline in reverse (with additional safeguards).
+
+### Data/control flow (Private)
+- Versions exist in the Private control plane, but operators may also **pin** a version through installer/Helm/Terraform values.
+- Rollback is implemented as a controlled update of the pinned version (or active pointer), plus a verification checklist.
+
+## Requirements and invariants
+### Version immutability
+- Version payloads are immutable once created.
+- Metadata fields like labels and “promotion status” are mutable, but the content hash (payload) is not.
+
+### Deterministic application
+- A given worker applies config version V deterministically.
+- The runtime must be safe under retries: applying V multiple times must converge to the same state.
+
+### Eventually consistent, but never “unknown”
+- During rollout, workers may temporarily run a mix of versions.
+- The system must always be able to report:
+  - the **desired/active** version for a scope
+  - the **observed** versions on workers (best-effort)
+  - the **rollout state** and last gate evaluation
+
+### Rollback safety
+- Rollback must be safe even when a rollout is mid-flight.
+- Race condition policy: a scope has a single monotonic “generation” such that apply/rollback operations cannot interleave silently.
+
+## Scope model
+A scope defines where a config applies.
+
+**Scope key fields** (v1):
+- tenant_id (required)
+- model_id (required)
+- region (optional; defaults to “all regions for tenant/model”)
+- deployment_mode (Hosted | Dedicated | Private) (required)
+
+Notes:
+- Dedicated is treated like Hosted from a control plane perspective, but may have additional isolation keys (e.g., dedicated_pool_id). We keep that as an optional field in v1.
+- Private may use customer-provided identifiers; we still store tenant_id/model_id as Redwood-level logical identifiers.
+
+## Data model
+This section describes the logical entities and suggested storage schema. Exact DDL lives in ENG-4821 and corresponding migrations.
+
+### Entity: OptimizationConfigVersion
+Represents an immutable configuration snapshot.
+
+Fields:
+- version_id: string (ULID)
+- scope_key: string (canonicalized tuple; see below)
+- payload_json: string (the full config)
+- payload_sha256: string
+- parent_version_id: string (optional; used to build a chain)
+- created_by: string (user/service principal)
+- created_at: timestamp
+- change_reason: string (operator-provided)
+- source: string (console|api|automation)
+- risk_level: string (low|medium|high; computed + overrideable)
+- annotations: string (freeform; optional)
+
+Canonical scope_key format:
+- "tenant:{tenant_id}|model:{model_id}|region:{region_or_all}|mode:{deployment_mode}|pool:{pool_id_or_none}"
+
+### Entity: OptimizationConfigPointer (Active)
+Represents the currently active (desired) version for a scope.
+
+Fields:
+- scope_key: string (PK)
+- active_version_id: string
+- generation: int (monotonic; increments on every apply/rollback)
+- updated_by: string
+- updated_at: timestamp
+
+Invariant:
+- (scope_key, generation) strictly increases with each pointer change.
+
+### Entity: OptimizationConfigRollout
+Represents an apply operation (including rollback).
+
+Fields:
+- rollout_id: string (ULID)
+- scope_key: string
+- from_version_id: string
+- to_version_id: string
+- type: string (apply|rollback)
+- status: string (queued|running|paused|failed|completed|canceled)
+- canary_strategy: string (percent|shard)
+- canary_steps: string (serialized list; e.g., "1,5,25,50,100")
+- step_duration_seconds: int
+- gateset_id: string (references default/override gate rules)
+- started_at: timestamp
+- completed_at: timestamp (nullable)
+- created_by: string
+- created_at: timestamp
+- failure_reason: string (nullable)
+
+### Entity: GateEvaluationRecord
+Stores the rollout’s gate evaluations for observability and audit.
+
+Fields:
+- rollout_id: string
+- step: string (e.g., "5%")
+- evaluated_at: timestamp
+- result: string (pass|fail|inconclusive)
+- details: string (human-readable summary + links)
+
+### Config payload schema (v1)
+Payload is a JSON object with top-level sections:
+- batching
+- caching
+- quantization
+- misc
+
+Example (illustrative):
+- batching.max_batch_tokens
+- batching.max_concurrent_sequences
+- caching.enabled
+- caching.prefix_cache.max_entries
+- quantization.profile_id
+- quantization.fallback_profile_id
+
+Schema validation rules:
+- strict JSON schema validation
+- unknown fields rejected by default (forward-compatible via explicit schema version)
+
+Semantic validation examples:
+- batching.max_batch_tokens must be within safe bounds per model family
+- caching.enabled requires runtime capability flag for the model/region
+- quantization.profile_id must exist and be compatible with model_id
+
+## Versioning semantics
+### Creating a version
+- A new version is created for a specific scope_key.
+- parent_version_id defaults to the current active version for the scope (if any).
+- A version can be created even if it is never applied (e.g., abandoned experiments).
+
+### Promotion
+Promotion is metadata indicating broader confidence.
+
+We support two promotion concepts:
+1. **Known-good label** for a scope: "known_good" tag for quick selection.
+2. **Recommended baseline** for a model family: implemented as a separate pointer type in a future phase.
+
+For v1, we implement only (1) as metadata (no extra pointer), to avoid complexity.
+
+## API surface
+APIs are provided via the Optimization Config Service. Some endpoints are internal-only at first; customer-facing equivalents may be added in later iterations.
+
+### Authentication and authorization
+- All endpoints require auth.
+- RBAC checks map to permissions:
+  - optimization_config.version.create
+  - optimization_config.version.validate
+  - optimization_config.rollout.start
+  - optimization_config.rollout.pause/resume/cancel
+  - optimization_config.rollback.execute
+  - optimization_config.version.promote (metadata)
+
+See: RBAC policy bundle updates and PM-902.
+
+### Endpoints (v1)
+**Versions**
+- POST /v1/optimization-config/versions
+  - create a new version for a scope
+- GET /v1/optimization-config/versions?scope_key=... (paginated)
+  - list versions
+- GET /v1/optimization-config/versions/{version_id}
+  - fetch version details
+- GET /v1/optimization-config/versions/{version_id}/diff?base_version_id=...
+  - server-side diff (base defaults to parent_version_id)
+- POST /v1/optimization-config/versions/{version_id}/validate
+  - runs schema + semantic checks; returns errors/warnings
+
+**Active pointer**
+- GET /v1/optimization-config/active?scope_key=...
+  - returns active_version_id + generation
+
+**Rollouts / safe apply**
+- POST /v1/optimization-config/rollouts
+  - create rollout (apply) for scope from active → target
+- GET /v1/optimization-config/rollouts/{rollout_id}
+  - rollout status + last gate result
+- POST /v1/optimization-config/rollouts/{rollout_id}:pause
+- POST /v1/optimization-config/rollouts/{rollout_id}:resume
+- POST /v1/optimization-config/rollouts/{rollout_id}:cancel
+
+**Rollback**
+- POST /v1/optimization-config/rollbacks
+  - creates a rollout of type=rollback with to_version_id = specified prior version
+  - server enforces "rollback target must be an existing version for the same scope_key"
+
+### Response semantics and idempotency
+- All create endpoints accept optional idempotency_key.
+- Rollout creation is idempotent by (scope_key, to_version_id, type, created_by) within a short window to prevent accidental duplicates.
+
+### Errors and edge cases
+- 409 Conflict if:
+  - a rollout is already running for the scope and the operation would overlap
+  - generation has moved (stale client)
+- 422 Unprocessable Entity for validation failures
+- 403 Forbidden for RBAC failures
+
+## Console workflows
+Console screens covered by DES-211/212/213.
+
+### 1) Version history (timeline)
+For a selected scope (tenant/model/region):
+- show active version
+- list prior versions with:
+  - created_by, created_at
+  - change_reason
+  - status tags: "validated", "applied", "failed rollout", "known-good"
+
+### 2) Diff view
+- server-side diff with field-level highlighting
+- risky fields emphasized (quantization.profile_id, batching.* ceilings)
+- show computed “risk_level” with rationale
+
+### 3) Safe apply
+Flow:
+1. Select a version (validated required for high-risk changes; optional for low-risk)
+2. Configure rollout:
+   - canary strategy (percent default)
+   - steps (defaults: 1% → 5% → 25% → 50% → 100%)
+   - step duration (default 10 minutes)
+   - gateset (default recommended)
+3. Start rollout
+4. Monitor progress:
+   - gate results per step
+   - links to dashboard panels
+5. Completion: version becomes active for scope
+
+### 4) Rollback
+Rollback entry points:
+- from a specific version details page (“Rollback to this version”)
+- from the active version card (“Rollback to previous active”)
+
+Confirmation modal includes:
+- blast radius summary (scope)
+- from_version → to_version
+- warning if rollback crosses quantization profile boundaries
+- “type to confirm” for high-risk scopes
+
+After rollback starts:
+- Console shows rollout state (rollback is just a rollout type)
+- links to rollback runbook and dashboards
+
+## Interaction with runtime/apply pipeline
+This design assumes the runtime already has a config apply pipeline that can be adapted for version fetching and idempotent application.
+
+### Runtime responsibilities
+- Periodically fetch (or subscribe to) active pointer for each scope:
+  - active_version_id
+  - generation
+- Fetch the corresponding version payload
+- Apply it using an idempotent applier
+- Emit metrics tagged by:
+  - tenant_id, model_id, region
+  - config_version_id
+  - rollout_id (when applicable)
+
+### Fetch model
+We support two modes:
+1. Pull-based:
+   - workers poll active pointer (fast path cached; low TTL)
+2. Push-assisted:
+   - control plane emits an event "optimization_config.changed" to notify runtime to refresh
+
+v1 uses pull-based with push-assisted as an optimization (eventing is already planned in PR-20063).
+
+### Apply checkpoints and idempotency
+To avoid mixed/partial state on a worker, apply is modeled as a small transaction:
+1. Validate payload compatibility with runtime build (capabilities)
+2. Apply batching params
+3. Apply caching params
+4. Apply quantization selection
+5. Commit applied_version_id + generation to a local state file / in-memory register
+
+If any step fails:
+- worker reports apply_failure metric including failing component
+- worker remains on previous applied version (or enters safe fallback mode depending on component)
+
+### Handling apply/rollback races
+We use the pointer generation field:
+- When a worker observes (active_version_id, generation), it applies only if generation is newer than its last applied generation.
+- If it is in the middle of applying generation N and sees generation N+1, it aborts and restarts from latest desired state.
+
+Control plane policy:
+- Only one rollout can be RUNNING per scope_key.
+- Rollback requests against an in-flight rollout:
+  - allowed only if requester has rollback permission
+  - rollout controller cancels/pauses the in-flight rollout and starts a rollback rollout with a new generation
+
+## Rollout controller and gating
+### Rollout progression
+For percent-based canary:
+- Controller selects traffic exposure increments by adjusting the request router policy for that scope.
+- At each step:
+  - wait for step_duration
+  - evaluate gates over the step window (with a warmup exclusion window; default first 2 minutes ignored)
+  - if pass → proceed
+  - if fail → pause and require operator action (v1)
+
+For shard-based canary:
+- Controller selects a fixed set of worker shards or sub-regions (Dedicated pools) for exposure.
+
+### Default gates (v1)
+Values are defaults; ADR defines final thresholds.
+
+SLO gates (per scope):
+- 5xx rate: must not exceed baseline + 0.20% absolute for two consecutive evaluation windows
+- p95 latency: must not exceed baseline * 1.15
+- p99 latency: must not exceed baseline * 1.20
+
+Saturation gates:
+- GPU utilization: must not exceed 92% sustained at canary step (to avoid queueing collapse)
+- queue_delay_p95: must not exceed 2x baseline
+
+Quantization quality gates:
+- If quantization.profile_id changes, require eval harness signal:
+  - regression_score <= threshold for selected prompt sets
+  - inconclusive results pause rollout
+
+### Gate evaluation inputs
+- Metrics from the runtime/observability stack tagged with config_version_id.
+- Optional perf-canary job results for controlled synthetic load.
+- Eval harness results for quantization changes.
+
+### Baselines
+Baseline is computed as:
+- current active version performance during the last 24 hours
+- adjusted by time-of-day seasonality where available
+
+v1 baseline uses a simpler approach:
+- median of last 6 hours for the same scope and traffic class
+
+## Audit logging
+Every lifecycle action emits an audit event with:
+- action (create|validate|apply_start|apply_pause|apply_resume|apply_complete|rollback_start|rollback_complete|promote)
+- actor identity (user/service)
+- scope_key
+- version_id (target)
+- from_version_id (when applicable)
+- rollout_id
+- request_id
+- timestamp
+
+Event naming and required fields are defined in the audit log specification page.
+
+## Failure modes and mitigation
+1. **Validation misses a semantic incompatibility**
+   - Mitigation: runtime capability checks; rollout gates detect regressions; rollback is fast.
+2. **Rollout controller stuck (no progression)**
+   - Mitigation: watchdog that fails rollout if no state change for N minutes; operator can cancel.
+3. **Mixed worker state persists**
+   - Mitigation: generation-based convergence; worker reports last_applied_version/generation; controller shows convergence metric.
+4. **Metrics tagging missing config_version**
+   - Mitigation: enforce tag presence in runtime instrumentation; gate evaluation marks “inconclusive” if tags absent.
+5. **Rollback makes things worse**
+   - Mitigation: rollback is itself gated and can be paused; operators can rollback again to earlier known-good.
+
+## Backward compatibility and migration
+Existing (pre-versioning) optimization configs will be migrated as follows:
+- For each existing scope, create an initial OptimizationConfigVersion v0 with:
+  - created_by = "migration"
+  - change_reason = "bootstrap from pre-versioning config"
+- Set active pointer to v0.
+
+During migration window:
+- old config store remains read-only
+- runtime reads active pointer only
+
+## Observability
+Required dashboards and metrics:
+- Rollout progress (step, percent, status)
+- Error rate and latency split by config_version
+- Apply failures (by component: batching/caching/quantization)
+- Convergence: % of workers reporting desired generation
+- Audit annotations on charts (apply/rollback events)
+
+## Security considerations
+- RBAC enforcement at API boundary (no direct DB writes).
+- Rollback requires elevated permission for production tenants.
+- All events are auditable and exportable to SIEM.
+- Private deployments must support local audit retention and optional export.
+
+## Implementation plan (summary)
+- Control plane: Version + Pointer tables, CRUD, diff, validation.
+- Rollout controller: staged policy changes + gate hooks.
+- Runtime: generation-aware fetch, idempotent apply, metrics tags.
+- Console: history, diff, safe apply wizard, rollback flow.
+- E2E: validate→canary→promote→rollback, with failure injection.
+
+## Open questions
+1. Should we allow **cross-scope promotions** in v1 (e.g., promote from canary region to all regions)? Current plan: not in v1.
+2. How do we represent Dedicated pool scoping cleanly without ballooning scope_key variants?
+3. What is the best default baseline window for gates in highly bursty workloads?
+4. Quantization eval noise: when to “pause” vs “fail” on inconclusive signals?
+
+## Appendix A: Example end-to-end sequence
+1. Operator creates version V123 for tenant T1, model M1, region us-east.
+2. Runs validation; receives warnings (risk=medium) but passes.
+3. Starts rollout R55 from V120 → V123 with steps 1/5/25/50/100.
+4. At 25% step, p95 latency exceeds threshold; rollout pauses.
+5. Operator clicks Rollback to V120; rollback rollout R56 starts.
+6. Active pointer updated to V120 with generation increment.
+7. Workers converge; dashboards show recovery; audit events recorded for both pause and rollback.

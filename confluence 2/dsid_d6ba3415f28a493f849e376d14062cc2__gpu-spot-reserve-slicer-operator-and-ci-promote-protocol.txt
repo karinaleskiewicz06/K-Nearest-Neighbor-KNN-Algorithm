@@ -1,0 +1,137 @@
+GPU Spot-Reserve Slicer Operator and CI Promote Protocol
+
+Summary:
+This document describes the design and operational runbook for the GPU Spot-Reserve Slicer Operator — a Kubernetes controller and accompanying Terraform promotion protocol that slices inference traffic and migrates workloads between spot and reserved GPU pools. The operator's goal is to maximize utilization and reduce cost volatility while preserving customer-facing SLOs (latency and availability) and providing a safe, testable CI/CD path for promoting changes to reserved capacity policies.
+
+Purpose and scope:
+- Purpose: Provide a deterministic, observable mechanism to:
+  1) allocate short-lived inference jobs to spot capacity when safe;
+  2) gracefully migrate or snapshot sessions to reserved capacity when preemption or SLO risk is detected; and
+  3) integrate with Terraform CI promotion so capacity policy changes (e.g., slice ratios, warm-pool sizes) can be validated in staging before landing in production.
+- Scope: Core inference-serving fleets (hosted + dedicated), Kubernetes-hosted inference agents, and Terraform modules that manage reserved/spot pool IAM and autoscaling. Not in scope: on-prem single-tenant appliances, long-running training jobs.
+
+Goals and acceptance criteria:
+- Keep 99th-percentile request latency under configured SLO when migrating between pools.
+- Limit forced migrations to < 0.5% of active sessions/hour under normal operations.
+- Achieve >= 85% spot utilization on non-critical workloads without exceeding spot-preemption-derived error budget.
+
+High-level architecture:
+- Components:
+  - Slicer Operator (K8s controller) — watches InferenceRoute CRs and NodePool annotations.
+  - NodePool CRD — describes a pool (spot/reserved), capacity, warm-count, and health signals.
+  - Promotion Pipeline (CI/Terraform) — staged Terraform workspace + integration tests that validate new slice policies.
+  - Metrics & Alerts — Prometheus metrics and Alertmanager rules derived from SLOs and migration counts.
+
+Behavioral model and decision flow:
+1) Admission: Incoming route is classified by traffic label (critical|best-effort|background). Admission controller consults NodePool weights and slice policies and assigns a preferred pool.
+2) Continuous scoring: Controller computes a migration risk score for each session:
+   risk = w1 * preemption_signal + w2 * node_cpu_tail + w3 * kv-cache-miss-rate + w4 * model-latency-delta
+   - w1..w4 are configurable thresholds per environment.
+3) Action thresholds:
+   - If risk >= migrate_threshold -> issue PrepareForMigration: create session-checkpoint + pre-warm on target reserved pool.
+   - If soon_preempt (e.g., cloud spot termination notice) -> immediate evacuate with higher priority.
+4) Graceful migration steps (automated):
+   1. Mark session as migrating in control plane.
+   2. Snapshot KV cache (if supported) and write to shared checkpoint store.
+   3. Provision reserved replica (target warm pool).
+   4. Rehydrate session state onto reserved replica.
+   5. Switch traffic and drain source replica.
+
+CRD / config reference (example fields described):
+- InferenceRoute: id, traffic_class, preferred_pool, max_retry_backoff, sticky_session_ttl
+- NodePool: pool_type (spot|reserved), region, gpu_type, slice_weight, warm_count, preempt_tolerance, health_check_interval
+
+Sample configuration table (recommended starting defaults):
+- slice_weight: spot=0.6, reserved=0.4
+- warm_count: spot=0, reserved=2 per 100 qps
+- preempt_tolerance: spot=0.1 (fraction of requests allowed to be preempted)
+- migrate_threshold: 0.7
+- snapshot_timeout: 30s
+- max_concurrent_migrations_per_cluster: 50
+
+CI/CD promote protocol (Terraform + integration tests):
+1) Create a feature branch for slice policy changes.
+2) CI runs unit tests + terraform fmt + terraform validate.
+3) Terraform plan applies to staging workspace (ephemeral): create staging NodePools and operator config.
+4) Smoke & SLO tests: run a synthetic traffic job (10–20m) that asserts:
+   - P50/P90/P99 latency within 15% of baseline.
+   - Migration error rate < 1% during induced preemption events.
+5) If validation passes, open a PR for manual review with promotion checklist.
+6) Merge triggers gated apply to production workspace with canary flag: the apply only adjusts slice_weight for a single region (canary).
+7) Canary run (2h): monitor metrics; auto-rollback if alerts triggered.
+8) Full rollout (if canary passes): incremental promotion across regions.
+
+Metrics and SLOs to export (Prometheus names suggested):
+- slicer_migrations_total{reason=\"preemption|risk\"}
+- slicer_migration_duration_seconds_bucket
+- nodepool_spot_utilization_ratio
+- inference_request_latency_seconds{quantile}
+- session_checkpoint_size_bytes
+- operator_reconcile_errors_total
+
+Alerting (examples):
+- High migration rate: slicer_migrations_total[5m] > 100 -> Pager (sev2) if sustained 15m
+- Migration failure ratio: failed migrations / total migrations > 0.02 -> Pager (sev1)
+- Spot utilization spike with SLO breach: nodepool_spot_utilization_ratio > 0.95 AND p99_latency_inference > SLO -> Pager (sev1)
+
+Operational runbook (incident scenarios):
+- Symptom: sudden spike in migrations and rising 99th percentile latency.
+  1) Page the oncall owner: eng-infra-gpu.
+  2) Check latest events for spot termination notices: k get events --all-namespaces | grep TerminationNotice.
+  3) Check slicer_migrations_total and operator_reconcile_errors_total on Grafana.
+  4) If migrations failing due to checkpoint store: check throughput/latency to S3/GCS endpoint (cloudwatch/stackdriver).
+  5) Mitigation: increase reserved warm_count via a hot-patch (kubectl patch nodepool <reserved> --type=json -p '[{\"op\":\"replace\",\"path\":\"/warm_count\",\"value\":<n>}])' and scale the reserved autoscaler.
+  6) If migration failures continue, temporarily flip the admission policy to prefer reserved for critical traffic: kubectl apply -f admission-overrides.yaml
+
+Safe-change checklist for infra owners (pre-promotion):
+- Run staged Terraform apply in the staging workspace with the exact module versions planned for production.
+- Execute synthetic traffic SLO test for at least 20 minutes under induced 10% preemption churn.
+- Confirm metrics exporters and dashboard panels are present in staging.
+- List of owners notified and oncall roster confirmed for the rollout window.
+
+Backwards compatibility and rollback:
+- Operator supports a graceful downgrade: config is annotated with schema_version. Newer operator writes migration markers compatible with previous agent rehydration APIs.
+- Rollback path: use Terraform workspace rollback to last-apply state, and run the operator migration-reconciliation job with --force-dry-run to validate no orphaned sessions remain.
+
+Ownership and responsibilities:
+- Slicer Operator maintainers: eng-infra/gpu-runtime team (primary), eng-platform (secondary).
+- Terraform modules: eng-infra/iac team.
+- CI promotion gating and tests: eng-developer-experience + eng-infra.
+
+Appendix A — Example quick ops commands:
+- View NodePools: kubectl get nodepool -A -o wide
+- Force immediate migrate for a session: kubectl patch session <id> -p '{\"status\":{\"force_migrate\":true}}'
+- Run canary Terraform apply: ./ci/terraform-promote.sh --workspace=canary-us-west-2 --plan-only
+
+Appendix B — Example minimal NodePool CR (YAML snippet):
+---
+apiVersion: infra.redwood.ai/v1
+kind: NodePool
+metadata:
+  name: reserved-us-west-2-a
+spec:
+  poolType: reserved
+  region: us-west-2
+  gpuType: a100-80gb
+  sliceWeight: 0.4
+  warmCount: 8
+  preemptTolerance: 0.02
+
+Appendix C — Terraform module integration notes:
+- The TF module exposes: nodepool_name, target_replica_count, warm_pool_min, tagging_map, preempt_policy.
+- CI promotion script must run terraform plan with var-file (ci/vars/canary-<region>.tfvars) and post-plan validation hooks that call the staging SLO test runner.
+
+Change log:
+- 2024-04-10: Initial draft by Aisha Patel.
+- 2024-09-17: Added CI promote protocol and metrics (Marcus Yuen).
+- 2025-11-12: Clarified migration thresholds and runbook escalations (Priya Ramachandran).
+
+Related reading and links:
+- See nodepool lifecycle design in eng-infra/terraform-and-iac/nodepool-operator-design.json (internal).
+- See operator telemetry & dashboards in eng-platform/dashboards-and-alerts/operator-slicer-overview.json (internal).
+
+Contacts:
+- Primary: eng-infra/gpu-runtime oncall (pager duty group: PD::eng-infra-gpu).
+- Secondary: eng-platform SRE lead (Marcus Yuen).
+
+This document should be treated as the single source of truth for the operator's production behavior, CI promotion gating, and incident runbook for spot-reserved migrations.

@@ -1,0 +1,382 @@
+Autoscaler Bounds and Predictive Signals — End-to-End Architecture (Dedicated Fleet)
+
+## Overview
+This document describes the end-to-end architecture for **customer-configurable autoscaling bounds (min/max)** and **predictive scaling signals** for **Redwood Dedicated** GPU fleets.
+
+The primary objectives are:
+- Enforce **hard customer bounds** (never exceed `max`, never drop below `min`) with deterministic behavior and auditability.
+- Introduce **predictive scaling** as an optional bias to improve readiness for known ramps, while ensuring **reactive signals** can override prediction when the prediction is wrong.
+- Preserve platform safety invariants: stability (avoid oscillation), graceful degradation under failures, and clear operational visibility.
+
+This architecture is scoped to Dedicated deployments (reserved pools); Hosted is explicitly out of scope.
+
+---
+
+## Key concepts and terminology
+- **Deployment**: A Dedicated customer deployment target (model + runtime profile) backed by an isolated GPU pool.
+- **Replica**: A schedulable serving unit (typically one model server process bound to a GPU slice or full GPU depending on SKU).
+- **Desired replicas**: The autoscaler’s computed target before bounds.
+- **Bounded desired replicas**: Desired replicas after applying customer bounds and safety clamps.
+- **Reactive signals**: Queue depth, latency, saturation, utilization, error rates.
+- **Predictive signal**: Forecasted demand curve (requests/sec or tokens/sec) derived from historical patterns and optional scheduled events.
+
+---
+
+## Architecture summary (components)
+### Control plane
+1) **Capacity Policy Service (CPS)** (Control Plane)
+- Stores and serves per-deployment scaling policy: min/max, cooldowns, predictive mode, and guardrail parameters.
+- Validates inputs and enforces RBAC.
+- Emits audit events for policy changes.
+
+2) **Policy Cache** (Autoscaler side)
+- Local cache of effective policy (short TTL) to avoid control plane dependency in the autoscaling loop.
+
+### Data plane / fleet
+3) **Dedicated Fleet Autoscaler** (Fleet)
+- Control loop that calculates desired replicas from reactive + predictive inputs.
+- Applies bounds deterministically.
+- Generates scale actions to the scheduler/provisioner.
+- Emits decision logs, metrics, and bound-hit counters.
+
+4) **Scheduler/Provisioner**
+- Executes scaling actions (add/remove replicas) within region capacity constraints.
+- Reports success/failure and placement results.
+
+### Signals + prediction
+5) **Signal Ingestion Pipeline**
+- Normalizes metrics from serving clusters (queue depth, saturation, latency) and publishes them to the autoscaler signal bus.
+
+6) **Forecast Provider Interface**
+- Contract used by autoscaler to fetch predictions per deployment and region.
+- Implements staleness checks and fallback behavior.
+
+7) **Prediction Service** (initial implementation: internal forecasting service)
+- Produces near-future demand forecasts at fixed time intervals.
+- Provides confidence metadata and a “generated_at” timestamp to enable staleness detection.
+
+### Observability + compliance
+8) **Scaling Decision Event Stream**
+- Structured decision logs for each autoscaler evaluation tick.
+- Stored with retention suitable for enterprise compliance, and queryable for incident response.
+
+9) **Dashboards/Alerts**
+- Grafana dashboards + alert rules for bound saturation, queue buildup, prediction error, and shortage conditions.
+
+---
+
+## High-level flow
+### 1) Policy configuration
+1. Customer (or Redwood admin) updates policy in Console/API (min/max, predictive toggle, cooldowns).
+2. CPS validates:
+   - `min_replicas >= 0`
+   - `max_replicas >= min_replicas`
+   - cooldown bounds within allowed ranges
+   - predictive mode gated by feature flag and account entitlement
+3. CPS persists policy and emits an **AuditLog event**: `capacity_policy.updated`.
+
+### 2) Autoscaler evaluation tick
+On each tick (default: 15s; configurable per region), the autoscaler:
+1. Fetches cached effective policy (refresh TTL: 60s; hard timeout: 200ms).
+2. Ingests latest reactive signals:
+   - queue depth (per deployment)
+   - p95 latency vs target
+   - saturation/utilization
+   - error rate (for safety gating)
+3. Optionally fetches prediction (if enabled):
+   - forecast horizon: 30 minutes
+   - resolution: 1 minute buckets
+   - minimum lead time: 5 minutes (configurable)
+   - staleness enforcement: must be generated within last 10 minutes
+4. Computes:
+   - `desired_replicas_raw` from reactive policy
+   - `desired_replicas_predicted` from forecast (if available)
+   - arbitration result: `desired_replicas_requested`
+5. Applies hard bounds and safety clamps:
+   - `bounded_desired = clamp(desired_replicas_requested, min_replicas, max_replicas)`
+   - apply anti-oscillation rules (cooldowns, step size, dampening)
+6. Emits:
+   - scale action (if needed)
+   - structured decision record (what inputs, what output, why)
+   - metrics for desired vs bounded, bound-hit counts
+
+### 3) Scale execution
+1. Scheduler/Provisioner attempts to reach `bounded_desired`.
+2. If region capacity cannot meet the requested state, autoscaler enters **Degraded:MinUnmet** or **Degraded:MaxSaturated** states and escalates via alerts.
+
+---
+
+## Autoscaler decision logic
+### Signal arbitration (reactive vs predictive)
+Predictive scaling is a bias, not a replacement. We use the following precedence:
+
+1) **Hard safety overrides (always on):**
+- If reactive signals indicate overload (e.g., sustained queue depth and/or latency SLO breach), scale up regardless of prediction, subject to `max_replicas`.
+- If reactive signals indicate instability (high error rate, crashloop), do not chase prediction aggressively; prefer stable step increases and longer cooldown.
+
+2) **Predictive bias (if enabled and forecast is healthy):**
+- Compute predicted capacity needed to satisfy upcoming demand using target utilization (e.g., 65–75% effective utilization) and model throughput profile.
+- If predicted required replicas exceed the reactive desired, raise `desired_replicas_requested` to the predicted value.
+
+3) **Reactive baseline (always available):**
+- If forecast is missing/stale/unhealthy, fall back to reactive computation.
+
+4) **Bounds and guardrails (always last):**
+- Clamp to min/max.
+- Apply anti-oscillation controls.
+
+### Anti-oscillation guardrails
+To prevent churn:
+- **Scale-up cooldown:** default 60s (allow faster response, but not multiple rapid increments within the cooldown unless overload override triggers).
+- **Scale-down cooldown:** default 10m (protect latency and prevent sawtoothing).
+- **Minimum scale step:** +1 replica on scale-up; scale-down step limited to 10–20% of current replicas per tick (configurable).
+- **Prediction dampening:** if forecast changes > X% between consecutive reads (default 25%), cap adjustment to X% unless overload override.
+
+### Determinism requirement
+For each tick we record:
+- `desired_replicas_raw` (reactive)
+- `desired_replicas_predicted` (if present)
+- `desired_replicas_requested` (after arbitration)
+- `bounded_desired_replicas` (after clamp)
+- `decision_reason` and `inputs_summary`
+
+This is used for auditability and to explain “why didn’t it scale?” or “why did it scale?” to internal teams and customers.
+
+---
+
+## Prediction service interface
+### Forecast Provider API (logical contract)
+Autoscaler calls a provider interface; the concrete provider may be swapped.
+
+**Request** (conceptual):
+- `deployment_id`
+- `region`
+- `horizon_minutes` (default 30)
+- `resolution_seconds` (default 60)
+
+**Response fields** (minimum):
+- `generated_at` (RFC3339)
+- `valid_for_seconds` (used for staleness)
+- `demand_series` (minute buckets; demand in tokens/sec or req/sec)
+- `confidence` (0–1)
+- `source` (historical_only | event_augmented)
+
+**Staleness rules:**
+- If `now - generated_at > 10m` OR `valid_for_seconds <= 0`, treat as stale.
+- If confidence < 0.4, treat as low-confidence; autoscaler may use it only to pre-warm up to a limited increment (e.g., +1) unless reactive supports.
+
+### Rate limits and timeouts
+- Autoscaler prediction fetch:
+  - max 1 request per deployment per minute (per region)
+  - timeout 150ms (hard)
+  - circuit breaker opens on 5 consecutive timeouts/5xx, resets after 2m
+- To reduce fanout, we prefer **batched fetches** per account/region (where supported), but the interface must degrade gracefully to per-deployment fetch.
+
+---
+
+## Signal ingestion architecture
+### Inputs
+Reactive inputs are derived from the serving layer and fleet telemetry:
+- **Queue depth**: requests waiting to be served.
+- **Token backlog** (where available): better proxy for long-context workloads.
+- **Latency**: p50/p95 end-to-end; plus model-server compute time.
+- **Saturation**: GPU utilization, KV-cache pressure, batcher saturation.
+- **Errors**: 5xx rate, OOM/restarts.
+
+### Pipeline
+1. Model servers emit metrics to regional collectors.
+2. Collectors publish normalized aggregates to the signal bus (per deployment + region).
+3. Autoscaler reads signals from the bus with a bounded lookback (e.g., last 5 minutes) and uses windowed functions (EWMA) to reduce noise.
+
+### Cardinality constraints
+- All metrics must label by `deployment_id` and `region`.
+- `customer_id` labeling is allowed for billing/CS drilldowns but must be used carefully; dashboards should aggregate by deployment by default.
+- Avoid per-request labels or model-prompt variants.
+
+(See: metric naming and cardinality standards.)
+
+---
+
+## Failure modes and expected behavior
+### 1) Forecast service unavailable / stale predictions
+**Symptoms:** timeouts, 5xx, stale `generated_at`.
+
+**Autoscaler behavior:**
+- Fall back to reactive scaling immediately.
+- Emit metric `predictive_forecast_stale=1` and increment `predictive_fallback_total{reason=stale|timeout|error}`.
+- Do NOT scale down based solely on missing predictions.
+
+**Alerting:**
+- Page only if predictive mode is enabled for N deployments and fallback rate sustained > 50% for 15m (to avoid noise during partial outages).
+
+### 2) Prediction is wrong (overshoot/undershoot)
+**Symptoms:** capacity oscillation, unexpected queue buildup.
+
+**Autoscaler behavior:**
+- Reactive overload override takes precedence for undershoot, scaling up to `max_replicas`.
+- For overshoot, scale-down is governed by longer cooldowns and limited step sizing.
+- Emit `prediction_error` metrics for evaluation and tuning.
+
+### 3) Customer sets misconfigured bounds
+Examples:
+- `min_replicas > max_replicas` (invalid)
+- `max_replicas` too low for the SLA
+- `min_replicas` too high for region capacity
+
+**Control plane behavior:**
+- Reject invalid schema (`min > max`).
+- Warn on suspicious configs (e.g., max below recommended range) but allow if customer confirms (enterprise may have intentional caps).
+
+**Autoscaler behavior:**
+- Strictly enforce configured bounds.
+- When max is hit and overload persists, enter **MaxSaturated** state and surface via dashboards/alerts.
+
+### 4) Region capacity shortage (cannot meet min)
+**Symptoms:** provisioning failures, pending replicas, unfulfilled min.
+
+**Autoscaler behavior:**
+- Enter **Degraded:MinUnmet**.
+- Keep retrying with exponential backoff; do not thrash.
+- Emit `min_unmet` indicator and include shortage reason codes from provisioner.
+
+**Customer impact + comms:**
+- This is an availability risk and requires SRE + CS escalation for affected enterprise accounts.
+- Routing integration may use bounded/degraded state to apply graceful degradation policies (without violating min/max semantics).
+
+### 5) Control plane outage / policy fetch failure
+**Autoscaler behavior:**
+- Use last-known-good cached policy until TTL + grace window expires (default grace: 30m).
+- If cache expires entirely, default to safe behavior:
+  - treat `min_replicas` as current replicas (prevent unsafe downscale)
+  - treat `max_replicas` as platform max for the SKU
+  - disable predictive mode
+- Emit `policy_cache_stale` metrics.
+
+### 6) Config churn / frequent policy updates
+**Risk:** oscillation driven by humans or automation.
+
+**Mitigation:**
+- Control plane rate-limits policy updates per deployment (e.g., 10 updates/hour).
+- Emit audit events and warnings for throttled updates.
+
+---
+
+## Observability (what we measure)
+### Core metrics (per deployment + region)
+- `autoscaler_desired_replicas` (raw/reactive)
+- `autoscaler_predicted_replicas` (if available)
+- `autoscaler_requested_replicas` (post-arbitration)
+- `autoscaler_bounded_replicas` (post-clamp)
+- `autoscaler_bound_hit_total{bound=min|max}`
+- `autoscaler_degraded_state{state=none|min_unmet|max_saturated|forecast_stale|policy_stale}`
+- `predictive_forecast_age_seconds`
+- `predictive_fallback_total{reason=stale|timeout|error|low_confidence}`
+- `prediction_error_abs` and `prediction_error_pct` (aggregated; avoid high-cardinality)
+
+### Decision logs
+Structured log/event per tick:
+- ids: `deployment_id`, `region`, `policy_version`
+- inputs snapshot: queue depth EWMA, latency EWMA, saturation
+- forecast snapshot: generated_at, confidence, horizon summary
+- outputs: desired/raw, desired/predicted, bounded
+- reasons: enum list (e.g., `OVERLOAD_OVERRIDE`, `PREDICTIVE_BIAS`, `CLAMP_MAX`, `COOLDOWN_SCALE_DOWN_BLOCKED`)
+
+### Dashboards
+See the dedicated observability dashboard spec for panel-level layout. Minimum required views:
+- desired vs bounded replicas over time
+- bound hit-rate (max and min)
+- queue depth + latency correlated with bound saturation
+- prediction vs actual demand curve (pilot-only, lower retention if needed)
+
+---
+
+## Security, auditability, and RBAC
+- Policy updates require explicit permissions:
+  - Customer: `dedicated.scaling_policy.write`
+  - Redwood internal: breakglass admin role with approval workflow (per enterprise contract)
+- Audit events are emitted for:
+  - create/update/delete scaling policy
+  - enable/disable predictive mode
+  - autoscaler decisions (at least a summarized decision record; full tick-by-tick may be sampled for very large fleets)
+- Retention targets:
+  - Audit log events: 1 year (enterprise), 90 days (standard)
+  - Decision logs: 30–90 days depending on volume; sampled logs must preserve determinism evidence for incidents
+
+---
+
+## Region-by-region rollout plan
+### Goals
+- Reduce blast radius.
+- Validate operational readiness and correctness under real traffic.
+- Ensure we can roll back quickly without changing customer behavior unexpectedly.
+
+### Phased rollout
+1) **Phase A — Dark launch (no customer-visible behavior change)**
+- Ship policy schema and autoscaler clamp logic behind feature flags.
+- Continue using platform defaults unless policy explicitly enabled.
+- Emit metrics and decision logs but do not enable predictive bias.
+
+2) **Phase B — Bounds-only pilot (single region)**
+- Enable for a small set of Dedicated deployments in `us-east-1`.
+- Validate:
+  - clamp correctness
+  - bound-hit metrics and alerting noise
+  - shortage behavior and degraded-state UX
+
+3) **Phase C — Predictive pilot (single region)**
+- Enable predictive mode for 1–3 deployments with known daily ramps.
+- Strict gating:
+  - forecast must be healthy (staleness, confidence)
+  - reactive overload override tested
+- Run game days: forecast outage, sudden spike, stuck scale-down.
+
+4) **Phase D — Multi-region expansion**
+- Expand to `us-west-2` then `eu-west-1`.
+- Validate region capacity differences and shortage alert routing.
+
+5) **Phase E — GA**
+- Enable self-serve for eligible Dedicated accounts.
+- Document SLA implications and recommended bounds.
+- Enforce operational gates (alerts, runbooks, dashboards, support playbooks).
+
+### Rollback strategy
+- Per-account / per-deployment feature flags:
+  - `bounds_enforcement_enabled`
+  - `predictive_mode_enabled`
+- Rollback action:
+  - disable predictive mode first (falls back to reactive)
+  - if needed, disable bounds enforcement only if explicitly approved (bounds are contractual for some accounts)
+- All rollbacks emit audit events and are visible to SRE + CS.
+
+---
+
+## Open questions / follow-ups (tracked outside this page)
+- How to model throughput profiles for different model/runtime configurations to convert demand forecasts into replica counts (tokens/sec calibration).
+- Whether to standardize on queue depth vs token backlog as the primary reactive signal per model family.
+- Long-term: cross-region predictive placement (out of scope for initial release).
+
+---
+
+## Appendix: Text diagram
+**Data + control flow (simplified):**
+
+Customer Console/API
+  -> Capacity Policy Service (validate + persist + audit)
+  -> Autoscaler Policy Cache (TTL)
+
+Serving Clusters (metrics)
+  -> Regional Collectors
+  -> Signal Bus
+  -> Dedicated Fleet Autoscaler (reactive computation)
+
+Prediction Service
+  -> Forecast Provider Interface
+  -> Dedicated Fleet Autoscaler (predictive bias)
+
+Dedicated Fleet Autoscaler
+  -> Bounds + guardrails (clamp + cooldown + dampening)
+  -> Scheduler/Provisioner (scale actions)
+  -> Decision events + metrics
+  -> Dashboards/Alerts
+
+This page focuses on the autoscaler and signals path; schema semantics and precedence are defined in the ADR referenced above.

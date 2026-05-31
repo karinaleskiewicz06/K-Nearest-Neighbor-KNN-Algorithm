@@ -1,0 +1,104 @@
+tokenizer-cache-corruption-detection-and-repair-runbook
+
+Summary:
+This runbook describes detection, triage, and automated/manual repair steps for tokenizer cache corruption observed in the inference runtime. Tokenizer cache corruption manifests as malformed tokenization results, increased tokenization errors, sudden token-count mismatches between client request and model input, or class-level failure rates on the tokenizer service. The goal is to restore correctness within the configured SLO window and minimize customer impact.
+
+Scope:
+- Services in scope: inference-runtime, tokenizer-service, kv-cache-agent, tokenizer-warm-pool
+- Environments: prod (primary), staging (diagnostics), canary (safe testing)
+- Not in scope: model weights corruption, client-side mis-encoding (see separate validation runbook)
+
+Background and risk:
+Tokenizer caches (prefix maps and serialized vocab snapshots) are kept in an in-memory slab inside tokenizer-service and backed by kv-cache-agent for warm-start across restarts. Corruption can be introduced by:
+- partial snapshot writes during eviction or preemption
+- mismatched serializer/deserializer after a rolling kernel upgrade
+- memory-safety bugs in the tokenizer native extension
+
+Impact matrix:
+- High: clients observe incorrect tokenization causing hallucinations or prompt truncation (>=1% requests fail golden prompt checks in 30m).
+- Medium: token-count mismatches with model KV cache leading to generation hangs (>=0.1% of requests).
+- Low: transient 5xx from tokenizer-service that self-heal after restart.
+
+SLO and alert thresholds (operator-facing):
+- Primary SLO: tokenization-correctness >= 99.9% over 1h for production routes.
+- Alert A (SEV2): golden-prompt-failure-rate >= 0.3% over 15m OR tokenizer-parse-errors/sec > 5 for 10m.
+- Alert B (SEV3): tokenizer-service-5xx-rate > 1% for 10m.
+
+Detection (automated):
+1) Metrics to watch (Prometheus):
+- tokenizer_golden_failures_total (labels: route, model)
+- tokenizer_parse_errors_total (labels: reason)
+- tokenizer_token_count_mismatch_total
+- tokenizer_restart_count_total
+2) Log signatures (ELK/Datadog): search for 'deserialize_vocab: checksum mismatch' or 'tokenizer: invalid token id' or 'kv-cache: snapshot truncated'
+3) Synthetic checks: the eval harness runs the `golden-tokenization` prompt set every 60s per canary region and emits a failure alarm to PagerDuty when >1 failure in 5m.
+
+First-response (automated / on-call):
+- PagerDuty routing: SEV2 -> inference-runtime oncall (primary), SEV3 -> infra-oncall.
+- Playbook kickoff: follow the steps below. If multiple regions impacted, treat as global incident and escalate to SRE lead.
+
+Triage checklist (5 minutes):
+1) Confirm alert details: routes, models, time window.
+2) Check surface-level indicators: are only specific model shards affected? Run: `curl -s http://grafana.internal/api/datasources/proxy/1/api/v1/query_range?query=tokenizer_golden_failures_total`
+3) Cross-check recent deploys: `git log -n 5 --pretty=oneline origin/main -- deployments/tokenizer-service` and CI/CD canary job IDs in Buildkite.
+4) Check node-level health on affected GPU hosts: `kubectl -n infra get pods -l app=tokenizer-service -o wide` and `kubectl logs -l app=tokenizer-service --tail=200`
+
+Automated mitigation (safe, low-risk, immediate):
+1) If tokenizer_parse_errors/sec is climbing but restart_count is low: trigger a graceful rolling restart of tokenizer-service pods with a 30s drain using the controlled drain job: `kubectl -n infra rollout restart deployment/tokenizer-service --grace-period=30`
+2) If the kv-cache-agent reports 'snapshot-inconsistent' on >1 node, pause warm-pool warmers (Terraform module: tf-module/gpu-warm-pool) by flipping `warm_pool.enabled=false` in the runtime-config ConfigMap: `kubectl -n infra patch configmap/runtime-config --type=json -p '[{"op":"replace","path":"/data/warm_pool.enabled","value":"false"}]'`
+3) If the golden-prompt failures persist after automated restarts (>2x windows), escalate to manual repair.
+
+Manual repair (when automated mitigation inadequate):
+Preconditions: have SSH access to an unaffected staging tokenizer pod (for safe testing) and a validated snapshot set in S3 (s3://redwood-tokens/snapshots/). Alert SCM and model teams before taking action.
+Step-by-step repair (expected duration: 30–90 minutes):
+1) Take a coordinated traffic freeze for affected routes (use traffic-router):
+   a) `curl -X POST -H "Authorization: Bearer $ROUTER_TOKEN" https://router.internal/api/v1/route/scale -d '{"route":"/v1/generate","weight":0.0,"reason":"tokenizer-repair"}'`
+   b) Verify traffic drain to canary/backups in Grafana.
+2) Identify corrupt nodes: list pods with recent 'deserialize' errors: `kubectl -n infra get pods -l app=tokenizer-service -o json | jq '.items[] | select(.status.containerStatuses[].lastState.terminated.message | test("checksum mismatch")) | .metadata.name'`
+3) For each corrupt pod:
+   a) cordon the underlying node if it's a dedicated tokenizer host: `kubectl cordon <node>`
+   b) Delete pod to force cold-start without warm cache: `kubectl -n infra delete pod <pod-name>`
+   c) On restart, force kv-cache-agent to pull validated snapshot: `kubectl -n infra exec deploy/kv-cache-agent -- /bin/sh -c "kvctl fetch --source s3://redwood-tokens/snapshots/validated --force"`
+4) If forced fetch fails with checksum errors, run the snapshot integrity verifier on a staging node: `s3verify --bucket redwood-tokens --prefix snapshots/validated --checksum-file checksums.txt`
+5) If all restarted pods are healthy and golden prompt tests pass for 10m, unfreeze traffic: reverse the router change with the same API (set weight back to previous values).
+
+Fallback and rollback options:
+- Roll back tokenizer-service to previous known-good image tag: `kubectl -n infra set image deployment/tokenizer-service tokenizer=ghcr.io/redwood/tokenizer:2026-01-18-rc1` (require approval from SRE lead).
+- If corruption appears tied to a kernel/native-extension release, revert kernel canary via the `kernel-flags` config in the node pool image pipeline and trigger a canary redeploy.
+
+Post-repair validation (10–60 minutes):
+- Run the full golden prompt suite with 1000 randomized prompts (eval-harness): `python infra/evals/run_golden.py --routes /v1/generate --parallel 64` and ensure 0 failures for the repaired routes.
+- Confirm Prometheus metrics: tokenizer_golden_failures_total == 0 for repaired routes for 30m window.
+- Check increase in token-count mismatch metric is at baseline.
+
+Preventive actions and long-term fixes (owner and cadence):
+- Short-term (owner: infra/runtime, 2 weeks): add snapshot checksum metadata to kv-cache-agent publish path and fail-safe to reject partial writes.
+- Medium-term (owner: eng-serving-runtime, 2 months): add an end-to-end canary for tokenizer serialization compatibility that runs during kernel and native-extension rollouts.
+- Long-term (owner: research/pa, 6 months): migrate tokenizer cache format to a backward-compatible versioned container with atomic swaps.
+
+Operational playbook checklist (to close incident):
+1) Incident timeline recorded in status page and incident tracker with at least 30s resolution.
+2) Owners notified and postmortem scheduled within 72 hours.
+3) Code/infra changes associated with the incident are authored as PRs with CI checks validating snapshot write/read cycle.
+
+Diagnostics snippets and eg. queries:
+- PromQL: `sum(increase(tokenizer_golden_failures_total{env=\"prod\"}[15m])) by (route)`
+- Log query (Datadog): `@service:tokenizer AND (\"checksum mismatch\" OR \"invalid token id\" OR \"snapshot truncated\")`
+- Quick health curl: `curl -sS http://tokenizer-service.infra.svc.cluster.local/healthz`
+
+Owner and escalation contacts:
+- Primary owner: infra/runtime (pager: @infra-runtime-oncall)
+- Secondary: eng-serving-runtime (pager: @runtime-sre)
+- SRE Lead: Liam O'Connor (liam@redwood.ai)
+- Product contact (tokenizer features): Priya Nambiar (priya@redwood.ai)
+
+Rationale and links to related docs:
+- See kv-cache consensus runbook for warming semantics and snapshot agreements.
+- See ci-cd/quantized-kernel-canary-matrix for compatibility steps when native extensions change.
+
+Revision history:
+- 2025-06-10: Initial draft (Maya Chen)
+- 2025-11-05: Added automated mitigation steps and PromQL queries (Diego Alvarez)
+- 2026-02-15: Expanded manual repair stepset and snapshot verification (Maya Chen, reviewers).
+
+End of runbook.

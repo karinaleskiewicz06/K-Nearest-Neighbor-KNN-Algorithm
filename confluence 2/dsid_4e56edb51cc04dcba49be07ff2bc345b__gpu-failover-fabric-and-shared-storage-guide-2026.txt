@@ -1,0 +1,118 @@
+GPU failover fabric and shared storage guidance for private deployments
+
+Summary
+This document describes the recommended architecture, operational runbooks, and upgrade/rollback guidance for GPU failover fabric and shared model storage in Redwood private deployments (VPC and on-prem). It is intended for SREs, platform engineers, and field deployment engineers responsible for day-2 reliability and hardware recovery.
+
+Scope
+- Applies to private deployments using: GPU pools (NVIDIA A2/A10/A100; AMD MI250), NFS/Ceph/Rook-backed model storage, and the Redwood inference runtime with KV cache persisted to network-attached storage.
+- Covers: failure modes, automatic and manual failover, consistency guarantees, safe upgrade paths, validation tests, and customer-facing acceptance criteria.
+
+Goals and SLOs
+- Failover detection: 30s median detection for node GPU fatal errors.
+- Recovery: 95% of single-GPU failures automatically recover to a healthy pod within 3 minutes (including KV cache warm start).
+- No-loss requirement: model weights integrity must be preserved across failovers; any in-flight outputs may be retried but must not cause state corruption.
+
+Background and motivation
+As customers run latency-sensitive workloads on private clusters, we must limit application impact when underlying GPU nodes, NICs, or storage volumes fail. Traditional VM-level failover is too slow for short tail latency targets; we use a failover fabric complemented by shared storage and light-weight state transfer to achieve fast recovery and bounded cost.
+
+High-level architecture
+- GPU failover fabric: a control plane component that monitors health signals (nvidia-smi errors, ECC events, kernel oops, device disconnect). When a device is considered unhealthy, the fabric will: 1) mark the device as degraded, 2) trigger request draining, 3) orchestrate model instance restart on a standby node or alternate device.
+- Shared model store: read-only model artifacts stored on a resilient store (Ceph or NFS+HA) mounted by all inference nodes. KV cache is sharded and backed by a fast object store (S3-compatible) and local SSD snapshots for warm-start.
+
+Hardware & network requirements (minimum)
+| Component | Minimum spec | Notes |
+|---|---:|---|
+| GPU per inference pod | 1 x A10 or equivalent | For quantized 8-bit models target. Increase for FP16/FP32. |
+| Local SSD | 200 GB NVMe | For runtime temp files and cache snapshots. |
+| Network | 25 Gbps RDMA (preferred) / 10 Gbps TCP | RDMA recommended for <1ms tail for cross-node KV fetches. |
+| Shared storage | Ceph RBD / NFS HA | Must expose POSIX and support consistent reads. |
+| Time sync | NTP or chrony across cluster | <5ms drift recommended for logs/traces. |
+
+Failure modes and desired behaviors
+1) Single-GPU hardware error (ECC, PSU):
+   - Mark device unhealthy, fail fast on new sessions, allow in-flight tokens to finish up to 5s, then drain.
+   - Trigger pod replacement on healthy node. If no immediate capacity, route traffic to compatible model variant (smaller quantized model) per routing policy.
+2) Node NIC failure / packet loss:
+   - Detect via heartbeat misses for 15s. Redirect ephemeral traffic to alternate node. If shared storage unavailable, degrade to cached prefixes until store is writable.
+3) Shared storage read errors:
+   - Retry with exponential backoff (3 attempts), use local snapshot as fallback, escalate to oncall storage owner if persistent.
+
+Operational runbook (play-by-play)
+1) Detection: fabric alarms are emitted when device health metrics cross thresholds (see thresholds section). Alerting goes to #private-deploy-sre.
+2) Automated response: failover fabric attempts non-disruptive restart and cache warm-start.
+3) Manual intervention if automated recovery fails after 3 minutes:
+   - Step 1: Open incident channel and tag owners.
+   - Step 2: Run health checks: `rdma-devices --list`, `kubectl -n redwood get pods -o wide`, `ceph health detail` or `showmount -e <nfs-server>`.
+   - Step 3: If GPU hardware fault: mark node cordoned `kubectl cordon <node>` and create ticket with on-site runbook for hardware swap.
+   - Step 4: If storage inconsistency: promote latest snapshot and run model integrity verification (sha256).
+
+Thresholds and health signals
+- ECC corrected rate > 100 errors / 10m -> warning.
+- ECC uncorrectable event -> immediate critical.
+- NVML GPU device removed event -> critical.
+- Storage read failure rate > 0.5% over 1m -> degraded.
+
+KV cache consistency and recovery pattern
+- We persist periodic local snapshots of KV segments (every 30s) to local SSD and push delta checkpoints to S3-compatible store asynchronously.
+- On failover: new pod fetches latest snapshot from local SSD on the node if available, otherwise fetches from object store. We accept warm-start miss and serve from model prefixes until cache restored.
+
+Upgrade and rollback procedure (safe path)
+1) Pre-upgrade checks (must pass):
+   - Health: cluster SLOs met for 24h, <1% error budget consumption.
+   - Free capacity: 15% spare GPU capacity cluster-wide or burst pool configured.
+   - Storage: > 20% free capacity on shared store and successful snapshot tests.
+2) Canary rollout:
+   - Stage a single control-plane canary. Run synthetic inference load for 30m. Verify tail latency and error rate.
+   - Roll out GPU driver and runtime updates in small batches (10% nodes per 20 minutes).
+3) Validation steps during each batch:
+   - Verify model loads, KV snapshot restore, and end-to-end traces.
+   - Run model-quality checks against 5 golden prompt sets.
+4) Rollback criteria (any triggers initiate immediate rollback):
+   - >= 2% increase in 99th percentile latency sustained for 10 minutes.
+   - New critical NVML errors.
+   - Failed model integrity verification.
+5) Rollback steps:
+   - Stop rollout, apply previous runtime image to effected nodes, restore KV snapshots if corruption detected, and re-run validation.
+
+Acceptance tests and customer readiness checklist
+- Smoke: model loads within 12s from cold start, top-1 output identical to baseline on 90% prompts.
+- Failover simulation: simulate ECC uncorrectable -> observe automated pod move within 3 minutes.
+- Load test: 99th percentile latency under target SLA with synthetic traffic after failover.
+- Telemetry: traces and logs include device_id, node_id, workload_id for all events.
+
+Sample commands and snippets
+- Check GPU NVML events: `journalctl -u gpu-monitor | grep NVML`
+- Force a graceful drain on node: `kubectl drain <node> --ignore-daemonsets --delete-local-data --grace-period=30`
+- KV snapshot upload sample (bash):
+```
+#!/bin/bash
+tar -czf /tmp/kv-snap-$(date +%s).tgz /var/lib/redwood/kv && 
+curl -X PUT -T /tmp/kv-snap-*.tgz https://objectstore.internal/redwood-kv/$(hostname)/
+```
+
+Ownership and escalation
+- Primary oncall: eng-private-deployments SRE team (#private-deploy-oncall).
+- Storage owner: infra-storage team.
+- H/w replacement: field-ops.
+Escalation matrix: oncall -> team lead (15m) -> platform SOC (30m) -> exec notifs (2h) for Sev2+.
+
+Telemetry and observability
+- Required metrics to export: gpu_ecc_corrected, gpu_ecc_uncorrected, gpu_temp_celsius, nvml_device_count, storage_read_errors, kv_snapshot_latency.
+- Traces must include: operation_id, request_route, model_version, device_id.
+- Dashboards: per-customer model route latency, per-node GPU health, storage latency heatmap.
+
+References and related pages
+- See reference architectures for networking and airgap bridges for special topologies.
+- See KV cache migration playbook for stateful migration recipes.
+
+Appendix A: Quick checklist for field deploy engineers (printable)
+1) Confirm spare GPU capacity (>=15%).
+2) Validate Ceph pool health `ceph -s` OK.
+3) Confirm NTP sync on nodes.
+4) Run smoke model load and capture baseline traces.
+5) Confirm S3 endpoints reachable from all nodes.
+
+Document history
+- 2026-07-22: Initial draft (Anika Patel).
+- 2026-09-10: Add RDMA guidance and thresholds (Marcus Chen).
+- 2026-12-01: Finalize upgrade/rollback criteria and acceptance tests (Lina Rodríguez).

@@ -1,0 +1,106 @@
+GPU runtime rapid-degradation automated mitigation runbook
+
+Summary
+
+This runbook describes the automated and manual mitigation sequence for rapid, service-level degradations originating in the GPU inference runtime (high tail latency, sudden throughput collapse, or token generation stalls). It is intended for on-call infra and runtime engineers and is designed to contain incidents to a short, reversible sequence of steps that restore service while preserving tenant data and billing fidelity.
+
+Scope and goals
+- Scope: GPU serving runtime and adjacent routing/cache layers across hosted and dedicated clusters. Excludes non-GPU control-plane issues (see separate control-plane runbooks).
+- Goal: Detect and contain degradation within the first 10 minutes, restore to degraded-but-functional state within 30 minutes, full remediation or rollback within 4 hours.
+- SLOs relevant: 99th percentile latency per model route <= configured SLO; 99.9% availability for reserved capacity tenants.
+
+Signals that trigger this runbook
+- Alert: gpu_runtime_high_tail_latency (Prometheus alert) firing for >3 zones for more than 90s.
+- Alert: runtime_kv_cache_eviction_rate > 5% for > 2m and correlated 95th+ token latency spike.
+- Synthetic probes: multi-region inference synthetic failing > 50% of probes in last 5m.
+- Billing telemetry: sudden drop in token counts by >30% while incoming request rate remains stable.
+
+Priority levels and initial decisions
+1) P0 (severe): multi-zone latency/throughput collapse impacting >10% of production traffic — execute full automated mitigation pipeline and page on-call.
+2) P1 (moderate): single region or single tenant major degradation — automated mitigation, no immediate rollbacks; page if automation fails.
+3) P2 (informational): transient probe spikes or minor tail latency rise — observe and collect traces.
+
+Automated mitigation pipeline (recommended order)
+Automations run from the incident coordinator job (Kubernetes Job 'runtime-incident-operator') and are gated with a 3-step safety: fast-check, throttled-action, safety-witness. Each action stage is idempotent and logs to incident-trace.
+
+1) Fast-checks (0–30s)
+- Validate alerts with independent telemetry: compare Prometheus rule with tracing (tempo) and synthetic probe status.
+- Run quick KV-cache health query: POST to /internal/kv_cache/_health on one replica. If >50% of replicas return unhealthy, continue.
+- Snapshot current routing table and active model variants (store in S3 incident-traces/<incident-id>/routing-snapshot.json).
+
+2) Throttled-action: graded mitigations (30s–4m)
+- Step A: Lower per-tenant concurrency limiter by 30% for affected routes (Config API: PATCH /config/tenants/{id}/concurrency). Purpose: shed load and allow KV-cache to stabilize.
+- Step B: Shift a small fraction of traffic (5–10%) to a known-compatible fallback model variant (e.g., quantized variant) using routing-weight API. This has built-in quality gates.
+- Step C: Increase runtime batching window by 10–25ms to improve throughput under contention (runtime-config: batching.window_ms).
+- Step D: If eviction rates are high, trigger coordinated KV-cache partial flush on 10% of replicas to rehydrate hot prefixes more deterministically (runtime-admin: /admin/kv_cache/flush?percent=10).
+- Each step waits 60s and re-evaluates outcome; if metrics recover, stop further steps.
+
+3) Safety-witness and escalation (4–10m)
+- If after graded mitigations the 95th latency remains > 2x SLO, escalate to broader containment: increase fallback traffic to 25% and open automatic model variant rollback windows.
+- Create an incident channel and post the automated action log with diffs to routing-snapshot.json.
+
+4) Broader containment (10–30m)
+- Controlled draining: route new sessions away from the most impacted replicas/pods (kubectl annotate node <node> runtime.maintenance=true + evict). Use safe-drain script: scripts/safe_drain.sh --grace=90 --label=runtime-critical=false
+- Autoscaler override: if autoscaler failed to scale-up, temporarily raise max replicas by +30% (K8s HPA/ScaleSet override) and request immediate node-provision via IaC pool (see Terraform pattern below).
+
+Manual mitigation checklist (if automation unsuccessful)
+1) Confirm scope: use tracing to identify whether extra latency is compute-bound (kernel/hw) or memory/kv-cache-bound. Queries:
+- Grafana: runtime.cpu_cycles{job="runtime"} / runtime.tokens_generated  -> indicates compute stall
+- PromQL: sum(rate(runtime_kv_cache_evictions[1m])) by (cluster,az)
+
+2) Safe rollback of recent runtime changes
+- If a kernel/runtime build rolled out within last 60 minutes, immediately mark rollout as paused and rollback to prior image:
+  - kubectl set image deployment/runtime-prod runtime=redwood/runtime:<previous-tag> -n redwood-runtime
+  - Verify pods reach Ready and KV cache warmup logs show successful rehydration.
+
+3) Emergency fallbacks to preserve availability
+- Expand fallback model variant to 50% traffic and maintain it while investigating quality regressions. Coordinate with applied-ml to run a minimal eval set against the fallback.
+- If dedicated tenant SLA is affected, notify CS to trigger customer-facing mitigation (quota credit or route pinning to dedicated capacity).
+
+4) Hardware/driver level steps (SRE + HW pairing)
+- If telemetry points to GPU driver/kernel OOM or ECC errors, isolate affected nodes: mark node unschedulable and start NIC/GPU diagnostic: /opt/bin/gpu-diagnostics.sh --collect --upload s3://redwood-gpu-diagnostics/<incident-id>/node-<id>.tar.gz
+- Coordinate with cloud provider support to attach serial logs and schedule replacement if node-level hardware fault is confirmed.
+
+Safe Terraform/IaC patterns for scale-up during incidents
+- We use a short-lived Terraform workspace pattern 'incident-<id>' created by the runtime-incident-operator. The workspace contains a single module: cluster/ephemeral-gpu-pool with constrained defaults: max_size=+30% from baseline, taint_label=incident=<id>, ttl=4h.
+- Runbook command (operator or oncall): terraform workspace new incident-<id> && terraform apply -var-file=incident-vars.json
+- Teardown is automatic after TTL; manual destroy: terraform destroy -auto-approve -var-file=incident-vars.json
+- Safety note: incident workspaces are permitted only for P0 incidents and require two approvals (oncall + team lead) via the incident-operator API.
+
+Observability and queries (copiable)
+- Prometheus alerts:
+  - gpu_runtime_high_tail_latency: |
+    expr: histogram_quantile(0.99, sum(rate(runtime_request_duration_bucket[2m])) by (le, route)) > 5.0
+    for: 90s
+- Useful queries:
+  - 95th latency by route: histogram_quantile(0.95, sum(rate(runtime_request_duration_bucket[5m])) by (le, route))
+  - KV-cache eviction rate: sum(rate(runtime_kv_cache_evictions[1m])) by (cluster,az)
+  - Active tokens vs generated tokens: sum(runtime_active_sessions) / sum(rate(runtime_tokens_generated[1m]))
+
+Operational roles and responsibilities
+| Role | On-call responsibilities | Escalation |
+|------|-------------------------|------------|
+| runtime-oncall | Triage alerts, run automated pipeline, perform manual rollback | Escalate to runtime-eng after 15m or if automation fails |
+| infra-oncall | Run IaC scale-up, manage cloud capacity and node replacement | Engage cloud account lead if provider assistance needed |
+| applied-ml | Approve fallback model increases >25% and run minimal eval set | Provide quality regression analysis |
+| customer-success | Notify customers with impacted SLAs and coordinate credits | Lead customer comms for multi-hour incidents |
+
+Post-incident: postmortem and follow-ups
+- Create a postmortem within 72 hours using the incident template. Include: timeline (per minute), automated action diffs, metric deltas, and root cause hypothesis.
+- Required follow-ups (ownership and SLA):
+  - Verify autoscaler behavior under similar load via chaos tests (owner: eng-infra, due: 2 weeks).
+  - Add synthetic probes for the specific failure mode that caused the incident (owner: runtime-eng, due: 1 week).
+  - If IaC incident workspace was used, reconcile cost and tag charges (owner: finance infra, due: 48 hours).
+
+Runbook artifacts and useful links
+- scripts/safe_drain.sh (repo: infra/runbooks/tools)
+- incident-operator API docs (internal link: /confluence/eng-infra/team-wiki/incident-operator-api.json)
+- Pre-built Terraform incident module (module path: modules/ephemeral-gpu-pool)
+- Dashboard links: Runtime Overview | per-route SLO dashboard | KV Cache heatmap
+
+Appendix: quick commands
+- Snapshot routing table: curl -sS https://runtime-admin.redwood.internal/api/v1/routing > /tmp/routing-snapshot.json && aws s3 cp /tmp/routing-snapshot.json s3://incident-traces/<incident-id>/routing-snapshot.json
+- Increase fallback weight (5%): curl -X POST -H "Authorization: Bearer $INCIDENT_TOKEN" -d '{"route":"/v1/generate","variant":"fallback-v2","weight":0.05}' https://routing-api.internal/shift-weight
+- Pause rollout and rollback image:
+  kubectl -n redwood-runtime rollout pause deployment/runtime-prod
+  kubectl -n redwood-runtime set image deployment/runtime-prod runtime=redwood/runtime:stable-20250114

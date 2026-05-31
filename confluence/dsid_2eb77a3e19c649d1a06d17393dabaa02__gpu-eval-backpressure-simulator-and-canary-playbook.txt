@@ -1,0 +1,158 @@
+GPU Eval Backpressure Simulator and Canary Playbook
+
+Summary
+
+This document describes the GPU Eval Backpressure Simulator (GEBS) and an associated canary gating playbook used by the CI/CD and GPU fleet teams to validate how model-eval workloads respond to resource contention, egress limits, and burst traffic. The simulator is intended to run as part of gated evaluation pipelines and to provide deterministic, repeatable stress checks before promotions to staging/production GPU pools.
+
+Goals
+
+- Provide a reproducible test harness that simulates: queueing/backpressure, preemption, bursty arrival patterns, and egress-constrained workloads.
+- Integrate with CI/CD (Buildkite) so every eval job can opt into a backpressure check.
+- Produce metric-driven canary gates (pass/fail) so model/infra changes cannot be promoted if they cause SLO regressions.
+- Offer an oncall-friendly runbook for triage when a backpressure gate fails during rollout.
+
+Scope and Non‑Goals
+
+- In scope: developer-triggered eval pipelines, nightly batch evals, and canary promotions for Dedicated pools.
+- Out of scope: host-level thermal or hardware failure simulation (handled by GPU-fleet chaos-day docs), and billing/cost chargeback automation.
+
+Architecture overview
+
+The simulator is implemented as a containerized service that can be executed inside Buildkite CI agents or ephemeral eval clusters. It has three components:
+
+1) Workload generator: produces synthetic requests with configurable arrival distributions (Poisson, burst, ramp) and payload characteristics (seq length, kv cache size).
+2) Resource stress controller: triggers artificial constraints (CPU steal, cgroup CPU quota reductions, network egress shaping, simulated preemption via SIGSTOP cycles) to model contention scenarios.
+3) Metrics exporter and gate engine: gathers latency percentiles, queue length, token throughput, failure rates, and computes gate decisions against configured thresholds.
+
+Design details
+
+- Language/stack: Go service + Python client harness. We chose Go for the stress controller because of lightweight static binaries suitable for Buildkite agents.
+- Container image: internal registry: redwood/gpu-gebs:stable (image must be signed and scanned by the CI pipeline).
+- Config model: YAML file with sections for generator, stressors, and gate thresholds. Examples below.
+
+Simulator configuration table
+
+| parameter | example | description | recommended range |
+|---|---:|---|---|
+| arrival_distribution | burst | arrival pattern: poisson|burst|ramp | burst for smoke, poisson for steady-state |
+| rps_target | 250 | target requests per second | 1 - 2000 |
+| seq_length | 512 | tokens per request | 32 - 4096 |
+| kv_cache_reuse_ratio | 0.6 | proportion of requests that reuse prefix cache | 0.0 - 1.0 |
+| egress_limit_kbps | 10240 | network egress shaping in kbps | 256 - 65536 |
+| preempt_cycle_s | 5 | seconds to SIGSTOP the model process per minute | 0 - 30 |
+| gate_latency_p95_ms | 120 | p95 latency threshold used for canary gate | 50 - 500 |
+| gate_error_rate_pct | 1 | percentage of requests allowed to fail | 0 - 5 |
+
+CI/CD integration (Buildkite example)
+
+- Trigger point: optionally run GEBS during the `eval` pipeline job, between model artifact validation and canary promotion steps.
+- Job snippet (Buildkite YAML):
+
+pipeline:
+  steps:
+    - label: "Eval: Backpressure Simulation"
+      command:
+        - \"docker run --rm -v $BUILDKITE_BUILD_PATH:/work -e CONFIG=/work/gebs-config.yaml redwood/gpu-gebs:stable \"
+      agents:
+        queue: gpu-eval
+      env:
+        GEBS_OUTPUT: /work/gebs-output.json
+      timeout_in_minutes: 45
+
+- Gate behavior: the job must exit non-zero if the gate engine computes a failure. The gate engine writes a human-readable summary to GEBS_OUTPUT and uploads artifacts to the Buildkite run.
+
+Canary promotion procedure (automated + manual steps)
+
+1) Automated pre-checks in CI (pass required): model artifact checksum, unit tests, smoke generation against a local CPU fallback, GEBS simulation with default config.
+2) If GEBS passes, pipeline triggers a staged canary deploy to a small Dedicated pool segment (5–10% of canary capacity) with traffic ratio 10:1 to baseline.
+3) Monitor the canary for 30 minutes against the SLOs below. If any gate fires, automatically rollback the canary and open an incident ticket assigned to the owning infra/product team.
+4) If canary is healthy, expand to 50% for an additional 60 minutes; if healthy, promote to 100% and mark the pipeline step as completed.
+
+Gate thresholds and SLOs
+
+- p95 latency < gate_latency_p95_ms (configurable, default 120 ms)
+- error_rate < gate_error_rate_pct (configurable, default 1%)
+- queue_length < 250 requests (guardrail)
+- token_throughput degradation < 15% vs baseline
+
+Metrics collection and dashboards
+
+Required exported metrics (prometheus names included):
+- gebs_request_latency_seconds{quantile=\"0.95\"}
+- gebs_request_failure_total / gebs_request_total (error rate)
+- gebs_queue_length
+- gebs_token_throughput_tokens_total
+
+Dashboards: a dedicated `GEBS / CI Gates` dashboard in Grafana (dashboards/gpu-gebs.json). Buildkite artifact uploads include the raw GEBS_OUTPUT JSON and a compact HTML summary.
+
+Triage runbook (oncall + developer flow)
+
+1) Alert created by CI: `gebs:ci:gate_failed` with step URL and GEBS_OUTPUT artifact.
+2) Primary responder: owner of the pipeline (tagged in Buildkite job); secondary: eng-infra oncall.
+3) Quick checklist:
+   - Review GEBS_OUTPUT summary (p95, error samples, queue length spikes).
+   - Re-run GEBS locally with the same config but reduced RPS to isolate whether the failure is linear (scale) or threshold-sensitive.
+   - Check GPU pool metrics (utilization, preemption events, host OOMs).
+   - If failure correlates to network egress shaping, inspect VPC egress ACLs and NAT gateway metrics.
+4) Common resolutions:
+   - If p95 regressed due to scheduling delays: increase warm pool size for canary or reduce batch size in runtime config.
+   - If error rate is due to KV cache misses: pin model variant with smaller context or enable prefix caching for canary.
+   - If caused by noisy neighbor: move canary to different physical host group or use stricter QoS tags.
+
+Rollback steps (fast path)
+
+1) Abort canary promotion in deployment system (console or CLI).
+2) Trigger automatic revert to previous model version: `rwdctl infra canary rollback --deployment-id <id>`
+3) Run a diagnostic GEBS with `--diagnose` flag to capture core traces and upload to S3: `docker run --rm -e CONFIG=/tmp/gebs.yaml redwood/gpu-gebs:stable --diagnose`
+4) Create incident with runbook link and assign to the model owner and infrastructure owner.
+
+Operational run modes and scheduling
+
+- Per-PR gating: lightweight GEBS run with `rps_target=50` and `seq_length=256` (max 15 minutes).
+- Nightly regression: full GEBS profile (RPS 500–1500, multiple egress/stop cycles) to detect non-linear issues.
+- Pre-release dry-run: run in a private staging Dedicated pool with realistic traffic mix and enable end-to-end observability (A/B tracing).
+
+Security and compliance notes
+
+- GEBS containers must not ship customer data. Use synthetic payloads only.
+- Image must be signed and scanned; CI rejects unsigned images.
+- When running in customer-facing Dedicated pools (rare), run with read-only service accounts and egress policies that match customer constraints.
+
+Ownership and maintenance
+
+- Owners: eng-infra (primary), eng-serving-runtime (secondary for model runtime parameter coupling).
+- Maintenance cadence: quarterly updates to keep arrival models in sync with production telemetry; monthly smoke-run in CI.
+
+Appendix: example GEBS YAML config
+
+```
+generator:
+  arrival_distribution: burst
+  rps_target: 250
+  seq_length: 512
+  kv_cache_reuse_ratio: 0.6
+stressors:
+  egress_limit_kbps: 10240
+  preempt_cycle_s: 5
+gates:
+  latency_p95_ms: 120
+  error_rate_pct: 1.0
+```
+
+Appendix: quick CLI snippets
+
+- Run locally with artifact output:
+  docker run --rm -v $(pwd):/work -e CONFIG=/work/gebs.yaml redwood/gpu-gebs:stable --output /work/gebs-output.json
+- Compute a CI-friendly artifact summary:
+  python ci/parse_gebs_output.py --input ge bs-output.json --format html --out summary.html
+
+Related pages
+
+- eng-infra/runbooks/gpu-rolling-reboot-and-network-bridge-playbook (operational reboot guidance)
+- eng-infra/gpu-fleet-and-capacity/gpu-demand-forecasting-and-ml-backed-scaling-playbook (capacity forecasting)
+
+Document history
+
+- 2024-08-15: initial draft (Maya Chen)
+- 2024-10-01: added Buildkite snippets and gate thresholds (Diego Ramos)
+- 2025-01-12: updated runbook and CI artifact flow to include HTML summaries (Lena Ho)

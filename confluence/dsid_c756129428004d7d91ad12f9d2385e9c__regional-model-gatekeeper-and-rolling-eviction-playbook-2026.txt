@@ -1,0 +1,150 @@
+Regional Model Gatekeeper & Rolling Eviction Playbook
+
+Summary
+
+This playbook describes the Regional Model Gatekeeper pattern and an operator-friendly rolling-eviction workflow to perform model version rollouts, regional capacity rebalancing, and emergency model swaps with minimal customer-visible impact. It applies to Redwood hosted & dedicated regions and private deployments where a central decision plane coordinates model placement and eviction heuristics.
+
+Goals and constraints
+
+- Zero (or near-zero) request error rate during model rollout and eviction events for high-tier customers. Target: error-rate increase < 0.2% for a 1-hour window.
+- Maintain tail latency SLOs: 95th percentile request latency <= 120ms for generate/chat, 99th percentile <= 350ms.
+- Graceful fallback to compatible variants (quantized / smaller architecture) if primary model capacity unavailable.
+- Avoid wholesale restart of serving nodes; prefer warm model swap and KV-cache transfer where possible.
+
+Key components
+
+1) Regional Model Gatekeeper (service name: gatekeeper-service)
+   - Responsible for decisioning: which model variant to serve per region and tenant slice.
+   - Inputs: capacity signals (gpu_mem_util, gpus_free), telemetry (tail_latency_ms, error_rate), cost signals, customer tier policies.
+   - Outputs: routing rules pushed to runtime-proxy, eviction decisions pushed to allocator, model swap jobs to runtime-operator.
+
+2) Runtime Operator (service name: runtime-operator)
+   - Executes safe rolling eviction jobs, coordinates warm loads, monitors cache rehydration.
+
+3) Runtime Proxy / Router (service name: serving-router)
+   - Enforces routing rules and fallbacks; emits per-route token and latency telemetry.
+
+SLOs and thresholds (defaults)
+
+- Region availability SLO: 99.95% per region (monthly).
+- Eviction gating thresholds (trigger candidate when both conditions hold for 2m):
+  - GPU memory utilization > 90% on >= 3 nodes in the region OR
+  - Tail latency (99th) > 400ms for model X across the region AND error rate > 0.75%
+- Immediate hard eviction criteria: GPU OOM observed, node memory corruption, or sustained node crash loop > 3 restarts in 10m.
+
+Runbook: Rolling eviction (operator procedure)
+
+Pre-flight checks (operator)
+1) Verify running capacity and traffic profile: check dashboard panel "Gateway - Region Capacity".
+2) Confirm active rollouts / canaries: run `rk rollout list --region=us-west-2` and verify no overlapping rollouts.
+3) Ensure backup fallback variants available for affected model family (e.g., bert-base-q4, gpt2-small-fp16).
+4) Confirm runbook owner & pager: add `@oncall-platform` to the ticket.
+
+Execution steps
+1) Create a Gatekeeper job: `rk gatekeeper create-eviction-job --model model-X:v3 --region us-west-2 --reason "hotspot eviction" --dry-run`
+   - Dry-run mode simulates decisions and lists affected tenants; review for unexpected impact.
+2) Approve and promote to plan: `rk gatekeeper approve-job <job-id> --approve-by <operator>`
+3) Runtime-operator will generate a rolling plan grouped by shard/affinity. Default cadence: 10% of shards every 90s.
+4) For each shard group:
+   a) Quiesce new long-running requests (soft drain) with serving-router header injection.
+   b) Warm-start target model variant on target node: `runtime-operator warm-start --node <id> --model model-X:v3`
+   c) Verify model health (kernel init complete, KV cache warm percent > 40%).
+   d) Switch routing atomically for the shard to the new node.
+   e) Monitor metrics for 5 minutes: tail latency, error-rate, token-per-second.
+   f) If metrics breach rollback thresholds (see below), abort and trigger rollback for the group.
+5) After completing all shard groups, mark job complete and run post-deploy validation.
+
+Rollback and abort criteria (per shard group)
+- If 95th latency increases by > 30% vs baseline for 5 minutes.
+- If error-rate for the group increases > 0.5 percentage points.
+- If model crash/reload observed > 2 times in the 10m window.
+- If synthetic QA prompts (canary set) fail > 2/5 checks.
+
+Rollback steps
+1) Pause the job: `rk gatekeeper pause-job <job-id>`
+2) Re-route shards to previous variant: `runtime-operator route-back --group <id>`
+3) Trigger an incident and assign SRE + model-release owner.
+4) Capture telemetry snapshot and KV cache heatmap for postmortem.
+
+Eviction safety knobs and operator overrides
+
+- Speed caps: max_shards_per_minute (default 10 shards/min).
+- Conservative mode: require 2 independent metrics (latency + error) to pass before eviction.
+- Tenant protection list: tenants with platinum tier are excluded unless explicitly allowed.
+- Force-evict token: `--force` only allowed if approval from oncall lead and customer-impacting condition.
+
+Dashboards and alerts (what to watch)
+
+Recommended dashboard panels to include in the "Regional Gatekeeper" view:
+- Model capacity heatmap: nodes x memory_reserved, memory_used, gpu_utilization.
+- Shard progress timeline: percent shards migrated, groups completed.
+- Per-tenant token rate & tail latency.
+- Canary prompt success rate (synthetic): rolling 5-min window.
+- KV-cache warm percent per node.
+
+Suggested alert rules (examples expressed simply):
+- gatekeeper.eviction.job-failure: fires if a job group fails > 2 groups (severity P1).
+- serving-router.tail-latency.spike: 99th latency > 450ms sustained 2m (P1).
+- runtime-operator.model-crash: model process crash > 3 events in 10m on same node (P0).
+- kvcache.rehydration.slow: median rehydration time > 5m (P2).
+
+Operator checklist after a rolling eviction
+
+- Verify all shards show healthy traffic with pre-rollout baselines.
+- Confirm KV cache hit-rate is within 5% of baseline or explain delta.
+- Run canary prompt suite and record results (attach to ticket).
+- Communicate completion: update status page for impacted tenants if customer-visible.
+- Create a short post-action note with metrics snapshot.
+
+Automation & CI guardrails
+
+- All gatekeeper jobs must pass CI validation which runs a smoke traffic replay in a sandbox region.
+- Integration test: `tests/gatekeeper/smoke_replay.py` runs synthetic traffic with canary prompts; must succeed before production-promote.
+- Feature flag: `gatekeeper.enable-automated-eviction` default off for new regions.
+
+Retrospective template (to be filled after significant events)
+
+- Event summary: short description and timeline.
+- What went well: e.g., warm-start reduced cold token surge by X%.
+- What failed or surprised us: e.g., KV cache warming slower than predicted for model-Y.
+- Action items (owner + due date): discrete experiments, monitoring improvements, dashboard additions.
+
+Common gotchas and mitigation tips
+
+- KV cache transfer may not be possible across different kernel/quantization runtime variants; plan fallbacks accordingly.
+- Synthetic canaries should represent both short interactions (chat) and long generations (streaming) to catch tail effects.
+- Be mindful of tenant-affinity: moving a shard can concentrate heavy tenants on the same node if not balanced.
+
+Roadmap & improvements (21-month horizon)
+
+- Q2 2026: Implement model-level graceful degradation scoring to prefer lighter variants automatically under load.
+- Q4 2026: Gatekeeper ML heuristic: predictive eviction scheduling using 30m lookback time-series and anomaly detection.
+- H1 2027: Cross-region KV cache tiering: coordinate warm replicas ahead of large migrations.
+- H2 2027: Self-healing rollouts: automated rollback + automated sandboxed remediation + postmortem draft generator.
+
+Ownership
+
+- Gatekeeper service: eng-platform (primary: Maya Patel)
+- Runtime-operator: eng-serving-runtime (primary: Javier Morales)
+- Dashboards & alerts: observability core (primary: Priya Nair)
+
+References
+
+- See runtime-operator runbook for warm-start CLI reference: ../runbooks/runtime-quantization-rollout-operator-playbook-2026.json
+- Use the operator-sandbox and replay lab for dry runs: ../team-wiki/operator-sandbox-synthetic-scenarios-and-verification-catalog-2025.json
+
+Appendix: Example CLI snippets
+
+- Create dry-run job:
+  rk gatekeeper create-eviction-job --model model-X:v3 --region eu-central-1 --dry-run --reason "capacity reclaim"
+
+- Approve and start (operator):
+  rk gatekeeper approve-job j-42 --approve-by maya.patel@redwood.ai
+
+- Pause/Abort a running job:
+  rk gatekeeper pause-job j-42 --reason "latency spike"
+
+- Inspect job details:
+  rk gatekeeper describe-job j-42 --output yaml
+
+This document should be kept in sync with the gatekeeper-service API spec and the runtime-operator CLI docs. For questions or suggested improvements, ping @maya.patel on the eng-platform Slack channel.

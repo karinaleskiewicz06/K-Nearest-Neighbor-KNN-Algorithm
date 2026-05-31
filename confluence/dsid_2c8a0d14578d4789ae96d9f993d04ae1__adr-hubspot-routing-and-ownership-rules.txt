@@ -1,0 +1,204 @@
+ADR: HubSpot routing and ownership rules for PLG signals (v1)
+
+## Summary
+This ADR defines how Redwood routes qualified PLG-to-sales signals into HubSpot, including deterministic company ownership assignment, task creation rules, re-notification thresholds, and auditability requirements. The goal is to create timely, actionable follow-up for Dedicated/Private expansion while minimizing spam, avoiding conflicting outreach with CS/Marketing, and ensuring decisions are explainable and reproducible.
+
+## Context
+The PLG signal pipeline produces a scored, deduped set of "sales-worthy" signals (usage thresholds and intent signals). Once a signal crosses the routing threshold, we:
+- Update HubSpot Company properties to reflect the latest signal state.
+- Append a HubSpot timeline note summarizing the signal.
+- Create a follow-up task with clear next steps and due dates.
+- Assign the Company (and the task) to the correct owner.
+
+Key constraints:
+- HubSpot API rate limits and transient failures must not cause missed or duplicated tasks.
+- Ownership assignment must be deterministic and stable (avoid reassigning accounts unexpectedly).
+- Existing account ownership (AE/CSM) must be respected.
+- Outreach must be suppressed when Marketing nurture is active or when a recent PLG outreach already occurred.
+- Routing decisions must be auditable for internal QA, customer escalation, and privacy review.
+
+## Decision
+We will implement ownership and routing as a deterministic rules engine with explicit precedence, stable region mapping, and a round-robin fallback per region. We will also enforce per-signal cooldowns and open-task suppression, and we will persist a full routing audit trail.
+
+### 1) Ownership precedence (highest to lowest)
+When routing a qualified PLG signal for a HubSpot Company, the router resolves an owner using the first matching rule:
+
+1. **Preserve existing HubSpot Company owner**
+   - If `hubspot.company.owner_id` is set AND the owner is an active user in the appropriate pipeline, **do not change it**.
+   - Rationale: avoids churn, preserves existing relationship context, and reduces internal confusion.
+
+2. **Preserve active Deal owner (if present) for sales-assisted motion**
+   - If the company has an **open Deal** in the "Sales" pipeline with an assigned owner, assign routing to that owner (even if company owner is missing).
+   - Rationale: prevents duplicate ownership when an opportunity is already in flight.
+
+3. **CSM ownership protection (existing customers)**
+   - If the company is an existing customer with an assigned CSM (tracked via `ri_csm_owner_id` or equivalent CS property) AND the signal is classified as **"Expansion"** (not "New conversion"), then:
+     - Keep Company owner unchanged (if set).
+     - Create the sales task for the AE owner only if an AE owner exists; otherwise route to the **CSM** with a task type "Coordinate expansion".
+   - Rationale: prevents conflicting outreach and ensures CS can orchestrate expansion conversations.
+
+4. **Region-based assignment**
+   - Determine region from best-available signals (in order):
+     - Billing country / contract country (if known)
+     - Admin user country (workspace primary)
+     - IP-derived region (coarse; only when above is missing)
+   - Map to sales region: **NA**, **EMEA**, **APAC**.
+
+5. **Round-robin fallback within region pool**
+   - If no prior owner exists, assign via round-robin within a configured pool for the resolved region.
+   - Round-robin state is stored outside HubSpot (router DB) to ensure determinism, rate-limit resilience, and testability.
+
+#### Ownership stability guarantees
+- Once a company is assigned via round-robin, we set the HubSpot Company owner and treat it as preserved for all future signals (Rule #1).
+- The router never reassigns owners based solely on future signal region changes unless explicitly requested by Sales Ops (manual override).
+
+### 2) Region mapping rules
+We will use a simple, auditable region mapping.
+
+**NA**
+- US, CA, MX
+
+**EMEA**
+- EU/EEA countries, UK, CH, NO, IS, and all other Europe + Middle East + Africa unless explicitly APAC
+
+**APAC**
+- AU, NZ, SG, JP, KR, IN, and other Asia-Pacific countries
+
+If the country is unknown:
+- Use the account’s primary workspace timezone to infer broad region.
+- If still unknown, default to **NA** and tag the record with `ri_routing_needs_review = true`.
+
+### 3) Task creation rules
+For each qualified signal routed to HubSpot, the router will create:
+
+A) **Company property updates** (idempotent upsert)
+- `ri_last_plg_signal_at` (ISO timestamp)
+- `ri_last_plg_signal_type` (enum string)
+- `ri_last_plg_signal_score` (numeric string)
+- `ri_plg_signal_confidence` (low|medium|high)
+- `ri_plg_signal_summary` (short text)
+- `ri_plg_signal_router_version` (e.g., v1.3.0)
+- `ri_plg_signal_last_task_id` (HubSpot task object id; if created)
+
+B) **Timeline note** (append-only)
+- Title format: `PLG Signal: <signal_type> (score <score>)`
+- Body includes:
+  - Signal type + score + confidence
+  - Window: last 24h / last 7d / last 30d
+  - Key drivers (e.g., 429 rate, spend velocity, doc intent)
+  - Suggested playbook path (Dedicated vs Private vs “monitor”)
+  - Router idempotency key and `plg_signal_id`
+
+C) **Follow-up task** (created only if not suppressed)
+- Task subject format: `Follow up: PLG signal – <signal_category>/<signal_type>`
+- Assigned to resolved owner (AE/CSM per precedence)
+- Due date:
+  - Reliability/SLO signals: due in **1 business day**
+  - Compliance/Private intent signals: due in **2 business days**
+  - Pure scale thresholds: due in **2 business days**
+- Task notes include a compact talk-track and required next step (e.g., "Offer benchmark plan" / "Schedule security review"), linking to the enablement playbook.
+
+### 4) Re-notification & suppression rules (noise controls)
+The router must suppress task creation when follow-up would be redundant or likely to annoy customers.
+
+#### 4.1 Dedupe key and idempotency
+- Idempotency key: `company_id + signal_type + signal_window_end_date`
+- If an event is replayed/backfilled, the router must:
+  - Re-upsert company properties and add a note only if the note does not already exist for the `plg_signal_id`.
+  - Never create a duplicate task for the same idempotency key.
+
+#### 4.2 Cooldown windows (per company per signal_type)
+A new task may be created only if the last routed task for that company + signal_type is older than:
+- **Reliability / 429 / latency degradation:** 7 days
+- **Spend velocity / scale thresholds:** 14 days
+- **Security/compliance intent (SOC2/VPC/Private):** 30 days
+
+If a new, different signal_type fires during the cooldown, it may still create a task if it is meaningfully distinct (e.g., a compliance signal during a scale cooldown is allowed).
+
+#### 4.3 Open-task suppression
+If there is an existing open HubSpot task with:
+- `ri_plg_signal_task = true` AND
+- created within the last 14 days
+
+…then do not create a new PLG task. Instead:
+- Update Company properties and append a timeline note.
+- Optionally update the existing task description with “Additional signals observed” when supported by HubSpot APIs (otherwise, rely on note).
+
+#### 4.4 Marketing-touch suppression (avoid double taps)
+If Marketing Ops flags the company as actively enrolled in a high-touch lifecycle campaign:
+- `ri_marketing_high_touch_active = true`
+
+…then:
+- Do not create an AE task for low-confidence intent signals.
+- Allow tasks for high-confidence reliability/compliance signals (customer experience and risk outweighs duplication).
+
+### 5) Auditability requirements
+All routing outcomes must be explainable and reproducible.
+
+#### 5.1 Router audit log (system of record)
+The router will write an immutable audit record to `signal_router_audit` with retention of **18 months**:
+- `plg_signal_id`
+- `company_id` and resolved `hubspot_company_id`
+- Input attributes used for routing (region inputs, owner inputs, suppression flags)
+- Resolved owner id + resolution rule (e.g., PRESERVE_COMPANY_OWNER, DEAL_OWNER, REGION_RR)
+- Suppression decision (true/false) + reason (COOLDOWN, OPEN_TASK, MARKETING_HIGH_TOUCH, INTERNAL_ORG)
+- HubSpot API request ids / response codes for each operation (property upsert, note create, task create)
+- Router version, timestamp
+
+#### 5.2 HubSpot trace fields
+To support Sales Ops and incident investigation directly in HubSpot:
+- All PLG tasks must include `ri_plg_signal_task = true` and `ri_plg_signal_id = <id>`.
+- All PLG notes must include the `plg_signal_id` in the body.
+- Company properties must include `ri_plg_signal_router_version`.
+
+#### 5.3 Privacy constraints
+Routing must follow the data handling policy:
+- Do not include raw prompts, user-entered content, or fine-grained event logs in HubSpot.
+- Notes must contain aggregated metrics only (counts/percentiles) and doc category intent (e.g., “Viewed Private Deployment docs”), not specific page URLs when avoidable.
+
+## Alternatives considered
+1. **Always round-robin (ignore existing owners):** rejected due to ownership churn and poor customer experience.
+2. **Route everything to SDR queue first:** rejected for initial NA pilot; adds latency and reduces accountability. May be revisited for high-volume cohorts.
+3. **Use HubSpot native workflows for ownership logic:** rejected for v1 due to limited testability, poor idempotency control, and difficulty encoding nuanced suppression and audit logging.
+
+## Consequences
+### Positive
+- Stable ownership and fewer internal conflicts.
+- Lower customer annoyance risk via cooldowns and open-task suppression.
+- Clear audit trail for debugging, Ops review, and customer escalations.
+
+### Negative / tradeoffs
+- Router service becomes a critical dependency for correct CRM hygiene.
+- Requires ongoing maintenance of region pools and user status.
+- Some edge cases (multi-region companies) will be handled via manual override rather than automation in v1.
+
+## Implementation notes
+### Required configuration (owned by Sales Ops + Biz Systems)
+- Region pools: list of eligible owner HubSpot user ids for NA/EMEA/APAC.
+- Exclusion lists:
+  - Internal/test orgs (never route)
+  - Known partners/sandboxes (route only on explicit allowlist)
+- Manual override property:
+  - If `ri_plg_owner_override_id` is set, router assigns to that owner and preserves thereafter.
+
+### Operational requirements
+- HubSpot API calls must be retried with exponential backoff on 429/5xx; queue work to avoid dropping.
+- All operations must be safe on replay (at-least-once delivery).
+- Dashboard metrics must include: tasks_created, tasks_suppressed_by_reason, hubspot_429_count, hubspot_5xx_count, and end-to-end lag.
+
+## Rollout and change management
+- Phase 1 (NA pilot): enable NA pools and region mapping; EMEA/APAC route to NA with `ri_routing_needs_review = true`.
+- Phase 2: enable EMEA routing after review with EMEA Sales Ops (see EU residency routing thread outcomes).
+- Any changes to precedence, cooldown windows, or suppression logic require:
+  - Update to this ADR (or ADR addendum)
+  - Approval from Sales Ops (Isabelle Laurent) + Biz Systems (David Kim) + Privacy (Dr. Aisha Rahman) for any data field changes
+
+## Open questions (tracked in project tickets)
+- When a company has both an AE and a CSM, should compliance signals notify both (two tasks) or just AE with a CSM mention?
+- Should we create a HubSpot "PLG Signal" custom object in v2 to avoid overloading company properties?
+
+## Appendix: Example routing outcomes
+- Company already owned by AE → preserve owner; create note + task if not in cooldown.
+- No owner, billing country = DE → route to EMEA pool via round-robin; set company owner; create task.
+- Existing customer with CSM-only ownership and an expansion signal → create CSM coordination task; do not cold-email from SDR.
+- High-touch Marketing nurture active + low-confidence pricing click → suppress task; still update properties + note for visibility.

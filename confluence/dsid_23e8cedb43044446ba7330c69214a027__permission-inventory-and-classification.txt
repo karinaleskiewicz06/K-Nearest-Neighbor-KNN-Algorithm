@@ -1,0 +1,247 @@
+RBAC v2 Permission Inventory & Classification (Canonical Catalog)
+
+## Purpose
+This page is the **canonical permission catalog** for Redwood Inference RBAC v2.
+
+It is used to:
+- Standardize **permission naming** and **sensitivity classification**.
+- Map **product actions (endpoints/jobs/Console workflows)** to permissions.
+- Identify **gaps** (missing checks, missing permissions, inconsistent error semantics).
+- Provide a source of truth for **role template generation** and **CI enforcement**.
+
+> Ownership note: Security owns the catalog format and tiering. Each domain team owns correctness for their mapped actions and coverage.
+
+---
+
+## Definitions
+- **Permission**: A named capability that may be granted via roles and bindings.
+- **Action**: A concrete operation (API endpoint, internal RPC, background job) that must be protected by a permission.
+- **Resource**: The object being acted upon (org/project/environment/deployment/key/etc.).
+- **Scope**: The boundary within which a permission grant applies (e.g., org-wide vs project-specific).
+
+---
+
+## Permission naming conventions (RBAC v2)
+See: ADR-014 (Permission naming and versioning).
+
+### Format
+Permissions follow a stable, dot-delimited string format:
+
+`<domain>.<resource>.<verb>[.<qualifier>]`
+
+Examples:
+- `org.users.invite`
+- `org.roles.update`
+- `inference.routing_policies.update`
+- `audit.logs.export`
+
+### Rules
+1. **Lowercase**, underscore for multiword resources (`routing_policies`, `api_keys`).
+2. Verbs are **imperative** and consistent across domains:
+   - `read`, `list`, `create`, `update`, `delete`
+   - security verbs: `rotate`, `revoke`, `export`, `enable`, `disable`, `approve`, `impersonate`
+3. Avoid embedding scope in the permission name. Scope is expressed via **binding scope** (org/project/environment/cluster).
+4. If a permission’s semantics must change incompatibly, introduce a **new permission** and deprecate the old one (do not silently change meaning).
+
+### Non-goals
+- Exposing a full customer-authored policy language (ABAC) in v2.
+
+---
+
+## Sensitivity tiers
+These tiers help define minimum review requirements, audit logging strictness, and break-glass expectations.
+
+| Tier | Name | Description | Examples | Default requirements |
+|---|---|---|---|---|
+| P0 | Critical security / irreversible impact | Can permanently affect org security posture, access, keys/secrets, audit integrity, or production traffic for many workloads | Manage roles, rotate org secrets, export audit logs, change SSO enforcement, modify routing policies | Mandatory authz decision audit logging; deny-by-default; 2-person review for role template defaults; integration tests required |
+| P1 | High impact operational | Can materially impact production behavior/cost/availability but typically reversible | Change model pinning/rollouts, modify rate limits, create deployments, change retention settings | Authz decision audit logging strongly recommended; integration tests for key workflows |
+| P2 | Moderate impact | Affects configuration or data visibility within a narrower scope | View usage analytics, create API keys (non-admin), update project settings | Standard authz logging; unit tests + coverage gate |
+| P3 | Read-only / low risk | Read-only views (still may expose sensitive metadata depending on dataset) | List deployments, read audit logs (not export), view role assignments | Standard logging; ensure least privilege in role templates |
+
+**Handling note:** Some read operations are still P0/P1 when they expose highly sensitive data (e.g., secret material). Do not assume read == P3.
+
+---
+
+## Resource types & supported scopes
+RBAC v2 bindings apply at one of these scopes.
+
+| Resource type | Examples | Supported binding scopes | Notes |
+|---|---|---|---|
+| org | org settings, SSO enforcement, org audit config | org | Highest-level scope; prefer narrow admin roles |
+| identity | users, service accounts, groups, role bindings | org | Includes invitation and lifecycle events |
+| rbac | roles, permissions, templates | org | Treat changes as P0 |
+| project | projects, API keys, usage settings | org, project | Most customer workflows are project-scoped |
+| environment | dev/stage/prod env config | org, project, environment | Used heavily for Dedicated + Private |
+| deployment | dedicated pools, private clusters, install/admin | org, project, environment, cluster | Cluster is relevant for Private |
+| inference | routing policies, model pinning, rollouts | org, project, environment | High production impact |
+| security | secrets, KMS config, retention, break-glass | org, project, environment, cluster | Secrets are always tightly controlled |
+| audit | audit log access/export, SIEM integration | org, project, environment | Export typically P0; read may be P1 depending on filter |
+| billing | invoices, payment methods, usage exports | org | Separation-of-duties recommended |
+
+---
+
+## Canonical permission catalog (current)
+This section lists permissions that should exist in the registry/policy bundle. It is intentionally concise; the next section maps permissions to concrete endpoints/jobs.
+
+| Permission | Tier | Resource type | Default binding scope | Description |
+|---|---|---|---|---|
+| org.settings.read | P3 | org | org | Read org settings and metadata |
+| org.settings.update | P1 | org | org | Update org-level settings (non-security) |
+| org.sso.read | P2 | org | org | Read SSO/SAML configuration state |
+| org.sso.update | P0 | org | org | Configure SSO/SAML, domain allowlists, enforcement |
+| org.users.read | P3 | identity | org | Read users and membership |
+| org.users.invite | P1 | identity | org | Invite a user to the org |
+| org.users.deactivate | P0 | identity | org | Deactivate/remove a user |
+| org.service_accounts.create | P1 | identity | org | Create a service account |
+| org.service_accounts.rotate_credentials | P0 | identity | org | Rotate service account credentials |
+| org.roles.read | P3 | rbac | org | Read roles and templates |
+| org.roles.create | P0 | rbac | org | Create custom roles |
+| org.roles.update | P0 | rbac | org | Update custom roles/permissions |
+| org.roles.delete | P0 | rbac | org | Delete a role |
+| org.role_bindings.read | P3 | rbac | org | Read role bindings |
+| org.role_bindings.create | P0 | rbac | org | Create role bindings (grant permissions) |
+| org.role_bindings.delete | P0 | rbac | org | Remove role bindings (revoke permissions) |
+| project.read | P3 | project | project | Read project metadata |
+| project.create | P1 | project | org | Create a new project |
+| project.update | P1 | project | project | Update project settings |
+| project.delete | P0 | project | org | Delete a project |
+| project.api_keys.read | P2 | project | project | List/read API keys (metadata only) |
+| project.api_keys.create | P1 | project | project | Create API keys |
+| project.api_keys.rotate | P0 | project | project | Rotate API keys |
+| project.api_keys.revoke | P0 | project | project | Revoke/delete API keys |
+| security.secrets.read_metadata | P2 | security | project, environment | Read secret names/metadata (no material) |
+| security.secrets.read_value | P0 | security | environment | Read secret material (where supported) |
+| security.secrets.create | P0 | security | environment | Create a secret |
+| security.secrets.update | P0 | security | environment | Update secret material |
+| security.secrets.delete | P0 | security | environment | Delete a secret |
+| security.retention.read | P2 | security | org, project | Read retention settings |
+| security.retention.update | P0 | security | org | Update retention/data residency controls |
+| security.breakglass.activate | P0 | security | org | Activate break-glass elevation |
+| inference.models.read | P3 | inference | project | Read model catalog availability (for project) |
+| inference.models.pin | P1 | inference | environment | Pin a model version for an environment |
+| inference.rollouts.update | P1 | inference | environment | Update rollout policy (canary/A-B/fallback) |
+| inference.routing_policies.read | P2 | inference | project, environment | Read routing policies |
+| inference.routing_policies.update | P0 | inference | environment | Modify routing policies affecting traffic |
+| inference.quotas.read | P2 | inference | project | Read quotas/rate limits |
+| inference.quotas.update | P1 | inference | project | Update quotas/rate limits |
+| audit.logs.read | P2 | audit | project, environment | Read audit logs (in product UI/API) |
+| audit.logs.export | P0 | audit | org, project | Export audit logs (bulk, SIEM) |
+| audit.siem_integrations.update | P0 | audit | org | Configure SIEM export integration |
+| billing.read | P2 | billing | org | Read billing info |
+| billing.update_payment_method | P0 | billing | org | Update payment method |
+| dedicated.capacity.read | P2 | deployment | org, project | Read dedicated capacity/pools |
+| dedicated.capacity.update | P0 | deployment | org | Modify dedicated GPU pool settings |
+| private.clusters.read | P2 | deployment | org | Read private clusters and status |
+| private.clusters.update | P0 | deployment | cluster | Update private cluster settings |
+| private.installer.bootstrap_admin | P0 | deployment | cluster | Bootstrap initial admin binding during install |
+
+---
+
+## Endpoint & job mapping (coverage + gaps)
+**Legend**
+- **Enforcement**: where the permission check must be enforced.
+  - `Gateway`: Redwood API Gateway middleware
+  - `Service`: control plane service interceptor
+  - `Both`: gateway + service (defense in depth; required for P0)
+- **Coverage**: current state as of last_updated.
+  - `✅` implemented and tested
+  - `🟡` implemented but missing tests / inconsistent error semantics
+  - `🔴` missing check or missing permission mapping
+
+> This table is intentionally biased toward **security-relevant** endpoints and admin operations. Non-sensitive read endpoints are tracked in the engineering coverage report but omitted here.
+
+| Surface | Endpoint / Job (service) | Action | Permission | Tier | Scope expected | Enforcement | Coverage | Owner | Notes / gaps |
+|---|---|---|---|---|---|---|---|---|---|
+| Console/API | GET /v1/orgs/{orgId} (control-plane) | Read org | org.settings.read | P3 | org | Service | ✅ | Ethan Park | Ensure denies return standardized 403 schema |
+| Console/API | PATCH /v1/orgs/{orgId} (control-plane) | Update org settings | org.settings.update | P1 | org | Service | 🟡 | Ethan Park | Needs integration test for deny case |
+| Console/API | GET /v1/orgs/{orgId}/sso (control-plane) | Read SSO | org.sso.read | P2 | org | Service | ✅ | Ethan Park |  |
+| Console/API | PUT /v1/orgs/{orgId}/sso (control-plane) | Update SSO/enforcement | org.sso.update | P0 | org | Both | 🟡 | Kaitlyn Nguyen | Require dual-enforcement due to high impact; add break-glass override path audit |
+| Console/API | GET /v1/orgs/{orgId}/users (control-plane) | List users | org.users.read | P3 | org | Service | ✅ | Ethan Park |  |
+| Console/API | POST /v1/orgs/{orgId}/users:invite (control-plane) | Invite user | org.users.invite | P1 | org | Service | ✅ | Ethan Park |  |
+| Console/API | POST /v1/orgs/{orgId}/users/{userId}:deactivate (control-plane) | Deactivate user | org.users.deactivate | P0 | org | Both | 🟡 | Ethan Park | Add approval workflow in Console later; ensure audit includes reason |
+| Console/API | POST /v1/orgs/{orgId}/service-accounts (control-plane) | Create service account | org.service_accounts.create | P1 | org | Service | 🟡 | Ethan Park | Missing explicit permission annotation on one RPC handler |
+| Console/API | POST /v1/orgs/{orgId}/service-accounts/{id}:rotate (control-plane) | Rotate SA credentials | org.service_accounts.rotate_credentials | P0 | org | Both | 🔴 | Kaitlyn Nguyen | Permission exists; service handler missing check; add regression test |
+| Console/API | GET /v1/orgs/{orgId}/roles (control-plane) | List roles | org.roles.read | P3 | org | Service | ✅ | Jordan Lee |  |
+| Console/API | POST /v1/orgs/{orgId}/roles (control-plane) | Create role | org.roles.create | P0 | org | Both | ✅ | Jordan Lee | P0: both layers required; CI gate on annotations |
+| Console/API | PATCH /v1/orgs/{orgId}/roles/{roleId} (control-plane) | Update role | org.roles.update | P0 | org | Both | ✅ | Jordan Lee | Ensure permission registry metadata includes “rbac-critical” |
+| Console/API | DELETE /v1/orgs/{orgId}/roles/{roleId} (control-plane) | Delete role | org.roles.delete | P0 | org | Both | ✅ | Jordan Lee |  |
+| Console/API | GET /v1/orgs/{orgId}/role-bindings (control-plane) | List bindings | org.role_bindings.read | P3 | org | Service | ✅ | Jordan Lee |  |
+| Console/API | POST /v1/orgs/{orgId}/role-bindings (control-plane) | Create binding | org.role_bindings.create | P0 | org | Both | 🟡 | Jordan Lee | Missing “why denied” reason mapping for scope mismatch |
+| Console/API | DELETE /v1/orgs/{orgId}/role-bindings/{id} (control-plane) | Delete binding | org.role_bindings.delete | P0 | org | Both | 🟡 | Jordan Lee | Needs integration test for removing last admin edge case |
+| Console/API | GET /v1/projects/{projectId} (control-plane) | Read project | project.read | P3 | project | Service | ✅ | Ethan Park |  |
+| Console/API | POST /v1/projects (control-plane) | Create project | project.create | P1 | org | Service | ✅ | Ethan Park |  |
+| Console/API | PATCH /v1/projects/{projectId} (control-plane) | Update project | project.update | P1 | project | Service | ✅ | Ethan Park |  |
+| Console/API | DELETE /v1/projects/{projectId} (control-plane) | Delete project | project.delete | P0 | org | Both | 🟡 | Ethan Park | Confirm break-glass path for accidental lockout scenarios |
+| Console/API | GET /v1/projects/{projectId}/api-keys (control-plane) | List API keys (metadata) | project.api_keys.read | P2 | project | Service | ✅ | Benji Okafor | Ensure response never returns key material |
+| Console/API | POST /v1/projects/{projectId}/api-keys (control-plane) | Create API key | project.api_keys.create | P1 | project | Service | ✅ | Benji Okafor |  |
+| Console/API | POST /v1/projects/{projectId}/api-keys/{keyId}:rotate (control-plane) | Rotate API key | project.api_keys.rotate | P0 | project | Both | 🟡 | Benji Okafor | Known issue: some clients call legacy rotate route; ensure dual-read mapping |
+| Console/API | DELETE /v1/projects/{projectId}/api-keys/{keyId} (control-plane) | Revoke API key | project.api_keys.revoke | P0 | project | Both | ✅ | Benji Okafor |  |
+| Control Plane | secrets-sync job (secrets-service) | Sync secret refs to runtime | security.secrets.read_metadata | P2 | environment | Service | 🟡 | Ines Carvalho | Job uses service identity; must still log authz decision context |
+| Console/API | GET /v1/projects/{projectId}/secrets (secrets-service) | List secret metadata | security.secrets.read_metadata | P2 | project | Service | ✅ | Marcus Lin | Confirm filtering by scope (env vs project) |
+| Console/API | GET /v1/environments/{envId}/secrets/{name} (secrets-service) | Read secret value | security.secrets.read_value | P0 | environment | Both | 🔴 | Marcus Lin | Not supported in Hosted for most secrets; ensure endpoint disabled or gated; if enabled, must require P0 |
+| Console/API | POST /v1/environments/{envId}/secrets (secrets-service) | Create secret | security.secrets.create | P0 | environment | Both | 🟡 | Marcus Lin | Missing standardized denial reason codes on one handler |
+| Console/API | PUT /v1/environments/{envId}/secrets/{name} (secrets-service) | Update secret | security.secrets.update | P0 | environment | Both | 🟡 | Marcus Lin | Add audit log redaction guarantees |
+| Console/API | DELETE /v1/environments/{envId}/secrets/{name} (secrets-service) | Delete secret | security.secrets.delete | P0 | environment | Both | 🟡 | Marcus Lin | Ensure tombstone prevents resurrection via eventual consistency |
+| Console/API | GET /v1/orgs/{orgId}/retention (control-plane) | Read retention | security.retention.read | P2 | org | Service | ✅ | Logan Wright |  |
+| Console/API | PUT /v1/orgs/{orgId}/retention (control-plane) | Update retention/residency | security.retention.update | P0 | org | Both | 🔴 | Logan Wright | Missing mapping for “residency” subfield; add explicit permission check; update role templates |
+| Internal | break-glass elevation workflow (security-service) | Activate break-glass | security.breakglass.activate | P0 | org | Service | 🟡 | Fiona McCarthy | Must alert SecOps + record approval; ensure time-bound TTL is enforced |
+| Hosted API | POST /v1/chat/completions (gateway + inference-router) | Generate (streaming/non-stream) | (not RBAC; project entitlement) | - | project | Gateway | ✅ | Amara Diallo | Not RBAC-scoped; protected by API key auth + project entitlements; still logs authz context as “entitled” |
+| Hosted API | POST /v1/chat/completions?stream=true (gateway + inference-router) | Generate streaming | (not RBAC; project entitlement) | - | project | Gateway | ✅ | Amara Diallo | Regression previously allowed bypass of middleware on one route variant; ensure route parity tests |
+| Console/API | GET /v1/models (control-plane) | Read model catalog | inference.models.read | P3 | project | Service | ✅ | Diego Santos |  |
+| Console/API | PUT /v1/environments/{envId}/model-pin (control-plane) | Pin model version | inference.models.pin | P1 | environment | Both | 🟡 | Diego Santos | Confirm pinning also impacts fallback model selection; needs “why denied” scope messaging |
+| Console/API | PATCH /v1/environments/{envId}/rollout-policy (control-plane) | Update rollout | inference.rollouts.update | P1 | environment | Both | ✅ | Diego Santos |  |
+| Console/API | GET /v1/environments/{envId}/routing-policy (control-plane) | Read routing policy | inference.routing_policies.read | P2 | environment | Service | ✅ | Diego Santos |  |
+| Console/API | PUT /v1/environments/{envId}/routing-policy (control-plane) | Update routing policy | inference.routing_policies.update | P0 | environment | Both | 🔴 | Diego Santos | Dedicated admin deny reported due to missing role template permission; fix templates + add integration test |
+| Console/API | GET /v1/projects/{projectId}/quotas (control-plane) | Read quotas | inference.quotas.read | P2 | project | Service | ✅ | Ethan Park |  |
+| Console/API | PUT /v1/projects/{projectId}/quotas (control-plane) | Update quotas | inference.quotas.update | P1 | project | Service | 🟡 | Ethan Park | Requires stricter audit event with old/new values |
+| Console/API | GET /v1/projects/{projectId}/audit-logs (audit-service) | Read audit logs | audit.logs.read | P2 | project | Service | ✅ | Kevin Osei | Ensure filtering cannot escape scope; pagination token must be scoped |
+| Console/API | POST /v1/projects/{projectId}/audit-logs:export (audit-service) | Export audit logs | audit.logs.export | P0 | project/org | Both | 🟡 | Kevin Osei | Private customer ticket: export denied due to missing permission mapping in Private role template; fix role bundle |
+| Control Plane | SIEM export pipeline config (audit-service) | Update SIEM integration | audit.siem_integrations.update | P0 | org | Both | 🔴 | Kevin Osei | Endpoint exists but permissions not annotated; add P0 checks + “deny reason: missing_permission” |
+| Console/API | GET /v1/orgs/{orgId}/billing (billing-service) | Read billing | billing.read | P2 | org | Service | ✅ | Naomi Feldman | Ensure separation-of-duties in templates |
+| Console/API | PUT /v1/orgs/{orgId}/billing/payment-method (billing-service) | Update payment method | billing.update_payment_method | P0 | org | Both | 🟡 | Naomi Feldman | Add MFA requirement later (out of scope v2) |
+| Dedicated | PATCH /v1/dedicated/pools/{poolId} (dedicated-control) | Update dedicated pool | dedicated.capacity.update | P0 | org | Both | 🔴 | Priya Natarajan | Requires Dedicated operator role; clarify scope between org vs project pools |
+| Dedicated | GET /v1/dedicated/pools (dedicated-control) | Read pools | dedicated.capacity.read | P2 | org/project | Service | 🟡 | Priya Natarajan | Ensure customer sees only their allocated pools |
+| Private | POST /v1/private/install:bootstrap (private-installer) | Bootstrap admin | private.installer.bootstrap_admin | P0 | cluster | Service | ✅ | Vivek Kulkarni | Must be one-time or tightly gated; log event with installer identity |
+| Private | PATCH /v1/private/clusters/{clusterId}/settings (private-control) | Update cluster settings | private.clusters.update | P0 | cluster | Both | 🟡 | Vivek Kulkarni | Confirm cluster-scope bindings work with IdP group mapping |
+| Private | GET /v1/private/clusters (private-control) | Read clusters | private.clusters.read | P2 | org | Service | ✅ | Vivek Kulkarni |  |
+
+---
+
+## Known gaps & remediation plan (tracked)
+1. **P0 enforcement parity (Gateway vs Service)**
+   - Requirement: P0 actions must enforce in **both** gateway and service where applicable.
+   - Current gap(s): `org.service_accounts.rotate_credentials`, `security.retention.update`, `inference.routing_policies.update`, `audit.siem_integrations.update`.
+   - Owner: Jordan Lee (framework), Amara Diallo (gateway), respective domain owners for service handlers.
+
+2. **Role template alignment**
+   - Dedicated + Private operator roles must include required P0 permissions (e.g., routing policy edits and audit export).
+   - Owner: Naomi Feldman (product), Jordan Lee (policy bundle).
+
+3. **Standard denial reason codes + “why denied” UX**
+   - Requirement: all sensitive endpoints return consistent denial code and include admin-debug header where allowed.
+   - Owner: Kaitlyn Nguyen (platform integration), Felix Schneider (Console).
+
+4. **Audit log decision context completeness**
+   - Requirement: log subject, action (permission), resource scope, policy version, decision, and denial reasons.
+   - Owner: Kevin Osei + Allison Grant.
+
+---
+
+## How to propose changes
+1. Add or update the permission in the **permission registry** (with tier, description, resource type).
+2. Update this page:
+   - Add to canonical catalog table
+   - Add/adjust endpoint mappings
+3. Update role templates (if needed) and run policy bundle lint.
+4. Add/adjust tests:
+   - Unit tests for service interceptors/annotations
+   - Integration tests for P0 workflows
+5. Notify #eng-security and tag owners for review.
+
+---
+
+## Change log
+- 2025-03-21 (Marcus Lin): Added retention/residency and SIEM integration permissions; updated mapping table with Dedicated/Private items and current coverage.
+- 2025-03-12 (Jordan Lee): Aligned naming with ADR-014 (underscores for multiword resources) and clarified P0 dual-enforcement requirement.
+- 2025-02-10 (Naomi Feldman): Added audit export and routing policy as explicit P0 items; added separation-of-duties note for billing roles.
+- 2025-01-22 (Marcus Lin): Initial catalog skeleton and tier definitions.

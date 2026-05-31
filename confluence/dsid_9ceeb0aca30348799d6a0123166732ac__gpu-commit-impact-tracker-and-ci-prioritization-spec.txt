@@ -1,0 +1,126 @@
+gpu-commit-impact-tracker-and-ci-prioritization-spec
+
+Summary:
+This document specifies the design, operational rules, and rollout plan for the GPU Commit Impact Tracker (GCIT) — a lightweight service and CI prioritization layer that estimates the likely infra cost and SLO impact of a given change (PR/commit) and then routes CI and preflight tests accordingly. GCIT reduces wasted GPU CI runs, surfaces risky changes earlier, and ensures high-risk changes receive prioritized, higher-fidelity tests without increasing overall CI capacity.
+
+Goals:
+- Reduce GPU CI waste by 30% within 6 months while maintaining or improving post-merge latency SLOs.
+- Surface potential infra regressions (latency, memory usage, eviction rate) earlier in the pipeline.
+- Route PRs to an appropriate test band (quick unit GPU simulator, smoke on small instance, full mixed-precision perf) based on predicted impact.
+- Provide a transparent, auditable score and decision path for routing.
+
+Scope:
+- Applies to all repos that create or modify serving runtime artifacts, quantized kernels, scheduler code, or tenant-facing config that affects batch/eviction behavior.
+- Not in scope: docs-only changes, front-end-only UI changes, or purely non-inference tooling (unless they touch deployment manifests).
+
+High-level architecture:
+1) GCIT webhook (GitHub App) receives PR metadata and a lightweight diff analysis.
+2) Impact classifier service (stateless) computes a risk score and recommended test-band. It uses rules + model features: touched files, module ownership, recent telemetry deltas, heuristic cost estimate, and historical flake/regression signals.
+3) CI router (Buildkite step or GitHub Actions dispatcher) applies test-band -> pipeline mapping and enforces concurrency buckets.
+4) Telemetry exporter records decisions, downstream test results, and final post-merge metrics for model retraining and policy tuning.
+
+Components detail:
+- Diff Analyzer: fast file-glob-based fingerprinting. Known fingerprints: kernel/ops/*.cu, runtime/kernel_selector/*, quantization/*.py, iac/*.tf, charts/*.yaml. Also extracts added/removed LOC and changed binary artifacts.
+- Feature Extractor: derives features including repo owner, touched modules, LOC, lines in CUDA files, references to public config flags, whether PR touches batching or KV cache code paths.
+- Rules Engine: a set of prioritized deterministic rules (see below). Rules short-circuit model output for safety-critical changes (e.g., anything touching preemption/fallback code yields HIGH risk).
+- Scoring Model: lightweight weighted model for alpha (logistic regression or XGBoost small). Stores stable weights in config and allows online adjustment from telemetry.
+- Router: Buildkite plugin that maps bands to concrete pipelines. Bands: fast-sim, smoke-small, perf-full, infra-ops.
+
+Heuristics and scoring (example) :
+- Base score = 0
+- +6 if any files under runtime/kernel_selector/ or kernel ops changed
+- +5 if CUDA/C++ files modified (detected by extension)
+- +4 if Terraform manifests under infra/ or iac/ changed
+- +3 if batching/kv-cache keywords present in diff
+- +2 if LOC > 200
+- -2 if change touches only docs/tests
+- Override TO HIGH risk if: contains changes to preemption, warm-pool, tenant-scheduling, or HSM integration code paths.
+
+Bands and routing rules:
+- fast-sim (score <= 2): runs quick unit tests + CPU-based microbench simulator. Max pipeline runtime: 20m. Used for low-risk infra-changes (e.g., small config updates).
+- smoke-small (score 3-6): runs a single small-GPU smoke job (p3.2xlarge equivalent), basic perf check, integration smoke. Runtime: 1h.
+- perf-full (score >= 7 OR rules override): full multi-config GPU matrix including mixed-precision kernel validations, quantization regression checks, and SLO synthetic traces. Runtime: 3–6h.
+- infra-ops (manual triage): flagged if heuristics detect secrets, network policy changes, or Terraform changes needing approval. Requires an infra-approver before CI proceeds.
+
+Test matrix mapping (short):
+- runtime/* changed -> perf-full
+- kernel/*.cu changed -> perf-full (with additional quant matrix)
+- iac/terraform/*.tf changed -> infra-ops (trigger plan + state-check job)
+- docs-only -> fast-sim
+
+Terraform / IaC integration requirements:
+- Add a small tf module tag to modules that affect warm-pool or warm-up seeding (tag: gcit_sensitive = true). The Diff Analyzer will treat those modules as HIGH risk.
+- CI must include a step that runs terraform plan | jq to surface changed resources; if any sensitive resources are present, mark infra-ops.
+- Provide a standard module variable gcit_impact_metadata = { owner = "team-x", impact = "high|medium|low" } (stringified map in module call). CI Diff Analyzer reads this value when present.
+
+Observability and metrics to emit:
+- Decisions: GCIT.decisions.total (labels: repo, team, band)
+- Latency delta exposures: postmerge.mean_p99_ms_delta
+- GPU CI savings: ci.gpu_minutes_saved_by_band (estimated)
+- False negative alerts: count of post-merge incidents traced to PRs that were routed to fast-sim
+- Weekly retraining dataset size: gcit.telemetry.rows
+
+SLOs and thresholds:
+- Decision latency: GCIT must score and respond within 10s for 95% of PRs.
+- Routing correctness: aim for 95% recall on HIGH-risk PRs (measured vs historical incidents over a rolling 90d).
+- GPU CI savings: reduce unnecessary perf-full runs by 30% within 6 months.
+
+Rollout plan (phased):
+- Phase 0 (canary, 2 weeks): Dry-run mode for a single low-risk repo (ci-inference-sandbox). GCIT attaches labels but does not change pipelines. Collect telemetry.
+- Phase 1 (staged, 6 weeks): Enable routing for 5 repos across infra, runtime, and tooling. Enforce slow-fail (if routing fails, fallback to perf-full).
+- Phase 2 (wide, 8 weeks): Onboard the rest of runtime + model-serving teams. Enable terraform gating for prod infra repos with manual approvers.
+- Phase 3 (optimizing): Adjust weights, add heuristics, integrate retraining loop.
+
+Oncall runbook (when a PR causes a post-merge regression traced to routing):
+1) Pager duty alert: gcit-regression-signal. First line oncall triages within 30m.
+2) Reproduce: identify PR, rerun full perf matrix against that PR commit.
+3) Mitigate: revert the PR or hotfix depending on severity. Rollback steps: GitHub revert -> CI pipeline 'emergency' that triggers perf-full for the revert commit.
+4) Root cause: was the routing score wrong (model/rules) or was the test matrix insufficient? Tag incident accordingly.
+5) Postmortem: owner team opens postmortem and attaches to related_pages list for retraining dataset.
+
+Config examples (router mapping YAML):
+
+router:
+  bands:
+    - name: fast-sim
+      max_runtime: 20m
+      concurrency_bucket: low
+    - name: smoke-small
+      max_runtime: 60m
+      concurrency_bucket: medium
+    - name: perf-full
+      max_runtime: 6h
+      concurrency_bucket: high
+    - name: infra-ops
+      requires_approver: true
+
+CLI snippets (for local testing):
+# Run local diff extraction
+$ gcit-diff-analyzer --repo . --base main --head feature/fast-path --out features.json
+
+# Score locally
+$ gcit-score --features features.json --config /etc/gcit/weights.yaml
+
+Ownership and contacts:
+- Primary owner: eng-infra CI/CD team (oncall alias: eng-infra-ci)
+- Secondary reviewers: runtime-team@redwood.ai, quantization@redwood.ai
+- SRE integration owner: Evan Li
+
+Open design questions / decisions to be made:
+- Should certain kernel-level changes automatically require a canary rollout on dedicated capacity? (tradeoff between cost and safety)
+- How to encode multi-repo changes atomically (cross-repo PRs)? Current plan: detect and escalate to infra-ops.
+
+Appendix A — Example scoring config (weights):
+weights:
+  kernel_selector: 4
+  cuda_file: 5
+  terraform_sensitive: 6
+  batching_keyword: 3
+  loc_threshold: 2
+
+Appendix B — Metrics dashboard queries (example):
+- Decision rate by band (last 30d): sum(GCIT.decisions.total) by band
+- Post-merge regressions traced to GCIT decisions: sum(alerts.where(label="gcit_regression"))
+
+End notes:
+GCIT is intended to be conservative by default and iteratively tuned with telemetry. The immediate aim is not to block developer velocity but to reduce expensive and silent regressions that only surface in production. For questions, reach out to the owners above or open a PR against this page.

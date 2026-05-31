@@ -1,0 +1,144 @@
+GPU tenant eviction predictor and provisioning guidelines
+
+Summary:
+This document describes a pragmatic system for predicting tenant GPU preemption/eviction risk and tying that prediction into provisioning, autoscaling, and tenant-level mitigation flows. It combines telemetry signals, a lightweight ML scoring pipeline, observability dashboards, Terraform/IaC tagging patterns, and CI/CD safety checks. The goal is to reduce application-visible disruptions and cost by proactively migrating or warming capacity for high-risk tenants while preserving fairness and SLOs.
+
+Why this exists (Motivation):
+- Preemptible/spot/interruptible GPU instances improve economics but increase evictions that impact tail-latency SLOs.
+- Current reactive approaches (post-eviction retry/backoff) let production customer requests surface incidents.
+- A low-latency predictor + automated provisioning flow reduces p99 latency spikes, decreases expensive emergency burst allocations, and improves tenant experience.
+
+Scope and constraints:
+- Applies to all multi-tenant hosted inference pools that use preemptible GPU instances or cloud shapes with eviction signals.
+- Not intended for on-prem private deployments (separate guidance in eng-private-deployments).
+- Predictor must be auditable, have a low query latency (<50ms), and be operated by infra SRE in partnership with runtime owners.
+
+Overview of the system:
+1) Telemetry ingestion: sample, store, and aggregate eviction-related signals per-host and per-tenant (see Telemetry section).
+2) Feature extraction: streaming windowed features (5m, 30m) and historical baselines.
+3) Scoring service: lightweight model (logistic-regression or small XGBoost) served as a single API that returns risk score [0.0-1.0].
+4) Decision layer: configurable policies translate scores into actions (no-op, pre-warm, start-dedicated, throttle-burst).
+5) Execution: IaC/Orchestrator triggers: Terraform run for reserved capacity, autoscaler signals, or request rerouting to resilient pools.
+6) Observability & auditing: dashboards, SLO checks, and rollout gating.
+
+Telemetry and signals (what we collect):
+- Instance-level: cloud interrupt_notice_count, instance_uptime, instance_type, lifecycle_event (spot-interruption, maintenance).
+- Kernel/driver: GPU_utilization_5s, mem_free_mb, cudnn_errors, nvlink_errors.
+- Scheduler: queue_depth_per_tenant, pending_requests_1m, avg_inflight_per_tenant.
+- Network/storage: egress_bandwidth_pct, disk_iops_burst, tail_retransmits.
+- Historical: eviction_rate_24h, eviction_rate_7d, tenant_recent_evictions (count).
+- External: provider_spot_capacity_index (region-level signal provided by cloud cost analytics).
+
+Implementation notes (feature engineering):
+- Windowing: compute rate features at 5m and 30m windows + exponential decay for 24h baseline.
+- Binarize categorical fields (instance_type family), normalize GPU_utilization by instance GPU count.
+- Use missing-value sentinel (-1) and include a feature 'signal_completeness' (percent of signals present) to guard against blind spots.
+
+Eviction Risk Model (operational profile):
+- Model family: start with regularized logistic regression (interpretable) for first 30d; consider small tree ensembles if feature interactions justify it.
+- Training cadence: daily retrain on rolling 14d window, validate on last 7d holdout.
+- Metrics: ROC-AUC target >0.72, precision@0.1 recall >0.6 on labeled eviction events.
+- Labeling: binary label when a tenant has a disruptive eviction requiring request-level retry within 30 minutes of interruption.
+- Explainability: store top-3 contributing features per prediction for troubleshooting.
+
+Decision policies (mapping score -> action):
+- score < 0.05: no action (baseline).
+- 0.05 <= score < 0.2: monitor & increase sampling frequency for tenant telemetry.
+- 0.2 <= score < 0.5: pre-warm strategy — allocate a warm slot in a non-preemptible warm-pool (time-limited reservation: default 20m).
+- 0.5 <= score < 0.8: proactive dedicated allocation or burst reserve, and notify runtime-owner channel.
+- score >= 0.8: immediate protective action — move new requests to a resilient pool, fail fast for batch jobs with retry token, and trigger an on-call page if SLO impact is expected.
+
+Operational runbook (when predictor raises a tenant to >=0.5):
+1) Alerting: create an Ops alert with ticket auto-created in PagerDuty playbook. Relevant labels: tenant-id, predicted_score, region.
+2) Triage (SRE on-call): check top-3 feature contributors and recent host eviction events in last 60m.
+3) Mitigate: engage the decision policy — attempt pre-warm or provision dedicated capacity. If the provisioning API fails, run fallback route: redirect requests to fallback model variant (lower-cost) or to a multi-region fallback.
+4) Post-mortem: if an actual eviction occurs that resulted in customer-visible errors, label the incident with model-prediction outcome and update training label store.
+5) Feedback: incrementally adjust policy thresholds in the feature-flagged decision service after triage approval.
+
+SLOs and guardrails for predictor-driven actions:
+- Prediction latency: median <25ms, p95 <80ms.
+- False positive mitigation budget: at most 2% of pre-warm actions per week may be false-positive without manual sign-off.
+- Cost guardrail: monthly cost impact must be <5% of spot-savings; infra-finance pipeline will sample cost-impact reports every 7 days.
+- Auditing: every prediction and action must be logged in the audit sink (request id, tenant id, features, score, chosen_action).
+
+Terraform / IaC changes required (patterns and examples):
+- Tagging: all GPU hosts must include tags: {"gpu_pool":"<pool>", "preemptible":"true|false", "tenant_priority":"<tier>"}. Decision service reads these tags when choosing migration targets.
+- Warm-pool resource module: introduce module 'infra-gpu-warm-reservations' with small ephemeral reservations (default 20m).
+- Provider abstractions: create an interface module that can call cloud provider instance-creation steps via Terraform Cloud run tasks or an orchestrator operator.
+
+Appendix: example Terraform variable table (as text):
+- variable name: tenant_eviction_policy
+  - type: map(string)
+  - description: mapping of tenant-id -> policy tier (e.g., "gold", "silver", "bronze")
+- variable name: warm_pool_default_ttl_minutes
+  - type: number
+  - default: 20
+- variable name: eviction_predictor_endpoint
+  - type: string
+  - description: internal scoring API URL
+
+Example IaC snippet (pseudo-terraform):
+```hcl
+module "warm_reservation" {
+  source = "git::ssh://git.company/infra/terraform-modules//gpu-warm-reservation"
+  tenant_id = var.tenant_id
+  ttl_minutes = var.warm_pool_default_ttl_minutes
+  pool_selector = "gpu-pool-spot-us-west2"
+}
+```
+
+CI/CD and testing guidance (safety-first):
+- Unit tests: model scoring service must have a deterministic test harness that includes adversarial examples (missing signals).
+- Integration tests: run a synthetic pipeline that injects a fake eviction spike and asserts that the decision layer triggers a pre-warm (observed via terraform plan/apply mocks).
+- Canary: enable predictor for 1% of tenants initially (labelled test-tenants) with full logging. Gradually increase to 10% and then to 100% after cost and false-positive checks.
+- Git reviewers: any change to action thresholds or IaC modules must be reviewed by infra-sre and runtime-team leads (use CODEOWNERS).
+
+Dashboards and alerts to create (metric names are canonical):
+- dashboard: tenant-eviction-risk-overview — top tenants by weekly avg_score, recent actions, and cost impact.
+- panel: predictor-health — latency_histogram_ms, errors_per_min, model_drift_score.
+- alert: predictor-latency-high — trigger when p95 latency >200ms for 5m. PagerDuty severity: P2.
+- alert: prewarm-failure-rate — trigger when prewarm_apply_fail_rate >2% over 10m. Severity: P1 if >5%.
+
+Rollout plan and change control:
+1) Dev sandbox: deploy scoring service to staging and wire to synthetic telemetry generator.
+2) Safety canary: enable decisions in read-only mode (log-only) for 2 weeks.
+3) Small active canary: 1% of tenants with prewarm enabled and a tight manual rollback path.
+4) Gradual ramp: 1% -> 5% -> 25% -> 100%; perform cost & false-positive review at each step (2 business days).
+5) Post-migration audit: after 100% rollout, run a 30-day cost & SLO review; if cost>target, revert policy changes behind feature flag.
+
+Ownership and contacts:
+- On-call owner (first responder): infra-sre team (pagerduty: infra-sre-eviction).
+- Long-term owner: infra-platform (runtime & autoscaler) with weekly syncs with serving-runtime team.
+- Data & model owner: applied-ml-and-evals.
+- Finance contact for cost analysis: finance-infra-analytics.
+
+Open questions and next steps (actions):
+- Q1: Approve the initial action thresholds and cost guardrails with finance (owner: infra-platform, due: 2026-03-01).
+- Q2: Implement feature-flag framework for policy tuning exposed in the Console (owner: eng-developer-experience, due: 2026-04-15).
+- Q3: Evaluate moving from logistic regression to a calibrated ensemble if precision/recall plateau (owner: applied-ml-and-evals, due: 2026-06-01).
+
+Appendix B: Example queries and CLI checks:
+- List tenants with recent high risk (SQL pseudo-query):
+```sql
+SELECT tenant_id, avg(score) as avg_score, count(*) as samples
+FROM eviction_predictions
+WHERE ts > now() - interval '7 days'
+GROUP BY tenant_id
+ORDER BY avg_score DESC
+LIMIT 50;
+```
+- CLI check for prewarm reservations (kubectl/infra-ctl):
+```bash
+infra-ctl warm-reservations list --region us-west2 --state active --json | jq '.[] | {tenant_id, ttl_remaining}'
+```
+
+References and related pages:
+- See runbooks: kv-cache-consensus-and-warmup-coordination-runbook for KV cache thawing implications.
+- See infra-iac module: infra-gpu-warm-reservations (module repo link in internal git).
+
+Change log: 
+- 2025-09-10 (Riley Chen) - initial draft created.
+- 2025-11-02 (Riley Chen) - added terraform patterns and CI/CD gating section.
+- 2026-02-12 (Maya Patel) - finalized thresholds and reviewer feedback incorporated.
+
+End of document.

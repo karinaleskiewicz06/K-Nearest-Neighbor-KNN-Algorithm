@@ -1,0 +1,179 @@
+Client Cost-SLO Assistant: design and rollout
+
+Summary
+-------
+This document describes the design, API surface, heuristics, rollout plan, and observability requirements for the Client Cost-SLO Assistant (CCSA), a product feature in Redwood Optimize that recommends, simulates, and (optionally) enforces per-client model selection and deployment settings to meet customer-specified latency and cost SLOs while preserving output quality. The assistant is intended as a route-level advisor and automated policy engine for Hosted and Dedicated customers.
+
+Goals
+-----
+- Provide actionable recommendations (model, quantization, batch shape, routing tier) that satisfy a client-specified target: e.g., 95th percentile latencies <= 200ms and tokens cost <= $0.0009 per token for a given route.
+- Support both "advisor-only" mode (UI + API suggestions) and "managed-enforcement" mode (platform applies routes and rollout policies automatically).
+- Produce reproducible simulations and explainable scoring so customers can review trade-offs.
+- Integrate with existing Optimize features: profiling, quantization profiles, and rollout engine.
+
+Non-goals
+---------
+- CCSA does not replace model training or fine-tuning to improve accuracy.
+- CCSA will not modify model weights or produce new quantization algorithms; it uses existing quantization profiles and vetted model variants.
+
+Scope and assumptions
+---------------------
+- Applies to text generation (chat/generate endpoints) and embeddings routes. Reranking and specialized tool-calling routes are out-of-scope for initial launch.
+- Requires recent per-route telemetry (last 14 days) and representative prompt traces provided by customer or sampled by Redwood.
+- Customers must have at least two compatible model variants in the catalog (e.g., base fp16 + 4-bit quantized) for automated recommendations to be meaningful.
+
+Key user stories
+----------------
+1) As a growth-stage SaaS engineer, I want the assistant to recommend a cheaper variant that keeps my 95p latency below 250ms while increasing per-request latency by no more than 10ms, so I can reduce costs without manual experiment planning.
+2) As an enterprise infra owner, I want to set a hard latency SLO (e.g., 150ms 95p) and let Redwood apply routing fallbacks in Dedicated pools to maintain the SLO under load spikes.
+3) As a product manager, I want a simulation report showing expected quality regressions (BLEU/ROUGE/semantic-sim) when switching to a quantized variant for a given prompt-set.
+
+Functional requirements
+-----------------------
+- RQ-001: Recommendation API: POST /v1/optimize/assistant/recommend with payload: {route_id, target_slos: [{metric, percentile, threshold}], budget_hint: {per_token_max, per_request_max}, prompt_sample_id}. API returns ranked recommendation list with score and estimated delta in cost/latency/quality.
+- RQ-002: Simulation engine: Given a candidate recommendation, produce a simulation report (latency histogram, cost projection, quality regression matrix) and a reproducible seed for audits.
+- RQ-003: Enforcement API: PATCH /v1/routes/{route_id}/policy to apply selected recommendation with a rollout plan (canary %, duration, fallback triggers).
+- RQ-004: Explainability: Each recommendation must include top-3 drivers (e.g., long-context prefix cache hit rate, KV cache reuse, model FLOPS diff) and confidence level (high/medium/low).
+- RQ-005: UI surface: Console page with "Recommendations" tab per route, simulation visualization, and one-click apply with sensible defaults.
+
+Non-functional requirements
+---------------------------
+- NFR-001: Recommendation latency: synchronous recommendations should respond within 3s for small prompt-sample inputs; asynchronous jobs for large simulation runs must complete within 30 minutes.
+- NFR-002: Accuracy: estimated 95p latency must be within ±15% of observed when applied in a staged rollout (measured across 3 production canary windows).
+- NFR-003: Auditability: every apply action must produce an immutable snapshot (policy config, simulation id, model version) stored in infra for 365 days.
+- NFR-004: Security: Recommendation input data must be filtered for PII per the data-management policy; sensitive prompt text redaction must be applied by default unless customer opts-in.
+
+Architecture overview
+---------------------
+- Components:
+  - Frontend: Console UI changes (React) + new "Recommendation" micro-frontend.
+  - Assistant API: service in eng-platform that orchestrates simulation calls and scoring.
+  - Simulation Workers: batch fleet in eng-serving-runtime that run workload replays against selected model variants with configured batch shapes and quantization flags.
+  - Policy Engine: integrates with routing/orchestrator to create/patch rollouts.
+  - Telemetry store: uses existing observability pipeline (per-route metrics and sampled traces) as data source.
+
+Data model and inputs
+---------------------
+- Required inputs: route_id, recent QPS, 14-day latency histogram, cost per token by model variant, sample prompt set (min 500 prompts recommended).
+- Output artifacts: recommendation list (JSON), simulation report (HTML + JSON), rollout policy (YAML), audit snapshot id.
+
+Recommendation algorithm (high-level)
+-------------------------------------
+1) Candidate generation: enumerate compatible model variants and applicable quantization profiles. Expand dimension with batch shapes and cache settings (enable/disable prefix caching).
+2) Fast filter: rule-based elimination of candidates that violate hard constraints (e.g., per-request token budget, unsupported model features).
+3) Cost-latency scoring: for remaining candidates compute multi-criteria score S = w_cost * normalized_cost + w_latency * normalized_95p_latency + w_quality * normalized_quality_drop. Weights default to {0.45, 0.45, 0.10} but are adjustable by client.
+4) Simulation: run prioritized candidates through the simulation workers using sampled prompts and estimated batching to produce final estimates.
+5) Explainability: collect top feature importances using lightweight SHAP-like attribution over candidate features (model flop estimate, median prefix length, cache hit-rate).
+
+Sample scoring table (example)
+-----------------------------
+| Candidate | Est. 95p (ms) | Est. $/k tokens | Est. quality drop | Score | Confidence |
+|-----------|---------------:|----------------:|------------------:|------:|-----------:|
+| gptx-16k-fp16 | 180 | 0.95 | 0.0% | 0.82 | high |
+| gptx-16k-4bit-q | 215 | 0.55 | 2.2% | 0.73 | medium |
+| gptx-8k-4bit-q | 260 | 0.42 | 3.8% | 0.59 | low |
+
+API examples (recommendation request)
+------------------------------------
+POST /v1/optimize/assistant/recommend
+Content-Type: application/json
+
+{
+  "route_id": "acct-123/product-chat-completion",
+  "target_slos": [{"metric": "latency_ms", "percentile": 95, "threshold": 200}],
+  "budget_hint": {"per_token_max": 0.0009},
+  "prompt_sample_id": "sample-2026-01-18-01",
+  "mode": "advisor"
+}
+
+Response (truncated):
+{
+  "recommendations": [
+    {"candidate_id": "gptx-16k-4bit-q", "score": "0.73", "estimated_latency_95p_ms": "215", "estimated_cost_per_k_tokens": "0.55", "quality_drop_percent": "2.2%"}
+  ],
+  "simulation_report_id": "sim-2026-02-12-07"
+}
+
+Rollout policy YAML example
+---------------------------
+# created by assistant apply action
+- id: rollout-apply-231
+  route: acct-123/product-chat-completion
+  steps:
+    - canary: 5%
+      duration: 30m
+      success_criteria:
+        - metric: latency_ms 95p
+          threshold: 220
+        - metric: error_rate
+          threshold: 0.5%
+    - canary: 25%
+      duration: 60m
+    - full: 100%
+  fallback: previous-policy
+
+Observability and telemetry
+---------------------------
+- New telemetry fields emitted by Policy Engine: applied_recommendation_id, simulation_id, rollout_snapshot_id.
+- Dashboards: per-route "Recommendation History" (applied vs simulated latency/cost/quality), Canaries panel with alerting runbook links.
+- Alerts: automated rollback triggers if production 95p latency exceeds simulated 95p by > 30% OR error_rate increase > 0.75% compared to baseline.
+
+Testing matrix and acceptance criteria
+-------------------------------------
+- Unit tests for scoring function and explainability output.
+- Integration tests: end-to-end recommendation -> simulation -> apply in staging Dedicated pool.
+- Performance test: simulate 1,000 concurrent advisor API requests (small prompt samples) to validate 3s latency SLA.
+- Quality validation: for each candidate applied in canary, compute semantic similarity on customer prompt sample; acceptance if similarity >= 0.96 of baseline across 3 canary windows.
+
+Rollout plan (phased)
+---------------------
+1) Alpha (internal): limited to Redwood SRE/product bundles, advisor-only, simulation runs manual. Duration 4 weeks.
+2) Beta (select customers): 5 customers on Hosted API + 3 Dedicated customers; advisor + optional apply by SE. Duration 8 weeks.
+3) GA: public in Console and API; managed-enforcement mode on request; default advisor-only. Target GA Q3 2026.
+
+Operational playbook (high level)
+--------------------------------
+1) Pre-apply checklist:
+   - Ensure simulation completed and passed acceptance thresholds.
+   - Confirm audit snapshot id stored and owner notification configured.
+2) During rollout:
+   - Monitor canary panel and alert thresholds; SRE on-call page lists primary owner.
+   - On triggered rollback, Policy Engine will switch to fallback; capture diagnostics automatically.
+3) Post-apply verification:
+   - 24h automated report comparing actual vs predicted cost and latency; if deviation > 20% open incident for product + runtime teams.
+
+Ownership and responsibilities
+------------------------------
+- Product: Maya Chen (feature owner) — product requirements, UX, acceptance.
+- Eng Platform: Diego Ramirez — Assistant API, simulation orchestration.
+- Eng Serving Runtime: Priya Patel — simulation workers, model variant compatibility.
+- Eng SRE: Hannah Li — rollout safety, alerts, on-call runbooks.
+
+Security and privacy considerations
+----------------------------------
+- By default, prompt samples are redacted for PII before being persisted or sent to simulation workers. Customers can opt into full-text simulation but must complete DPA addendum and explicit consent flag.
+- Simulation workers run in dedicated tenant-scoped containers; no longer than 48h ephemeral storage retention for prompt artifacts.
+
+Open questions and risks
+------------------------
+- RQ1: How to handle customers with skewed long-tail prompt distributions where sampled prompts under-represent rare slow cases? Mitigation: require customer-provided worst-case prompt set for SLAs.
+- RQ2: Model compatibility matrix maintenance for new quantization profiles. Mitigation: automation job to re-run candidate enumerations nightly against catalog changes.
+- Risk: Over-reliance on estimator results leading to frequent rollbacks. Mitigation: conservative confidence thresholds and mandatory canary windows.
+
+Appendices
+----------
+- A: Glossary of terms (SLO, 95p, rollout, canary, quantization profile)
+- B: Example simulation result (link to HTML report stored in artifact store)
+- C: Implementation roadmap and deliverables per sprint (see roadmap JIRA epic OPT-312).
+
+References
+----------
+- Tenant-aware cost and SLO management PRD (related_pages[0])
+- Latency tiered routing spec (related_pages[1])
+
+Next steps (immediate)
+----------------------
+- Product review with reviewers listed above (target 2026-02-18).
+- Engineering spike: prototype simulation worker run for 3 model variants using sample-500 prompt set (owner: Priya).
+- Security review for redaction defaults and artifact retention (owner: Hannah).
+

@@ -1,0 +1,357 @@
+Runbook: Audit Log Pipeline Incident Response (Ingestion + Export)
+
+## Purpose
+This runbook covers detection, triage, mitigation, and customer communications for incidents affecting audit log **ingestion**, **processing/normalization**, and **export** (SIEM targets) across Hosted, Dedicated, and Private deployments.
+
+Audit logs are a security control: we optimize for durability and correctness over perfect exactly-once semantics. Our default delivery goal is **at-least-once**; duplicates are possible and must be handled via `event_id` by consumers.
+
+## Scope
+In-scope components (names may differ slightly by region/environment):
+- **Producers**: API Gateway, Control Plane (tenant/config/policy/RBAC), Console backend, Private installer/upgrade tooling
+- **Audit ingest**: `audit-ingest` (HTTP/gRPC) + authn/authz for producers
+- **Buffer**: Kafka topic(s) `audit.events.v1` / `audit.events.dlq` (Hosted/Dedicated)
+- **Processor/normalizer**: `audit-normalizer` (schema validation + v1 normalization)
+- **Storage**: `audit-store` (internal append-only store used by exporter and internal queries)
+- **Exporter**: `audit-log-exporter` (Splunk HEC, Azure Sentinel/Log Analytics, Datadog, generic HTTPS)
+- **Observability**: metrics/traces/logs for end-to-end latency and drop rate
+
+Out of scope:
+- Missing event emission due to product/coverage gaps (see: **Audit Log Coverage Regression Runbook**)
+
+## Ownership + escalation
+Primary on-call: **SRE On-Call** (rotation)
+Secondary/SME:
+- Exporter + SIEM integration: **Kevin Osei (Security Eng)**
+- Observability dashboards/metrics wiring: **Logan Wright / Nadia Rahman**
+- Control plane producer regressions: **Ethan Park**
+- Console admin action regressions: **Dylan Brooks / Chloe Martin**
+- Private install/upgrade instrumentation: **Vivek Kulkarni** (product) + Private Eng on-call
+
+Escalate immediately if:
+- Evidence of tampering or suspicious admin activity during outage
+- Sustained drops or missing audit events for sensitive actions
+- Customer security review/POC blocked by export correctness
+
+## Definitions
+- **E2E delivery latency**: time from producer emission (`event_time`) to successful persistence in `audit-store` (and/or exporter ack when configured).
+- **Drop rate**: events accepted by ingest but not persisted/processable within SLA window (excluding configured filters/redaction drops).
+- **DLQ**: dead-letter queue for events failing validation/normalization.
+- **Customer export backlog**: exporter queue lag for a given tenant/export destination.
+
+## SLO targets (Hosted/Dedicated)
+These guide paging thresholds (exact values may be tuned per tier).
+- Delivery latency SLO: 99.9% of events persisted to `audit-store` within **5 minutes**
+- Drop rate SLO: < **0.1%** events over 30 minutes (excluding explicit rejects with `result=denied` due to schema validation)
+
+Private:
+- When configured with local buffering, target is “no data loss during transient outages”; long outages may require manual backfill depending on customer configuration.
+
+## Detection signals (what pages SRE)
+### Primary alerts (pager)
+1) **Audit pipeline drop rate high**
+- Condition: `audit_ingest_accepted_total` vs `audit_store_written_total` delta implies drop > 0.1% for 10m
+- Impact: potential missing audit evidence
+
+2) **Audit E2E delivery latency high**
+- Condition: p95 `audit_e2e_latency_seconds` > 600s for 10m
+- Impact: delayed visibility; SIEM export delayed
+
+3) **Kafka consumer lag (audit-normalizer)**
+- Condition: consumer lag > 100k messages OR lag time > 3 minutes for 10m
+- Impact: growing backlog; eventual latency breach
+
+4) **Exporter failure rate high (per target type)**
+- Condition: `export_attempts_total{status="error"}` / attempts > 2% for 10m OR consecutive failures > 20
+- Impact: customer SIEM not receiving events
+
+5) **DLQ spike**
+- Condition: `audit_dlq_written_total` rate > baseline + threshold for 10m
+- Impact: schema/normalization regression, potential data loss if not remediated
+
+### Secondary signals (non-paging but high value)
+- Support tickets: reports of missing RBAC/key lifecycle events (e.g., “no role change events in SIEM”)
+- Status checks: exporters show “degraded” destinations
+- Traces: increased latency across `audit-ingest -> kafka -> audit-normalizer -> audit-store`
+
+## Dashboards (Grafana)
+Use the “Audit Logging” folder. Recommended panels:
+- **Audit Pipeline Overview**: accepted/sec, persisted/sec, E2E latency (p50/p95/p99), drop estimate, DLQ rate
+- **Kafka Health (Audit)**: topic throughput, ISR, partition skew, consumer group lag
+- **Audit Exporter**: queue depth per tenant/destination, success/error rates, retry/backoff, largest offenders
+- **Per-region breakdown**: to detect partial regional issues
+
+If you cannot find the dashboards: search `audit pipeline` or `audit-log-exporter`.
+
+## Initial triage (5–10 minutes)
+1) **Confirm scope**
+- Hosted only vs Dedicated vs Private
+- Single region vs multi-region
+- Ingestion vs export vs both
+
+2) **Check active alerts**
+- Is it latency (backlog) or drops (data loss risk) or exporter-only?
+
+3) **Classify customer impact**
+- Are admin/sensitive actions currently happening? (Look at producer volumes)
+- Are enterprise customers actively exporting to SIEM? (Exporter queue + failure rate)
+
+4) **Establish incident channel + roles**
+- Incident commander (IC), communications, operations
+- Add SMEs early if DLQ spike or exporter auth/config failures
+
+## Decision tree (quick)
+- **Ingest down / 5xx**: treat as SEV-1 for audit control posture if sustained > 10 minutes.
+- **Kafka/normalizer backlog**: mitigate by restoring consumer throughput and/or scaling, then backfill from buffer.
+- **Exporter failing but store healthy**: treat as SEV-2/SEV-3 depending on number of affected enterprise tenants and duration.
+- **DLQ spike**: treat as potential regression; prioritize stop-the-bleed (rollback) + recovery of DLQ events.
+
+---
+
+## Common failure modes + mitigations
+
+### A) `audit-ingest` elevated 5xx / timeouts
+**Symptoms**
+- Producers logging errors on event emission
+- `audit_ingest_requests_total{status=~"5.."}` elevated
+- Drop rate may look “okay” if events never accepted; producers may buffer/spool depending on service
+
+**Likely causes**
+- Bad deploy (panic/exception)
+- Dependency outage (Kafka auth, internal auth service)
+- CPU/memory pressure, connection exhaustion
+
+**Mitigation**
+1) Roll back last deploy if correlated with change window.
+2) Scale up `audit-ingest` horizontally (ensure HPA not capped).
+3) Check downstream dependencies:
+   - Kafka connectivity/auth from `audit-ingest`
+   - Internal authn/authz service health
+4) If a single region is failing, reroute producers (where supported) to a healthy region endpoint.
+
+**Operational commands (Hosted/Dedicated)**
+- Check pods:
+  - `kubectl -n audit get pods -l app=audit-ingest`
+  - `kubectl -n audit describe hpa audit-ingest`
+- Recent errors:
+  - `kubectl -n audit logs deploy/audit-ingest --since=20m | tail -200`
+
+**Notes**
+- Do not disable audit emission in producers without Security Eng approval; prefer buffer/queue modes.
+
+---
+
+### B) Kafka partition/ISR issues or `audit-normalizer` consumer lag
+**Symptoms**
+- E2E latency rising; accepted/sec stable
+- Kafka consumer lag alert firing
+- `audit_store_written_total` falls behind `audit_ingest_accepted_total`
+
+**Likely causes**
+- Kafka broker degraded, partition under-replicated
+- Normalizer CPU constrained or stuck on poison-pill messages
+- Hot partition due to skewed keying
+
+**Mitigation**
+1) Confirm Kafka health (ISR, under-replicated partitions).
+2) Scale `audit-normalizer` consumers (careful: avoid overwhelming store).
+3) If poison messages suspected:
+   - Check DLQ rate.
+   - Identify failing schema validations and route to DLQ instead of blocking partitions.
+4) If store is the bottleneck, scale store writer capacity or temporarily reduce exporter concurrency.
+
+**Operational commands**
+- Consumer lag:
+  - `kafka-consumer-groups --bootstrap-server <broker> --describe --group audit-normalizer`
+- Broker health (if you have access via tooling): check “under replicated partitions” panel.
+
+---
+
+### C) DLQ spike (schema validation/normalization failures)
+**Symptoms**
+- `audit_dlq_written_total` elevated
+- Exporters may be healthy, but events are missing/partial
+- Often correlated with producer release or schema library change
+
+**Likely causes**
+- New event types emitted without registry updates
+- Required fields missing (actor/tenant/resource)
+- Oversized fields / cardinality constraints violated
+
+**Mitigation (stop the bleed)**
+1) Identify top DLQ reason (dashboard panel: “DLQ reason breakdown”).
+2) If correlated with a deploy, roll back the responsible producer or shared audit library.
+3) If a single event type is causing the issue, consider temporary allow-listing (only with Security Eng approval) OR improve normalization rules.
+4) Preserve DLQ data for recovery/backfill.
+
+**Recovery**
+- After fix/rollback, reprocess DLQ if the underlying data is safe to emit post-normalization.
+
+**Caution**
+- Never “auto-fix” by dropping required fields; that defeats investigative usefulness.
+- Ensure redaction rules are still applied during reprocessing.
+
+---
+
+### D) Exporter failing (Splunk HEC / Sentinel / Datadog / HTTPS)
+**Symptoms**
+- `audit-store` healthy; exporter queue depth rising
+- Destination-specific errors (401/403, TLS errors, rate limits, 5xx)
+- Customer reports missing events in SIEM; internal audit store shows events present
+
+**Likely causes**
+- Credential expired/rotated
+- Destination endpoint changed, DNS/TLS issues
+- SIEM rate limiting or payload size constraints
+- Exporter deploy regression
+
+**Mitigation**
+1) Validate whether the issue is tenant-specific or broad.
+2) For tenant-specific:
+   - Confirm exporter config change was itself audited (look for `audit.export.destination.updated` event).
+   - Ask Support to confirm customer endpoint/auth details (do not request secrets in Slack; use ticket attachments/secure fields).
+3) For broad issue:
+   - Roll back exporter release.
+   - Reduce batch size and increase backoff to avoid amplifying rate limits.
+4) If the SIEM is down/unreachable:
+   - Keep queueing (within retention limits) and communicate “delayed delivery”.
+   - Do not drop unless queue retention is at risk; if at risk, escalate to Security Eng + Product for customer comms.
+
+**Customer guidance during exporter incidents**
+- We deliver at-least-once; duplicates can occur during retry.
+- Customers should dedupe on `event_id` (stable unique ID).
+
+---
+
+### E) Partial region outage / routing issues
+**Symptoms**
+- One region shows latency/drops; others normal
+- Customers in that region see delayed/missing audit logs
+
+**Mitigation**
+1) Confirm with per-region dashboard.
+2) If supported, fail producers to another region endpoint.
+3) Validate data residency constraints before cross-region routing (some tenants cannot leave region).
+4) For residency-restricted tenants, prioritize restoring the regional pipeline; do not violate residency.
+
+---
+
+## Backfill + reconciliation
+Backfill is used when events were buffered but not persisted/exported, or when exporter downtime caused destination gaps.
+
+### 1) Determine what was lost vs delayed
+- If `audit-ingest` accepted events and Kafka retained them, most issues are **delayed**, not lost.
+- If producers could not reach ingest and have no local spool, there may be true loss.
+
+### 2) Backfill sources (in priority order)
+1) **Kafka buffer** (Hosted/Dedicated): replay from offsets for affected window.
+2) **audit-store**: re-export events for a time window and tenant(s).
+3) **Private local spool** (Private deployments): depends on customer config; may require customer to run a replay command.
+
+### 3) Backfill procedure (Hosted/Dedicated)
+- For processing backlog: restore consumers; allow system to catch up.
+- For DLQ: after fix, run DLQ reprocessor job for the time window and reason code.
+- For exporter: trigger re-export from `audit-store` for affected tenant + window.
+
+### 4) Idempotency + duplicates
+- Backfill/replay will likely create duplicates at the destination if the destination does not dedupe.
+- Use `event_id` as the dedupe key. Where destinations support it, map `event_id` to a stable field.
+- If a customer cannot dedupe, coordinate with Security Eng for recommended downstream handling (e.g., “ignore duplicates within same `event_id`”).
+
+### 5) What to document during backfill
+- Affected time window (UTC)
+- Affected tenants / deployment types
+- Backfill method used (Kafka replay, store re-export, DLQ reprocess)
+- Estimated duplicate risk
+
+## Customer impact assessment (what Support/Security will ask)
+Be prepared to answer:
+- Were audit events lost or delayed?
+- For what window and which event types?
+- Did any sensitive action events fail to record?
+- Did export to SIEM fail? Were events still present in Redwood audit store?
+- Are there duplicates due to retries? What is the dedupe strategy?
+
+If you cannot definitively determine “no loss,” say so and provide the best available evidence (metrics + offsets + store counts).
+
+---
+
+## Communication templates
+
+### A) Internal update (Slack incident channel)
+**Subject:** Audit logging pipeline degraded – <region/env> – <symptom>
+
+**Status:** Investigating / Mitigating / Monitoring
+
+**Impact:**
+- Ingestion: <healthy/degraded/down>
+- Processing/persistence: <healthy/degraded>
+- Export: <affected targets/tenants>
+- Customer-visible: <delayed audit logs> / <missing export> / <unknown>
+
+**What we know:**
+- Started: <time UTC>
+- Primary signal: <alert name>
+- Suspected cause: <deploy/dependency/outage>
+
+**Next steps (owner + ETA):**
+- <action>
+
+**Risks:**
+- Potential gaps for <event types> between <window>
+- Duplicate exports possible due to retries
+
+### B) Customer-facing (Support ticket reply snippet)
+We’re currently investigating an issue impacting audit log <delivery/export>.
+
+- **Current behavior:** Audit events may be **delayed** in delivery to <SIEM/endpoint>. We are prioritizing recovery.
+- **Data integrity:** Our system is designed for **at-least-once** delivery; once service is restored, events are expected to catch up. In some cases, retries can produce **duplicate events**, which can be deduplicated using the `event_id` field.
+- **Next update:** <timeframe>
+
+If you can share a sample missing time window (UTC) and affected destination, we can validate presence in our audit store and advise on re-export.
+
+### C) Customer-facing (when exporter destination is failing due to customer config)
+We’re seeing delivery failures to the configured destination (e.g., authentication/TLS/connectivity errors). Audit events are still being captured in Redwood and queued for export.
+
+Recommended next steps:
+1) Verify the destination endpoint and credentials/token.
+2) Confirm the destination is accepting requests from Redwood’s egress IPs (if allow-listing is enabled).
+3) Once updated, we can trigger a re-export for the affected window.
+
+### D) Status page wording (only with IC + Comms approval)
+We are investigating an issue causing delays in audit log delivery and/or export for some customers. Core inference services are not impacted. We will provide updates as we restore normal audit log latency.
+
+---
+
+## Post-incident checklist
+Within 2 business days:
+- Create incident report and include:
+  - Root cause
+  - Impact window + affected components
+  - Evidence for “lost vs delayed” determination
+  - Backfill performed (and duplicate risk)
+- File follow-ups:
+  - Alert tuning (if noisy) and dashboard gaps
+  - Capacity/perf improvements (if backlog)
+  - Regression tests for schema/normalizer (if DLQ)
+  - Customer-facing doc updates (if exporter behavior misunderstood)
+
+## Appendix: Handy queries and checks
+### Count sanity checks (approximate)
+- Compare accepted vs persisted over window:
+  - `sum(increase(audit_ingest_accepted_total[30m]))` vs `sum(increase(audit_store_written_total[30m]))`
+
+### Identify top exporter offenders
+- Queue depth by tenant/destination
+- Failure rate by destination type (Splunk vs Sentinel)
+
+### Validate dedupe fields present
+- Spot-check event payload includes: `event_id`, `schema_version`, `event_time`, `tenant_id`, `actor_type`, `actor_id`, `event_type`
+
+---
+
+## Contacts
+- SRE On-Call: see PagerDuty “SRE Primary”
+- Security Eng (audit/export): Kevin Osei
+- Observability: Allison Grant, Logan Wright
+
+If this runbook is missing a scenario, add it and request review from SRE + Security Eng.

@@ -1,0 +1,133 @@
+Per-request Credit Accounting and Economic Priority Scheduler — Design & Runbook
+
+Summary:
+
+This document specifies the Per-request Credit Accounting model and the Economic Priority Scheduler (EPS). The EPS attaches a short-lived "credit" budget to each incoming inference request to make admission and scheduling decisions that trade off latency, cost, and fairness across tenants and routes. The design combines kernel-cost estimates from the profiler, per-route SLAs, and configurable economic policies to preserve customer SLOs while minimizing operator cost.
+
+Goals and non-goals:
+- Goals:
+  - Provide deterministic admission decisions for mixed workloads (interactive + batch) that respect per-route latency budgets and global cost targets.
+  - Allow runtime to prioritize requests when capacity is constrained using an explicit credit currency.
+  - Surface a small, inspectable config and telemetry surface for cost attribution and debugging.
+- Non-goals:
+  - This is not a replacement for the long-term scheduling fabric; EPS is an admission and intra-node prioritization layer.
+  - EPS does not currently reassign credits between live requests; credits are assigned at admission and can be topped only by explicit policy hooks.
+
+Design overview:
+1) Credit currency and accounting
+- Each request is assigned a numeric credit at admission. Credits are consumed by execution events (kernel dispatch, attention passes, KV cache fetch).
+- Credit consumption map is derived from the profiler cost model (see "Profiling integration" below). Credits measure operator cost (approximate GPU milliseconds weighted by tensor compute intensity) rather than tokens or bytes to better correlate to real running cost.
+- Credits are opaque to customers but logged in tracing and metrics with per-request credit_assigned and credit_remaining fields.
+
+2) Admission policy and thresholds
+- Admission uses a two-step check: (A) SLO guard: ensure the request's declared max-latency and model variant are compatible with current node tail-latency (p99) and slot availability; (B) Economic guard: request credit <= route_max_credit OR global_background_budget allows burst credits.
+- Default thresholds (can be overridden per-tenant/route):
+  - route_max_credit: 300 (default)
+  - background_burst_budget_pct: 10% of spare capacity
+  - min_credit_reserve: 20 (to prevent very small requests from starving kernels for bookkeeping)
+
+3) Priority synthesis and preemption
+- Priority key is a tuple: (tier, credit_price, latency_slack).
+  - tier: explicit customer tier (hosted / dedicated / private).
+  - credit_price: derived from route pricing config to favor higher-commit customers when cost is constrained.
+  - latency_slack: (declared_slo - expected_runtime_latency) / declared_slo. Negative slack indicates likely SLO violation.
+- When slots are contended, EPS sorts runnable requests by effective_priority_score = credit_price * (1 + max(0, -latency_slack)*SLA_WEIGHT) / sqrt(credits_assigned). This formula is tunable; see config table below.
+- Preemption: soft preemption is supported for queued requests only (we avoid kernel-level preemption except for cooperative handoff). Soft preemption cancels queued low-priority requests and returns HTTP 429 with credit_refund.
+
+4) Profiling integration
+- The EPS consumes kernel-level cost hints from the continuous profiler pipeline. Key inputs:
+  - kernel_average_ms_by_shape: mapping of (model,seq_len,batch_size) -> ms per token
+  - attention_factor and kv_fetch_penalty per model family
+- A local estimator converts declared request properties (model, prompt_len, expected_generated_tokens) into a credit estimate using the profile mapping. The estimator includes a conservative safety multiplier (default 1.25) to account for variability.
+
+5) Telemetry and observability
+- Per-request tags emitted to tracing and metrics: credit_assigned, credit_consumed, admission_decision, priority_score, preempted_by (request id).
+- Dashboards to build:
+  - Credit burn heatmap: credits_consumed / minute by node and model family.
+  - Admission waterfall: requests accepted/rejected by reason (SLO, economic, malformed).
+  - Priority inversion alarms: if lower priority requests are consistently served while higher-priority ones wait > 2x expected latency.
+
+Config table (defaults):
+| key | default | description |
+|---|---:|---|
+| eps.route_max_credit | 300 | Max credit per request for non-enterprise routes |
+| eps.safety_multiplier | 1.25 | Multiplier applied to profiler estimate |
+| eps.sla_weight | 8.0 | Weight for latency slack in priority_score |
+| eps.background_burst_pct | 10 | Percent of idle capacity allowed for bursts |
+| eps.min_credit_reserve | 20 | Minimum credit unit for the scheduler |
+| eps.preempt_grace_ms | 1500 | Time allowed for soft preemption handlers |
+
+Operational runbook (for oncall / SRE):
+- Symptom: sudden spike in 429 rejections for interactive routes.
+  1) Check "Admission waterfall" dashboard: confirm whether rejections are ECONOMIC or SLO.
+  2) If ECONOMIC: inspect recent changes to eps.route_max_credit and global credit pool. Roll forward to previous config if an accidental drop occurred.
+  3) If SLO: check node p99 latency and kernel watchdog logs. If p99 elevated > 2x baseline, escalate to runtime team and execute the "node-remediate-and-drain" procedure.
+  4) Mitigation: temporarily raise background_burst_pct to 20% for 5–15 minutes using: 
+```
+redwoodctl runtime set-config --path eps.background_burst_pct --value 20 --expiry 15m
+```
+- Symptom: priority inversion alert firing.
+  1) Inspect traces for preempted_by field. Identify request causing inversion.
+  2) Check whether credit_price was misconfigured (billing or pricing service outage can zero a price).
+  3) If misconfiguration, set a safe default: `eps.default_credit_price = 1.0` and re-evaluate.
+
+Release and rollout checklist (canary strategy):
+1) Unit tests for estimator and priority scoring.
+2) Integration tests with profiler stub (simulate worst-case kernel-cost variance +15%).
+3) Canary rollout to non-critical region (region-us-west-2-canal) with 2% traffic. Monitor credit-burn, 95th latency, and 429 rates for 30 minutes.
+4) Gradual ramp to 25% then 100% with staged config updates.
+
+Benchmarks and profiling harness to validate EPS:
+- Synthetic scenarios to run in the benchmarking suite:
+  1) Mixed-interactive: 70% short prompts (<64 tokens), 30% long streaming (>512 tokens) with standard concurrency. Measure admission rate and p95 latency.
+  2) Peaky-burst: bursts of 10x baseline traffic for 2 minutes to verify background_burst_pct behavior and credit refunds.
+  3) Priority-contest: mix of free-tier and enterprise-tier requests at 1:1 ratio under constrained capacity to validate economic ordering.
+- Expected KPIs:
+  - p95 latency for interactive routes <= configured SLO + 20ms during steady state.
+  - 429 rate < 0.5% under steady state.
+
+Debugging recipes (common queries):
+- Find requests with high credit burn but low token count:
+```
+SELECT request_id, model, prompt_len, generated, credit_assigned, credit_consumed
+FROM trace.requests
+WHERE credit_consumed > 1000 AND generated < 32
+ORDER BY credit_consumed DESC
+LIMIT 50;
+```
+- Recompute estimator for a single request locally (Python snippet):
+```
+# estimator.py (snippet)
+def estimate_credits(model, seq_in, gen, batch):
+    base_ms = profile.get((model, seq_in+gen, batch), 0.8)
+    credits = base_ms * (seq_in+gen) * eps.safety_multiplier
+    return int(max(eps.min_credit_reserve, credits))
+```
+
+Ownership and escalation:
+- Owner: Runtime Performance Team (runtime-performance@redwood.com)
+- Primary oncall escalation: runtime-sre -> runtime-platform -> runtime-performance. See oncall rota in /people-ops/oncall.
+
+Open questions and future work:
+- Should credits be refundable in-part for aborted streaming requests? (tradeoff: bookkeeping cost vs user UX)
+- Explore kernel-level cooperative credit donation for live re-prioritization.
+- Integrate cost-based credits with billing so credits can be surfaced to customer dashboards for explainability.
+
+Appendix: Config example (YAML)
+```
+# eps-config.yaml
+eps:
+  route_max_credit: 300
+  safety_multiplier: 1.25
+  sla_weight: 8.0
+  background_burst_pct: 10
+  min_credit_reserve: 20
+  preempt_grace_ms: 1500
+```
+
+Links and references:
+- Profiling pipeline: /eng-serving-runtime/profiling-playbook/continuous-runtime-profiling-strategy-2026.json
+- Scheduler policy language: /eng-serving-runtime/kernel-and-scheduling/scheduler-policy-language-declarative-profiles-2026.json
+- Admission runbooks: /eng-serving-runtime/runbooks/runtime-deployment-circuit-breakers-and-sla-fallback-playbook-2026.json
+
+This doc will be updated as EPS matures — major revisions should include new benchmark runs and an updated release checklist.

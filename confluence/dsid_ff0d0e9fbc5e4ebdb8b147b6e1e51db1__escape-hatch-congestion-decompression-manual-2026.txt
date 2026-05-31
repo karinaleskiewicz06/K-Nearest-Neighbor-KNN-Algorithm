@@ -1,0 +1,163 @@
+Escape Hatch: Congestion Decompression & Kernel Handshake Manual
+
+Summary
+
+This document defines Redwood Inference's official "escape hatch" strategy for handling sustained congestion and kernel saturation: a coordinated congestion decomposition and kernel-handshake protocol that (1) reduces tail-latency exposure, (2) preserves critical SLOs by controlled fidelity degradation, and (3) provides a clear operator runbook for diagnosing and recovering from congestion events. The guidance spans runtime architecture trade-offs, scheduler/kernel interactions, profiling checks, benchmark validation, release notes for v0.14 of the handshake protocol, and a known-issues appendix.
+
+Why this exists
+
+- Congestion is multi-dimensional: CPU/host networking, GPU kernel throughput, KV cache pressure, and admission-controller throttles interact and can amplify tail latency.
+- Previous ad-hoc mitigations (global queue cuts, blunt shedding) risked client-visible errors or large quality regressions.
+- This manual codifies a minimal, observable, and reversible path — the "escape hatch" — that runtime and operations can use without full-scale rollback.
+
+Scope and owners
+
+- Scope: Serving runtime (request orchestration, scheduler/kernel admission, KV cache warmup), telemetry contracts between runtime and scheduler, operator runbook.
+- Owners: runtime-scheduler (primary), kernel-engineering (secondary), eng-sre (oncall runbook), observability (telemetry contract).
+
+Key concepts (short)
+
+- Congestion decomposition: Break an incident into orthogonal stressors (kernel queueing, KV miss storm, network slope) and treat each with targeted mitigations.
+- Kernel handshake: A lightweight per-request negotiation between dispatcher and kernel to confirm admission and a fidelity/priority token.
+- Escape hatch stages: 1) Soft-cohort shaping, 2) Priority-aware fidelity staircasing, 3) Kernel offload (batch-eviction + fallback model), 4) Emergency rejection (last resort).
+
+Architecture overview
+
+1) Dispatcher -> Scheduler -> Kernel handshake flow
+
+- Dispatcher issues a pre-admit probe to scheduler with metadata: model_id, sequence_length_est, client_priority_tier, kv_prefetch_hint, trace_id.
+- Scheduler responds with a handshake token: {admitted: bool, expected_wait_ms: int, fidelity_profile: string, kernel_slot_hint: id, trace_flags}.
+- Dispatcher attaches token to the request and routes to the claimed kernel node. Kernel validates the token (nonce + timestamp) before binding resources.
+
+Benefits:
+- Avoids blind offload: kernels only begin expensive work once token validated.
+- Enables admission-time decisions (expected wait) surfaced to callers and observability.
+
+2) Congestion decomposition surface points
+
+- Kernel queueing: long kernel start latency despite short network and dispatch times.
+- KV cache miss storm: many cold sessions with repeated kv-prefetches causing memory pressure and eviction churn.
+- Dispatcher/multiplex contention: overloaded event loop or slow gRPC channels.
+- Network backpressure: transient NIC saturation or cross-AZ variance.
+
+Telemetry contract (required signals)
+
+- Required per-request fields (exported to traces/metrics): pre_admit_ts, handshake_issue_ts, handshake_response_ts, kernel_bind_ts, kernel_start_ts, kernel_complete_ts, kv_miss_count, admitted_fidelity_profile, kernel_slot_id, tv_cpu_ms, gpu_busy_ms.
+- Aggregates/alerts: 95/99/99.9 kernel_bind_time; kv_miss_ratio over 2-minute windows; admission_reject_rate; per-model fidelity-downgrade-rate.
+
+Escape hatch stages (detailed)
+
+Stage 0 — Detection
+- Triggers (any one): 99.9 kernel_bind_time > 500ms for 3 consecutive 1-minute windows OR kv_miss_ratio > 0.25 AND error_rate increase > 0.5%.
+- Action: escalate to oncall, annotate traces with incident_id, and enable enhanced sampling for affected models.
+
+Stage 1 — Soft-cohort shaping (fast, reversible)
+- Goal: Reduce inflow rate using priority-aware shaping and client-visible hints.
+- Steps: 1) Scheduler flips cohort-shaped admission (80% of low priority requests are moved to a rate-limited queue). 2) Emit a 429-with-hint response that instructs SDK to backoff + optionally switch to smaller max_tokens.
+- Expected impact: 20–40% kernel queue reduction within 30s.
+
+Stage 2 — Priority-aware fidelity staircasing (controlled quality tradeoff)
+- Goal: Reduce per-token kernel work for non-critical requests.
+- Steps: 1) For affected kernels, inject fidelity_profile override via handshake token (e.g., quantized-8b-fast, llm-lite-summary). 2) Scheduler ensures canary A/B percentages for fidelity change (default 5% -> 25% -> 50% per 2-minute steps). 3) Monitor quality regressions using sentinel prompt set evaluation (see profiling section).
+- Rollback: automatic if quality alert > threshold or error rate increases.
+
+Stage 3 — Kernel offload and fallback routing
+- Goal: Preserve SLOs by moving some load off saturated kernels to compatible fallback variants (smaller model, different GPU class, CPU-based short-run).
+- Steps: 1) Router consults fallback_matrix for model compatibility. 2) For in-flight requests with long expected wait, router reissues handshake to fallback kernel with incremental fidelity. 3) Upgrade path: when capacity returns, tokens expire and dispatcher resumes original routing.
+
+Stage 4 — Emergency rejection (last resort)
+- Goal: Prevent catastrophic cascade and maintain control plane stability.
+- Steps: 1) Admission controller returns structured rejection with exact reason code and safe duration. 2) Operators run immediate remediation (kernel drain, node reboot, capacity surge via Dedicated burst policy).
+
+Operator runbook (step-by-step)
+
+1) Triage (first 5 minutes)
+- Open incident and tag affected models.
+- Run quick decomposition checklist: check kernel_bind_time, kv_miss_ratio, dispatch loop latency, NIC metrics.
+- If kernel_bind_time is primary, apply Stage 1. If kv_miss_ratio is primary, apply Stage 1 and enable KV-prefetch backoff.
+
+2) Apply Stage 2 (if Stage 1 insufficient)
+- Use admin CLI to apply fidelity overrides for model X in zone Y:
+
+- CLI example:
+  rwdctl runtime handshake override --model xlarge-1 --zone us-west-2 --profile quant8-fast --fraction 0.25 --reason "incident-<id>"
+
+3) Escalate to kernel-engineering if kernel_busy_ms continues > 90% for > 5 minutes. Provide trace ids and sample payloads.
+
+4) Recovery & validation
+- Monitor sentinel prompt set regression suite (see Profiling checks below).
+- Gradually remove overrides once 95/99 kernel_bind_time back within SLO for 10 consecutive 1-minute windows.
+
+Profiling & benchmark verification
+
+- Purpose: ensure any fidelity changes do not create unacceptable quality regressions, and that kernel handshake yields expected latency improvements.
+
+1) Sentinel prompt set (operational)
+- A curated set of 200 prompts per model capturing worst-case sequence lengths, KV dependence, and multi-turn. Run with fidelity variants and compare: exact match rate, BLEU-like similarity, and latency distribution.
+- Baseline run command (local harness):
+  python perf_harness.py --model xlarge-1 --profile quant8-fast --concurrency 50 --duration 5m --tracing
+
+2) Microbenchmarks for handshake overhead
+- Expectation: pre-admit handshake roundtrip adds <= 2ms median and <= 10ms p99.
+- Test procedure: run a short synthetic workload with handshake enabled and disabled; measure kernel_bind_time delta.
+
+3) End-to-end shadow test
+- Mirror 2% of production traffic to a sandbox fleet with handshake and fidelity staircasing enabled. Observe divergence metrics over 30 minutes and ensure error delta < 0.2%.
+
+Release notes (protocol v0.14)
+
+- New: per-request handshake token with nonce/timestamp and fidelity_profile field.
+- New: scheduler sampling flag handshake_verbose that enables extra telemetry for incident triage.
+- Change: default pre-admit threshold lowered from 200ms to 150ms for high-priority tiers.
+- Fix: race between token expiry and kernel_bind that could cause stale admissions under high-clock-skew.
+
+Known issues (short appendix)
+
+- ISSUE-1134: KV prefetch backoff sometimes over-throttles cold-start interactive sessions. Workaround: increase per-account warmup budget for 5 minutes.
+- ISSUE-1187: Handshake round-trip may exceed 10ms for cross-AZ dispatch in certain AZ pairings due to suboptimal route selection; mitigation: prefer intra-AZ routing for handshake where available.
+- ISSUE-1210: Some third-party SDKs ignore 429-with-hint and aggressively retry causing repeated admission attempts. Mitigation: server responds with Retry-After and stream-close flag; recommend SDK update.
+
+Operational checklists (cheat-sheet)
+
+- Detection: run `rwdctl metrics query --metric kernel_bind_p99 --window 5m --model <model>`
+- Apply soft shaping: `rwdctl runtime admission shape --model <model> --cohort low --rate-limit 20rps`
+- Apply fidelity override: `rwdctl runtime handshake override --model <model> --profile quant8-fast --fraction 0.25`
+- Validate sentinel suite: `python perf_harness.py --model <model> --profile <profile> --sanity`
+
+Post-incident follow-up (RCA template)
+
+- Description: short summary of what triggered the escape hatch and which stage was used.
+- Root cause decomposition: kernel-binding vs kv-miss vs dispatch.
+- Evidence: traces, metrics, CLI actions taken, timestamps.
+- Remediation: code change, scheduler tuning, capacity adjustment.
+- Preventative experiments: shadow runs, benchmark expansion.
+
+Appendix: JSON handshake token example
+
+{
+  "token": "rwd-tn-1234abcd",
+  "admitted": true,
+  "expected_wait_ms": 48,
+  "fidelity_profile": "quant8-fast",
+  "kernel_slot_hint": "k-az3-7",
+  "issued_at": "2026-10-03T15:12:22Z",
+  "nonce": "f3b9a2",
+  "sign": "sha256:..."
+}
+
+Appendix: Quick signal glossary
+
+- kernel_bind_time: time between handshake_response_ts and kernel_bind_ts.
+- kv_miss_ratio: fraction of requests that encountered at least one KV miss in the warmup window.
+- admitted_fidelity_profile: the effective fidelity the kernel will run.
+
+Related pages and references
+
+- See runtime-decision-graph-and-observed-behaviour-catalog for incident classification.
+- See runtime-deployment-circuit-breakers-and-sla-fallback-playbook for integrated rollback patterns.
+
+Revision history
+
+- 2026-02-15 (A. Menon): initial draft describing handshake concept and stage flow.
+- 2026-04-30 (D. Chen): added telemetry contract and CLI examples.
+- 2026-10-03 (A. Menon): published; added sentinel profiling suite and v0.14 release notes.

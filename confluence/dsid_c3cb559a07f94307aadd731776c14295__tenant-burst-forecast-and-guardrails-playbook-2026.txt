@@ -1,0 +1,139 @@
+Tenant Burst Forecasting and Operational Guardrails Playbook
+
+Overview
+
+Purpose:
+This playbook describes the strategy, configuration, and operational procedures for forecasting tenant-level bursts and enforcing guardrails in Private deployments (VPC and on-prem). It is intended to reduce customer-visible throttling, avoid runaway queue growth, and provide deterministic failover behavior when capacity is constrained.
+
+Scope and audience:
+- Scope: Tenant-level predictive capacity, burst protection policies, alerting, dashboards, and incident runbook for Private deployments only.
+- Audience: SREs, Platform Engineers, Field Ops, Solutions Engineers supporting private customers.
+
+Summary of approach:
+1) Continuously forecast short-term (1–10 minute) request and token demand per tenant using a lightweight sliding-window predictor.
+2) Synthesize forecast with current available capacity (GPU-token/s, KV cache hitrate, batching headroom) via the capacity-orchestrator service.
+3) If forecast > safe headroom threshold, enable staged guardrails: adaptive batching, soft prioritization, temporary lightweight rate-shedding, and pre-warmed fallback model routing.
+4) Emit structured alerts and create a customer incident if mitigations escalate to enforced shedding or cross-region failover.
+
+Key services and components referenced:
+- tenant-telemetry-proxy: collects per-tenant metrics (rps, tokens/s, queue_len, avg_latency, kv_cache_hit).
+- capacity-orchestrator: central decision engine that computes headroom and issues scaling/mitigation commands.
+- tenant-autoscaler: executes scale-up/scale-down of dedicated pools and burst nodes.
+- runtime-proxy: enforces request-level prioritization and rate-shed directives.
+- observability: Grafana dashboards built from metrics in Prometheus/ClickHouse and tracing via Jaeger.
+
+SLOs and operational thresholds (recommended defaults):
+- P95 token latency (local model path): <= 200ms (target), p95 under sustained load.
+- Queue wait time SLO: 95% of requests see < 500ms queue wait.
+- Burst detection trigger: < 2 minutes predicted demand growth > 40% over baseline AND queue_len > 25 requests.
+- Critical capacity threshold: GPU token/s headroom < 15% for a control group for 60s.
+
+Telemetry and metrics (must be collected at 30s resolution):
+- tenant.rps (requests per second)
+- tenant.tokens_per_sec
+- tenant.queue_length
+- tenant.avg_queue_wait_ms
+- tenant.kv_cache_hit_pct
+- node.gpu_util_pct, node.gpu_tokens_per_sec
+- autoscaler.pending_nodes, autoscaler.provision_time_ms
+- runtime_proxy.enforced_shed_ratio
+
+Configuration examples
+
+1) Autoscaler intent config (YAML) - placed in customer config repo:
+
+autoscaling_intents:
+  - tenant_id: "tenant-42"
+    min_nodes: 2
+    max_nodes: 20
+    target_util_pct: 60
+    burst_headroom_pct: 25   # maintain this headroom for short bursts
+    provision_timeout_ms: 45000
+    preferred_zones: ["zone-a", "zone-b"]
+
+2) Guardrail policy (JSON blob used by capacity-orchestrator):
+
+{
+  "policy_id": "guard-forecast-v1",
+  "priority_levels": ["control_plane","high","normal","background"],
+  "stages": [
+    {"name":"adaptive_batch","action":"increase_batch_max","delta_tokens":128},
+    {"name":"soft_prio","action":"downgrade_background","ratio":0.5},
+    {"name":"temp_shed","action":"rate_limit","max_rps":50}
+  ],
+  "escalation_window_s": 120
+}
+
+Detection heuristics and forecasting algorithm (summary)
+- Baseline: maintain exponential moving average (EMA) of tenant.tokens_per_sec with alpha=0.2 over 5m.
+- Burst predictor: short-term AR(1) on 30s buckets with anomaly score = (current - EMA)/EMA.
+- Predictive headroom need = max(0, forecasted_tokens/s - effective_tokens/s_capacity).
+- Effective tokens/s capacity accounts for current batching efficiency and kv_cache_hit_pct (effective_capacity = baseline_capacity * (1 - expected_cache_loss)).
+
+Operational decision rules (simplified)
+1) If predictive headroom_need < burst_headroom_pct * baseline_capacity: no action.
+2) If headroom_need between burst_headroom_pct and 2x burst_headroom_pct: issue adaptive_batch action and notify SRE channel (info).
+3) If headroom_need > 2x burst_headroom_pct OR queue_len > 100: enable soft_prio and pre-warm fallback model (notify on-call).
+4) If enforced shedding required for > 60s or node.gpu_util_pct > 95% across control plane: open incident and route traffic to hosted fallback or cross-region private pool.
+
+Runbook: Handling a detected forecasted burst (step-by-step)
+1) Detection (automated): capacity-orchestrator emits event "burst_predicted" with tenant_id, forecast_window_s, predicted_tokens_s, recommended_actions. Alert rule: severity low->medium.
+2) Automated mitigation (0-30s): tenant-autoscaler tries fast-provision of up to N_burst_nodes (configurable; default N=2). At the same time runtime-proxy increases batch_max for the tenant by configured delta.
+   CLI: redwoodctl autoscaler describe --tenant tenant-42
+
+3) Observe (30-90s): watch metrics: tenant.queue_length, tenant.avg_queue_wait_ms, node.gpu_util_pct, autoscaler.pending_nodes. Dashboard: "Tenant Burst Forecast" panel (preset).
+
+4) Escalation (90-180s): if queue_len not reducing or gpu_util remains > 90%: enable stage 2 guardrails (soft_prio, temp_shed). Notify on-call via PagerDuty with runbook link.
+
+5) Customer communication (if mitigations impact latency or visible errors): follow private-deploy incident comms template. Notify via dedicated customer Slack/Email channel, include expected impact window and mitigation steps.
+
+6) Recovery and verification: once queue and latency are within SLOs for 3 consecutive minutes and pending_nodes == 0, revert temporary policies automatically and create a post-burst summary event.
+
+Incident checklist (if cross-region failover required)
+- Confirm sustained enforced shedding or node-level OOMs across multiple racks for > 120s.
+- Verify backups of KV cache eviction state have been replicated (path: /var/lib/kvcache/snapshots).
+- Engage field ops to validate network egress rules for cross-region traffic.
+- Execute cross-region routing toggle: redwoodctl routing set-fallback --tenant tenant-42 --target "private-pool-eu-west-2"
+- Document impact and rollback plan in incident channel.
+
+Testing and validation guidance
+- Synthetic workload harness: run 10–20x baseline rps for 5 minutes, verify autoscaler provisions within provision_timeout_ms and queue_len stays < 200.
+- Chaos tests: simulate 40% KV cache degradation and confirm effective_capacity calculation still holds and guardrails trigger as expected.
+- Load windowed replay: use tenant historical traces to validate forecast false-positive/negative rates under different seasonality.
+
+Upgrade and rollback considerations
+- Capacity orchestrator versioning: ensure new control-plane releases are backwards-compatible with guardrail policy schema v1. When upgrading, deploy canary to non-critical tenants with traffic mirroring enabled for 30m.
+- Schema migration: never change policy field semantics in-place; use policy_version and deprecation rollout.
+- Rollback steps: if an autoscaler release causes mis-provisioning, immediately set autoscaler.enabled=false for the affected tenant(s) and run manual scale commands:
+
+  redwoodctl autoscaler manual-scale --tenant tenant-42 --nodes 4
+
+Ownership and contacts
+- Runbook owner: Aria Mendoza (platform-capacity)
+- On-call rotation: platform-sre (pagerduty: PD-Platform-SRE)
+- Field escalation: Solutions Eng (solutions-oncall)
+
+Dashboards and alerts to create
+1) Tenant Burst Forecast - panel: predicted_tokens/s vs actual_tokens/s (alerts when prediction error > 50% and queue_len > 25).
+2) Guardrail Actions - table showing last 30 minutes of actions per tenant (adaptive_batch, soft_prio, temp_shed).
+3) Provision Latency - histogram of autoscaler.provision_time_ms (alert if p95 > provision_timeout_ms).
+
+Appendix: Example alert rule (Prometheus-style)
+ALERT TenantBurstPredicted
+  IF (predictive_tokens_per_s - tenant_tokens_per_s)/tenant_tokens_per_s > 0.4 AND tenant_queue_length > 25
+  FOR 1m
+  LABELS { severity = "warning" }
+  ANNOTATIONS {
+    summary = "Forecasted burst for {{ $labels.tenant }}",
+    runbook = "https://confluence.internal/eng-private-deployments/day-2-ops/tenant-burst-forecast-and-guardrails-playbook-2026"
+  }
+
+Appendix: Small glossary
+- headroom: percent spare capacity available to absorb burst without degrading SLOs.
+- soft_prio: temporary deprioritization of background/low-priority requests in favor of high-priority customer traffic.
+- temp_shed: temporary, targeted rate-limiting of non-critical requests to preserve system stability.
+
+Revision history
+- 2025-09-15: initial draft by Aria Mendoza.
+- 2025-11-20: added predictive algorithm summary and default thresholds (reviewed by Ravi Patel).
+- 2026-02-12: updated escalation windows and cross-region failover checklist (reviewed by Sofia Ortega).

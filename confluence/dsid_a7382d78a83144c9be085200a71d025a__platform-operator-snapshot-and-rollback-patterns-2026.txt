@@ -1,0 +1,128 @@
+Platform operator snapshot and rollback patterns
+
+Overview
+-------
+This runbook documents standard patterns for creating restoration points (snapshots) and performing safe rollbacks across the platform. It is intended for platform operators, SREs, and anyone performing stateful maintenance on services that materially affect inference SLAs.
+
+Why this matters
+- Rapid, reliable rollback reduces blast radius for configuration, model, and state migrations.
+- Consistent snapshot semantics increase confidence in automated rollbacks and disaster recovery tests.
+- Clear validation and communication steps minimize user impact and postmortem overhead.
+
+Scope
+- Applies to: control-plane config (feature flags, routing policies), service state (Redis/KV caches that support prefix snapshots), model artifacts (model weights/quantized blobs), and service-critical databases (internal tenancy mappings).
+- Excludes: customer data backups (handled by compliance backups) and long-term archival retention policies.
+
+Owners and contacts
+- Primary owner: eng-platform (platform-operator rotation)
+- Secondary: eng-sre (oncall)
+- Pager: #platform-ops Slack channel, route to oncall if SLO impact > 5% predicted
+
+SLOs and safety thresholds
+- Inference-frontend P95 latency: target < 200 ms; emergency rollback if P95 increases by > 50% over 10m and sustained for 3 consecutive 5m windows.
+- Error budget burn: immediate rollback if component contributes > 20% of total error budget burn in last 30m.
+- Token-cost anomaly: rollback candidate deployments that increase per-token cost by > 30% vs baseline within first 1k requests.
+
+Snapshot types and semantics
+1) Immutable artifact snapshot (model blobs)
+   - What: S3/GCS object version + model manifest (sha256).
+   - When to use: model swaps, quantization rollouts, or any time you change weights.
+   - How to create: publish artifact to prod-bucket with version tag and generate manifest. Example: 
+     rdi model publish --model-id transformer-x --version v20260112 --bucket prod-models --manifest ./manifests/transformer-x-v20260112.json
+   - Restore: point runtime to previous manifest and trigger rolling restart of model workers.
+
+2) KV-prefix snapshot (in-memory caches: prefix/KV cache)
+   - What: consistent snapshot of tenant prefix state for fast warmup during rollback.
+   - When to use: before cache-sharding, eviction policy change, or prefix-rewrite operations.
+   - How to create: use cachectl snapshot API (atomic for prefix ranges): 
+     cachectl snapshot create --prefix tenant-A --retention 2h --name pre-evict-20260112
+   - Restore: cachectl snapshot apply --name pre-evict-20260112 --mode warm-only
+
+3) Configuration snapshot (control plane)
+   - What: structured config bundle (JSON/YAML) of routing, feature flags, quotas, and rollout policies.
+   - When: before rolling out canary, routing policy changes, or quota model changes.
+   - How: 
+     rdi config export --scope control-plane --out /tmp/cp-snapshot-20260112.yaml
+   - Restore: rdi config apply --from /tmp/cp-snapshot-20260112.yaml --dry-run (first) then apply
+
+4) Database schema/data snapshot (small internal DBs)
+   - What: logical dump or snapshot clone for non-customer-critical DBs. Large relational DBs use separate backup runbooks.
+   - How: pg_dump --schema-only / data-only where appropriate; use read-replica snapshots for large volumes.
+
+Preflight checklist (run before making changes)
+- Verify current SLO baselines and last-24h behavior. Command: telemetry query last-24h --service inference-frontend --metrics p95,error_rate
+- Create all relevant snapshots for the change type (artifact, config, KV as applicable).
+- Annotate the deployment/incident with snapshot references: 
+  kubectl annotate deploy inference-frontend platform/snapshot=pre-evict-20260112 --overwrite
+- Confirm automation rollback hooks are enabled: rolloutPolicy.rollbackOnFailure = true
+- Notify stakeholders in #platform-ops with rollback window and expected user impact. Use communication template (see Communications section).
+
+Automated rollback patterns
+- Canary auto-rollback: canary is configured with SLI monitors. If p95 latency or error budget thresholds cross their heuristics within the canary window, the controller triggers an automated rollback to the previous version referenced by the last_good_manifest.
+- Progressive artifact fallback: runtime attempts to fetch primary model artifact; on checksum mismatch or missing blob, fallback to tagged fallback-1 variant and emit alert.
+- Safe-apply for control plane: config apply stages (validate -> dry-run -> staged-apply -> promote). Failure at any stage halts promotion and triggers rollback to last applied stage.
+
+Manual rollback runbook (step-by-step)
+Situation: A model rollout increased p95 and error-rate for a subset of tenants.
+1) Triage and decision 
+   - Confirm metrics: p95 increased by 80% in region us-west-2 for service inference-frontend.
+   - Query request traces to confirm model-specific errors: tracing query service=inference-frontend and tag:model=transformer-x-v20260112.
+   - Decision point: if impact > the SLO thresholds above and is tied to model artifact, proceed with artifact rollback.
+2) Communicate \   - Post to #platform-ops and send incident update: include snapshot IDs, expected downtime (usually ~0 for rolling swap), and rollback ETA.
+3) Execute artifact rollback (safe path)\   - Put new canary in pause: rdi rollout pause --deployment inference-frontend-canary\   - Re-point deployment manifest to previous model: rdi model set-version --deployment inference-frontend --model-id transformer-x --version v20251230\   - Trigger rolling restart of model workers with graceful drain: kubectl rollout restart deployment/model-workers --request-timeout=30s\   - Monitor health and SLOs closely for the next 5 minutes, then 30m.
+4) Validate\   - Health checks: runtime-health ok for model-workers (green for >90% instances).\   - Telemetry: p95 returns to baseline within 3x canary traffic; error-rate back to pre-rollout.\   - If validation fails, escalate to eng-sre for deeper investigation.
+5) Post-rollback actions\   - Record rollback reason and root-cause hypothesis in the incident tracker.\   - Create a follow-up action: schedule an experiment with lower-risk canary and extended validation for the model change.
+
+Emergency rollback (fast-path)
+- Use when change causes service outage or catastrophic data corruption risk.
+- Steps (do in parallel where safe): 
+  1) Alert oncall and declare incident with severity P0/P1.\   2) Execute fastest known-safe revert: control-plane config revert or model re-point to last_good_manifest. \   3) If DB corrosion suspected, quiesce writes: apply maintenance mode via feature-flag (rdi ff set maintenance-mode true) and restore from last logical snapshot clone.\   4) Bring read-only or degraded mode online to reduce user impact while investigation continues.
+
+Validation matrix (examples)
+| Snapshot type | Quick validation signal | Full validation window | Failure action |
+|---------------|-------------------------|------------------------|----------------|
+| Artifact      | model health probes OK   | 30m                   | rollback       |
+| KV prefix     | cache warm ratio > 70%  | 15m                   | reapply snapshot or failover|
+| Control-plane | config lint pass        | 10m                   | revert config |
+| DB logical    | replica sync            | Depends (1h–4h)       | restore clone |
+
+Operator CLI cheat sheet
+- rdi model publish --model-id <id> --version <v> --bucket <bucket> --manifest <file>
+- rdi model set-version --deployment <d> --model-id <id> --version <v>
+- rdi config export --scope control-plane --out <file.yaml>
+- cachectl snapshot create --prefix <p> --name <name> --retention <h>
+- cachectl snapshot apply --name <name> --mode <warm-only|full>
+- telemetry query last-24h --service <s> --metrics p95,error_rate
+- kubectl annotate deploy <d> platform/snapshot=<name> --overwrite
+
+Communication templates
+- Incident start: 
+  Subject: [PLATFORM] Incident: <short-desc> — starting rollback to snapshot <id>
+  Body: Impacted: inference-frontend, region: us-west-2. Rollback target: pre-evict-20260112. ETA: 12:34 UTC. Expected user impact: <none|degraded|read-only>. Contact: #platform-ops.
+- Post-rollback update: 
+  Subject: [PLATFORM] Completed rollback — <short-desc>
+  Body: We reverted to <snapshot/id>. Key metrics: p95 baseline restored to X ms. Next steps: RCA, test plan for re-rollout.
+
+Automation and safety guardrails
+- All automated rollbacks must be annotated in the audit log and linked to commit/manifest IDs.
+- Rollback tokens: every automated rollback should create a short-lived token for operator investigation to replay.
+- Quarantine window: failed rollback attempts should not be retried more than 2x automatically; after that require manual sign-off.
+
+Testing and periodic exercises
+- Quarterly rollback drills: execute full artifact + KV + config rollback in a staging region with simulated traffic.
+- Postmortem playbook: every real rollback leading to user impact > 1% of tenants requires a cross-team postmortem within 7 days.
+
+Appendix: checklist templates
+- Pre-change checklist (1) create snapshots (2) annotate deployment (3) enable verbose telemetry (4) inform stakeholders (5) set rollback watch window 
+- Rollback checklist (1) pause rollout (2) restore snapshot or re-point artifact (3) restart gracefully (4) validate telemetry (5) close incident
+
+Postmortem example fields
+- Title, incident id, timeline of actions with timestamps, snapshot ids used, rollback executor, validation signals, root cause hypothesis, action items, owners, ETA for fixes.
+
+Related reading
+- Operator workflows for LLM KV cache sharding and rebalancing (link in related_pages)
+- Predictive scale and eviction playbook (see related pages)
+
+Revision history
+- 2026-01-12: Created by Aisha Patel.
+- 2026-02-03: Added emergency rollback fast-path and validation matrix (reviewers: Marcus Liu, Eleni Torres).

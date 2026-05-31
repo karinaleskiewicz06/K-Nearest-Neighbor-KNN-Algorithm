@@ -1,0 +1,164 @@
+GPU image supply-chain signing and provenance playbook
+
+Summary:
+This playbook defines the standard process for producing, signing, annotating, and promoting GPU runtime images and model-serving artifacts through our CI/CD pipelines. It combines practical pipeline snippets (Buildkite + GitHub Actions), verification procedures (Cosign + Rekor), SBOM handling, Terraform attachment patterns, and runbook steps for suspected supply-chain compromises. The target audience is infra engineers, platform SRE, and security engineers responsible for image supply-chain integrity.
+
+Goals:
+- Ensure all GPU images used in production are signed and traceable to a reproducible build.
+- Produce SBOMs and provenance records that satisfy SLSA level 2+ checks for CI attestation.
+- Provide automated gating for image promotion with built-in verification steps.
+- Define rapid incident procedures when provenance/signature checks fail.
+
+Scope and assumptions:
+- Applies to: container images (GPU runtime images, model runtime bundles, driver shim images), OCI artifacts stored in our internal registry (registry.redwood-infra.internal).
+- Does not cover OS-level firmware updates or third-party marketplace images unless imported via our import workflow.
+- Requires: access to KMS for signing keys, Rekor transparency log, Cosign/Notation installed in CI runners, and the image-promotion Terraform module (see section).
+
+Definitions:
+- Artifact: OCI image or model artifact that will be deployed to serving clusters.
+- Provenance: machine-readable statement (in-toto/Cyber/Provenance v0.1) that records build inputs, outputs, and the CI job that created it.
+- SBOM: Software Bill of Materials produced by syft (or equivalent) describing packages in the image.
+
+High-level flow:
+1. Build stage (ephemeral runner)
+   - Reproducible build using pinned base images and deterministic build args.
+   - Produce image digest, SBOM (syft --format json), and provenance file (in-toto or cosign-attestation).
+2. Sign stage
+   - Cosign signs the image digest using KMS-backed keys (See "Key management").
+   - Attestations (SLSA predicate) are uploaded to Rekor and associated with the digest.
+3. Verification stage (pre-promotion)
+   - Admission checks and promotion pipelines verify signature + sbom + predicate.
+4. Promotion stage
+   - Terraform module attaches the immutable digest to the appropriate image alias and updates the Promotion ledger (Terraform state + tagging).
+
+Key management:
+- Production signing keys are stored in a customer-managed KMS project: kms://projects/redwood-prod/locations/global/keyRings/supply-chain/cryptoKeys/gpu-signing-key
+- CI uses short-lived signers: workflows request an ephemeral signing token via the sign-service (internal), which calls KMS.sign.
+- Rotate keys annually; emergency rotation steps are in the "Emergency key rotation" appendix.
+
+Tooling and versions (recommended):
+- cosign v2.7+ for signing and attestations
+- rekor-server v0.12+ (hosted at rekor.redwood-infra.internal)
+- syft v0.72+ to generate SBOMs
+- in-toto or SLSA predicate generator (bundled in our buildkit image)
+
+CI pipeline snippets
+- Buildkite (reference):
+
+  steps:
+    - label: "build: gpu-runtime-image"
+      command: |
+        set -euo pipefail
+        export IMAGE_NAME=registry.redwood-infra.internal/gpu-runtime:${BUILDKITE_COMMIT} 
+        buildctl build --frontend=v0.10 --opt source=.,platform=linux/amd64,linux/ppc64le -o type=image,name=$IMAGE_NAME,push=true 
+        syft $IMAGE_NAME -o json > sbom-$BUILDKITE_COMMIT.json 
+        cosign attest --key kms://projects/redwood-prod/... $IMAGE_NAME --type slsa \\n          --predicate-file provenance-$BUILDKITE_COMMIT.json
+        cosign sign --key kms://projects/redwood-prod/... $IMAGE_NAME
+
+- GitHub Actions (promotion job):
+
+  name: verify-and-promote
+  runs-on: ubuntu-latest
+  steps:
+    - uses: actions/checkout@v4
+    - name: Verify signature
+      run: |
+        IMAGE=registry.redwood-infra.internal/gpu-runtime:${{ inputs.digest }}
+        cosign verify --key kms://projects/redwood-prod/... $IMAGE
+        cosign verify-attestation --type slsa --key kms://projects/redwood-prod/... $IMAGE
+    - name: Check SBOM policy
+      run: |
+        jq '.artifacts | length' sbom-${{ inputs.digest }}.json > /dev/null || exit 1
+    - name: Terraform promote (uses image-promotion module)
+      run: |
+        cd infra/terraform/modules/image-promotion && terraform init && terraform apply -var image_digest=${{ inputs.digest }} -auto-approve
+
+Policy table (minimum gate checks before promotion):
+| Gate | Criteria | Failure action | Owner |
+|-----|----------|---------------|-------|
+| signature present | cosign sign found for digest | block promotion | infra-cicd |
+| attestation SLSA | predicate includes build id, builder id, input digests | block promotion | security |
+| SBOM completeness | >= 90% package coverage, no high severity unknown packages | request manual review | platform-security |
+| base image policy | base image digest must be in approved list | block promotion | infra-inventory |
+
+Terraform module usage
+- Module: modules/image-promotion (inputs and example table)
+| Input name | Type | Example | Notes |
+| image_digest | string | sha256:abcd... | mandatory; immutable pointer used by runtime config |
+| repo_alias | string | gpu-runtime:stable | Optional alias that will be updated to point to digest |
+| promoted_by | string | ci/buildkite#1234 | audit field |
+
+Verification in cluster (runtime gating)
+- Kubernetes admission controller (image-integrity-advisor) enforces:
+  - If image tag is not pinned to a digest, deny deploys in production namespaces.
+  - Verify cosign signature via Rekor and validate predicate fields: build_id matches allowed builders; SBOM attached URL reachable.
+- Example policy snippet (Gatekeeper-style YAML):
+  apiVersion: constraints.gatekeeper.sh/v1beta1
+  kind: K8sAllowedImages
+  metadata:
+    name: require-signed-images
+  spec:
+    enforcementAction: deny
+    parameters:
+      signatureVerification: true
+
+Runbook: signature/attestation failure during promotion
+1. Alert fires: alert name = CI.ImagePromotion.SignatureMissing (pager to infra-cicd).
+2. Initial triage (first 15 minutes):
+   - Confirm digest in registry: 
+     curl -s https://registry.redwood-infra.internal/v2/_catalog | jq .
+   - Re-run cosign verify locally from a secure bastion: cosign verify --key <kms-ref> image@sha256:...
+3. If verify fails due to missing attestation:
+   - Check Rekor: curl -s https://rekor.redwood-infra.internal/api/v1/log/entries?hash=<hash>
+   - If Rekor has entry but CI didn't upload, escalate to platform-ci team and re-run attestation upload job.
+4. If cosign verify fails due to key error:
+   - Check sign-service logs: /var/log/sign-service/*.log on signers.redwood-infra.internal
+   - Validate KMS permission: gcloud kms keys get-iam-policy ... (or aws kms get-key-policy ...)
+5. If signing key compromised (see Indicators of Compromise below):
+   - Trigger "Emergency key rotation" (section below).
+   - Revoke affected promotions and schedule rebuilds for all images signed with the key.
+
+Indicators of compromise:
+- Multiple unexpected signatures using same key from different CI jobs outside scheduled windows.
+- Rekor entries with mismatched build ids or builder identifiers.
+- Missing or tampered SBOMs in the registry for promoted digests.
+
+Emergency key rotation (high level):
+1. Mark current key as compromised in the key registry and revoke signing permissions.
+2. Provision new KMS key: kms://projects/redwood-prod/.../gpu-signing-key-v2.
+3. Update sign-service to use new key; block all promotions until the rollout is complete.
+4. Rebuild all artifacts that used the old key and push signed alternatives.
+5. Update Terraform image-promotion ledger to point to newly signed digests.
+6. Post-incident: rotate all CI runner tokens and audit who used the old key.
+
+Monitoring & Alerts:
+- Alert: CI.ImagePromotion.SignatureMissing (severity: warning) - triggered on failed signature/attestation check during promotion.
+- Alert: Registry.SBOM.Missing (severity: critical) - triggered when promoted digest lacks SBOM.
+- Telemetry: Track median time between build completion and successful Rekor entry (goal <= 2 minutes).
+
+Ownership and contacts:
+- Image signing pipeline owner: infra-cicd@redwood.com (primary: Ethan Park)
+- Key material owner: security-kms@redwood.com (primary: Marta Svensson)
+- Incident lead for rotation: oncall-security (bookable via PagerDuty)
+
+Appendices:
+A. Example cosign sign command (KMS):
+   cosign sign --key kms://projects/redwood-prod/locations/global/keyRings/supply-chain/cryptoKeys/gpu-signing-key \
+     registry.redwood-infra.internal/gpu-runtime@sha256:abcd1234
+
+B. Example Rekor query (to validate attestation):
+   curl -s 'https://rekor.redwood-infra.internal/api/v1/log/entries?hash=sha256:abcd1234' | jq .
+
+C. Rebuild checklist (for rotated keys):
+- Update CI templates to point at new key reference.
+- Regenerate SBOMs and provenance; verify locally before mass promotion.
+- Run promotion in small canary clusters (canary x 5 nodes) for 24h before global rollout.
+
+D. Related policies and docs:
+- Secure SDLC: /confluence/security-and-compliance/secure-sdlc
+- Image promotion module: /confluence/eng-infra/terraform-and-iac/image-promotion-module-spec
+
+Revision history:
+- 2023-06-15: created (Priya Malhotra)
+- 2024-08-02: added Rekor and SBOM policy table (Marta Svensson)
+- 2025-02-10: emergency key rotation appendix and Terraform input table (Ethan Park)

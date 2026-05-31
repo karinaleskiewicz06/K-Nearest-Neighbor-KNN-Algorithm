@@ -1,0 +1,163 @@
+Tenant-aware Kernel Ladder: Architecture, Profiling, and Runbook
+
+Summary:
+This handbook documents the tenant-aware kernel ladder: a runtime subsystem that adaptively promotes and demotes kernel configurations per-tenant to meet latency SLOs while optimizing GPU utilization and cost. It combines architecture rationale, kernel scheduling rules, profiling playbook, benchmarking plan, rollout checklist, and an incident runbook.
+
+Purpose and scope:
+- Audience: serving runtime engineers, SREs, on-call, and performance engineers.
+- Scope: design and operational procedure for the kernel ladder (promotion/demotion, telemetry signals, safety guards, and rollback).
+- Non-goals: hardware provisioning, global autoscaler policies, and model architecture changes.
+
+1) High-level design
+Overview:
+- Kernel ladder is a discrete set of kernel profiles (K0..K4) that trade throughput/cost for worst-case latency. Each profile is a precompiled kernel bundle + scheduler hints (batch slice size, preemption score, qcache warmup).
+- Per-tenant control plane maps tenant -> ladder policy. Policy attributes: base_profile, min_profile, max_profile, promotion_cooldown_s, demotion_cooldown_s, telemetry_weights.
+- Runtime components:
+  - Ladder controller (per-node): watches incoming telemetry and per-tenant session state, emits profile-change intents.
+  - Kernel activation agent (per-GPU): applies profile bundles and issues kernel handshake; ensures safe rollback if activation fails.
+  - Quota crediter: ensures profile changes respect slot accounting and kernel credits.
+  - Telemetry exporter: publishes promotion/demotion events and rationale to metrics and traces.
+
+Architecture diagram (text):
+- Request -> Request-classifier -> Tenant policy lookup -> Ladder controller -> Kernel activation agent -> GPU dispatcher -> Kernel execution -> Telemetry sink
+
+2) Policy model and scheduling rules
+Policy fields (table):
+| field | type | description | example |
+|---|---|---|---|
+| base_profile | string | default kernel profile for tenant | K1 |
+| min_profile | string | lower bound allowed | K0 |
+| max_profile | string | upper bound allowed | K3 |
+| promotion_metric | string | telemetry metric used for upshift | tail_latency_99ms |
+| promotion_threshold | string | threshold to trigger promotion | 150ms |
+| demotion_metric | string | metric used for downshift | avg_tokens_per_second |
+| promotion_cooldown_s | int | min seconds between promotions | 60 |
+| demotion_cooldown_s | int | min seconds between demotions | 300 |
+
+Scheduling rules (short):
+- Prefer non-disruptive profile changes: when possible, move only new allocations to the higher profile and let existing sessions finish (soft promotion).
+- Hard promotion: if tail latency > promotion_threshold for 3 consecutive 1-min windows, force immediate kernel swap for hot sessions with warm-up prefetch.
+- Demotion: only demote when sustained over a 10-minute window and GPU utilization headroom > 25%.
+- Safety: at most 20% of a node's kernels can be in an experimental (K4) profile concurrently.
+
+3) Telemetry & SLOs
+Canonical metrics (exported to metrics namespace rwd.runtime.ladder):
+- tenant.tail_latency_99_ms (gauge, ms)
+- tenant.avg_latency_ms (gauge, ms)
+- tenant.token_throughput_tps (gauge)
+- node.gpu_utilization_pct (gauge)
+- ladder.promotion_events_total (counter)
+- ladder.failed_activations_total (counter)
+
+SLO guidance (example tenant class):
+- Enterprise interactive: p99 latency <= 180ms for requests <= 256 tokens, availability >= 99.95%.
+- Standard API customers: p99 latency <= 300ms, availability >= 99.9%.
+- Background batch: p99 latency <= 2s, availability >= 99.5%.
+
+Alert thresholds (examples):
+- Pager (SEV2): tenant.tail_latency_99_ms > 250ms sustained for 5m AND ladder.promotion_events_total increased by > 30% in 10m.
+- Ops (SEV3): ladder.failed_activations_total > 5 in 10m on a single node.
+
+4) Profiling playbook (how to collect targeted signals)
+Objective: gather representative traces and microprofiles to decide ladder step definitions and promotion thresholds.
+Steps:
+1. Identify representative tenants: choose 3 tenants per SLA class (interactive, standard, batch).
+2. Use sampled tracing at 1% of requests for 24h with request context "ladder-prof"; capture kernel dispatch timings, batch shapes, KV cache hit ratio, and prefetch latencies.
+3. Run microbenchmarks on candidate kernel bundles: run 10k synthetic short requests (32–64 tokens) and long requests (512 tokens) across K0..K4. Collect p50/p95/p99 and memory working set.
+4. Create a ladder-definition artifact (YAML) for each tenant class. Example: 
+
+---
+tenant_class: interactive
+ladder_steps:
+  - id: K0
+    description: minimal-latency (low-batch, high-priority, small kernels)
+    expected_p99_ms: 120
+    cost_factor: 1.8
+  - id: K1
+    description: balanced
+    expected_p99_ms: 160
+    cost_factor: 1.0
+  - id: K2
+    description: throughput-optimized
+    expected_p99_ms: 260
+    cost_factor: 0.6
+---
+
+5. Validate ladder offline using the workload replay harness in benchmarking suite (see section 5).
+
+5) Benchmarking plan and acceptance criteria
+- Bench harness: use the operational-workload-simulator with recorded traces. For each ladder candidate, measure: node throughput, tail latency, GPU idling, kernel switching time, and cost-per-token estimate.
+- Acceptance criteria (release gating):
+  - p99 latency improvement for promoted tenants >= 25% vs base_profile under matched load, AND
+  - Cost uplift per-token <= 40% for interactive tenants (for enterprise customers with higher SLOs), OR
+  - No more than 5% increase in node-level tail latency for mixed-tenant workloads.
+
+6) Release & rollout checklist
+Pre-flight:
+- Generate ladder YAML artifacts and commit to repo rwd/ladder-defs.
+- Run full bench harness and attach results to release ticket.
+- Code review and canary gate: enable ladder in canary region with traffic fraction 0.5% for 2 hours.
+Gradual rollout:
+1. 0.5% traffic - 2h - check metrics and failed_activations_total.
+2. 2% traffic - 4h - validate p99 and GPU utilization headroom.
+3. 10% traffic - 6h - watch cross-tenant tail latencies.
+4. 50% traffic - 24h - if stable, escalate to 100%.
+Rollback criteria (automated):
+- Any single-node ladder.failed_activations_total > 10 in 5m -> immediate rollback of ladder on that node.
+- Cross-tenant node p99 latency regressions > 15% sustained for 15m -> rollback to previous kernel bundle set.
+
+7) Operational runbook (on-call playbook for SEV2/SEV3)
+When triggered: detect via alert or manual observation.
+A. Initial triage (first 10 minutes):
+1. Check ladder.failed_activations_total and node.gpu_utilization_pct graphs.
+2. Identify affected tenants and node(s) via trace ids and metrics.
+3. If failed_activations_total spikes on a node: ssh to node and inspect /var/log/rwd/kernel-activation.log for handshake errors; run `rwdctl kernel status --node $NODE`.
+
+B. Mitigation steps (10-30 minutes):
+1. Soft demote affected tenant(s): `rwdctl ladder set --tenant $TID --profile K1 --mode soft`.
+2. If kernel activation handshake fails repeatedly, drain node from scheduler and trigger a rolling restart of kernel agent: `rwdctl node cordon $NODE && rwdctl agent restart kernel-agent --node $NODE`.
+3. If cross-tenant p99 regressions: temporarily enable global conservative policy: `rwdctl ladder set-global --max_profile K1` (admin only).
+
+C. Post-incident actions (30m+):
+1. Collect the following artifacts and attach to incident ticket: kernel-activation.log, last 30m of ladder telemetry, sample traces (ladder-prof), bench-run summary.
+2. Open a performance regression ticket if ladder caused regressions, assign to kernel-scheduling team.
+
+8) Known limitations and issues
+- Kernel activation latency: some legacy kernels require a cold handshake that can take 120–250ms. Workaround: prefer soft promotions and warm-prefetch for affected models.
+- Cache-skew edge-case: per-tenant promotions may create KV cache fragmentation; mitigation: periodic KV compaction job (daily) and prefetch heuristics.
+- Rollout oscillation: naive promotion/demotion based solely on p99 can oscillate. The ladder uses cooldown windows and hysteresis, but complex multi-tenant bursts may still cause flapping. Future fix: add predictive smoothing using short-term AR models.
+
+Known issues table (brief):
+| id | symptom | workaround | owner |
+| KLD-101 | failed kernel handshake on A100p 2.0 nodes | cordon node and restart kernel-agent | kernel-scheduling team |
+| KLD-112 | tenant p99 spike after hard promotion | revert tenant to previous profile and soft-warm | SRE/perf |
+| KLD-117 | KV cache fragmentation for >1000 active tenants | run kv-compact and limit concurrent promotions | runtime-infra |
+
+9) Postmortem and metrics to track after rollout
+- Reduction in tenant-tail-p99 per SLA class
+- ladder.promotion_events_total/k (normalized) vs failed_activations_total
+- Node-level avg GPU-ptime (time kernels are active) and idle fraction
+- Cost per token estimates before/after ladder
+
+10) Ownership, contacts and escalation
+- Primary maintainers: kernel-scheduling (team alias: team-kernel-sched@redwood.com)
+- On-call rotation: kernel-scheduling SRE and runtime-platform SRE (see oncall roster link: /confluence/eng-sre/oncall-roster)
+- Pager escalation: SEV2 -> oncall SRE, then engineering manager.
+
+References and artifacts:
+- rwd/ladder-defs repository (internal)
+- Benchmark runs: /artifacts/bench/ladders/2026-01 (links attached to release ticket)
+- Related pages: predictive-slotting-and-quota-orchestration-2026, delta-routing-and-cost-partitioning-architecture-2026
+
+Appendix: Useful CLI snippets
+- Check a tenant's current profile:
+  rwdctl ladder get --tenant $TID
+- Force soft promotion for debugging:
+  rwdctl ladder set --tenant $TID --profile K2 --mode soft --reason "debug/latency-test"
+- Dump last activation logs for node:
+  sudo journalctl -u rwd-kernel-activation -n 500 | tee ~/activation-tail.log
+
+Revision history:
+- 2026-01-15: Initial draft (Ava Martinez).
+- 2026-02-10: Add acceptance gating criteria and bench harness steps (Daniel Cho).
+- 2026-03-02: Update rollout steps and rollback automation triggers (Marcus Flynn).

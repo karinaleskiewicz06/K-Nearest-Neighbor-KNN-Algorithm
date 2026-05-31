@@ -1,0 +1,180 @@
+GPU Canary Traffic Shaper — Terraform & CI Orchestration Runbook
+
+Summary
+
+This runbook describes the GPU Canary Traffic Shaper: an orchestration pattern and operational playbook that combines a Terraform adapter, CI gating, and a lightweight traffic-shaping proxy to safely roll out warm-pool and prewarm changes across heterogeneous GPU pools. The goal is to reduce cold-start exposure for mixed-precision model variants while protecting tenant SLAs and egress budgets.
+
+Scope
+
+- Applies to: Hosted and Dedicated GPU fleets managed by the allocator-service and gpu-canary-allocator job.
+- Includes: Terraform module usage, CI pipeline gating steps, monitoring thresholds, and incident mitigation steps.
+- Excludes: On-prem air-gapped packaging and customer-managed private deployments (see eng-private-deployments docs for that flow).
+
+Background and motivation
+
+We have observed that large-model cold starts (token generation latency spikes) are the leading cause of transient 99th percentile latency regressions for chat workloads. Prewarming via warm pools mitigates this but introduces cost and fairness concerns when new warm-pool policies are rolled out. The Canary Traffic Shaper provides a safe, observable path to:
+
+- Gradually shift a small percentage of production traffic to the new warm-pool allocator.
+- Validate prewarm correctness and KV cache behavior under real traffic.
+- Automate rollback when latency, error, or cost signals exceed thresholds.
+
+Key ownership and contacts
+
+- Owner: allocator-platform (eng-infra) — primary on-call: @allocator-oncall
+- Author: Maya Patel (allocator-platform)
+- Reviewers: Diego Martínez (gpu-fleet), Priya Singh (observability), Owen Liu (ci-cd)
+- Runbook escalation: follow eng-sre/runbooks oncall escalation matrix.
+
+Goals and SLOs
+
+- Warm-hit rate for canary traffic >= 95% within 120s of rollout start.
+- 99th percentile downstream token latency impact <= +15% compared to baseline (pre-canary).
+- Error rate introduced by canary <= 0.1% absolute increase.
+- Cost delta for canary cohort <= 10% of baseline for the first 24 hours.
+
+Telemetry & dashboards (what to watch)
+
+- Grafana: gpu_canary/warmpool/latency_p99, gpu_canary/warmpool/warm_hit_rate, allocator/evictions_per_minute
+- Traces: sample (trace rate 1%) instrumented through allocator-service -> runtime-proxy -> model-server
+- Billing: per-tenant token billing tag for the canary cohort, tracked in cloud-billing:dataset.gpu_canary_costs
+
+Architecture (text diagram)
+
+Production traffic -> traffic-shaper proxy (edge) -> canary-router (routes X% to new allocator) -> allocator-service (new warm-pool) -> runtime -> model
+
+Key components:
+- traffic-shaper proxy: small stateless proxy that marks requests for canary cohort.
+- canary-router: routing policy that reads feature flag + percentage and applies sticky hashing by tenant id.
+- terraform adapter: tf module aws_gpu_warmpool_canary that wires warm-pool resources and IAM roles.
+- ci-gate: pipeline job that runs sim harness + e2e smoke before promoting changes.
+
+Terraform: module usage example
+
+Use the dedicated canary adapter module in infra repo to create warm pool resources and attach allocation policy. Minimal example:
+
+```hcl
+module "gpu_warmpool_canary" {
+  source = "git::ssh://git@github.com/redwood/infra-modules.git//aws/gpu-warmpool-canary"
+  name_prefix = "canary-warmpool"
+  target_accounts = ["redwood-prod-1", "redwood-prod-2"]
+  region = "us-west-2"
+  pool_size = 8
+  prewarm_image = "gcr.io/redwood/gpu-prewarm:v3"
+  iam_role = module.allocator_iam.role_arn
+  tags = { team = "allocator-platform", purpose = "canary" }
+  maintenance_windows = ["Sun:02:00-03:00"]
+}
+```
+
+Important notes: the module creates a smaller-capacity labeled pool and outputs a canary_token used by the traffic-shaper proxy. It also emits monitoring metrics and a tfstate tag that the ci-gate reads.
+
+CI/CD pipeline integration
+
+We gate all terraform changes with the following steps (example: GitHub Actions):
+
+1. PR opens -> runs `terraform plan` with the canary module enabled.
+2. CI executes `./scripts/run_canary_sim.sh` (see testing section) against a shadow endpoint to validate behavior.
+3. Observability smoke: CI posts synthetic traffic to the canary-router and checks warm_hit_rate and latency against baseline for 30m.
+4. If thresholds pass, PR enters manual approval stage (team reviewer).
+5. Merge triggers `terraform apply`. Post-apply, the canary controller is enabled at 1% traffic for 30 minutes automatically.
+
+CI gating example job (pseudo):
+
+```yaml
+jobs:
+  canary-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: terraform init/plan
+        run: |-
+          terraform init -backend-config=\"bucket=redwood-tfstate\"
+          terraform plan -var=\"enable_canary=true\"
+      - name: run simulator
+        run: ./scripts/run_canary_sim.sh --duration 1800 --baseline-id ${{ secrets.BASELINE_ID }}
+      - name: validate observability
+        run: ./scripts/check_metrics.sh --thresholds metrics.json
+```
+
+Testing & simulation harness
+
+A small simulator lives in infra/tools/canary-sim. It replays representative requests captured from production (anonymized) to the shadow allocator and reports:
+
+- warm_hit_rate, kv_cache_miss_rate, p99_latency, and failure modes (e.g. OOM, allocation timeouts).
+
+Example run: `./canary-sim --endpoint https://shadow-canary.internal --traffic-file samples/chat-small.json --concurrency 50 --duration 900`
+
+Output parser produces a summary JSON with the exact metrics used by CI for gating. The simulator also supports a fault-inject mode: `--inject evict=0.05` to exercise eviction behavior.
+
+Runbook: detection & mitigation (operational steps)
+
+Detection signals (alert triggers):
+- Alert: gpu_canary/warmpool/latency_p99 > baseline*1.15 for 5m
+- Alert: gpu_canary/warmpool/error_rate > baseline + 0.001 for 5m
+- Alert: billing:gpu_canary_costs > baseline*1.10 over 1h
+
+Immediate mitigation (fast path) — responsible: allocator oncall
+1. Confirm alerts (Grafana + traces). If noisy, raise incident and page oncall.
+2. Reduce canary traffic fraction to 0% via canary-router toggle (API: POST /canary-router/v1/override {"fraction":0}).
+3. If override fails, scale down warm-pool counts: `terraform apply -var='pool_size=0'` for the canary module (use the canary tf workspace).
+4. If errors continue, revert the tf changes (`terraform destroy` of the canary resources) and switch traffic routing back to the stable allocator.
+5. Run `canary-sim --inject evict=0.2` against the shadow pool to reproduce the failure and capture traces for postmortem.
+
+Rollback checklist (post-mitigation)
+- Ensure the canary fraction is 0% and stable allocator metrics are within baseline.
+- Open an incident if not already opened and attach traces + terraform plan output.
+- Notify product and customer success teams if any customer-facing impact occurred.
+
+Post-deployment validation (automated)
+
+- After enabling canary at incremental steps (1%, 5%, 10%, 25%, 100%), the automation does a 30m check at each step. Promotion only continues if all checks pass.
+- If the traffic-shaper shows allocation timeouts > 0.5% for the cohort, automated rollback should trigger.
+
+Testing matrix (example)
+
+| Test | Purpose | Minimum pass criteria | Notes |
+|------|---------|-----------------------|-------|
+| Smoke e2e | validate routing + basic inference | warm_hit_rate >= 90% | run for 10 minutes |
+| Load replay | validate sustained behavior | p99 <= baseline*1.10 | 30 minutes, concurrency=200 |
+| Cost sensitivity | ensure cost delta acceptable | cost_delta <= 10% | billing report after 1h |
+
+(Above table represented as plain text line-delimited table for portability.)
+
+CI failure modes and common fixes
+
+- Terraform plan drift: run `tfstate-checker` and reconcile remote modules. If drift is complex, escalate to infra-iac team.
+- Canary simulator failures: verify `samples/*.json` freshness (regenerate with `scripts/extract_sample.sh`).
+- Observability missing metrics: ensure canary module enabled `metric_export=true` and that the exporter IAM role is attached.
+
+Operational notes and hard limits
+
+- Hard limit: canary pool_size must be <= 10% of the production warm-pool capacity to avoid noisy neighbor effects. This is enforced in the module with a precondition.
+- Maintenance windows: canary upgrades must not start during global maintenance windows listed in the module output.
+- IAM: canary module creates a scoped role with least privilege for the allocator; do not reuse highly-privileged roles.
+
+Postmortem triggers
+
+Open a formal postmortem if any of the following occur during canary rollout:
+- Customer-impacting latency or errors (SLA breach).
+- Cost overrun > 25% in 24 hours attributable to canary.
+- Data-plane inconsistency requiring manual KV cache reset.
+
+Appendix: useful commands and scripts
+
+- Run simulator locally: `infra/tools/canary-sim --endpoint https://shadow-canary.internal --traffic-file samples/chat-small.json`
+- Query warm-pool metrics: `curl -s "https://metrics-api.internal/query?name=gpu_canary/warmpool/latency_p99&range=5m"`
+- Toggle router override: `curl -X POST -H \"Authorization: Bearer $ADMIN_TOKEN\" -d '{"fraction":0}' https://canary-router.internal/v1/override`
+- CI smoke script: `./scripts/check_metrics.sh --metrics gpu_canary/warmpool/latency_p99 --threshold 1.15`
+
+Related docs & references
+
+- See: /confluence/eng-infra/terraform-and-iac/warm-pool-module-spec for module API details.
+- Observability playbook: /confluence/eng-infra/dashboards-and-alerts/allocator-metrics-onboarding
+
+Revision history
+
+- 2025-09-15: Draft created (Maya Patel)
+- 2025-11-05: Added CI gating steps and simulator example (Priya Singh)
+- 2026-01-12: Updated thresholds and rollback checklist after incident simulation (Diego Martínez)
+
+END OF DOCUMENT

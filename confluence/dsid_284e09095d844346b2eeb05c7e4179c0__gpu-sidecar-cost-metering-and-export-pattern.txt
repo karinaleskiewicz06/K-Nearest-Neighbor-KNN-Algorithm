@@ -1,0 +1,209 @@
+GPU sidecar cost metering and export pattern
+
+Overview
+
+This document describes the GPU sidecar cost-metering-and-export pattern: a lightweight telemetry sidecar running on GPU hosts (Kubernetes DaemonSet or VM agent) that captures per-request GPU allocation signals, attributes them to tenant identifiers (account, team, route), and exports normalized usage events for downstream billing, cost dashboards, and capacity-aware autoscaling. The pattern is designed to be infrastructure-agnostic (supports hosted, dedicated, private) and to integrate with Redwood's existing billing pipeline (ingest, normalization, chargeback).
+
+Motivation
+
+- Current chargeback relies on coarse allocation (node-level, pool-level). That underestimates tenant burst costs and blurs per-route unit economics.
+- We need fine-grained, low-latency usage events to:
+  - attribute per-request GPU-utilization and memory residency time,
+  - feed autoscaler signals and priority schedulers,
+  - generate near-real-time cost reports for product owners.
+
+Goals and non-goals
+
+- Goals:
+  - Emit per-inference usage events with <= 60s latency to billing ingest.
+  - Keep agent CPU overhead < 2% on GPU hosts and memory < 128MB.
+  - Provide deterministic tagging: tenant_id, route, model_version, request_type, seq_length, tokens_generated.
+- Non-goals:
+  - The sidecar is not a replacement for full APM. Do not use it for deep tracing or user-level PII capture.
+
+Architecture and components
+
+- Sidecar agent (DaemonSet or VM agent): collects local signals and emits enriched events.
+- Local buffer + backpressure: write-ahead log on disk (configurable, default 4MB) to survive short network blips.
+- Export adapters: Kafka/Fluentd for hosted pipeline, S3+Glue for batch export in private deployments.
+- Normalizer service (billing team): consumes raw events, deduplicates, applies rate-based pricing rules, and emits normalized billing records.
+
+Signals collected (minimal required set)
+
+| signal | description | unit | notes |
+|---|---:|---:|---|
+| tenant_id | Account or tenant UID | string | required for all events |
+| route | API route or internal customer route | string | e.g., /v1/generate-chat |
+| model | model identifier + variant | string | include quantization flag if available |
+| start_ts | request start timestamp (ISO8601) | timestamp | used to compute residency/time-on-gpu |
+| end_ts | request end timestamp | timestamp | nullable (in-flight) |
+| gpu_mem_bytes | peak GPU memory used | bytes | measured by runtime/kernel accounting |
+| gpu_util_pct | sampled GPU utilization during request | percent | optional, sampled at 250ms intervals |
+| tokens_generated | tokens emitted by model | integer | used by pricing rules |
+| request_id | globally unique request id | string | for dedupe across HA exports |
+
+Design details
+
+1) Attribution approach
+- Primary: route + tenant_id passed in request header (x-redwood-tenant, x-redwood-route).
+- Secondary: if headers absent, map from workload identity (k8s pod labels: redwood.tenant, redwood.route).
+- Fallback: node-level assignment to default pool (used only for internal debug).
+
+2) Sampling and aggregation
+- Events can be emitted as:
+  - per-request events (default for latency-sensitive billing), or
+  - aggregated minute-buckets for very high request rates (configurable in values.yaml).
+- Aggregation schema: tenant_id, route, model, minute_ts, sum_tokens, sum_gpu_mem_seconds, count_requests.
+
+3) Resilience and correctness
+- Local WAL prevents accepted requests being lost during short-term exporter outages. WAL retention: 10 minutes by default.
+- Exporter has exactly-once semantics via request_id + exporter dedupe window (30m). Billing normalizer must implement idempotency keys.
+
+4) Privacy and PII
+- Do NOT include raw prompts or user text. Sidecar only collects numeric and categorical metadata. Any deviation must be pre-approved by Security.
+
+Terraform / IaC module interface (example)
+
+- Module name: registry.redwood.com/infra/gpu-sidecar-exporter
+- Inputs (high level):
+  - cluster_id (string) - kube cluster identifier
+  - export_endpoint (string) - kafka://host:port or https://billing-ingest.redwood.com/v1/events
+  - auth_secret (string) - reference to k8s secret for TLS credentials
+  - retention_mb (number) - local WAL size in MB
+  - replicas (number) - daemonset replica target (default 1 per node)
+
+Usage snippet (Terraform)
+
+```
+module "gpu_sidecar_exporter" {
+  source        = "registry.redwood.com/infra/gpu-sidecar-exporter"
+  cluster_id    = var.cluster_id
+  export_endpoint = "kafka://pk-01.redwood-data:9092"
+  auth_secret   = kubernetes_secret.sidecar_tls.id
+  retention_mb  = 8
+}
+```
+
+Kubernetes DaemonSet example (values.yaml fragment)
+
+```
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gpu-sidecar-exporter
+  labels:
+    app: gpu-sidecar
+spec:
+  selector:
+    matchLabels:
+      app: gpu-sidecar
+  template:
+    metadata:
+      labels:
+        app: gpu-sidecar
+    spec:
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: exporter
+        image: ghcr.io/redwood-inference/gpu-sidecar:stable-2025-01
+        resources:
+          limits:
+            cpu: "250m"
+            memory: "128Mi"
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+        env:
+        - name: EXPORT_ENDPOINT
+          valueFrom:
+            secretKeyRef:
+              name: sidecar-config
+              key: export_endpoint
+        volumeMounts:
+        - name: wal
+          mountPath: /var/lib/gpu-sidecar/wal
+      volumes:
+      - name: wal
+        emptyDir:
+          sizeLimit: 10Mi
+```
+
+Operational SLOs and alerts
+
+- Ingest latency: 95th percentile <= 60s from request end_ts to billing-ingest ack. Pager if 5m sustained > 120s.
+- Export failure rate: > 0.5% errors per 5m window triggers P1 to infra-observability.
+- Local WAL fullness: if > 80% for 2m, fire warning and throttle non-critical metrics.
+- Resource overhead: if measured CPU or memory for sidecar > configured limit on >3 nodes, alert to infra-team.
+
+Metrics and dashboards (recommended panels)
+
+- Sidecar: per-node export throughput (events/sec), local_wal_size_mb, export_error_rate, exporter_backoff_seconds.
+- Billing normalizer: dedupe_rate, normalized_events/sec, latency distribution, per-tenant cost-per-minute.
+
+Operational runbook (short)
+
+1) Detect: Alert trg: export_error_rate > 0.5%
+2) Triage: check sidecar logs (kubectl -n infra logs daemonset/gpu-sidecar-exporter).
+3) Verify network: curl export_endpoint from a node (uses sidecar TLS secret).
+4) If exporter downstream (kafka or HTTP) is unhealthy, switch terraform variable export_endpoint to fallback (s3-batch) and trigger a canary deploy.
+5) Recover: increase WAL retention if exporter experiencing short blips (terraform var retention_mb), then monitor normalized events until backlog drained.
+6) Post-incident: open incident in JIRA, attach WAL dump (if needed) and listing of affected tenant_ids for reconciliation.
+
+Rollout plan (recommended phased rollout)
+
+- Canary (3 nodes): enable sidecar with aggregation-mode=minute, export to staging-kafka. Monitor CPU/memory, WAL usage, and ingestion latency for 48h.
+- Gradual (10% nodes): enable per-request events for a subset of clusters. Compare chargeback deltas vs historical baseline.
+- Full rollout: switch default to production ingest and enable dedupe window in billing normalizer.
+
+Security considerations
+
+- Secrets: use KMS-backed k8s secrets for export credentials. Rotate creds quarterly.
+- Network: egress must be to dedicated VPC endpoints; do not route billing events over public internet without TLS + mTLS.
+- Auditing: sidecar must record a compact audit index (request_id, tenant_id, exported_ts) kept for 90 days in internal logs.
+
+Open design questions / future work
+
+- GPU residency vs wall-clock time: evaluate adding fine-grained memory residency accounting (per-kv cache) to better capture long-cached context held on GPU.
+- Sampling optimization: potential use of adaptive sampling under heavy load to reduce ingestion cost while preserving billing accuracy.
+
+Ownership and contacts
+
+- Primary owner: eng-infra (Aisha Thompson) - runbooks and rollout coordination.
+- Billing normalizer owner: finance-and-legal (Ravi Singh) - ingestion schema and pricing rules.
+- Observability: eng-platform (Maya Chen) - dashboards and alerts.
+
+References and related docs
+
+- GPU tenant tagging and IAM: /confluence/eng-infra/terraform-and-iac/gpu-cost-centre-mapping-and-tagging-iam-policies.json
+- Egress shaping and tenant fairness: /confluence/eng-infra/cloud-accounts-and-networking/egress-bandwidth-burst-shaper-and-tenant-fairness-implementation.json
+- Kafka export adapter design: internal RFC (rfc-kafka-exporter-2024-11)
+
+Appendix: example normalized event (JSON)
+
+```
+{
+  "request_id": "req_20250201_9f2a",
+  "tenant_id": "acct_27",
+  "route": "/v1/generate-chat",
+  "model": "redwood-13b-q8_0",
+  "start_ts": "2025-01-31T18:14:22Z",
+  "end_ts": "2025-01-31T18:14:23Z",
+  "gpu_mem_bytes": 2147483648,
+  "gpu_util_pct": 87.3,
+  "tokens_generated": 42
+}
+```
+
+Notes
+
+- Keep the sidecar small and single-purpose. When additional telemetry needs arise, prefer dedicated pipelines to avoid agent bloat.
+- Any schema change to normalized events must be versioned and reviewed by billing team.
+
+Document history
+
+- 2024-05-10: initial draft by A. Thompson
+- 2024-08-12: added WAL sizing defaults and k8s toleration guidance (review: M. Chen)
+- 2025-02-01: promoted to published after canary validation and billing normalizer contract finalized (reviewers: R. Singh, D. Alvarez)

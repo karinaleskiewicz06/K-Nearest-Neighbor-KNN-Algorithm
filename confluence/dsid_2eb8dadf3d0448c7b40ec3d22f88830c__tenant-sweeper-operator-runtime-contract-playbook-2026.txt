@@ -1,0 +1,202 @@
+Tenant Sweeper: Operator Runtime Contract and Isolation Playbook
+
+Overview
+
+This document defines the runtime contract for the Tenant Sweeper operator (tenant-sweeper), describes patterns for safe tenant isolation and sweeping in VPC and on-prem private deployments, and provides the operational playbooks for day-2 operations, upgrades, and rollback scenarios. The Tenant Sweeper is a control-plane helper that executes canonical isolation workflows: network policy enforcement, KV/cache eviction, resource reclamation, and graceful tenant quiescing.
+
+Scope
+
+- Audience: Platform engineers, Onsite field operators, SREs, and Customer Success engineers responsible for private deployments.
+- Applies to: Redwood Private (VPC and on-prem) customer deployments that use the tenant-operator lifecycle manager and the redwood-runtime v2+ serving runtime.
+- Excludes: Hosted API (managed by Platform team) and experiments with third-party multi-tenant proxies not integrated with the tenant-operator API.
+
+Goals
+
+1) Define a clear operator runtime contract so teams can rely on predictable reconciliation behavior and safe isolation semantics.
+2) Provide a repeatable sweep and rollback playbook for day-2 incidents and planned maintenance.
+3) Enumerate minimum customer requirements and validation checks before executing disruptive operations.
+
+Operator Runtime Contract (tenant-sweeper)
+
+Behavioral guarantees:
+- Reconciliation model: declarative. The operator reconciles desired IsolationState objects; changes are eventually consistent but use a strict ordering (network -> KV/cache -> worker detach -> resource reclaim).
+- Idempotency: All sweeper actions must be idempotent to allow retries and safe partial-execution.
+- Observability: Each reconciliation run emits a trace and a single line event to audit.log with correlation_id (trace_id). Metrics exposed: tenant_sweeper_reconciles_total, tenant_sweeper_duration_seconds_bucket, tenant_sweeper_errors_total, tenant_sweeper_action_counts{action=\"network-policy\"|\"kv-evict\"|\"detach\"|\"reclaim\"}.
+- Safety locks: Sweeper must obtain a per-tenant distributed lock (etcd or customer KVS) before executing destructive steps. Lock TTL default 5m, extensible by flag --lock-ttl.
+
+API contract (CRD summary)
+
+- IsolationState (CRD) fields (flattened):
+  - tenant_id (string)
+  - mode (string): one of active | quiesce | isolate | reclaim
+  - reason (string)
+  - dry_run (bool)
+  - snapshot_id (string) optional: id of state snapshot to attach before reclaim
+  - requested_by (string)
+  - notify_channels (list) optional: pagerduty/slack ops hooks (comma separated)
+
+Operational invariants:
+- network enforcement always precedes KV eviction.
+- cache/KV eviction emits a snapshot event and a tenant_kv_snapshot_{id} metric.
+- detach requests are soft by default (worker drains for 30s) unless force=true is set in IsolationState.
+
+SLOs and thresholds (operator-level)
+
+- Availability: tenant-sweeper control plane should be available 99.95% monthly.
+- Reconcile latency: p95 < 8s for non-destructive sweeps (network-policy changes), p95 < 45s for full isolate+kv-evict workflows.
+- Error budget: error rate < 0.5% per week for reconciliation errors.
+
+Minimum Customer Readiness Checklist (pre-sweep)
+
+| Item | Requirement | Check Command / Location | Owner |
+|------|-------------|--------------------------|-------|
+| Access | Service account with tenant-sweeper role and KMS decrypt | ops@customer: gcloud/az/oci role binding | field-ops |
+| Telemetry | Customer telemetry endpoint subscribed (prometheus remote_write) | verify in control-plane config | tel-team |
+| Snapshot storage | S3/MinIO bucket with write ACL for snapshots | aws s3 ls s3://<bucket>/snapshots | field-ops |
+| Network | VPC security groups allow control-plane agent access to all worker subnets | run network-checker tool | netops |
+
+Pre-flight checks (automated)
+
+1) run: redwood-ctl sweeper preflight --tenant <tenant_id> --k8s-context <ctx>
+   - exits non-zero if: missing lock, missing snapshot bucket, control-plane unreachable, or operator CRD schema mismatch.
+2) run smoke tests: redwood-ctl serving smoke --tenant <tenant_id> --qps 1 --model small
+
+Day-2 Isolation Playbook (non-emergency, planned maintenance)
+
+1) Schedule maintenance window and notify stakeholders (customer-business, CS, SRE). Document correlation_id.
+2) Dry-run: Apply IsolationState with dry_run=true. Command:
+   kubectl apply -f - <<EOF
+   apiVersion: infra.redwood.ai/v1
+   kind: IsolationState
+   metadata:
+     name: sweep-tenant-<tenant_id>-dry
+   spec:
+     tenant_id: "<tenant_id>"
+     mode: "isolate"
+     dry_run: true
+     requested_by: "oncall@redwood.io"
+   EOF
+3) Wait for tenant_sweeper_reconciles_total to report run and inspect traces in the tracing UI. Confirm no destructive actions emitted.
+4) Execute non-destructive phase: network-policy enforcement. Apply IsolationState with dry_run=false mode=isolate.
+5) Confirm network isolation (run remote curl from control-plane into worker subnets; expect connection reset for tenant endpoints).
+6) Initiate cache/KV snapshot and optional eviction: IsolationState.mode=quiesce followed by IsolationState.mode=reclaim for final reclaim.
+7) For reclaim, set snapshot_id to the snapshot created in step 6.
+8) Verify reclaimed resources: node annotations, tenant quota counters, and per-tenant billing records reconciled.
+9) Release locks and end maintenance window.
+
+Emergency Tenant Quarantine (unplanned, high-risk)
+
+Triggers:
+- Sustained noisy tenant causing GPU OOMs or KV corruption.
+- Data exfiltration detection via telemetry and data-loss indicators.
+
+Quick steps:
+1) Set IsolationState with mode=isolate and force=true to immediately enforce network blackhole for tenant endpoints. Include notify_channels for pager escalation.
+2) Snapshot KV immediately: redwood-ctl sweeper snapshot --tenant <tenant_id> --destination s3://... --tag emergency-<timestamp>
+3) Optionally block tenant ingress at VPC edge: run edge-proxy block-tenant --tenant <tenant_id>. This is done in parallel but must be noted in the audit.log.
+4) Attach operator lock to prevent concurrent reclamation workflows: redwood-ctl lock acquire --tenant <tenant_id> --ttl 15m
+5) Escalate to incident commander and follow forensic evidence preservation playbook in /confluence/security-and-compliance/incident-response-security.
+
+Upgrade and Rollback Procedures (runtime + operator changes)
+
+Principles:
+- All upgrades must be first validated in a shadow environment that mirrors tenant entropy for at least 72h under synthetic load.
+- Operator changes that modify action ordering must be tested with the preflight suite and a 3-tenant canary rollout.
+- Rollback is allowed only if state snapshot(s) exist and integrity checks pass.
+
+Planned upgrade steps (summary):
+1) Bump redwood-runtime/operator image tag in control-plane manifests (image digest recommended).
+2) Create a canary IsolationState set for a non-critical tenant and run through dry_run -> isolate -> quiesce -> reclaim cycles. Collect metrics.
+3) Gradual roll: 10% -> 50% -> 100% over 4 hours with health gates (error rate, reconcile latency, p95 serving latency).
+4) Post-upgrade validation: run the acceptance checklist (listed below).
+
+Rollback steps (if upgrade fails):
+1) Pause any further operator rollouts: kubectl rollout pause deployment/tenant-sweeper -n redwood-system
+2) Revert control-plane images to prior digest and redeploy.
+3) Run: redwood-ctl sweeper verify-snapshots --since <upgrade_time> and reattach latest valid snapshot to impacted tenants:
+   redwood-ctl sweeper restore --tenant <tenant_id> --snapshot <snapshot_id>
+4) Drain/unstage nodes that received upgraded runtime kernels until runtime versions match.
+5) Confirm serving p95 and tenant_sweeper_reconciles_total rates returned to baseline.
+
+Acceptance checklist after upgrade / rollback
+
+- All canary tenants completed full IsolationState cycles without errors.
+- Metrics: tenant_sweeper_errors_total == baseline +/- 0.2% and reconcile latency p95 <= baseline + 10s.
+- Serving p95 latency across tenants < 250ms for small models and < 500ms for large models under steady synthetic load.
+- KV snapshot integrity verified (sha256 checksum match).
+- Audit logs present for every action with correlation_id.
+
+Testing matrix (minimal test scenarios)
+
+1) Plan: 3 tenants (canary, regression, baseline)
+2) Workloads: low QPS chat, bursty inference, model-hot-swap stress with quantized fallback
+3) Tests: isolation dry-run, network-only isolation, full reclaim, force-evict with persistence restore
+
+Owner and escalation
+
+- Primary owner: eng-private-deployments/platform (oncall: platform-oncall@redwood.io)
+- Secondary owner: eng-sre (oncall: sre@redwood.io)
+- Legal/Compliance: security-and-compliance for evidence preservation (security-legal@redwood.io)
+- Escalation ladder: platform -> SRE -> CTO oncall.
+
+Runbook snippets and useful commands
+
+- Acquire lock: redwood-ctl lock acquire --tenant <tenant_id> --ttl 300s\- Snapshot KV: redwood-ctl sweeper snapshot --tenant <tenant_id> --destination s3://snapshots --tag pre-reclaim-<ts>\- Dry-run isolation: kubectl apply -f isolationstate-dry.yaml\- Force isolate: kubectl patch isolationstate sweep-tenant-<id> -p '{"spec":{"mode":"isolate","force":true}}' --type=merge
+
+Configuration examples (tunable flags)
+
+| Flag | Default | Purpose | Notes |
+|------|---------|---------|-------|
+| --lock-ttl | 300s | per-tenant lock TTL | Increase to 1200s for long-running reclaim workflows
+| --snapshot-timeout | 180s | timeout for KV snapshot operation | Higher for large KVs stored on slow object stores
+| --drain-time | 30s | worker drain duration for soft detach | Can be increased to 120s for long inference tails
+| --concurrent-workers | 3 | parallel reconciliation workers | Raise for large clusters, watch reconcile latency
+
+Telemetry and dashboards to inspect
+
+- Dashboards: "Tenant Sweeper Overview", "Tenant Isolation Latency", "KV Snapshot Health" (redwood console).
+- Key alerts:
+  - tenant_sweeper_errors_total > 1% for 5m -> SEV2
+  - tenant_sweeper_reconcile_latency_p95 > 60s -> SEV2
+  - missing snapshot uploads -> SEV3
+
+Post-incident evidence collection checklist
+
+1) Export reconciliation traces for correlation_id and upload to incident folder.
+2) Export KV snapshot metadata (size, sha256) and object store logs.
+3) Collect network policy diffs and edge-proxy block events.
+4) Register findings with customer compliance evidence bundle.
+
+Appendices
+
+A. Example IsolationState manifest (full)
+---
+apiVersion: infra.redwood.ai/v1
+kind: IsolationState
+metadata:
+  name: sweep-tenant-12345
+spec:
+  tenant_id: "12345"
+  mode: "reclaim"
+  reason: "planned-maintenance-20261018"
+  dry_run: false
+  snapshot_id: "snap-20261018-001"
+  requested_by: "platform-oncall"
+
+B. Troubleshooting notes
+- If snapshots fail due to permissions: verify KMS decrypt access for service account and object store ACLs.
+- If reconciler is stuck in pending lock: check distributed lock service (etcd leader metrics) and increase --lock-ttl as needed.
+- If worker drains do not free GPU memory: follow GPU eviction playbook in /confluence/eng-serving-runtime/gpu-failover-fabric-and-shared-storage-guide-2026.
+
+C. Related artifacts and links
+- Operator schema: /git/internal/infra/crds/IsolationState.yaml
+- Sweeper source: git@repo:redwood/tenant-sweeper
+- Canaries and synthetic load harness: /confluence/eng-private-deployments/day-2-ops/live-traffic-simulation-and-sla-validation-playbook-2026
+
+Document history
+
+- 2026-02-10: Created by Maya K. Reynolds (initial draft)
+- 2026-06-01: Added emergency quarantine procedure (Carlos M. Ortega)
+- 2026-10-18: Expanded upgrade validation checklist and metrics (Priya S. Nair)
+
+For questions or suggested updates, contact the document owner (platform@redwood.io).

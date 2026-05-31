@@ -1,0 +1,129 @@
+Async KVCache Prefetch and Adaptive Kernel Selection Playbook
+
+Summary
+This playbook describes the design, operational controls, profiling guidance, benchmarking recipes, and incident runbooks for the asynchronous KV cache (KVCache) prefetcher and the adaptive kernel selection subsystem. The document explains how the prefetching pipeline integrates with the request classifier and kernel selector to reduce token-era latency for long-context and multi-shot workloads while preserving cost and fairness SLOs.
+
+Why this exists
+- Root cause: Tail latency often originates from sequential KV loads and conservative kernel choices for requests with uncommon sequence profiles.
+- Goal: Reduce P95/P99 generation latency by prefetching KV segments and selecting kernels tuned to the observed request pattern without increasing average GPU occupancy or costs by more than 8%.
+
+Scope
+- Included: Async prefetch coordinator, request classification heuristics, kernel selection policy, metrics and alert thresholds, profiling steps, benchmarking recipes, rollout and rollback steps.
+- Excluded: Model architecture changes, quantization profiles (see quantization-profiles directory), network-level transport changes.
+
+High-level architecture (text diagram)
+- Ingress -> Request Classifier -> Routing & Prefetch Coordinator -> Kernel Selector -> GPU Dispatcher -> KVCache (per-shard) -> Runtime Executor
+- Feedback loop: Runtime Telemetry -> Adaptive Policy Engine -> Prefetch & Kernel Policy Store
+
+Components and responsibilities
+1) Request Classifier
+- Tag requests at ingress with a sequence profile: typical length distribution, presence of tool/function calls, streaming flag, and priority class. Uses lightweight sampling models (logistic model trained on historical traces).
+- Responsible for assigning a prefetch hint (none, soft-prefetch, eager-prefetch) and candidate kernel families (A/B) for the Kernel Selector.
+2) Prefetch Coordinator
+- Receives hints and maintains per-session prefetch state. Issues non-blocking KV reads to co-locate likely KV pages before the request reaches the hot kernel path.
+- Uses backpressure-aware dispatch: prefetch requests are priority-0 and are throttled by an adaptive token bucket per-GPU to maintain tail SLOs.
+3) Kernel Selector
+- Maintains a policy table indexed by (model-variant, sequence-profile, priority). Each entry contains candidate kernels with expected latency & cost vectors.
+- Uses a bandit-style experiment framework for online exploration (epsilon-greedy by default) with decay windows tied to model version rollouts.
+4) Adaptive Policy Engine
+- Periodically (5m) retrains lightweight policies from telemetry. Generates updated thresholds for prefetch aggressiveness and kernel switching.
+
+Key design tradeoffs and safeguards
+- Safety first: Kernel switches are allowed only if the candidate improves expected latency without exceeding a configured cost delta (default +8%).
+- Backpressure integration: Prefetch-level throttles yield immediately under GPU memory pressure or when per-GPU kernel saturation > 85%.
+- Gradual exploration window: exploration rate is capped to avoid noisy regressions in canaries.
+
+Operational metrics and dashboards (minimum required)
+- Prefetch hit rate (per model, per region): percent of requests where prefetched KV page satisfied first KV fetch.
+- Prefetch to primary fetch latency delta (ms).
+- Kernel selection distribution: percent usage of each kernel family by model-version.
+- P50/P95/P99 generation latency (token complete) by kernel family and sequence-profile.
+- GPU occupancy and queue length by kernel family.
+- Cost-per-token delta by kernel family.
+
+SLO guardrails (observable thresholds)
+- P95 generation latency: target 120ms, alert if >160ms sustained for 3m.
+- Prefetch hit rate: target >= 70% on long-context workloads, warning if <50%.
+- Kernel-induced cost delta: warn at >+8% sustained 30m, page at >+12%.
+
+Profiling playbook (how to investigate quality/latency regressions)
+1) Initial triage
+- Verify if latency spike correlates with: recent kernel rollout, prefetch policy change, model-version rollout, or GPU pool capacity event.
+- Query traces: filter by request classifier tag and kernel family.
+2) Reproduce with developer sandbox
+- Use the sandbox driver with the same sequence-profile and batch shape. Run microbenchmarks with and without prefetch: ./bench_driver --model vX --profile long-context --prefetch on/off --kernel A/B.
+3) Telemetry collection
+- Capture a full trace set for 5 minutes: kernel dispatch times, KVCache miss/hit events, per-token latency, and GPU occupancy. Use the runtime trace sampler: rt-sample --duration 300 --labels kvcache,prefetch,kernelselect.
+4) Root-cause patterns and fixes
+- High KV miss & low prefetch hit -> increase conservative prefetch window and examine classifier false negative rate.
+- Kernel family P99 regressed -> disable exploration flag for that family; roll back canary.
+- GPU memory pressure during prefetch -> reduce per-GPU prefetch tokens or restrict eager-prefetch to dedicated pools.
+
+Benchmarking suite (recipes and canonical configs)
+- Objective: quantify cost/latency tradeoffs for prefetch aggressiveness and kernel families across representative profiles.
+- Canonical workload set: short-chat (avg len 30), long-instruction (avg len 512), multi-shot session (avg len 800 with KV locality).
+- Benchmark config table (text):
+  - Test name: long-kv-prefetch-scan
+    concurrency: 200
+    seq_profile: long-instruction
+    prefetch: eager
+    kernels: [A-optimized, B-latency]
+    duration: 30m
+  - Test name: mixed-plg-burst
+    concurrency: 500
+    seq_profile: mixed
+    prefetch: soft
+    kernels: [A-optimized]
+    duration: 60m
+- Key result artifacts to capture: per-token latency histograms, GPU occupancy heatmaps, prefetch hit/miss timelines, and cost-per-token estimations. Store outputs as parquet with schema: trace_id, timestamp, model_version, kernel_family, cpu_ms, gpu_ms, kvcache_event, cost_units.
+
+Release and rollout plan
+1) Local QA: unit tests + microbench suite.
+2) Canary: enable soft-prefetch + adaptive kernel selection in a 1% canary pool with exploration rate 1%. Monitor the following for 30m: P95 latency, prefetch hit rate, kernel cost delta.
+3) Staged expansion: 1% -> 5% -> 20% -> global. At each stage the policy engine must show no adverse impact on SLOs for 30m before advancing.
+4) Automatic rollback triggers: sustained P95 regression > 20% or prefetch hit rate drop > 30% vs baseline for 15m.
+
+Runbook snippets (incident steps)
+- Symptom: sudden P99 spike for long-context model
+1) Check recent policy changes: /ops/deploy-log or policy-store update id.
+2) Query prefetch hit rate and kernel distribution for the last 10m.
+3) If prefetch hit rate dropped > 40%: immediately flip prefetch to conservative mode for the affected model-version: rt-cfg set prefetch.policy conservative --model vX --scope pool:us-east-1-canary
+4) If a kernel family shows P99 > baseline by >50%: reroute to fallback kernel family: rt-route set --model vX --kernel-family B --scope pool:us-east-1-canary
+5) Engage runtime-oncall and kernel-owner (see ownership section).
+
+- Symptom: elevated GPU memory pressure correlated with prefetch activity
+1) Reduce per-GPU prefetch tokens: rt-cfg set prefetch.tokens 4 --scope pool:eu-west-1
+2) If memory pressure persists, disable eager-prefetch globally for the affected pool: rt-cfg set prefetch.enabled false --scope pool:eu-west-1
+3) Schedule a postmortem and attach sampled traces.
+
+Observability and tracing guidance
+- Span instrumentation: add spans for prefetch.issue, prefetch.wait, kvcache.load, kernel.select, kernel.dispatch.
+- Sampling: keep deterministic sampling for requests in canary pools and stratified random sampling across sequence profiles (target 1% global, 10% for canaries).
+- Annotation: annotate spans with request_classifier tag, prefetch_hint, kernel_family, and kvcache_page_id.
+
+Ownership and contacts
+- Primary owners: Serving Runtime - Kernel and KV team (team slack: #runtime-kv-kernel)
+- Secondary: Eng-SRE for capacity events (#eng-sre)
+- Pager duties: runtime-oncall@redwood.ai
+
+Open issues and known limitations
+- Prefetch heuristics still misclassify some nested tool-calling sessions; leads to wasted KV reads in low-locality sessions. Tracking work item: RUNTIME-1126.
+- Kernel exploration can oscillate under non-stationary traffic patterns; mitigation: add per-model decay windows (WIP: RUNTIME-1183).
+
+Appendices
+A) CLI snippets
+- Re-run microbench: ./bench_driver --model vX --profile long-context --prefetch eager --kernel-family A --out results.parquet
+- Toggle conservative prefetch: rt-cfg set prefetch.policy conservative --model vX
+B) Suggested alert definitions (PromQL-like, text form)
+- prefetch_hit_rate < 0.5 for 10m -> severity: warning
+- p95_generation_latency{model="vX",kernel_family!="fallback"} > 160ms for 3m -> severity: page
+
+C) Related experiments and artifacts
+- Experiment: kernel-A vs kernel-B bandit logs (s3://redwood-experiments/kernelselect/bandit/2025-11)
+
+Document history
+- 2025-07-15: Initial authoring (Anya Patel)
+- 2025-11-02: Added benchmarking recipes and rollout thresholds (reviewers: Marco Ruiz)
+- 2026-02-03: Clarified GPU backpressure behavior and added CLI snippets (reviewers: Priya Shah, Evan Chao)
+
+End of document

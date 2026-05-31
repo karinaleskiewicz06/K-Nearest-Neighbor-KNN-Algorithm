@@ -1,0 +1,131 @@
+Predictive Warmstart and Cache-Hinting Architecture for Low-Latency Serving
+
+This document defines the Predictive Warmstart and Cache-Hinting architecture (PWC Architecture) designed to reduce observable tail latency and cold-start variability for multi-tenant model serving. The design couples an inference-side predictive planner with the KV-cache prefetcher and the runtime's kernel scheduler to proactively populate hot state and shape scheduling hints based on traffic predictions.
+Goals:
+- Reduce 95th and 99th percentile request latency for cold or low-traffic model variants by pre-populating KV caches and tensor allocator state before request arrival.
+- Provide a low-risk canary and rollout path that can be throttled per-customer or per-model.
+- Expose telemetry for cost vs latency trade-offs and enable automated tuning.
+Non-goals:
+- This design does not replace hardware-level warmup that requires model weight preloading. It focuses on runtime-level warmstart (KV cache, allocator priming, kernel hints) and workload-level caching policies.
+Applies to: hosted and dedicated runtime pools where multi-tenant scheduling and KV-cache are active.
+Out of scope: on-prem private deployments with strict air-gapped constraints unless customer opts in; deep model weight transformer warmups that require offline preparation.
+Operational observations (2024-Q4 to 2025-Q2) showed that mixed workloads with bursty conversational sessions produce repeated cold-like tails: small sessions that skip cache priming cause disproportionate tail-latency spikes and GPU kernel mispredictions. Existing approaches (heuristic ttl-based caching, on-request prefetch) either over-provision memory or introduce request-time overhead. Predictive warmstart aims to move the decision upstream to a planner that learns short-term traffic patterns and coordinates safe prefetches.
+High level components:
+- Predictive Planner: time-series and event predictor that emits warmstart candidates (tenant, model, session signature, TTL recommendation).
+- Cache Hint Broker: lightweight control plane that accepts predictions and converts them into cache-prefetch jobs and kernel-hint annotations.
+- Prefetch Worker (on-node): receives jobs, enqueues KV-cache prefetch, tensor allocator prime, and lightweight kernel micro-benchmarks to 'touch' critical code paths.
+- Scheduler Integration Layer: exposes a hint API that the kernel scheduler uses to preferentially schedule warmstart jobs during free slots and to avoid starving priority traffic.
+- Telemetry and Cost Estimator: aggregates prefetch effectiveness and cost (tokens, memory, kernel time) for feedback to Planner's policy optimizer.
+1) Runtime telemetry (session arrives, token distribution, model variant) flows to the Planner via a time-series ingestion stream (Kafka topic: runtime.session.signals).
+2) The Planner produces candidate warmstart events in the 'pwc.candidates' topic. Each event has: tenant_id, model_id, signature_hash, preferred_node_affinity, estimated_score, ttl_seconds. Example payload (JSON): {
+  "tenant_id": "cust-123",
+  "model_id": "redwood-v2-small",
+  "signature_hash": "sha256:abcd...",
+  "preferred_node": "poolA-6",
+  "score": 0.78,
+  "ttl": 120
+}.
+3) Cache Hint Broker validates, rate-limits, and enqueues Prefetch Worker jobs.
+4) Prefetch Worker issues prefetch calls to the local KV-cache API, primes allocators (page-touch) and runs microkernel invocations with a capped budget.
+5) Scheduler uses annotation flags on these jobs to schedule during slack periods; if server load exceeds threshold, prefetch jobs are evicted gracefully and rescheduled.
+Core heuristics and policies:
+- Scoring function: score = alpha * recency_score + beta * session_prob + gamma * model_cost_factor - delta * mem_pressure_penalty. We empirically set alpha=0.5, beta=0.3, gamma=0.15, delta=0.05 for initial rollout.
+- Signature selection: prefer shortest canonical token prefix that maximizes reuse; prefer session-level signatures for chat workloads, request-level signatures for retrieval/embedding workloads.
+- Budgeting: each node has a prefetch budget (cpu_millis, gpu_ms, mem_mb) and a soft_cost_limit. Prefetch jobs are charged to the originating tenant's cost center.
+- TTL adaptation: if repeated hits observed, TTL is extended multiplicatively up to an upper cap (configurable). If misses exceed a threshold within window W, the Planner reduces score for that signature.
+Prefetch Worker responsibilities:
+- KV-cache prefetch API call example: POST /internal/kvcache/prefetch {
+  "model": "redwood-v2-small",
+  "signature": "<signature>",
+  "context": ["The user's last message summary..."]
+}
+- Allocator prime: touch pages and pre-allocate GPU tensors of expected size. CLI helper: runtime-prime --model redwood-v2-small --tensor-shape 1x2048 --budget-ms 20.
+- Microkernel probe: run a 5-10ms inference warm call with deterministic random seed using quantized path where applicable.
+Notes: Prefetch operations must be idempotent and safe on repeated application.
+Integration points:
+- Hint API: schedule.hint_register(job_id, priority_hint, preferred_window_ms).
+- Admission control: scheduler consults node prefetch_budget and current load. If CPU or GPU util > 75%, hints are deprioritized.
+Fallbacks:
+1) If prefetch failed due to mem pressure, mark signature as 'expensive' and reduce Planner score for 10 minutes.
+2) If kernel microbenchmark reveals slow path on a variant, the runtime will annotate model_variant as 'compat_slow' and Planner will prefer alternative variant ids for warmstarts.
+Configuration key/value (presented as a table in prose):
+- pref.max_concurrent_prefetch_per_node: 8 (integer) - Maximum concurrent prefetch jobs on a node.
+- pref.cpu_budget_millis_per_min: 5000 (ms) - CPU budget per node per minute.
+- pref.gpu_budget_ms_per_min: 300 (ms) - GPU warmstart budget per node per minute.
+- pref.kv_prefetch_ttl_default_s: 60 (seconds) - Default TTL for prefetch entries.
+- pref.score_threshold: 0.6 (0-1) - Planner emits only scores >= threshold.
+SLO/Target metrics to track: 95th token latency (-10% target vs baseline), 99th token latency (-5% target), Prefetch success hit rate >= 70% for emitted jobs, Prefetch cost per saved-latency ms under configured cost cap.
+Required telemetry (exported to metrics and traces):
+- metric: pwc.prefetch.emitted_total (labels: tenant, model, node, variant)
+- metric: pwc.prefetch.hit_total (labels identical)
+- metric: pwc.prefetch.cpu_ms_consumed
+- metric: pwc.prefetch.gpu_ms_consumed
+- trace: pwc.candidate.lifecycle (events: created, broker_validated, dispatched, completed, evicted)
+- logs: prefetch-worker INFO/ERROR with structured fields (tenant_id, model_id, signature_hash, reason)
+Dashboards to create:
+- Prefetch efficiency: hit/emit over 1h/24h windows
+- Node budget exhaustion heatmap
+- Per-tenant cost impact dashboard (rolling 7d)
+Incident: Unexpected spike in prefetch CPU usage and scheduler thrashing.
+Severity: P1 if impacting user latency, P2 otherwise.
+Immediate steps:
+1) Disable Planner emission for affected node pools: POST /internal/pwc/control -d '{"action":"pause_pool","pool":"poolA"}'.
+2) Evict prefetch jobs: runtime-cli prefetch evict --node poolA-*.
+3) Revert score_threshold to 0.9 as temporary mitigation: PATCH /config/pref.score_threshold -d 0.9.
+4) Collect debug traces: pwc.dump-trace --since 15m --out /tmp/pwc-trace.json.
+Postmortem checklist:
+- determine root cause (planner mis-estimation, model change, telemetry lag).
+- run retrospective experiment to tune alpha/beta parameters.
+- update planner training windows if needed.
+- Prefetches must not access customer PII or external connectors; only use deterministic context hashes and minimal context summaries.
+- All control plane calls are authenticated via mTLS and signed tokens.
+- Budget accounting must be auditable: prefetch cost charged back to tenant's usage ledger.
+- Provide an opt-out signal for customers who require strict cost isolation (tenant_prefetch=false).
+Phased rollout recommendations:
+1) Internal dogfooding (2 nodes, non-critical pools) for 2 weeks. Monitor hit rate and 95p latency.
+2) Canary graduates to 5% of traffic in a dedicated pool for a set of model families for 4 weeks.
+3) Increase to 25% after verifying cost caps and no regression in tail-latency.
+4) Global rollout with adaptive TTL and per-tenant opt-in within 12 weeks.
+Canary health matrix (pass/fail):
+- 95p latency regression <= 0%
+- Prefetch hit rate >= 65%
+- Prefetch cpu_ms_consumed per node < configured budget
+Common failure modes and detection:
+- High miss-rate: indicates Planner misprediction. Detect by pwc.prefetch.hit_total / pwc.prefetch.emitted_total < 0.4. Mitigation: increase signature windows or reduce emission frequency.
+- Mem pressure evictions: detected via kernel eviction traces and node-level OOM counters. Mitigation: lower pref.kv_prefetch_ttl_default_s and reduce concurrent prefetch.
+- Scheduler starvation: detect by node idle vs kernel queue backlog mismatch. Mitigation: raise scheduler hint backoff and reduce pref.max_concurrent_prefetch_per_node.
+Primary owner: Runtime Performance Team (oncall alias: #rt-perf-oncall).
+Secondary owner: Serving Scheduler Team.
+Escalation path:
+- Pager: runtime-perf-pager (P1)
+- Slack: #rt-perf-alerts
+- Email: runtime-performance@redwood.ai
+The PWC architecture is designed to be additive: safe defaults ensure no prefetch by default (score_threshold default=0.95). Older runtime nodes ignore hint headers gracefully (they accept but do not act on hints). Config migration scripts exist to mark legacy nodes with 'hintable:true' during gradual upgrades.
+- Integrate with Redwood Optimize: use historical cost/quality trade data to auto-tune alpha/beta weights.
+- Explore model-aware microbenchmarks that exercise attention kernels more precisely.
+- Study cross-tenant prefetch sharing heuristics for identical signature reuse with privacy-preserving aggregation.
+- See runbook: /confluence/eng-serving-runtime/runbooks/cold-start-warmup-strategies-and-entropy-reduction-2025
+- Kernel telemetry guidelines: /confluence/eng-serving-runtime/team-wiki/kernel-telemetry-annotation-guidelines-2025
+- Prefetch control plane proto: internal git repo path: //git.redwood/internal/pwc/proto (link in internal repo browser)
+2026-02-08: Published initial stable spec and added detailed runbook and canary matrix.
+2025-12-12: Draft approved by runtime performance review; adjusted default score weights.
+2025-10-15: Created initial design doc.
+Example Planner emission (Kafka event) JSON string:
+{
+  "tenant_id": "acme-inc",
+  "model_id": "gptx-8b",
+  "signature_hash": "sha256:ef01...",
+  "preferred_node": null,
+  "score": 0.72,
+  "ttl": 90
+}
+CLI: Retrieve prefetch metrics:
+$ metrics-cli query 'pwc.prefetch.hit_total{model="gptx-8b"}' --window=1h
+YAML example: default planner config:
+planner:
+  emit_interval_s: 5
+  score_threshold: 0.6
+  alpha: 0.5
+  beta: 0.3
+  gamma: 0.15
+  delta: 0.05

@@ -1,0 +1,142 @@
+Execution Quiet Mode and Preemption Consensus Policy (ADR)
+
+Defines the Execution Quiet Mode (EQM) concept and an inter-shard preemption consensus policy to reduce tail-latency regressions from aggressive preemption in mixed-priority multi-tenant inference workloads. Specifies contract-level API hints, runtime config surface, telemetry requirements, rollout and rollback steps, and safety gates.
+Overview:
+
+This ADR introduces Execution Quiet Mode (EQM) — a runtime-lever and coordination protocol intended to reduce tail latency impact of preemption events on short, latency-sensitive requests while preserving cluster fairness and capacity guarantees for throughput-oriented work. EQM is a temporary, bounded state that runtime shards can enter where non-essential preemption operations are deferred or batched for a short, consensus-bounded window.
+
+Why this change matters:
+- Preemption of GPU slices and kernel rebinds is a major contributor to 99th/99.9th percentile latency spikes for interactive requests.
+- Existing preemption-crediting (2025) and graceful prewarming guidelines mitigate many cases, but we still observe SLO regressions when large topology changes happen during high burst windows.
+- EQM reduces coordination noise and allows the runtime to prioritize finish-the-short-work semantics without violating capacity escrow policies.
+
+Goals and non-goals:
+- Goals:
+  - Reduce observed p99/p999 latency for requests with <100ms ideal execution time by at least 30% in presence of preemption churn.
+  - Maintain documented fairness bounds: no single tenant can cause >15% sustained capacity drift against committed escrow due to EQM.
+  - Make behavior observable and reversible with clear telemetry and rollout gates.
+- Non-goals:
+  - EQM is not intended to remove long-term capacity contracts or replace preemption-credit accounting.
+  - EQM will not be used to permanently delay eviction of overdue maintenance work.
+
+Audience and ownership:
+- Primary owners: Runtime team (serving-runtime), SRE (eng-sre) for rollout automation, and Observability team for telemetry and dashboards.
+- API hint owners: eng-developer-experience (defines developer-facing request flags).
+
+Specification:
+1) Execution Quiet Mode (EQM) semantics:
+  - EQM window: short duration (configurable; default 250ms) during which non-critical preemption operations are deferred. EQM windows are only granted when a shard determines a high density of short-latency requests and the preemption storm probability exceeds threshold.
+  - Short request definition: latency budget <= 150ms and token count <= 64 (configurable). Requests marked by client hint "latency_hint: interactive" are eligible.
+  - Deferred operations: kernel teardown/rebind, slice compacting, background garbage collection of KV segments. Critical eviction for security or overcommit still proceeds with higher priority.
+  - Batching of deferred operations: at the end of a contiguous EQM window, deferred operations are executed in controlled batches bounded by a global operation budget (default 3 operations per shard per EQM release).
+
+2) Preemption Consensus Protocol (PCP):
+  - Purpose: coordinate EQM windows across shards to avoid uncoordinated deferral leading to congestion at window release.
+  - Mechanism: lightweight ephemeral ballot using the platform's existing shard-control-plane (gossip with vector clock tie-break).
+  - Fields in ballot: proposed-window-duration-ms, shard-load-signal (quantized), deferred-op-count, proposed-release-time.
+  - Consensus rule: majority of active shards in the placement must accept the ballot within ballot-timeout (default 30ms); otherwise the proposer falls back to local-only EQM.
+  - Safety: ballots include a monotonic epoch id; a shard may veto if local escrow or maintenance deadlines are within the proposed window.
+
+3) API contract and client hints:
+  - New optional request header/metadata: "X-Redwood-Exec-Hint: interactive|background|best-effort". SDKs must expose this as latency_hint/priority_hint.
+  - Request schema example (JSON metadata): {"latency_hint": "interactive", "max_latency_ms": 120}. (SDKs must validate and attach cost-hint metadata to tracing spans.)
+
+4) Telemetry and observability requirements:
+  - Required metrics (per shard and aggregated):
+    - eqm.window_enter_count (counter)
+    - eqm.window_duration_ms.pXX (histograms: p50,p90,p99,p999)
+    - eqm.deferred_ops_count (counter)
+    - eqm.release_burst_ops (gauge)
+    - preemption.event_latency_ms.pXX (histograms)
+    - request.latency_ms.by_latency_hint.pXX (histograms)
+    - fairness.capacity_drift_pct (gauge)
+  - Traces: every EQM ballot must attach the ballot id to the trace root; release events must generate a synthetic event with deferred-op ids.
+  - Alerts (SRE):
+    - eqm.release_burst_ops > 50 across cluster in 1m -> P2 investigation (mechanism mis-tuned).
+    - fairness.capacity_drift_pct > 20% sustained 5m -> P1 (potential SLA violation).
+
+5) Configuration surface (example YAML):
+  runtime_eqm:
+    enabled: true
+    default_window_ms: 250
+    max_batch_ops_on_release: 3
+    ballot_timeout_ms: 30
+    short_request:
+      max_tokens: 64
+      max_latency_ms: 150
+    telemetry_sample_rate: 0.2
+
+Operational playbook (short):
+1. Preflight checks (automated):
+   - Run synthetic load generator (short-alpha) for 10m with and without EQM. Compare p99/p999 for interactive traffic.
+   - Verify fairness metric: synthetic background tenant retains >=85% of baseline throughput.
+2. Canary rollout (staged):
+   - Stage 0: deploy EQM disabled but telemetry active (1d).
+   - Stage 1: enable EQM in 2% of shards using local-only mode (no PCP) and monitor 6h.
+   - Stage 2: enable PCP-enabled EQM in 10% shards with adaptive window tuning (24h).
+   - Stage 3: ramp to 50% with autoscale playbook enabled (48h).
+   - Stage 4: full rollout with conservative defaults (7d), then enable adaptive tuning.
+3. Rollback criteria (immediate revert):
+   - p99(interactive) increases by >10% relative to pre-rollout baseline for 15m.
+   - fairness.capacity_drift_pct > 15% for 10m.
+   - eqm.release_burst_ops > 50 as an acute spike.
+
+Testing and validation:
+- Unit tests: ballot proposer and voter edge cases, veto paths, epoch wrap.
+- Integration tests: multi-shard simulator with synthetic preemption events; ensure no more than N deferred ops released per second (N derived from capacity budget).
+- Performance tests: synthetic short-request workload (Poisson arrivals) to validate p99 improvements and to catch regression against long-work throughput.
+- Fault injection: force shard crush and network latency in ballot path to verify local-fallback behavior and that it degrades safely.
+
+Compatibility and migration notes:
+- Backwards-compatible: if clients do not send hints, runtime treats requests as default (best-effort).
+- Private deployments: EQM defaults off for Private until customer signs off; offering is opt-in for sensitive regulated workloads.
+- Interaction with autoscaler: EQM increases short-term utilization; autoscaler policies must be annotated to ignore transient EQM-driven inflation when making scaling decisions.
+
+Security and compliance:
+- EQM should never defer operations required for tenant isolation (credential revocation, hard eviction for security incidents). Ballot veto rules enforce this.
+- Audit logs: all EQM ballot decisions and deferred-op ids are recorded in audit store for 90 days by default; this is configurable per-region.
+
+Open questions and trade-offs:
+- Ballot latency vs. benefit: tight ballot windows improve coordination but increase protocol sensitivity to network jitter. We choose a conservative default (30ms) with fallback to local-only EQM to mitigate.
+- How to quantify fairness for bursty background workloads with variable cross-tenant traffic patterns; proposed path: use synthetic benchmarks and rolling-window fairness metric (rolling 1h).
+
+Impact matrix (summary table described):
+- User-facing latency: interactive p99/p999 expected to decrease (target 30% improvement under preemption churn).
+- Background throughput: acceptable degradation up to 15% during ramp; otherwise rollback.
+- Operational complexity: moderate — requires ballot protocol instrumentation, dashboarding, and SRE runbooks.
+
+Rollout owners and timeline:
+- Proposal owner: Priya Natarajan (Runtime team).
+- Engineering implementation: Runtime team (Q2 2025).
+- SRE dashboards and alerts: Eng-SRE (Q2–Q3 2025).
+- SDK support for exec hints: Eng-Developer-Experience (Q3 2025).
+
+Related pages:
+- /confluence/architecture-and-standards/infra-standards/graceful-gpu-preemption-and-prewarming-guidelines-2026
+- /confluence/architecture-and-standards/infra-standards/preemption-crediting-and-gpu-borrowing-protocol-2025
+- /confluence/eng-serving-runtime/runtime-architecture/adaptive-kv-coordinator-and-eviction-contract-2026
+
+Appendix: CLI example (debugging):
+- List active ballots: redwood-runtimectl eqm ballots --shard <id> --since 1m
+- Force local-only EQM toggle: redwood-runtimectl eqm set-local-only --shard <id> --enable|--disable
+
+Appendix: Example telemetry alert rule (pseudo):
+- name: eqm-excessive-release-burst
+  expr: sum(rate(eqm.release_burst_ops[1m])) by (cluster) > 50
+  for: 1m
+  severity: P2
+
+Conclusion:
+EQM plus a lightweight preemption consensus protocol provides a pragmatic path to reduce tail-latency regressions caused by uncoordinated preemption activity while keeping fairness and capacity accounting explicit. This ADR documents the contract, telemetry, rollout, and rollback steps required for safe adoption.
+Accepted: introduce Execution Quiet Mode with PCP and API hints. Rejected: using a global coord service to serialize all preemption — too high latency and single point of failure.
+Stage 0: telemetry-only (1 day)
+Stage 1: local-only EQM (2% shards, 6h)
+Stage 2: PCP-enabled EQM (10% shards, 24h)
+Stage 3: ramp to 50% with autoscale annotations (48h)
+Stage 4: full rollout with adaptive tuning (7d)
+interactive_p99_improvement: target -30%
+background_throughput_degradation: tolerance up to 15%
+operational_overhead: moderate
+/confluence/architecture-and-standards/infra-standards/graceful-gpu-preemption-and-prewarming-guidelines-2026
+/confluence/architecture-and-standards/infra-standards/preemption-crediting-and-gpu-borrowing-protocol-2025
+/confluence/eng-serving-runtime/runtime-architecture/adaptive-kv-coordinator-and-eviction-contract-2026

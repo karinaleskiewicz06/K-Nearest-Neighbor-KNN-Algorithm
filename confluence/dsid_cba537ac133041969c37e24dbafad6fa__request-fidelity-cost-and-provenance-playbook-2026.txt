@@ -1,0 +1,153 @@
+request-fidelity-cost-and-provenance-playbook-2026
+
+Summary
+
+This playbook defines how the runtime produces per-request provenance and cost-attribution records and how teams should use those signals to investigate fidelity regressions, quantify unit economics, and support billing/chargeback for Dedicated/private deployments. It bridges kernel scheduling telemetry, KV cache instrumentation, model variant metadata, token accounting, and accelerator utilization.
+
+Scope
+
+- Applies to all requests processed by the inference serving runtime (hosted, dedicated, private).
+- Covers the attribution pipeline from request start to final token emission (including fallbacks and partial responses).
+- Excludes offline training/compilation jobs and batch-only offline analytics (those have separate costing).
+
+Goals
+
+1. Produce a stable, compact per-request attribution record in <= 20ms after response completion.
+2. Attribute cost to the most granular levers available: model-variant, kernel-hours, GPU-time-ms, energy-estimate, and cache-hit-paths.
+3. Ensure provenance contains reproducible routing and fallback decisions for debugging quality regressions.
+4. Support downstream consumers: billing, Optimize recommendations, SRE incident correlation, and product analytics.
+
+Definitions
+
+- Request provenance: immutable trace of routing decisions, model variants, kernel hints, and cache interactions for a single request.
+- Cost delta: estimated incremental cost caused by a request, expressed in micro-dollars and normalized per-token.
+- Fidelity tag: classification (high/medium/low) of whether the served result used lower-fidelity fallbacks (quantized model, distilled variant, partial decode).
+
+Observability signals to collect
+
+Collect these signals at the request boundary and include them in the attribution record:
+
+- request_id, tenant_id, route_id, model_id, model_version
+- sequence_length_requested, sequence_length_generated, prompt_token_count, completion_token_count
+- scheduling_slot_id, kernel_id, kernel_version, kernel_wall_time_ms, kernel_cpu_ms
+- gpu_active_ms, gpu_sm_percent, gpu_power_watts_estimate
+- kvcache_hits, kvcache_prefetches, kvcache_miss_reason
+- queue_wait_ms, preemption_events, priority_class, admission_decision_reason
+- fallback_sequence (ordered list of fallbacks applied), fallback_reasons
+- feature_flags_active (list), quantization_profile, batch_size_at_execution
+- streaming_chunks_count (if streamed) and partial_response_flags
+
+Data model (compact payload)
+
+We publish a compact JSON for downstream consumers. Example payload (every field is optional but prefer consistent presence):
+
+{\
+  \"request_id\": \"r_01E9YX5J\",\
+  \"tenant_id\": \"t-acme\",\
+  \"model_id\": \"redwood-7b-q4\",\
+  \"model_version\": \"2026-01-10\",\
+  \"prompt_tokens\": 42,\
+  \"completion_tokens\": 128,\
+  \"kernel_profile\": [{\"kernel_id\": \"matmul_v2\", \"wall_ms\": 32, \"cpu_ms\": 1}],\
+  \"gpu_ms\": 45,\
+  \"kvcache_hits\": 12,\
+  \"kvcache_misses\": 3,\
+  \"fallbacks\": [\"quantized-fallback\"],\
+  \"fidelity_tag\": \"medium\",\
+  \"estimated_cost_micros\": 1250\
+}
+
+Attribution algorithm (high-level)
+
+1. Token baseline: compute token-cost baseline using model catalog per-token weights (prompt vs completion).
+2. Kernel augmentation: add kernel wall-time * kernel-specific energy and price coefficient (kernel hinting table maintained by runtime-perf team).
+3. Accelerator overheads: map gpu_ms and power_estimate to a per-tenant proportional cost using timestamped capacity allocation (handles shared Dedicated pools).
+4. Cache crediting: subtract estimated saved cost from kvcache_hits using prefix-length-weighted credit.
+5. Fallback penalty: add a small adder for fidelity loss (used by product analytics), tagged separately from monetary estimates.
+
+Implementation notes and tables
+
+- Kernel hint table (canonical source: /infra/config/kernel-hints): maps kernel_id -> {energy_coeff, base_latency_ms, price_coeff}. Teams must version updates and include migration notes.
+
+- Example cost coefficients (illustrative):
+| source                 | coefficient example | unit               | comment                  |
+|------------------------|---------------------|--------------------|--------------------------|
+| model_token_prompt     | 0.00035             | micro$ per token   | prompt tokens cheaper    |
+| model_token_completion | 0.00080             | micro$ per token   | completion tokens more   |
+| kernel_price_coeff     | 0.12                | micro$ per ms      | multiply by wall_ms      |
+| gpu_power_coeff        | 0.00003             | micro$ per watt-ms | used for energy estimates|
+
+Runbook: Investigate a high-cost or fidelity-regression request
+
+1. Find request: query the attribution index by request_id or tenant/time window. Example Kibana query:
+- request_id:r_01E9YX5J OR (tenant_id:t-acme AND @timestamp:[now-1h TO now])
+
+2. Inspect top-level fields: model_id, kernel_profile, gpu_ms, kvcache_hits. If estimated_cost_micros >> baseline estimate, continue.
+
+3. Check scheduling and admission logs: verify queue_wait_ms and preemption_events. If queue_wait_ms > 50ms, escalate to SRE (page on-call).
+
+4. Validate model variant: confirm model_version and quantization_profile. If fidelity_tag==low or fallback sequence contains \"distilled\" or \"quantized-fallback\", open a fidelity regression ticket and attach the attribution payload.
+
+5. Reproduce in sandbox: use the request-replay tool with preserved RNG and decision overrides to force the same kernel and cache paths. Command example:
+
+# replay tool (developer sandbox)
+redwood-replay --request r_01E9YX5J --preserve-routing --force-cache-prefetch
+
+6. If kernel wall times dominate, run the microbenchmark for the identified kernel on matching hardware (ref: benchmarking/kernel-microbench-runbook).
+
+7. If kvcache misses are unexpectedly high, follow kvcache warmup checklist: verify shard placement, prefetch hints, and session-affinity.
+
+Policies and thresholds
+
+- Attribution latency: target <= 20ms 95th. If backlog > 1000 records/min over target, open a capacity incident. Owner: telemetry-team.
+- Fidelity alerts: emit an automatic alert when fallback rate for a model-version exceeds 2% for 30m rolling window. Owner: runtime-ml-product.
+- Cost drift: trigger a cost-anomaly signal when tenant-level per-token cost deviates > 20% vs previous 72h. Owner: billing-ops.
+
+Data retention and privacy
+
+- Attribution records are retained 90 days in hot storage, 2 years in compressed cold storage.
+- Records may contain prompt_token counts but not prompt text in hosted mode; private deployments may opt-in to richer payloads.
+- Sensitive tenant identifiers should be hashed for analytics exports. See /security-and-compliance/data-management for procedures.
+
+Rollout checklist for the attribution pipeline
+
+1. Unit tests for kernel hinting translation and cost math.
+2. Integration test: ingest 1k synthetic requests across concurrency shapes and validate sum(est_costs) ~= measured billing samples within 5%.
+3. Canary: enable attribution at 1% of traffic with sidecar publish to test index; monitor attribution-latency and mismatch-rate.
+4. Gradual ramp: 1% -> 5% -> 25% -> 100% over 48 hours with manual signoffs.
+
+Consumer integration patterns
+
+- Billing: consume estimated_cost_micros on a per-tenant aggregation schedule (hourly). Keep a reconciliation process between estimated_cost_micros and actual metered GPU-hours (weekly).
+- Optimize: use per-request kernel footprints to suggest quantization profiles and batching knobs for the tenant.
+- SRE: correlate attribution records with trace IDs and kernel traces for incident correlation.
+
+Operational ownership and contacts
+
+- Runtime telemetry pipeline: telemetry-team (oncall: telemetry@redwood.ai)
+- Kernel hint table owner: perf-kernel-team (lead: Jonah Kim)
+- Billing & reconciliation: finance-ops (lead: Priya Menon)
+- Model fidelity alerts: runtime-ml-product (lead: Marceline Ortega)
+
+Change log
+
+- 2026-01-15 (Aisha Patel): Created playbook, initial fields and algorithm.
+- 2026-02-20 (Aisha Patel): Added rollout checklist, example payload, and retention policy.
+
+Appendices
+
+A. Example computed attribution (CSV friendly one-line):
+request_id,tenant_id,model,prompt_tokens,completion_tokens,gpu_ms,kvcache_hits,fallbacks,estimated_micros
+r_01E9YX5J,t-acme,redwood-7b-q4,42,128,45,12,quantized-fallback,1250
+
+B. Common troubleshooting quick-links
+- Kernel microbenchmark runner: infra://tools/kernelbench
+- kvcache warmup dashboard: dashboards/runtime/kvcache-warmup
+- Attribution index docs: infra://docs/attribution-index
+
+C. Open questions (to be reviewed quarterly)
+- Should estimated_cost_micros incorporate full electricity regionalization or remain approximate? (owner: finance-ops)
+- How to encode multi-model ensembles with shared KV cache crediting best — per-request attribution or per-ensemble? (owner: runtime-ml-product)
+
+Document ownership: engineering (runtime-observability)
+

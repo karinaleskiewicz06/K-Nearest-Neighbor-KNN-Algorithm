@@ -1,0 +1,288 @@
+KV + Prefix Cache Telemetry: Runtime Architecture Overview
+
+## Summary
+This page describes how prefix cache and KV cache telemetry is produced inside the serving runtime, how signals map to the request lifecycle (prefill vs decode), and how telemetry flows to the ingestion pipeline with controlled overhead and label cardinality.
+
+**Audience:** Runtime engineers, Telemetry/Platform, SRE/Observability, and PMs validating cache hit-rate and “wasted prefill” recommendations.
+
+**Non-goals:** This is not a cache policy/eviction algorithm spec. It focuses on *instrumentation* and *data flow*.
+
+---
+
+## Terminology
+- **Prefix cache:** Reuses computed prefill artifacts based on canonicalized prompt prefixes. Primarily reduces prefill work.
+- **KV cache (decode cache):** Reuses key/value tensors across decode steps within a sequence (and, depending on policy, across closely related requests in multi-turn chat when safe).
+- **Prefill:** Forward pass over the prompt/context to initialize attention state.
+- **Decode:** Token-by-token generation after prefill.
+- **Reuse depth:** The number of tokens reused from a cached prefix (or effective reused prefill tokens).
+- **Wasted prefill:** Prefill tokens computed that did not contribute to subsequent decode due to cache miss, eviction, policy, mismatch, or retry semantics.
+
+---
+
+## High-level architecture (signals -> ingestion)
+The runtime emits cache telemetry at two levels:
+1) **Request-scoped event counters/histograms** recorded in the hot path with bounded labels.
+2) **Span annotations (tracing)** for deep debugging and correlation with latency without adding metric cardinality.
+
+### Data flow (text diagram)
+1. **Gateway / control plane** sets request context (tenant, route, model/version, deployment mode, region) and passes a bounded tag set to the runtime.
+2. **Runtime request lifecycle** (admission -> prefill -> decode -> completion) records cache events:
+   - prefix lookup result + reused tokens
+   - KV reuse effectiveness during decode
+   - evictions / pressure signals
+   - wasted prefill accounting
+3. **Local runtime aggregator** batches metric updates and enforces runtime-side sampling/rate limits.
+4. **Telemetry ingestion** applies allowlists and cardinality guards; drops/aggregates forbidden labels.
+5. **Storage + query layer** supports dashboards and batch aggregation for recommendations.
+
+---
+
+## Where telemetry is emitted in the runtime
+Telemetry is emitted in three primary components:
+
+### 1) Request context + tag binding (early lifecycle)
+**Location:** request admission / request context construction
+
+**What happens:**
+- The runtime constructs a `CacheTelemetryContext` from request metadata.
+- Only allowlisted label values are accepted (e.g., model family or normalized model ID rather than raw model string if needed).
+
+**Key point:** all downstream metric calls use this pre-baked context to avoid repeated tag assembly overhead.
+
+### 2) Prefix cache instrumentation (prefill stage)
+**Location:** before prefill begins, during prefix lookup/validation
+
+**Signals recorded:**
+- Prefix lookup attempts and outcomes (hit/miss/partial).
+- Reuse depth / reused tokens histogram.
+- Miss reason (bounded enum).
+
+**Why here:** This is the earliest point where we know whether we can avoid some prefill compute.
+
+### 3) KV cache instrumentation (decode stage)
+**Location:** decode loop and/or scheduler hooks around decode step execution
+
+**Signals recorded:**
+- KV reuse effectiveness (e.g., percent of decode steps with valid KV reuse, or reused KV blocks).
+- Miss reason events when decode cannot reuse expected state.
+
+**Why here:** KV cache effectiveness impacts throughput/latency and can diverge from prefix cache results depending on batching, retries, and scheduling.
+
+### 4) Evictions + memory pressure (continuous)
+**Location:** cache allocator / eviction policy
+
+**Signals recorded:**
+- Eviction counter (by eviction reason enum).
+- Pressure gauges (e.g., bytes used, eviction rate proxy).
+
+**Why here:** Hit-rate drops are often a *symptom* of pressure; these indicators are needed for triage and recommendations.
+
+### 5) Wasted prefill accounting (prefill completion + decode correlation)
+**Location:** request completion (or first-decode checkpoint) where we can attribute whether prefill work yielded reuse/benefit
+
+**Signals recorded:**
+- Wasted prefill tokens histogram/bucketed counter.
+
+**Key nuance:** We avoid logging any raw prompt content; wasted prefill is computed from token counts and reuse indicators.
+
+---
+
+## Mapping telemetry to the request lifecycle
+This section ties the metrics to lifecycle points. This mapping is important for correctness (no double counting) and for interpreting dashboards.
+
+### Lifecycle timeline
+1. **Admission**
+   - Bind `deployment_mode`, `region`, `route_id`, `model_id`, `model_version_id` (bounded/allowlisted), and request-shape buckets.
+
+2. **Prefix lookup (start of prefill)**
+   - Emit: `prefix_lookup_total{result=hit|miss|partial, miss_reason?}`
+   - Emit: `prefix_reuse_tokens_bucket` histogram (reuse depth)
+
+3. **Prefill execution**
+   - Emit: `prefill_tokens_bucket` histogram (request shape)
+   - No prompt content is recorded.
+
+4. **Decode loop**
+   - Emit: `kv_reuse_events_total{result=hit|miss, miss_reason?}`
+   - Emit: `decode_tokens_bucket` histogram
+
+5. **Completion / finalization**
+   - Emit: `wasted_prefill_tokens_bucket` (derived)
+   - Emit: end-to-end counters (request count, retry count if applicable, with retry-safe semantics)
+
+### Streaming + retries
+- Metrics must be retry-safe. When a stream retry occurs, the runtime must not double-count prefix/KV events from the original attempt.
+- The runtime tags a request attempt with a stable request ID and attempt index and uses “first successful attempt wins” semantics for counters that should be once-per-logical-request.
+- Tracing spans may include per-attempt annotations for debugging, but metric emission stays bounded.
+
+### Continuous batching (batched prefill)
+- When multiple requests share a continuous batch prefill, hit attribution must be per-request (not per-batch), while shared compute should not inflate “hit” counters.
+- The instrumentation uses request-local reuse accounting derived from the cache lookup outcome and per-request token ranges in the batch.
+
+---
+
+## Signal taxonomy (what we emit)
+Exact names and label sets are governed by the observability standards and the ADR. This section describes the *classes* of telemetry and how they should be interpreted.
+
+### A) Hit/miss counters
+**Purpose:** Track cache effectiveness over time.
+
+- Prefix cache hit-rate: “Did we reuse prefill artifacts for this request?”
+- KV cache hit-rate/effectiveness: “Did decode reuse expected KV state efficiently?”
+
+**Partial hit semantics:**
+- A partial hit occurs when some prefix tokens are reused but the full desired prefix is not reusable (e.g., hash mismatch after N tokens, or version mismatch).
+- Partial hits should be visible as separate result class so operators can distinguish “completely cold” from “almost warm.”
+
+### B) Reuse depth histograms
+**Purpose:** Hit-rate alone is not enough; reuse depth shows whether hits are meaningful.
+
+- `reused_tokens` bucketed by prompt length bucket and model.
+- Enables: detecting regressions where hit-rate stays flat but reused tokens collapse.
+
+### C) Evictions and pressure
+**Purpose:** Root-cause hit-rate regressions and support recommendations.
+
+- Eviction count by reason (bounded enum).
+- Pressure indicator gauges (bytes used, high-watermark %, or eviction rate proxy).
+
+### D) Wasted prefill
+**Purpose:** Identify compute that didn’t pay off and is often fixable (routing locality, TTL, policy flags, canonicalization).
+
+- Wasted prefill should be interpreted alongside evictions and miss reasons.
+- High wasted prefill with high eviction pressure typically indicates insufficient cache capacity or TTL mismatch.
+
+### E) Trace annotations (low cardinality alternative)
+**Purpose:** Correlate cache events to latency and scheduler behavior.
+
+- Spans annotate cache lookup outcomes, reuse depth, and eviction/pressure snapshots.
+- Traces are sampled separately from metrics and are not required for baseline dashboards.
+
+---
+
+## Join keys and label strategy (how we slice without cardinality blowups)
+Telemetry must be actionable by model/route/deployment mode/region and request shape while staying within budgets.
+
+### Required dimensions (bounded)
+- `deployment_mode`: Hosted | Dedicated | Private
+- `region`: canonical region code (bounded)
+- `model_id`: normalized model identifier (bounded set)
+- `model_version_id`: allowlisted stable ID (bounded, rollover-safe)
+- `route_id`: internal stable route identifier (bounded; not raw URL paths)
+- `request_shape`: buckets (e.g., prompt length bucket, total tokens bucket)
+
+### Explicitly NOT allowed in metric labels
+- Raw tenant IDs, user IDs, raw prompt hashes with high uniqueness, request IDs, or free-form strings.
+
+### Tenant slicing
+- Tenant-level views are provided via:
+  1) Dedicated/Private deployments where tenant count is naturally small and allowlisted.
+  2) Analytics tables / batch aggregates where controlled rollups are computed off-metrics.
+
+---
+
+## Sampling, rate limiting, and overhead controls
+The runtime must keep instrumentation overhead near-zero (especially at p95/p99). Controls:
+
+1. **Metrics aggregation:** Use in-process counters/histograms with periodic flush; avoid per-token metric emissions.
+2. **Event sampling:** High-volume events (e.g., decode reuse) use probabilistic sampling, then are scaled at query time where appropriate.
+3. **Local rate limiting:** If a component produces unusually high event volume, the runtime clamps emission and increments a “dropped_by_ratelimit” counter.
+4. **Feature flags:** All new telemetry is behind runtime config flags so we can canary and roll back quickly.
+
+Operational guidance:
+- Prefer measuring reuse at request boundaries (prefill completion, request completion) instead of per decode token.
+- Use histograms/buckets rather than raw counts by unique values.
+
+---
+
+## Privacy and data handling
+- No raw prompt text is emitted.
+- Prompt-derived features are restricted to coarse buckets (prompt length) and cache-safe canonicalization outcomes (hit/miss/partial), not raw hashes.
+- Tracing annotations must not include prompt content; only bounded enums and counts.
+
+---
+
+## Ingestion pipeline expectations (runtime -> telemetry backend)
+The runtime assumes the ingestion pipeline will:
+- Enforce label allowlists and drop unknown/unsafe labels.
+- Apply cardinality guards (e.g., cap series per metric per time window).
+- Preserve monotonicity expectations for counters; handle process restarts and counter resets.
+- Maintain consistent mapping for model/version identifiers so dashboards can join across gateway logs and runtime metrics.
+
+**Failure detection:**
+- A “metric drop” should be distinguishable from a “true hit-rate change.”
+- The pipeline should publish a health indicator metric (ingested series count, drop count by reason).
+
+---
+
+## Common failure modes and how the architecture mitigates them
+1) **Double counting due to streaming retries**
+- Mitigation: emit once-per-logical-request counters at completion; track attempt index only in traces.
+
+2) **Incorrect hit attribution under continuous batching**
+- Mitigation: compute per-request reuse from request-local token ranges; add integration tests that simulate batched prefill.
+
+3) **Cardinality explosion from route or model labels**
+- Mitigation: route_id/model_version_id allowlists, normalization, ingestion-side guards.
+
+4) **Hit-rate regressions caused by workload mix changes**
+- Mitigation: always break down by request shape buckets and model; use guardrail alerts that consider mix.
+
+5) **Telemetry overhead regression**
+- Mitigation: perf canary gates and sampling defaults; ability to disable high-volume sub-metrics independently.
+
+---
+
+## Validation checklist (runtime-facing)
+Before enabling in production, validate:
+1. **Correctness:**
+   - Repeated identical prompts produce expected prefix hit-rate and reuse depth.
+   - Forced version mismatch produces misses attributed to version mismatch.
+   - TTL expiration produces misses attributed to ttl_expired.
+
+2. **Overhead:**
+   - p95/p99 latency regression is within the perf-canary budget.
+   - CPU overhead from metric emission is within expectations under peak QPS.
+
+3. **Joinability:**
+   - model/version/route identifiers match gateway/control-plane dimensions.
+   - region and deployment_mode are consistent with dashboard filters.
+
+4. **Cardinality:**
+   - series count stays within budget after enabling all breakdowns.
+   - ingestion drop counters remain near zero.
+
+---
+
+## Ownership and change management
+- Runtime instrumentation owners: Runtime team (primary: Omar El-Sayed; approver: Sofia Ivanova)
+- Metric schema and label policy owner: Nadia Rahman (Telemetry)
+- Dashboards/alerts owner: Allison Grant (Observability)
+
+Any change that modifies:
+- hit/miss definitions,
+- miss reason taxonomy,
+- label sets (especially route/model/version), or
+- wasted prefill attribution
+
+…requires review from Runtime + Telemetry + SRE and an update to the relevant ADR/standards page.
+
+---
+
+## Open questions (tracked; do not block current rollout)
+- Whether KV reuse effectiveness should be expressed primarily as a histogram (reuse ratio) or as hit/miss counts with weighted scaling under sampling.
+- Whether we need an additional “canonicalization_mismatch” reason distinct from “hash_mismatch” for recommendations.
+- How to best represent multi-turn chat partial reuse across turns without adding high-cardinality conversation identifiers.
+
+---
+
+## Appendix: Miss reason taxonomy (bounded enum)
+The runtime emits miss reasons from a bounded set. Exact names are defined in the ADR/standards, but the categories are:
+- `capacity` (insufficient cache space / allocation failure)
+- `ttl_expired`
+- `policy_disabled` (route-level or deployment-level caching disabled)
+- `hash_mismatch` (prompt canonicalization or prefix mismatch)
+- `version_mismatch` (model/version incompatibility)
+
+Guidance:
+- Keep taxonomy stable; adding a new miss reason requires cross-team review due to dashboard and alert dependencies.

@@ -1,0 +1,231 @@
+ADR-008: Key rotation strategy (key versioning, dual-read/dual-decrypt window, cutover + rollback)
+
+## Status
+Published.
+
+## Summary
+This ADR standardizes how Redwood rotates encryption keys used for envelope encryption across Hosted, Dedicated, and Private deployments. The core decision is to use explicit *key versioning* plus a bounded *dual-read/dual-decrypt* window controlled by configuration flags, with clear cutover criteria and rollback steps.
+
+The strategy is designed to:
+- Avoid hard cutovers that cause widespread decrypt failures.
+- Provide auditable, repeatable rotation steps (including evidence artifacts).
+- Limit blast radius during KMS incidents by controlling retry budgets and fallback behavior (see ADR-007).
+
+## Context
+Redwood uses envelope encryption for sensitive material (e.g., stored credentials, connectors, some control-plane configuration secrets, and other scoped data that is encrypted-at-rest outside of core database encryption). In envelope encryption:
+- A **DEK** (data encryption key) encrypts the payload.
+- A **KEK** (key encryption key) in a cloud KMS/HSM encrypts (wraps) the DEK.
+- Decrypt requires calling the KMS to unwrap the DEK, then decrypting locally.
+
+Operational problems we must handle:
+- KMS dependency degradation (timeouts/throttling) and permission drift.
+- Rotation where some components are upgraded later (mixed versions during rollouts).
+- Multiple deployment modes:
+  - **Hosted/Dedicated:** Redwood owns the KMS integration and can coordinate fleet-wide rotation.
+  - **Private:** Customer owns KMS/HSM policies and may have constraints on cadence, key creation, region residency, and change windows.
+
+Non-goals (explicit):
+- Changing cryptographic algorithms or introducing net-new primitives.
+- Replacing provider-native KMS semantics.
+
+## Terminology
+- **KeyRef:** A stable reference to a KEK usable for encrypt/decrypt. Examples: AWS KMS key ARN, GCP KMS CryptoKey resource name, Azure Key Vault key identifier.
+- **KeyVersion (Redwood):** An application-level version label that selects a KeyRef for writes and a set of KeyRefs for reads.
+- **Primary key:** The KeyRef used for new encryptions (write path).
+- **Secondary keys:** KeyRefs allowed for decrypt during the dual-decrypt window.
+- **Dual-read/dual-decrypt:** Read path attempts decrypt using primary KeyRef first, then secondary KeyRefs (in a deterministic order), within strict per-request budgets.
+
+## Decision drivers
+- Reliability: avoid global outages during rotation or key policy changes.
+- Safety: deterministic rollback path when decrypt mismatch signals appear.
+- Auditability: produce consistent evidence of who/what/when (rotation logs + audit events).
+- Multi-environment compatibility: same model across Hosted, Dedicated, and Private.
+
+## Decision
+### 1) Key versioning model
+We will represent “current encryption key” as a versioned configuration entry (KeyVersion), rather than relying solely on provider-native automatic key rotation.
+
+Rationale:
+- Provider-native rotation behavior varies and is not always transparent across multi-cloud or customer-managed configurations.
+- We need an explicit dual-decrypt window and rollback, which is easiest when KeyRefs are explicit and versioned.
+
+**Data model requirement:** Every new ciphertext produced by Redwood services MUST include metadata indicating the KeyRef (or KeyVersion) used for wrapping, so read-path selection can be deterministic and observable.
+
+### 2) Dual-read/dual-decrypt window behavior
+During rotation, services will operate with:
+- **Write path:** encrypt using *primary* KeyRef only.
+- **Read path:** attempt decrypt using:
+  1) The KeyRef specified on the ciphertext metadata (preferred), if present.
+  2) Otherwise: primary KeyRef, then secondary KeyRefs.
+
+Constraints:
+- Dual-decrypt MUST be bounded by strict timeout/retry budgets (ADR-007) to avoid turning KMS failures into amplified tail latency.
+- Secondary attempts are only permitted for error classes consistent with “wrong key” / “key not usable” (e.g., InvalidCiphertext/BadDecrypt). For timeouts/throttling, we DO NOT fan out across keys; we fail fast according to dependency budgets.
+
+### 3) Cutover criteria
+We define cutover as: “primary KeyRef becomes the only allowed decrypt KeyRef in steady state.”
+
+A rotation is eligible to cut over when all of the following are true for the dual-decrypt window duration (default: 7 days Hosted/Dedicated; configurable for Private):
+- **Decrypt success rate:** >= 99.99% for KMS unwrap operations on primary key for all supported regions.
+- **Fallback usage:** secondary-key decrypt attempts < 0.1% of decrypt traffic (and decreasing), with no unexplained spikes.
+- **No mismatch signals:** zero instances of decrypt producing invalid plaintext / auth failures attributable to key selection (for AEAD-mode payloads, invalid tags are hard failures and must be investigated).
+- **Error budget:** KMS dependency error-rate and latency within SRE thresholds (no active incident / paging alerts triggered by KMS for the rotation cohort).
+
+### 4) Rollback plan
+Rollback is defined as reverting primary selection and/or reintroducing previous KeyRefs into the allowed decrypt set.
+
+We will support rollback by:
+- Keeping the previous primary key enabled and permitted for decrypt for a minimum retention window (default: 30 days Hosted/Dedicated; Private set by customer policy) after cutover.
+- Maintaining a fast config toggle to:
+  - Set previous KeyRef as primary again, and
+  - Re-enable dual-decrypt with both old and new keys.
+
+Rollback triggers include:
+- Sustained increase in InvalidCiphertext/BadDecrypt correlated with cutover.
+- Unexplained increase in decrypt latency or throttling after switching keys.
+- Customer-reported decrypt errors during Private change window.
+
+### 5) Differences by deployment mode
+#### Hosted API (Redwood-managed)
+- Redwood owns KeyRefs and IAM, so we can:
+  - Rotate on a quarterly cadence by default (or per compliance requirements),
+  - Run background re-encryption jobs to reduce secondary decrypt usage quickly,
+  - Enforce standard windows and alerts globally.
+
+#### Dedicated (Redwood-managed, customer-isolated)
+- Same as Hosted in mechanism, but:
+  - Windows and cutover are scoped per customer environment/cluster.
+  - Evidence artifacts are generated per customer tenant (audit exports available).
+
+#### Private (customer-managed KMS/HSM)
+- Rotation must be executable by customer operators with Redwood guidance:
+  - Redwood provides runbook + installer preflight validation.
+  - Default dual-decrypt window is longer (recommended 14–30 days) due to slower change control.
+  - Redwood must not assume the ability to create new keys; customers may rotate by updating an alias to point to a new key, creating a new version, or importing new key material depending on provider.
+  - Rollback steps must be compatible with customer change windows and approvals.
+
+## Proposed operational sequence (standard rotation)
+### Preconditions (all modes)
+- KMS integration uses the standardized wrapper and telemetry (ADR-007).
+- Least-privilege IAM roles are in place, including separate principals for runtime decrypt vs rotation operations where applicable.
+- Audit logging for key selection and rotation changes is enabled.
+
+### Steps
+1) **Create/identify the new KeyRef**
+   - Hosted/Dedicated: Security/Infra provisions a new KMS key (or new key resource as required by provider strategy).
+   - Private: Customer provisions the new key or version under their KMS/HSM; Redwood provides required policy templates.
+
+2) **Grant permissions**
+   - Ensure runtime principals can decrypt with both old and new keys during the dual-decrypt window.
+   - Validate with preflight checks (Private installer) and/or automated canary checks (Hosted/Dedicated).
+
+3) **Enable dual-decrypt configuration**
+   - Set new KeyRef as **primary**.
+   - Add old KeyRef as **secondary**.
+   - Enable dual-decrypt flag.
+
+4) **Observe and migrate**
+   - Monitor metrics (see “Observability”).
+   - Run re-encryption-on-write and/or background migration jobs where available to reduce dependence on old key.
+
+5) **Cutover**
+   - After meeting cutover criteria, remove old KeyRef from secondary list (or disable dual-decrypt).
+
+6) **Post-cutover retention**
+   - Keep old key enabled for rollback window.
+   - After rollback window ends, disable and/or schedule deletion in alignment with retention requirements.
+
+## Configuration interface (logical)
+Exact config keys vary by service, but the logical model MUST include:
+- Primary KeyRef (single)
+- Secondary KeyRefs (list; order defined)
+- Dual-decrypt enabled (bool)
+- Rotation metadata (change ticket id, operator id) for audit logs
+
+Recommended defaults:
+- dual_decrypt_window_days:
+  - Hosted/Dedicated: 7
+  - Private: 14 (min), 30 (recommended for regulated change control)
+
+## Observability and audit requirements
+### Required metrics (minimum)
+Services performing KMS unwrap MUST emit:
+- kms.unwrap.latency_ms (histogram) with tags: env, region, provider, service, operation, key_version (redacted mapping), outcome
+- kms.unwrap.errors (counter) with tags: error_category (AccessDenied, NotFound, Throttling, Timeout, InvalidCiphertext, Internal), provider_code
+- kms.dual_decrypt.fallback_used (counter) with tags: from_key_version, to_key_version, reason
+- kms.rotation.cutover_state (gauge) to show primary/secondary configuration state
+
+### Required logs and audit events
+- Emit structured logs on decrypt failures with:
+  - error_category, provider_code, key_version (logical), request_id, tenant_id (if applicable)
+- Emit audit log events on:
+  - KeyVersion config changes (primary/secondary updates)
+  - Dual-decrypt enable/disable
+  - Cutover completion
+  - Rollback activation
+
+Note: Key identifiers in logs MUST follow redaction rules (store a stable logical ID; do not emit raw customer ARNs/URIs in shared multi-tenant logs).
+
+## Failure modes and how this decision behaves
+- **KMS timeout/throttling:** Dual-decrypt does not “spray” across keys. We honor request budgets and fail according to ADR-007 to avoid retry storms.
+- **AccessDenied due to IAM drift:** Dual-decrypt helps only if *one* key remains permitted; otherwise decrypt fails. This is why preflight validation and least-privilege role separation are required.
+- **Wrong key selection / stale config:** Dual-decrypt provides immediate rollback path by reintroducing the old key as primary/secondary.
+- **Key disabled / scheduled deletion too early:** This is a hard failure for any data encrypted under that key. Retention windows are mandatory.
+
+## Alternatives considered
+1) **Rely solely on provider automatic rotation (single key id forever)**
+- Pros: minimal application changes.
+- Cons: inconsistent across providers; limited observability into “which key material was used”; rollback and staged cutover are less controllable; harder to satisfy enterprise audit narratives that require explicit evidence of rotation and verification.
+
+2) **Hard cutover without dual-decrypt**
+- Pros: simpler implementation.
+- Cons: unacceptable operational risk; leads to widespread decrypt failures during staggered deployments and long-lived ciphertext.
+
+3) **Always attempt decrypt with N keys on every read**
+- Pros: fewer config transitions.
+- Cons: increases KMS call volume and tail latency; increases blast radius under KMS degradation; makes incidents noisier.
+
+Decision: adopt explicit versioning + bounded dual-decrypt window.
+
+## Consequences
+### Positive
+- Predictable, testable, and auditable rotation procedure.
+- Safer rollouts across mixed service versions.
+- Clear rollback levers that on-call can execute quickly.
+
+### Negative / costs
+- Requires ciphertext metadata changes (where missing) and migration logic.
+- Requires disciplined config management and post-cutover cleanup.
+- Adds operational overhead for Private customers (mitigated via docs + validation tooling).
+
+## Implementation notes (for engineers)
+- Ciphertext envelopes must include: key_version or key_ref_id, algorithm suite identifier (already standardized), and an envelope format version.
+- Any caching of key metadata MUST respect rotation safety (no indefinite cache; cache invalidation on config change).
+- Dual-decrypt attempts must be instrumented distinctly (primary attempt vs fallback attempt) to make cutover decisions evidence-based.
+
+## Rollout plan
+- Phase 1: Implement control-plane flags + ciphertext metadata write (new objects).
+- Phase 2: Enable dual-decrypt in staging; run game-day scenarios (KMS outage, throttling, permission misconfig).
+- Phase 3: Canary in one Hosted region + one Dedicated tenant.
+- Phase 4: Fleet rollout with SRE sign-off and alerting tuned.
+- Phase 5: Publish Private operator guide and evidence template; roll out to Private customers with change windows.
+
+## Open questions
+- Private customers using external key stores (XKS/HYOK): confirm provider-specific best practice for key retention and rollback windows.
+- Define minimum supported lifetime for decrypting “legacy ciphertext without key metadata” and a retirement plan.
+
+## Appendix A: Example cutover checklist (operator-facing)
+- [ ] New KeyRef provisioned and tagged (owner, purpose, environment).
+- [ ] IAM validated for runtime decrypt/encrypt on both keys.
+- [ ] Dual-decrypt enabled (old key added as secondary).
+- [ ] Dashboards confirm stable latency and error-rate.
+- [ ] Secondary fallback usage below threshold for >= 7 days (or customer-defined window).
+- [ ] Cutover executed; old key retained for rollback window.
+- [ ] Evidence captured (change ticket, approvals, audit export snapshot, metric screenshot links).
+
+## Appendix B: Evidence expectations (summary)
+See the rotation evidence template and runbook for required artifacts. At minimum, we must be able to show:
+- Who approved and executed the change
+- When primary/secondary were updated
+- Verification results (metrics, logs, health checks)
+- Confirmation of rollback readiness and retention window

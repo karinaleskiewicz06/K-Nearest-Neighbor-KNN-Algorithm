@@ -1,0 +1,152 @@
+Kernel handoff and decision tracing manual
+
+Summary
+-------
+This document defines the kernel handoff model used by the Redwood serving runtime, the decision-tracing taxonomy we record for each request, and an operational playbook for diagnosing and repairing misrouted or stalled kernel executions. It combines architecture rationale, concrete observability requirements, and a step-by-step incident remediation procedure.
+
+Scope
+-----
+Applies to: runtime kernel scheduler, request router, KV-cache manager, dispatcher, and observability collectors.
+Excludes: higher-level API routing policies (handled in routing-policy-spec) and storage-layer persistence.
+
+Goals
+-----
+- Ensure deterministic, searchable traces for every kernel decision that affects latency or fidelity.
+- Provide clear remediation steps for common kernel-handoff faults (e.g., orphaned execution, priority inversion, kernel oscillation).
+- Standardize the set of trace attributes collected across GPU types and sharded topologies so SRE and runtime teams can collaborate with minimal context switching.
+
+Background and motivation
+-------------------------
+As the runtime supports heterogeneous GPU pools, model variants, and admission policies, requests frequently cross component boundaries: request classifier -> KV-cache -> scheduler -> kernel executor -> postprocessor. Historically, when a request hit a tail-latency anomaly, correlating which component made a specific decision (e.g., preempt, requeue, fallback to a lower-fidelity kernel) required ad-hoc logs. The decision-tracing model codifies the minimal set of attributes to record and provides a canonical span taxonomy so every execution path is queryable in our trace backend.
+
+Decision-trace model (required attributes)
+-----------------------------------------
+Each decision event must be emitted as a trace span with the following attributes (key:value). All values are strings unless noted.
+- trace_id: global 128-bit trace identifier (hex)
+- request_id: request UUID
+- span_id: span UUID
+- parent_span_id: nullable span UUID
+- timestamp_iso: ISO-8601 timestamp
+- component: one of [classifier, kv-cache, scheduler, dispatcher, kernel, postprocessor, network-proxy]
+- decision: canonical verb (e.g., admit, preempt, requeue, fallback_kernel, pin_shard, evict_kvcache)
+- reason_code: short code (e.g., PCPU_HIGH, KV_MISS, MODEL_MISMATCH, PREEMPT_FOR_HIGHPRIO)
+- kernel_hint: free-text kernel name / version / layout (optional)
+- target_gpu: GPU identifier or pool tag (optional)
+- estimated_latency_ms: integer (estimation produced at decision time)
+- actual_latency_ms: integer (set on completion span only)
+- owner_service: tenant or internal service that originated the request
+- fidelity_level: one of [full, quantized-8, quantized-4, sparse]
+
+Trace span taxonomy (recommended)
+--------------------------------
+- request.start (component=classifier): initial classification and admission decision
+- cache.lookup (component=kv-cache): synchronous KV-cache check; emits evict_kvcache/kvcache_hit/kvcache_miss decisions
+- schedule.plan (component=scheduler): computes slot, kernel_hint, and priority
+- dispatch.attempt (component=dispatcher): attempts to bind to GPU slot; may emit requeue or fallback_kernel
+- kernel.exec (component=kernel): start->complete lifecycle for a kernel run; must include estimated and actual latencies
+- postprocess.apply (component=postprocessor): output transformations, safety filters, or sampling hooks
+- request.finish (component=network-proxy): final response code and end-to-end latency
+
+Handoff rules (canonical flow and invariants)
+---------------------------------------------
+1) Immutability at decision time: once a span with decision=admit or schedule.plan is emitted, the core decision fields (decision, reason_code, kernel_hint) must not be mutated; subsequent changes must be recorded as new spans (e.g., dispatch.attempt -> decision=requeue).
+2) Single-writer for GPU binding: dispatcher must be the authoritative emitter of the bind event for a given kernel.exec span. Any other component writing bind/bound should include dispatch_span_id reference.
+3) Latency estimations: scheduler must include estimated_latency_ms; executor records actual_latency_ms. Estimation delta (actual - estimated) propagates to an attached metric for calibration.
+4) Fallback semantics: fallback_kernel spans must include fallback_chain attribute (comma-separated list of kernels attempted) and a fidelity_level tag for each fallback step.
+
+Operational configurations (table)
+---------------------------------
+| config_key | default | description | owners | alert_threshold |
+| khandoff.trace-sampling-pct | 5 | Percent of requests with full decision-traces emitted (for low-overhead prod) | runtime-observability | 95th latency >= 2x baseline |
+| scheduler.max-requeues | 3 | Maximum scheduler requeues before forcing a fallback kernel | scheduler-team | >3 requeues per request |
+| dispatcher.bind-timeout-ms | 1200 | Time to wait for GPU bind before requeueing | dispatcher-team | binds timed out >0.5% |
+| kernel.exec-timeout-ms | 30000 | Wall-time cap for kernel execution before kill | runtime-safety | OOM or watchdog kills >0.1% |
+
+Runbook: diagnosing misrouted kernels
+-------------------------------------
+This procedure is for incidents where requests are executed on an unexpected kernel (wrong fidelity or model variant) or stuck in dispatch/requeue loops.
+1) Triage: obtain a sample trace_id from the failing request (from customer report or alert).
+2) Trace inspection: query traces by trace_id. Look for schedule.plan span and the subsequent dispatch.attempt spans. Verify kernel_hint and fidelity_level recorded by schedule.plan match kernel.exec.
+3) Check dispatcher logs: locate dispatch.bind events correlated by parent_span_id = schedule.plan.span_id. If bind failed, read reason_code (e.g., SLOT_EXHAUST, POOL_MISMATCH).
+4) KV-cache correlation: if schedule.plan used cached prefix (kvcache_hit), confirm the cached fingerprint's kernel_hint matches current model variant. If mismatch, mark as KV_MISMATCH and file a corrective ticket (see "Corrective actions").
+5) Requeue loop detection: count consecutive requeue decisions for request_id. If > scheduler.max-requeues, escalate to oncall and attach the trace + first and last dispatch.attempt spans.
+6) Mitigation steps (fast):
+   a) For SLOT_EXHAUST: temporarily expand pool tag (if autoscaling safe) or divert traffic to a fallback pool.
+   b) For POOL_MISMATCH: trigger a small live reconfiguration to add the requested model variant to the target pool (requires change-request ticket for private deployments).
+   c) For PREEMPT_FOR_HIGHPRIO: ensure high-priority tenant actually owns preempt budget; if misconfigured, rollback recent quota changes.
+
+Corrective actions (post-incident)
+---------------------------------
+- File an operational postmortem with the trace_id, list of spans, and the root cause decision span.
+- If KV_MISMATCH is root cause, run the cache audit job: 
+  CLI: 
+  rwd cache-audit --model model-name --since 24h --format json
+  Expected output is a list of cached fingerprints with kernel_hint metadata. Reconcile mismatches by re-hashing prompt fingerprints or invalidating the affected keys.
+- If dispatcher bug: attach dispatch logs and build id, and create a patch with a unit test that simulates the misrouting using the synthetic-dispatch test harness.
+
+Trace retention and sampling guidance
+-----------------------------------
+- Full decision-traces (all spans listed above) are sampled at khandoff.trace-sampling-pct. All requests have a lightweight request.start and request.finish at 100% sampling (for billing/CSAT correlation).
+- For on-demand debugging, the runtime supports a per-request debug-flag header: X-RWD-Debug: trace=full which forces full-span emission for that request (customer-facing header must be gated behind support tier).
+
+Alerting matrix (examples)
+-------------------------
+- alert: dispatch.bind-timeout-rate-spike
+  description: >
+    Rate of dispatch.bind timeouts (bind-timeout-ms) exceeds 0.5% of requests over 5m.
+  severity: P1
+  runbook-ref: misrouted-kernels -> step 1-3
+
+- alert: requeue-loop-detection
+  description: >
+    Fraction of requests with > scheduler.max-requeues in the last 10m.
+  severity: P1
+  runbook-ref: misrouted-kernels -> step 5
+
+Examples and sample trace snippets
+----------------------------------
+Example schedule.plan span (JSON, illustrative):
+{
+  "trace_id": "a1b2c3d4e5f6...",
+  "span_id": "span-0001",
+  "component": "scheduler",
+  "decision": "schedule.plan",
+  "kernel_hint": "gptx-quant8-v2:layout=col32",
+  "fidelity_level": "quantized-8",
+  "estimated_latency_ms": "128",
+  "reason_code": "KV_MISS"
+}
+
+Example dispatch.attempt sequence (pseudo):
+- dispatch.attempt span_id=span-0002 parent=span-0001 decision=requeue reason_code=SLOT_EXHAUST
+- dispatch.attempt span_id=span-0003 parent=span-0001 decision=requeue reason_code=SLOT_EXHAUST
+- dispatch.attempt span_id=span-0004 parent=span-0001 decision=fallback_kernel reason_code=MAX_REQUEUES
+
+Appendix: CLI and debug helpers
+-------------------------------
+- Query traces: rwd trace-get --id <trace_id> --backend jaeger | jq '.'
+- Dump dispatch state for node: rwd node-dispatch-state --node-id <NODE> --since 5m
+- Force a single-request full trace (dev only): 
+  curl -H "X-RWD-Debug: trace=full" -H "Authorization: Bearer <token>" \
+    https://runtime-internal.redwood/api/v1/generate -d '{"prompt":"test"}'
+
+Ownership and rollout plan
+-------------------------
+- Owners: scheduler-team (primary), dispatcher-team (secondary), runtime-observability (traces & alerts).
+- Rollout: incremental — enable full-span emission for canary pool only (khandoff.trace-sampling-pct=50) for 1 week, then 10% across production for 48 hours, then the configured default.
+- Migration notes: older kernels without span hooks must implement a shim that emits kernel.exec.start/kernel.exec.complete spans to satisfy the model.
+
+Related pages and references
+----------------------------
+- See runtime-architecture request-multiplexing diagram for the visual handoff map.
+- See profiling-playbook causal-latency-attribution for calibration of estimated vs actual latency.
+
+Change log
+----------
+- 2025-11-12: Document created (Marco Chen).
+- 2026-01-05: Added requeue-loop detection thresholds and example alerts (reviewer: Aisha Patel).
+- 2026-02-18: Finalized trace attribute list and added KV-cache audit CLI commands (reviewer: Lena Ortiz).
+
+Contact
+-------
+For questions or to request trace sampling increases, ping #runtime-observability or email runtime-observability@redwood.ai.

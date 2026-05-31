@@ -1,0 +1,145 @@
+Emergency model hotpatch and rollback procedure
+
+Overview:
+This runbook defines a safe, auditable process for performing emergency hotpatches and full rollbacks of model deployments in production. The goal is to restore SLO compliance and prevent client-impacting behavioral regressions while preserving traceability for post-incident review. This document is intended for SRE and Serving Runtime on-call engineers, Product Engineers owning model behavior, and Platform Engineers coordinating infrastructure changes.
+
+Scope and intent:
+- Applies to model variants serving text generation, chat, embeddings, and reranking across Hosted and Dedicated environments. Does NOT cover private on-prem control-plane changes (those follow the Private Ops handbook).
+- Describes two corrective actions: (A) hotpatch (code/config/feature gate change that preserves model binary), (B) rollback (reverting to a previous pinned model version).
+- Includes decision criteria, preconditions, step-by-step procedures, verification checks, and communication templates.
+
+Key principles:
+- Minimum blast radius: prefer targeted hotpatches that scope to affected tenants or routes before global changes.
+- SLO-first: actions triggered when SLO deviation or error-budget burn meets thresholds defined in the Decision Criteria section.
+- Observable and reversible: all changes must be automated through the deployment pipeline and provide an automated rollback path.
+- Post-action evidence: collect telemetry and artifact snapshots for incident review.
+
+Roles and responsibilities:
+- Oncall SRE (owner): owns execution, live coordination, and final go/no-go on rollbacks/hotpatches.
+- Serving Runtime Engineer (runtime): implements hotpatch (binary-safe config changes, KV cache eviction), monitors resource impact, and adjusts autoscaling as needed.
+- Model Owner/Product Engineer (product): provides behavioral criteria (regression test set, golden prompts) and approves rollbacks that could impact model correctness.
+- Release Engineer (release): runs the CI/CD pipeline, verifies artifacts, and ensures deployment manifests are signed.
+- Incident Commander (IC): coordinates cross-team comms, customer-facing messaging, and retro assignment.
+
+Decision criteria (when to hotpatch vs rollback):
+1) Triage severity and SLO impact:
+   - If P99 latency or 95th percentile error rate crosses service SLO by >3x and persists for >5 minutes -> action required.
+   - If error budget projected to be exhausted within the hour -> action required.
+2) Behavioral regression vs infra fault:
+   - Behavioral (e.g., hallucination spike, safety filter failures): prefer rollback to last known-good model variant if hotspot affects >10% of requests or cannot be mitigated by a config change.
+   - Infra (OOMs, CUDA driver regressions, kernel-level stalls): prefer hotpatch (runtime config change, memory throttling) and capacity adjustments.
+3) Availability of canary/blue-green targets:
+   - If a verified canary model exists with <1% divergence on regression set, prefer canary promote instead of rollback.
+4) Customer blast radius:
+   - If only VIP tenants are affected, prefer tenant-scoped hotpatch or targeted routing.
+
+Preconditions and safety checks (must pass before making changes):
+- SLO and error-budget dashboards live and accessible. Take a screenshot of current state.
+- Deployment CI pipeline green for the artifact and integrity signature present.
+- A test harness run: run the model regression test set (20–50 golden prompts) against target version; capture outputs.
+- Capacity check: ensure headroom for rolling traffic (at least 25% spare GPU capacity per AZ or configured burst capacity).
+- Approvals: Product Engineer and Serving Runtime must sign-off for rollback; SRE + Release Engineer for hotpatch. Document approval in the incident doc.
+
+Emergency hotpatch procedure (short-lived, targeted fixes):
+Purpose: apply a non-model-binary change that reduces client impact quickly (e.g., toggling safety filters, lowering max_tokens, disabling a problematic postprocessor, adjusting batching window).
+Steps:
+1) Prepare change in a hotpatch branch with a concise, reversible flag (featureflag: model_hotpatch_{incident_id}).
+2) Run a dry-run locally against the canary cluster using the CI pipeline: `ci/deploy --dry-run --target canary --patch-flag=...`. Capture logs.
+3) If dry-run passes, deploy to a single canary region and monitor these signals for 10 minutes:
+   - Request success rate (1m/5m/15m)
+   - Tail latency (p50/p95/p99) and queue length
+   - Token throughput and GPU utilization
+   - Golden prompt regressions (automated diff scoring)
+4) If canary metrics are stable and regressions are within thresholds, orchestrate phased rollout: zone-by-zone, 10% -> 30% -> 60% -> 100% over 30m windows. Pause and wait at each step for 5 full minutes.
+5) If any metric worsens beyond kill-switch thresholds (see table below), immediately trigger automated rollback for that region and notify IC.
+6) After full rollout, remove temporary flags within 72 hours or convert into permanent config with appropriate PR and review.
+
+Automated kill-switch thresholds (examples):
+- error_rate_increase > 200% vs baseline (5m)
+- p99 latency increase > 2x baseline
+- customer-facing errors (5xx/invalid responses) > 0.5% of requests
+
+Rollback procedure (reverting model version):
+Purpose: when model behavior is the root cause or hotpatch is insufficient. Rollback is conservative because it changes served model artifacts.
+Prerequisites: artifact of target model must be signed and present in artifact registry; previous version must be validated on regression harness.
+Steps:
+1) Confirm decision: Product Engineer and SRE agree that rollback is required. Document the rationale in the incident ticket (include golden prompt diffs).
+2) Lock writes to model-routing config to prevent concurrent changes: `redwoodctl config lock model-routing --reason \"rollback-<incident_id>\"`
+3) Promote previous model variant to canary with 1–2% traffic and run automated regression suite & telemetry for 10–15 minutes.
+4) If canary is green, execute phased traffic shift using the traffic-controller tool: `redwoodctl traffic shift --model <prev_version> --policy phased --steps 10,30,60,100 --step-delay 1800s`
+5) During each step, the SRE oncall must verify:SLO trends, error rates, customer telemetries/alerts, and resource utilization. If any step fails, abort and revert to pre-rollback state.
+6) Once fully rolled back, mark the incident as "mitigated" and schedule a postmortem within 72 hours.
+
+Post-action verification checklist:
+- Confirm SLOs are trending back within expected bounds for 30–60 minutes.
+- Verify no silent regressions by running full golden prompt suite (100+ prompts) and checking automatic diff metrics and human review samples for high-risk cases.
+- Capture memory/GPU pressure metrics and ensure autoscaler did not thrash during the change.
+- Export routing and model artifact manifests for evidence.
+
+Operational tooling and commands (typical examples):
+- `redwoodctl model list --env prod --format json` (list active variants)
+- `redwoodctl traffic history --model <id> --window 1h` (audit last hour of routing decisions)
+- `redwoodctl canary promote --model <id> --pct 2` (canary promote helper)
+- CI pre-check example (YAML):
+  - name: model-regression-check
+    run: |
+      python tools/regression_runner.py --model $MODEL_ID --prompts samples/golden_set.json --out /tmp/reg_out.json
+- Example feature-flag toggle call (internal API):
+  PATCH /flags/model-hotpatch/{flag}
+  {\n    \"enabled\": true,\n    \"scope\": \"tenant:tenant-id-123\"\n  }
+
+Telemetry and dashboards to consult (minimum):
+- SLO dashboard: service/slo/model-inference (p50/p95/p99 latency, error rate, availability)
+- Error budget burn: alerts for >30% burn in 1h or >70% projected in 6h
+- Routing dashboard: model-routing/traffic-split (per-region, per-tenant)
+- Regression scoring dashboard: evaluation/regression-diff (daily and live canary scoring)
+- Resource dashboard: gpu-fleet/utilization, memory/oom-rate, scheduler-queue-length
+
+Communication templates (IC -> stakeholders):
+- Short status update (post-action):
+  Subject: [INC <id>] Model mitigation executed — status: partial/complete
+  Body: Action taken: rolled back model vX.Y or applied hotpatch flag model_hotpatch_<id>.
+  Immediate impact: p99 latency down from Xms -> Yms; error rate reduced from A% -> B%.
+  Next steps: monitoring for 60m, schedule postmortem, customer outreach if impacted.
+
+- Customer-facing template (for affected tenants):
+  Subject: Redwood Incident <id> — temporary mitigation applied
+  Body: We identified a regression affecting inference quality/availability and applied an emergency mitigation to restore service. We are monitoring and will follow up with full postmortem.
+
+Evidence collection for postmortem:
+- Deploy manifests and `redwoodctl` audit logs for the time window (UTC timestamps).
+- Golden prompt input/outputs before and after change (store in incident evidence bucket).
+- SLO dashboard snapshots (PNG) and raw telemetry export (CSV) covering 2 hours before and 2 hours after action.
+- Autoscaler and scheduler logs showing scaling events.
+
+Testing and rehearsal guidance (reliability initiative tie-in):
+- Run quarterly tabletop exercises focused on model rollback and hotpatch scenarios with sample failure injects (e.g., safety filter failure, embedding drift).
+- Maintain a canary matrix: at least one verified canary per major model family with automated smoke tests run daily.
+- Add a scheduled job that performs a dry-run of the rollback traffic-shift tool to validate automation and permissions.
+
+Runbook maintenance and ownership:
+- Owner: eng-sre (oncall runbook steward: Priya Kothari).
+- Review cycle: annual or after any incident that exercises this runbook.
+- Change process: all edits must be PR-reviewed by SRE + Serving Runtime and linked to a retro or incident ticket.
+
+Appendix: thresholds table (copyable)
+- severity_level | condition | action_required | approvals
+- SEV2 | error_budget_burn_rate >= 30% in 1h | hotpatch/targeted rollback | SRE + runtime engineer
+- SEV1 | error_budget_projection < 1h | immediate rollback & IC escalation | SRE + product + IC
+
+Appendix: quick troubleshooting tips:
+- If canary shows regressions but host metrics healthy: throttle to 0% and collect model outputs for human review.
+- If OOMs spike post-rollback: temporarily reduce batching window and re-evaluate quantization profile for that variant.
+- If autoscaler oscillates: increase cooldown to 10m and add capacity buffer of +15% for the rollback window.
+
+Document history and changelog:
+- 2026-02-18: Created by Aisha Malik (initial draft)
+- 2026-04-12: Added kill-switch thresholds and traffic-controller CLI examples (reviewed by Diego Morales)
+- 2026-06-01: Clarified approval gating and updated telemetry checklist (Hannah Park)
+
+Related artifacts and links:
+- CI job: ci/model-deploy-hotpatch.yml
+- Tooling repo: git@internal:redwood/deploy-tools.git (script: traffic_controller.py)
+- Incident template: /confluence/eng-sre/incident-review/standard-incident-template
+
+End of document.

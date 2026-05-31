@@ -1,0 +1,196 @@
+Dynamic KV-Cache Resilience and Warmup Playbook
+
+Summary
+-------
+This playbook describes our recommended architecture, operational procedures, and diagnostic workflows for handling dynamic KV cache (prefix / KV cache) resilience and warmup in the serving runtime. It synthesizes kernel scheduling interactions, profiling steps, benchmark configurations, and automated runbooks to: reduce cold-start latency, mitigate cache-eviction storms, and preserve SLOs under bursty traffic and model rollouts.
+
+Scope
+-----
+- Applies to all hosted and Dedicated serving runtime clusters using the v2 KV-cache layer (sharded prefix KV cache across inference shards).
+- Includes guidance for Private deployments where runtime configuration parity is required.
+- Does NOT replace per-customer onboarding docs for Private (see eng-private-deployments).
+
+Why this matters
+----------------
+- Cold KV-cache regimes can add 10–40% tail latency for short sequences and increase GPU cost by 15–60% during warmup windows.
+- Improper eviction + kernel scheduling interference leads to thrashing: high kernel contention, repeated model recomputation, and increased rate of transient OOMs.
+
+Goals and SLO impact
+--------------------
+- Target median additional token latency from cold-kvcache: <= 5 ms for standard Llama-like models.
+- Tail (p99) increase during warmup events: < 20% of baseline.
+- Reduce warmup token count to reach steady-state cache hit rate by 50% vs uncontrolled rollout.
+
+Architecture overview
+---------------------
+High-level components:
+- KV Cache Shard Manager: responsible for shard ownership, lease renewal, and local warmup policy.
+- Warmup Coordinator: broadcast mechanism (gossip/leader) used to coordinate aggressive prefix caching after a model variant rollout.
+- Kernel Scheduler: enforces priority bands for warmup vs production requests to avoid preemption storms.
+- Local LRU/Adaptive Evictor: per-shard eviction policy with heuristics for token frequency, request recency, and model-fingerprint awareness.
+
+Interaction diagram (text)
+1) Model rollout triggers Warmup Coordinator to mark new model-variant shards CAN_WARMUP.
+2) Warmup Coordinator signals subset of traffic nodes to send protocol-safe prefetch requests (synthetic prefixes) to populate KV shards.
+3) Kernel Scheduler temporarily assigns warmup requests to a separate priority band with controlled concurrency to avoid kernel inversion.
+4) KV Cache Shard Manager tracks warmup progress with hit-rate metrics and signals a ramp-down once steady-state hit-rate achieved.
+
+Operational knobs and recommended defaults
+---------------------------------------
+| Setting | Default | Notes |
+|---|---:|---|
+| warmup.enabled | true | Enable coordinated warmup post-rollout |
+| warmup.max_parallel_prefetch | "8" | Max concurrent synthetic warmup streams per node |
+| warmup.prefetch_window_seconds | "180" | Window to complete aggressive warmup |
+| kvcache.eviction_threshold_mb | "8192" | Per-shard soft threshold to start adaptive eviction |
+| scheduler.warmup_priority_band | "low" | Lower priority than live production but higher than background maintenance |
+| scheduler.concurrent_warmup_limit | "16" | Global per-GPU limit enforced by kernel scheduler |
+
+Note: values are intentionally strings here to match internal config APIs that accept env var strings.
+
+Profiling playbook: diagnosing warmup and eviction issues
+---------------------------------------------------------
+When you observe increased tail latency or unexpected token generation costs, follow these steps:
+1) Snapshot telemetry for the affected interval (use timeframe covering 2x warmup_window):
+   - metrics: kvcache.hit_rate, kvcache.evictions/sec, kernel_queue_length, gpu_utilization, request_latency_p50/p95/p99
+   - traces: end-to-end request trace including kvcache calls and kernel scheduling annotations
+
+2) Run targeted profiler on affected GPU nodes:
+   - CLI: `redwood-profile --nodes <node-list> --duration 60s --tags kvcache,warmup,kernel`
+   - Expect to capture: repeated model layer recomputations, KV fetch stalls, kernel enqueue spikes.
+
+3) Inspect kernel scheduler counters:
+   - `curl http://<node>/debug/kernel-scheduler/stats` (JSON)
+   - Look for: warmup_priority_band queue depth > scheduler.concurrent_warmup_limit or frequent task preemptions.
+
+4) Heap/Memory checks:
+   - `nvidia-smi` and runtime allocator stats. Watch for abrupt free/alloc cycles that coincide with eviction spikes.
+
+Common root causes and mitigations
+---------------------------------
+- Symptom: High eviction rate immediately after a canary rollout.
+  - Cause: Warmup coordinator disabled or misconfigured; synthetic prefetch not triggered.
+  - Mitigation: Re-enable warmup.enabled, increase max_parallel_prefetch to 12 for initial ramp, then reduce.
+
+- Symptom: Kernel priority inversion (live traffic starved) during warmup.
+  - Cause: Warmup requests scheduled at same or higher priority as production.
+  - Mitigation: Ensure scheduler.warmup_priority_band < production; apply throttling: scheduler.concurrent_warmup_limit=8.
+
+- Symptom: Warmup completes but hit-rate decays rapidly under bursty traffic.
+  - Cause: Eviction policy too aggressive for mixture of short/long sequences.
+  - Mitigation: Switch to adaptive evictor with model-fingerprint hysteresis and increase kvcache.eviction_threshold_mb by 20%.
+
+Benchmarks and validation harness
+--------------------------------
+We validate warmup changes with two benchmark profiles stored in the perf repo:
+- warmup-prefill-suite: simulates rollout with synthetic prefixes, measures time-to-80%-hit-rate and cost delta.
+- mixed-burst-suite: 90% short-seq low-latency requests + 10% long-seq heavy KV usage to validate eviction behavior.
+
+Example benchmark invocation:
+```
+perf-runner --suite warmup-prefill-suite --nodes 10 --concurrency 120 --duration 300 --model llama-3-8b --kvcache-enabled
+```
+Expected outputs (asserted by CI):
+- time_to_80_hit_rate < 120s
+- p99_latency during warmup < baseline_p99 * 1.25
+- additional GPU-seconds < 1.5x baseline for warmup period
+
+Runbook: automated remediation steps
+-----------------------------------
+Trigger conditions (automated):
+- kvcache.evictions/sec > 50 for > 60s OR
+- kvcache.hit_rate < 0.5 for > 180s post-rollout OR
+- kernel_queue_length[warmup_band] > scheduler.concurrent_warmup_limit for > 30s
+
+Automated remediation sequence (scripted):
+1) Throttle warmup: set scheduler.concurrent_warmup_limit = 4 via config push and notify SRE.
+2) Temporarily raise kvcache.eviction_threshold_mb by 25% for affected shards.
+3) If eviction rate remains high after 2 minutes, pause rollout (Warmup Coordinator: PAUSE_WARMUP) and failover 10% of traffic to previous model.
+4) Create incident with severity: high and attach profiling artifacts.
+
+Manual escalation checklist for oncall
+------------------------------------
+1) Confirm the automated remediations executed successfully.
+2) Take heap+KV cache core dump: `postmortem-tool collect --type kvcache --duration 30s`
+3) Validate kernel scheduler policy file (path: /etc/redwood/kernel-scheduler/policy.yaml) for unintended overrides.
+4) If root cause unclear, escalate to runtime-kernel team and attach profiler snapshot.
+
+Release notes (behavioral changes to track)
+------------------------------------------
+- 2026-02-18: Enabled Warmup Coordinator by default for Canary rollouts.
+- 2026-02-25: Kernel Scheduler: new warmup_priority_band added; default concurrent_warmup_limit=16.
+- 2026-02-28: Adaptive Evictor v1.2 rolled out to 10% of clusters; adds model-fingerprint hysteresis.
+
+Known issues and workarounds
+---------------------------
+- Issue: kvcache hit-rate metric can lag by up to 30s under heavy aggregation (observed 2026-01-10). Workaround: use raw per-shard counters for real-time gating.
+- Issue: Synthetic prefetch increases billing for Dedicated customers. Workaround: limit prefetch_window_seconds and scope warmup to sample nodes.
+- Issue: On certain GPUs (driver <= 535.54), kernel enqueue stalls observed when many small kernels are scheduled concurrently. Workaround: pin warmup kernels to separate CUDA streams and upgrade driver.
+
+Telemetry and dashboards to monitor
+---------------------------------
+Must-have panels:
+- KV Cache: per-shard hit_rate, evictions/sec, memory_used_mb
+- Scheduler: queue_depth by priority_band, preemptions/sec, avg_hold_time_ms
+- Cost: warmup_gpu_seconds by cluster and model_variant
+- Alarms: automated trigger conditions (see Runbook)
+
+Diagnostics snippets
+-------------------
+- Quick hit-rate query (PromQL):
+```
+rate(kvcache_hits_total[1m]) / (rate(kvcache_hits_total[1m]) + rate(kvcache_misses_total[1m]))
+```
+- Kernel scheduler queue snapshot (example):
+```
+curl -s http://<node>/debug/kernel-scheduler/queues | jq .
+```
+
+Testing and rollout guidance
+---------------------------
+- Canary strategy: 5% initial traffic with warmup.prefill enabled for 5 minutes, then 25% for 15 minutes, then 100% if metrics stable.
+- Benchmarks must be run in isolated capacity to avoid noise. Attach perf-run output and raw profiler captures to rollout ticket.
+
+Team responsibilities and ownership
+---------------------------------
+- Runtime-kernel team: kernel scheduler changes and API for priority bands.
+- Serving-runtime team: KV Cache Shard Manager, Warmup Coordinator and adaptive evictor.
+- Eng-sre: alerting, automated runbooks, capacity overrides during incidents.
+- Observability: dashboards, perf-suite maintenance.
+
+Appendix: example config snippets
+--------------------------------
+Warmup Coordinator YAML (example):
+```
+warmup:
+  enabled: true
+  max_parallel_prefetch: 8
+  prefetch_window_seconds: 180
+  coordinator_type: "gossip"
+```
+Kernel scheduler policy excerpt:
+```
+priority_bands:
+  - name: production
+    priority: 10
+  - name: warmup
+    priority: 5
+    concurrency_limit: 16
+  - name: background
+    priority: 1
+```
+
+Contacts and escalation links
+----------------------------
+- runtime-kernel Slack: #runtime-kernel
+- serving-runtime Pager: /pagerduty/service/serving-runtime
+- Perf repo: git@internal:redwood/perf-suites.git (folder: warmup-prefill-suite)
+
+Revision history
+----------------
+- 2026-02-12: Drafted by Maya Thompson.
+- 2026-02-18: Warmup Coordinator defaults note added (Diego Alvarez).
+- 2026-02-25: Scheduler policy excerpt and automated remediation steps (Priya Shah).
+- 2026-03-01: Finalized and published (Jonas Müller).
+
+End of document.

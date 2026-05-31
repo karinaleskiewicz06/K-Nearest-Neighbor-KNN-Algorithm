@@ -1,0 +1,164 @@
+Air-gapped KMS & HSM Offline Key Rotation and Certificate Renewal Playbook
+
+Summary:
+This playbook documents the operational steps, validation checks, and rollback procedures for rotating cryptographic material (KMS keys, HSM-wrapped keys, and TLS certificates) in air-gapped or VPC-isolated private deployments. It targets situations where the control plane or operator tools cannot reach a vendor-managed KMS and where offline procedures are required to satisfy compliance windows and key lifetime policies.
+
+Audience:
+- Private deployment operators
+- Field engineers performing maintenance on air-gapped sites
+- Security engineers responsible for key lifecycle and audit evidence
+
+Scope and non-goals:
+- Scope: periodic key rotations, short-term emergency key rotation, certificate renewals for control-plane services, operator tooling for signed artifacts, and evidence capture for audits.
+- Non-goals: provisioning of new HSM hardware, supply-chain firmware signing (see separate supply-chain playbook), and cloud-hosted KMS flows.
+
+Prerequisites and assumptions:
+1) Authorized operator with access to the on-site key ceremony kit and audited operator laptop (FIP-140-2 FIPS mode enforced).
+2) Hardware: approved HSM model (list in table below), USB drive with encrypted evidence container, and a dedicated air-gapped operator VLAN.
+3) Software: offline key-rotation utility (rotctl v1.4+), pkcs11-tool, openssl 3.x, and the offline signing agent image.
+4) Policy: rotation window approved in change control and a signed attestation from customer security if required.
+
+Approved HSM models (examples):
+| HSM model | Minimum firmware | Notes |
+| --- | ---: | --- |
+| YubiHSM-2 | 2024-09 | Field-friendly, single-tenant wrapping only |
+| Thales Luna 7K (FIPS) | 4.2.1 | Requires vendor-brokered maintenance contract for deep recovery |
+| NitroHSM (OEM) | 1.8.0 | Supports sealed backups and operator multisig |
+
+Roles and responsibilities:
+- Onsite Operator: performs the physical key ceremony, executes CLI steps, captures video and hash artifacts.
+- Remote Security Reviewer: validates evidence bundle, signs off in change control.
+- Platform Owner: coordinates pre/post rollout config changes and traffic fencing.
+- SRE Oncall: monitors service health during rotation window and executes rollback if thresholds are hit.
+
+High-level workflow (summary):
+1) Pre-check (remote & local)
+2) Prepare rotation bundle and offline tokens
+3) Stop traffic or enter maintenance window
+4) Perform HSM/KMS key rotation and rewrap secrets
+5) Rotate TLS certificates and update service manifests
+6) Validate and run smoke tests
+7) Record evidence and close change request
+
+Detailed procedure:
+A. Pre-check (remote, 48–24 hours before)
+- Validate change window and confirm operators present.
+- Verify backup snapshots of KV cache and model state exist and are stored per retention policy.
+- Confirm available spare capacity in adjacent zone (if present) to absorb traffic.
+- Run rotctl preflight: rotctl preflight --target <site-id> --verify-hardware which performs PKCS11 probe and prints: HSM_PRESENT=true, FIRMWARE_MATCH=true, SLOT_COUNT=2. Save output to evidence container.
+
+B. Prepare rotation bundle (on secure operator laptop)
+1. Generate offline signing key pair (operator-key) in ephemeral HSM slot: pkcs11-tool --module /usr/lib/libhsm.so --keypairgen --label operator-key --id 0x01 --key-type rsa:3072.
+2. Create rotation manifest (YAML) listing keys to rotate, impacted services, expected downtime, and pre/post-sanity commands. Example manifest snippet:
+
+rotation_manifest:
+  site_id: "site-eu-42"
+  operator: "a.kapoor"
+  rotate_kms_keys: ["site-root-kek", "tenant-wrapping-key"]
+  rotate_tls_certificates: ["control-plane", "ingress-gateway"]
+  expected_downtime_seconds: 120
+
+Save manifest to /tmp/rotation-manifest.yaml and compute SHA256: sha256sum /tmp/rotation-manifest.yaml > /tmp/rotation-manifest.sha256.
+
+C. Enter maintenance window and traffic fencing
+- Announce 15 minutes before maintenance to stakeholders.
+- Redirect traffic using local traffic-gating: curl -X POST http://local-proxy/admin/fence?site=site-eu-42 --header "Authorization: Bearer <operator-token>"
+- For critical tenants, enable failover routing to adjacent region using the operator CLI: rdbctl reroute-tenants --site site-eu-42 --targets site-eu-43 --tenants all
+
+D. HSM / KMS key rotation steps (offline ceremony)
+1) Take HSM to maintenance mode per vendor: hsmctl enter-maintenance --slot 0 --force.
+2) Export wrapped key blobs (existing KEK wrap) for archival: pkcs11-tool --read-object --label site-root-kek --type secret-key --token-label site-hsm > /tmp/site-root-kek.wrapped
+3) Generate new KEK (Key Encryption Key) inside the HSM to avoid plaintext exposure: pkcs11-tool --module /usr/lib/libhsm.so --keypairgen --label site-root-kek-v2 --key-type aes:256 --token-label rotation-token
+4) Wrap tenant keys with the new KEK atomically: rotctl wrap --in /var/lib/keys/tenant-keys.json --out /var/lib/keys/tenant-keys.wrapped --kek-label site-root-kek-v2
+5) Record sequence numbers and mapping to rotation manifest.
+
+E. TLS certificate renewal (control-plane and gateway)
+1) Generate CSRs locally using the operator-key stored in HSM: openssl req -new -key proc:pkcs11:object=operator-key -subj "/CN=control-plane.site-eu-42" -out control-plane.csr
+2) If there is an on-site CA appliance: submit CSR to local CA appliance via its offline UI and retrieve signed certs. For purely offline signatures, use a threshold-signer: threshold-sign --csr control-plane.csr --keyshare /mnt/keyshares --out control-plane.crt
+3) Update service manifests with new certificate SHA: sha256sum control-plane.crt | awk '{print $1}' > /etc/certs/control-plane.crt.sha256
+4) Perform a staged reload where possible: kubectl --kubeconfig=/etc/kube/site-kubeconfig set data secret/control-plane-certs --from-file=control-plane.crt --dry-run=client -o yaml | kubectl apply -f -
+
+F. Post-rotation validation (smoke and canary tests)
+- Service health checks (expected): 95% success on control-plane health endpoints for 10 minutes.
+- Latency threshold: 99th percentile token latency must not increase > 10% compared to rolling baseline.
+- Use built-in smoke harness: rotctl smoke --site site-eu-42 --tests control-plane,ingress --expected 95
+- If any test fails, immediately execute rollback below.
+
+Rollback and recovery
+- If HSM wrap step fails or wrapped blobs mismatch, fallback: restore previous wrapped blobs from /var/lib/keys/backup and restart services. Command: rotctl unwrap --in /var/lib/keys/backup/tenant-keys.wrapped --kek-label site-root-kek --out /var/lib/keys/tenant-keys.json
+- For TLS cert rollback: replace secret/control-plane-certs with prior version from k8s secret snapshot: kubectl apply -f /var/backups/secrets/control-plane-certs-pre-rotation.yaml
+- Notify remote security reviewer and document the incident with timestamps, operator IDs, and audio/video evidence.
+
+Evidence capture and audit trail
+- Mandatory artifacts to collect: rotation-manifest.yaml, manifest.sha256, HSM event log slice (vendor-exported), video of operator ceremony showing hardware serials, pkcs11-tool logs (redacted), signed acceptance from remote reviewer.
+- Evidence container structure (encrypt using operator-key):
+  evidence-bundle-<site>-<date>.tar.gz
+    |- rotation-manifest.yaml
+    |- manifest.sha256
+    |- hsm-eventlog.json
+    |- op-video.mp4 (hash recorded)
+    |- smoke-results.json
+    |- signatures/*.sig
+
+Testing and validation matrix (example)
+| Test | Target | Pass criteria | Recovery action |
+| --- | --- | --- | --- |
+| HSM slot probe | All physical HSMs | Probe returns SLOT_COUNT >= 1 | Escalate to vendor oncall |
+| Wrapped blob integrity | All tenant wrap files | SHA256 matches manifest | Restore from backup, revert wrap |
+| TLS handshake | Control-plane endpoint | TLS v1.3 handshake OK, cert chain valid | Rollback to previous cert secret |
+| Smoke inference | Inference gateway | 95% success, latency within 10% | Quiesce traffic, rollback keys |
+
+Operational considerations and safety nets
+- Staged rotations: rotate KEKs first, then tenant keys, then certificates to minimize the blast radius.
+- Maximum rotating window: 15 minutes for critical control-plane certificates; if exceeded, abort and rollback.
+- Parallelization: limit concurrent tenant rewraps to N=8 to keep operator workload manageable.
+- Retention: keep previous wrapped blobs for 30 days encrypted in the evidence store.
+
+CLI and example commands (abbreviated)
+- rotctl preflight --site site-eu-42 > /tmp/preflight.json
+- pkcs11-tool --module /usr/lib/libhsm.so --list-slots
+- openssl x509 -in control-plane.crt -text -noout
+- kubectl get secret control-plane-certs -o yaml > /var/backups/secrets/control-plane-certs-pre-rotation.yaml
+
+Change control checklist (must complete before closing change):
+1) Preflight report attached and reviewed.
+2) Evidence bundle uploaded to secure archive and checksum recorded in ticket.
+3) Remote security reviewer approval recorded (signed attestation).
+4) Post-rotation smoke results within thresholds.
+5) Post-mortem template created for any non-trivial issues.
+
+References and related documents:
+- Third-party KMS/HSM integration requirements (internal)
+- Airgap packaging and attestation playbook (onprem-packaging)
+- Incident response runbook for key compromise
+
+Appendix A — Quick decision matrix for emergency rotation:
+- Situation: customer reports suspected key compromise. Action: perform emergency rotation, do not wait for scheduled window. Use shortest path: generate KEK in HSM, perform tenant key rewrap using highest-priority tenants first, and notify legal.
+
+Appendix B — Template: rotation-manifest.yaml (full)
+site_id: "<site>"
+operator: "<operator>"
+start_time_utc: "<YYYY-MM-DDTHH:MM:SSZ>"
+rotate_kms_keys:
+  - name: "site-root-kek"
+    old_blob: "sha256:..."
+    new_label: "site-root-kek-v2"
+rotate_tls_certificates:
+  - name: "control-plane"
+    csr: "control-plane.csr"
+    cert: "control-plane.crt"
+expected_downtime_seconds: 120
+pre_checks: ["preflight", "backup_snapshots", "stakeholder_notify"]
+post_checks: ["smoke", "latency_regression", "evidence_uploaded"]
+
+Contact matrix:
+- Onsite Operator: +1-555-0101 (pager)
+- Remote Security Reviewer: security-reviewers@redwood.dev
+- Vendor HSM Support: support@hsm-vendor.example (oncall)
+
+Change history:
+- 2026-03-15: Initial draft by Aisha Kapoor
+- 2026-06-02: Added threshold signing section (Marco Lin)
+- 2026-10-02: Clarified evidence retention and added timeouts (Priya Desai)
+
+End of document.

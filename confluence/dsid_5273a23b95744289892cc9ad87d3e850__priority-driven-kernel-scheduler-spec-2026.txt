@@ -1,0 +1,139 @@
+Priority-Driven Kernel Scheduler: Design and Runbook
+
+Specification and operational runbook for the Priority-Driven Kernel Scheduler used by Redwood's serving runtime. Covers design rationale, scheduling algorithm, configuration knobs, SLO mappings, metric instrumentation, rollout steps, and incident mitigation playbooks for latency and throughput regressions.
+Purpose and scope
+
+This document defines the Priority-Driven Kernel Scheduler (PDKS) used in the Redwood serving runtime. It describes the design goals, algorithm, configuration surface, expected SLO behavior, and operational runbook for on-call engineers and release owners. The PDKS module is responsible for deciding kernel assignment, preemption, and batching windows for GPU workers (processes: rw-runtime-worker, rw-batching-proxy), and for enforcing tenant and model-level latency/throughput policies.
+
+Why a priority-driven scheduler?
+
+- Production goals: meet 95th/99th percentile latency SLOs for interactive (chat/generation) workloads while maintaining cost-efficient GPU utilization for background/throughput jobs (embeddings, bulk rerank).
+- Mixed workload environment: hosted API, Dedicated pools, and Private clusters all run on the same runtime binary; scheduling logic must support strict isolation for Dedicated pools and best-effort background work for shared pools.
+- Operational predictability: explicit priority tiers make rollback and mitigation simpler (e.g., throttle low-priority batching windows rather than kill running kernels).
+
+Design overview
+
+1) Priority tiers
+- P0 (latency-critical): interactive chat/generation requests with SLA/enterprise flags. High preemption weight, small batching windows (configurable min_batch = 1), KV cache locality pinned.
+- P1 (standard): normal API requests. Balanced batching and latency.
+- P2 (background): embeddings, bulk transforms, scheduled jobs. Large batching windows, throttled when P0/P1 backlog grows.
+- P3 (best-effort): offline jobs, non-critical re-runs. Lowest priority, allowed to be paused or migrated.
+
+2) Key scheduling primitives
+- Kernel assignment: map model_variant -> kernel_profile. The kernel selection subsystem consults a per-model kernel_profile table (see config table below) that includes preferred CUDA/cuBLAS/cuDNN kernels and quantized-code paths.
+- Preemption policy: preemptible=true on P1/P2/P3; P0 requests set preemptible=false. Preemption is implemented via checkpointing KV cache and fast context switch (10–30ms target).
+- Fairshare buckets: soft quotas per-customer and per-tenant to avoid noisy neighbor across P1/P2. Buckets are refilled every 60s.
+- Batching window adjustment: dynamic window adjusts between min_batch and max_batch based on measured inter-arrival time and current SLO pressure.
+
+3) Observability surface
+- Metrics emitted (Prometheus names):
+  - rw_scheduler_queue_length{priority}
+  - rw_scheduler_avg_batch_size{model,priority}
+  - rw_scheduler_preemptions_total{cause}
+  - rw_kernel_kernel_selection_latency_ms
+  - rw_scheduler_kernel_switch_latency_ms (target < 30 ms)
+  - rw_scheduler_gpu_occupancy_percent
+  - rw_scheduler_slo_violation_count{model,priority,percentile}
+
+4) SLO mapping and expected behavior
+- Interactive (P0): 99th percentile latency target <= 300 ms (local processing, small context lengths). When P0 backlog > 10% of worker queue, scheduler will: (a) reduce batching window to min_batch for affected workers, (b) throttle P2/P3 intake by 50%, (c) signal autoscaler with priority reason = "P0_backlog".
+- Standard (P1): 95th percentile latency <= 750 ms. If P1 SLO breaks, scheduler raises preemption aggressiveness for P2 and reduces P1 batching windows by up to 30%.
+- Background (P2): Throughput-oriented; no hard latency SLO, but throttled under pressure.
+
+Configuration reference (key knobs)
+
+| knob_name | default | description | safe_range | owner_service |
+|-----------|---------|-------------|------------|---------------|
+| min_batch_size | 1 | Minimum number of requests to form a kernel batch for a worker | 1–8 | rw-batching-proxy |
+| max_batch_size | 64 | Maximum allowed batch size per kernel invocation | 16–1024 | rw-batching-proxy |
+| preemption_grace_ms | 30 | Time allowed to checkpoint KV cache and context-switch | 10–200 | rw-runtime-worker |
+| fairshare_window_s | 60 | Seconds for fairshare refill | 30–600 | rw-scheduler-service |
+| p0_backlog_threshold_pct | 10 | Percent of queue backlog to trigger P0 emergency actions | 5–25 | rw-scheduler-service |
+| dynamic_batch_alpha | 0.6 | Weight for exponential smoothing on batch size calc | 0.1–0.95 | rw-batching-proxy |
+
+Kernel selection table (example snippet)
+
+- Model family: llama2-70b
+  - preferred_kernel: fused_attention_v3
+  - quantized_profile: q4_0 (fast_path=true)
+  - recommended_max_seq: 4096
+- Model family: mosaic-1b
+  - preferred_kernel: attention_split_kv
+  - quantized_profile: q5_1 (fast_path=false)
+  - recommended_max_seq: 2048
+
+Operational runbook: alerts and first actions
+
+Triggering alerts (examples):
+1) ALERT: rw_scheduler_slo_violation_count{priority="P0",percentile="99"} > 0 for 3m
+2) ALERT: rw_scheduler_gpu_occupancy_percent < 25% for 10m (possible kernel contention or driver issue)
+3) ALERT: rw_scheduler_preemptions_total increased by > 5x in 5m window
+
+First-response checklist (page owner: runtime-oncall)
+1) Acknowledge pager; post to #runtime-ops with alert details and diagnostics link.
+2) Run quick health queries (Grafana):
+   - Check rw_scheduler_queue_length by priority and model
+   - Check rw_scheduler_avg_batch_size and GPU occupancy per node
+3) If P0 SLO violated:
+   - Execute emergency throttle: curl -X POST https://ops-api.internal/v1/scheduler/adjust -d '{"action":"throttle","priorities":["P2","P3"],"factor":0.5}'
+   - Scale up Dedicated capacity: run infra script: ./tools/scale_pool --pool=dedicated-default --delta=+2 --reason="P0_slo_emergency"
+   - If preemptions spiking, check kernel_switch_latency_ms: if > 150ms, escalate to infra and GPU-firmware teams.
+4) If GPU occupancy low across nodes: check driver logs (/var/log/nvidia-installer.log) and dmesg for ECC/PCIe errors; consider node drain and GC.
+
+Mitigation flows (detailed)
+
+- Flow A: Temporary P2 suspension
+  1. Verify backlog levels and confirm P0 impact.
+  2. Use operator API to set intake_allowed=false for tags matching background_jobs for 15m.
+  3. Monitor P0 latency; when 99p returns to target for 5 minutes, re-enable intake at 50% and ramp.
+
+- Flow B: Kernel-path fallback
+  1. If kernel_selection_latency_ms spikes and model fails to launch optimized kernel, fallback to generic_kernel for affected model_variant via: curl -X POST https://ops-api.internal/v1/kernel/fallback -d '{"model":"<model_variant>","to":"generic_kernel"}'
+  2. Notify model-onboarding and performance teams to triage kernel build.
+
+Rollout checklist for changes to scheduler (release owner required)
+1) Design review completed and reviewers signed off.
+2) Unit and integration tests in CI: scheduler unit tests, simulated traffic harness with P0/P1/P2 mixes.
+3) Canary deploy to a single Dedicated pool (tag: canary-scheduler-1) with traffic split 1% for 24 hours.
+4) Run perf harness: ./tools/perf-harness --profile=interactive-heavy --duration=30m and validate rw_scheduler_* metrics.
+5) Gradual ramp: 5% -> 20% -> 50% -> 100% across non-critical pools over 48–72h with rollback gates after each step.
+
+Troubleshooting examples (commands)
+- Inspect per-worker queue: curl -s http://localhost:6060/debug/queues | jq '.'
+- Force a kernel-selection dry run: curl -X POST http://localhost:6060/debug/kernel_dryrun -d '{"model":"llama2-70b","sequence_length":1024}'
+- Dump KV cache stats: docker exec -it rw-worker /bin/sh -c 'rw-kvtool stats --format=json'
+
+Testing and benchmarking guidance
+
+- Use the benchmarking suite job-profile: interactive-p0-random (available in perf repo). Key expectations: 99p latency for small context (<= 512 tokens) should be within 300ms with P0 traffic at 20 rps per worker.
+- Synthetic stress tests: mix P0 at 10rps, P1 at 50rps and P2 batch jobs to saturate GPU memory. Verify preemption triggers and kernel_switch_latency_ms under 30ms.
+
+Known limitations and future work
+
+- Checkpoint cost: KV cache checkpointing can exceed preemption_grace_ms for very large contexts (>= 32K). Future: incremental checkpointing and CRDT-style partial restore.
+- Multi-GPU scheduling: current algorithm optimizes per-GPU workers independently and has suboptimal cross-GPU placement for large model sharding. Future: global placement optimizer with communication-cost model.
+- Heterogeneous hardware: CPU fallback paths for quantized kernels are immature; expect 2x latency when falling back to CPU.
+
+Appendices
+
+A. Glossary
+- KV cache: key-value attention cache used to accelerate autoregressive decoding.
+- Kernel profile: pre-built binary path and launch config for a model variant.
+- Preemption grace: configured time budget to serialize and checkpoint in-flight state.
+
+B. Ownership and contacts
+- Runtime scheduler service: Kevin O'Neill (kevin.oneill@redwood.ai)
+- Serving runtime oncall: runtime-oncall rotation (see team-wiki page)
+- Kernel builds & infra: Marco Ruiz (marco.ruiz@redwood.ai)
+
+C. Related docs
+- runtime-architecture: high-level runtime architecture and RPC flow
+- profiling-playbook: how to collect traces for kernel and batching latency
+- throughput-latency-workload-catalog-2026: canonical workloads used by the perf team
+
+Document history
+- 2025-11-03: Draft created (Emily Chen)
+- 2025-12-10: Added preemption flow examples (Marco Ruiz)
+- 2026-02-10: Expanded rollout checklist and added CLI commands (Emily Chen)
+
+If anything in this runbook is unclear or you need privileged access to execute any of the mitigation steps, contact runtime-oncall or the owning engineers listed in section B.

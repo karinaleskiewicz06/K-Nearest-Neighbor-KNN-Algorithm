@@ -1,0 +1,204 @@
+Operator live-trace collection and rollback playbook
+
+Summary
+
+This runbook describes the on-call operator workflow for collecting live inferences traces (live-traces), extracting high-fidelity kernel/dispatch telemetry, performing a safe canary or full rollback of runtime/kernel changes, and verifying SLA preservation. It is intended for SREs and runtime engineers running live incidents where a kernel, scheduler, or runtime rollout is suspected of degrading latency, throughput, or correctness.
+
+Scope
+
+- Applies to the production inference runtime (service: inference-runtime-v2) across Hosted and Dedicated clusters.
+- Covers: live-trace capture, short-term retention, signal triage, automated rollback criteria, manual rollback steps, verification, and post-incident actions.
+- Does NOT cover model artifact rollbacks or customer data access procedures. See the release gating doc for those flows.
+
+Ownership and escalation
+
+- Primary owner: eng-serving-runtime oncall (team roster: runtime-sre@redwood.com).
+- Fallback: runtime-core engineers (runtime-core@redwood.com).
+- Pager escalation: follow the oncall rotation. If SLA impact > 5% error budget within 30m, notify on-call manager and SRE lead.
+
+Signals / When to run this playbook
+
+Run this playbook when one or more of the following are observed:
+
+- Tail P99 latency for text.generate or chat.stream exceeds baseline by > 40% for 10+ minutes.
+- Error rate (5xx or RPC timeouts) increases above 0.5% absolute and persists 5+ minutes.
+- Sudden spike in kernel-level timeouts or NVLink retransmits reported by kernel telemetry.
+- Canary or experimental rollout shows divergent latency/cost compared to control group.
+
+Prerequisites and quick checks
+
+- Ensure you have kube and opscli access: kube-context with cluster-admin and opscli >= v1.12.
+- Confirm active trace retention window: default retention for live-traces is 2 hours. If the incident is older, check archived trace store (s3://redwood-runtime-traces/archived).
+- Check current rollout state: opscli rollout status inference-runtime-v2 --environment=prod
+- Confirm SLOs: generation P95 < 200ms, P99 < 850ms, error rate < 0.5%.
+
+Step A — Rapid triage: collect lightweight indicators (0–5 minutes)
+
+1) Pull high-level SLO metrics and recent deployment metadata:
+
+- Grafana panels: inference/slo-overview-prod, kernel/dispatch-health, scheduler/admission-rate.
+- CLI queries (examples):
+  - opscli metrics query "sum(rate(inference_generation_latency_ms_p99[5m]))" --env=prod
+  - kubectl -n runtime get pods -l app=inference-runtime-v2 -o wide
+
+2) Identify suspect deployment(s) and kernel artifact versions:
+
+- opscli rollout list --service=inference-runtime-v2 --env=prod
+- If a kernel or runtime image was deployed in the last 30–120 minutes, note the image tag and rollout id.
+
+3) Open a live incident channel and annotate: #inc-runtime-prod and add the rollout id, observed metric deltas, and time window.
+
+Step B — Live-trace capture (5–30 minutes)
+
+Goal: capture a set of 200–500 representative trace samples covering slow tails and error cases. Keep captures focused to reduce overhead.
+
+1) Select 2–3 representative frontends or routes (e.g., /v1/generate, /v1/chat/stream).
+2) Use the trace capture command to start an on-host sampler:
+
+- opscli trace start --service inference-runtime-v2 --routes "/v1/generate,/v1/chat/stream" --duration 30m --sampler=error-first --max-samples 500 --label incident=<INCIDENT_ID>
+
+3) For immediate collection (when rollout is live), prefer error-first sampling to ensure tokenization/kernel failures are captured. For tail-latency troubleshooting, use tail-latency sampler: --sampler=latency-tail --threshold-ms=500.
+
+4) Monitor capture progress and backpressure:
+
+- opscli trace status <trace-id>
+- If capture fails due to agent overload, reduce duration to 10m and retry.
+
+5) After capture completes, snapshot raw trace bundle to archive for triage:
+
+- opscli trace export <trace-id> --dest s3://redwood-runtime-traces/incidents/<INCIDENT_ID>/raw.zip
+
+Step C — Signal enrichment and quick attribution (30–90 minutes)
+
+1) Enrich traces with kernel and scheduler telemetry (automatic for live-traces). Use the trace viewer filters:
+
+- Kernel step durations: kernel.exec_ms, kernel.kv_lookup_ms, kernel.copy_ms
+- Scheduling signals: scheduler.queue_ms, admission.rejected_count, preempt.count
+
+2) Run the quick attribution queries (examples):
+
+- opscli trace query --trace-id <trace-id> --filter "kernel.exec_ms > 200" --aggregate "count(),p99(kernel.exec_ms)"
+- jq filter for trace bundle: jq '.spans[] | select(.tags.kernel_exec_ms>200) | {pod:.host, span:.name, t:.duration_ms}' traces.json
+
+3) Look for these common failure modes:
+
+- Kernel regression: p99 kernel.exec_ms increased while scheduling queue_ms stays stable.
+- Admission/backpressure: admission.rejected_count spike, long scheduler.queue_ms leading to timeout.
+- KV-cache hot miss storm: many large kv_lookup_ms peaks correlated with model switching.
+
+Decision point: do we rollback?
+
+Rollback is recommended when:
+
+- A deterministic regression is attributed to a specific kernel or runtime image AND
+- The regression meets business impact thresholds (P99 > 40% above baseline or error delta > 0.3% absolute for 15+ minutes) OR
+- Canary group divergence > 25% on cost/latency and automated rollback policy (canary-fidelity-policy) tripped.
+
+Step D — Automated canary rollback (safe, fast)
+
+If the rollout was governed by opscli and automatic canary policies are enabled, trigger the automated rollback first so the system can restore traffic gradually:
+
+- opscli rollout abort --rollout-id <id> --reason "auto-rollback: runtime P99 regression"
+
+Verify progress: opscli rollout status <id> should show traffic shifting back to previous replica set. Monitor SLOs for 5–20 minutes after rollback completion.
+
+Step E — Manual rollback (when automated path is not available or failed)
+
+1) Pre-rollback checks:
+
+- Ensure the prior image is available in registry: docker pull registry.redwood.com/runtime:<previous-tag>
+- Confirm db/config compatibility for hot rollback (consult runtime-hot-compat-list).
+
+2) Manual rollback via opscli (preferred):
+
+- opscli rollout promote --service inference-runtime-v2 --image registry.redwood.com/runtime:<previous-tag> --env prod --strategy=rolling --max-unavailable=1 --max-surge=1 --annotate "rollback:incident=<INCIDENT_ID>"
+
+3) K8s direct rollback (only if opscli path unavailable):
+
+- kubectl -n runtime set image deploy/inference-runtime-v2 inference-runtime=registry.redwood.com/runtime:<previous-tag>
+- kubectl -n runtime rollout status deploy/inference-runtime-v2 --timeout=10m
+
+4) If the rollback cannot complete due to image pull or resource constraints, follow the escalation steps:
+  - Open a high-priority ticket to infra-ops and ping #infra-urgent. Include deployment error logs and node pressure reports.
+
+Step F — Verification and validation (5–30 minutes)
+
+1) Immediate checks (0–5 minutes after new pods become Ready):
+
+- smoke: run integration smoke suite against canary endpoints (smoke-cli run runtime/basic-smoke --env=prod --sample=20)
+- sanity logs: kubectl -n runtime logs -l app=inference-runtime-v2 --tail=200 | grep -i error | head -n 50
+
+2) SLO and telemetry validation (5–30 minutes):
+
+- Confirm P95/P99 and error rate trending back to baseline via Grafana.
+- Verify kernel metrics: kernel.exec_ms p99 reduced to baseline.
+- Validate admission queue and preemption counters normalized.
+
+3) If metrics do not stabilize after rollback, revert the rollback and trigger deep investigation with runtime-core (see Post-incident actions).
+
+Step G — Post-incident actions
+
+1) Record incident timeline and actions in the incident tracker; attach trace bundle and opscli logs.
+2) Create an action item to run replay experiments against the archived trace set in the lab environment (lab replay tag: incident-<INCIDENT_ID>-replay).
+3) If rollback was caused by a kernel change, schedule a kernel-stage regression hunt: owner runtime-kernel-team, priority P1, due within 3 business days.
+
+Configuration reference (threshold table)
+
+- Metric | Alert threshold | Operator action
+- P99 latency (generation) | > 40% baseline for 10m | Run this playbook, collect traces, consider rollback
+- Error rate (5xx) | > 0.5% absolute for 5m | Collect traces, check canary, consider rollback
+- Admission rejects | > 1000/min | Inspect scheduler, consider capacity adjustments
+- Kernel exec p99 | > 200 ms 
+
+Quick commands and parsable examples
+
+- List recent rollouts:
+  - opscli rollout list --service inference-runtime-v2 --limit 10 --env=prod
+- Start trace capture (JSON example):
+  - opscli trace start --json '{"service":"inference-runtime-v2","routes":["/v1/generate"],"duration_mins":20,"sampler":"latency-tail","max_samples":300,"label":"incident-1234"}'
+- Export and unzip traces locally:
+  - aws s3 cp s3://redwood-runtime-traces/incidents/incident-1234/raw.zip ./ && unzip raw.zip
+
+Known limitations and safety notes
+
+- Live trace captures produce additional overhead on runtime pods; prefer short captures and avoid simultaneous capture on all nodes.
+- Rollback does not revert model artifacts; ensure model compatibility with previous runtime.
+- For multi-region incidents, rollback by region to limit blast radius.
+
+Verification checklist to close the incident (all items required)
+
+- [ ] Trace bundle captured and archived (s3 path noted)
+- [ ] Rollback (automated or manual) executed if criteria met
+- [ ] SLO metrics returned to baseline for 30 minutes or incident escalated
+- [ ] Incident channel annotated with rollout id and action history
+- [ ] Post-incident replay scheduled and owner assigned
+
+Appendix: helpful queries and field definitions
+
+- kernel.exec_ms: time spent executing kernel compute (ms)
+- kernel.kv_lookup_ms: average per-request KV cache lookup time (ms)
+- scheduler.queue_ms: time spent waiting for slot assignment (ms)
+- admission.rejected_count: count of requests rejected by admission controller
+
+- Example Kibana/Kusto query for tail traces:
+  - "service:inference-runtime-v2 AND span.duration_ms:>400" | sort by @timestamp desc | limit 500
+
+- Artifact registry locations: registry.redwood.com/runtime:<tag> and registry.redwood.com/kernel:<tag>
+
+Related reading
+
+- Runtime rollout and canary policy (link): /confluence/eng-serving-runtime/runtime-architecture/runtime-feature-flagging-experimentation-contract-2026
+- Trace format and viewer guide (link): /confluence/eng-serving-runtime/team-wiki/trace-viewer-and-format-spec-2026
+
+Contact matrix
+
+- Runtime SRE oncall: runtime-sre@redwood.com
+- Runtime kernel team: runtime-kernel@redwood.com
+- Infra ops: infra-ops@redwood.com
+
+Document history
+
+- Created by Lena Ortiz 2026-11-12
+- Reviewed by Arjun Rao and Priya Singh 2026-12-03
+- Updated to include automated canary commands and verification checklist 2027-02-03
+

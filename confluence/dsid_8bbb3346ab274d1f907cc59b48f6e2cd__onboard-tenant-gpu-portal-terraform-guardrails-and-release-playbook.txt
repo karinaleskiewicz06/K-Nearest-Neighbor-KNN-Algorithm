@@ -1,0 +1,159 @@
+Onboard tenant GPU portal — Terraform guardrails, network controls, and CI/CD release playbook
+
+Summary:
+This playbook documents the self-service tenant GPU onboarding portal and the associated Terraform modules, network guardrails, CI/CD release process, and operational runbooks. The aim is to enable product teams to onboard GPU tenancy with automated safety checks, predictable network egress controls, and a tested release/rollback pipeline while preserving capacity and cost signals for infra.
+
+Audience:
+- Infra engineers owning tenant allocation and network guardrails
+- Platform/product teams building tenant self-service flows
+- SRE/oncall teams who operate GPU pools
+
+Scope:
+- Terraform module contract for tenant GPU envelope (VPC, subnet, SGs, IAM/service accounts)
+- Network egress / NAT and peering guardrails and per-tenant sharding options
+- CI/CD pipelines for module promotion + golden image promotion for GPU images
+- Preflight checks, canary rollout rules, and rollback procedures
+- Day-2 runbook for capacity, egress, and certificate/SA rotation issues
+
+Design overview (text diagram):
+- Self-service portal (internal) calls Platform API -> Terraform Runner (CI job) -> applies tenant module into tenant-account (or tenant namespace)
+- On apply success: control-plane labels tenant in capacity allocator; network policies and egress fencing applied via dynamic NAT gateway mapping
+- Canary step: allocate 1 fractional GPU pod from warm-pool before full quota assignment
+
+Key principles:
+- Least privilege by default: network and IAM are tightly scoped to tenant resources.
+- Fail-fast preflight: disallow applies if cost/quota or network policy checks fail.
+- Observable and reversible: every apply produces a change-event with plan artifact, diffs stored in artifact store.
+- Shard-aware: assignments use tenant-shard keys to balance thermal and preemption risk across pools.
+
+Owner & contacts:
+- Primary: eng-infra:gpu-capacity (paging)
+- Secondary: eng-infra:cloud-networking
+- Product integrator contact: onboarding@redwood.dev
+
+Prerequisites (what the tenant portal must present):
+1) Tenant ID and account owner contact
+2) Workload profile: bursty/steady, latency-sensitivity (low/med/high), preempt-tolerance (yes/no)
+3) Desired max fractional GPUs and billing center tag
+4) Network needs: public egress allowed? (yes/no), required CIDR peering endpoints
+
+Terraform module contract (public inputs):
+Table: (written as plain text for confluence)
+- module variable: tenant_id — string — unique tenant slug used for tagging and shard-keying
+- variable: billing_tag — string — cost center tag (required)
+- variable: workload_profile — string (bursty|steady|low-latency) — affects warm-pool vs dedicated placement
+- variable: max_fractional_gpus — number — max requested fractional GPUs for this tenant
+- variable: allow_public_egress — bool — if true, egress must be explicitly gated via NAT mapping and egress policies
+- variable: peering_endpoints — list(string) — optional VPN/peering endpoints to whitelist
+
+Outputs (contract):
+- output: tenant_network_id — string — VPC/subnet identifier
+- output: tenant_service_account_email — string — SA for workloads
+- output: assigned_shard_key — string — shard id for capacity routing
+
+Sample Terraform usage snippet (example):
+```
+module "tenant_gpu_env" {
+  source = "git::https://git.internal.redwood/terraform/tenant-gpu-env.git//modules/tenant-env"
+  tenant_id = "acme-corp"
+  billing_tag = "acme-prod"
+  workload_profile = "low-latency"
+  max_fractional_gpus = 4
+  allow_public_egress = false
+  peering_endpoints = ["10.2.5.0/24"]
+}
+```
+
+Network guardrails and egress model:
+- Default model: tenant workloads egress through per-shard NAT gateways with egress ACLs tied to tenant_service_account and allowlist.
+- Egress fencing: allow_public_egress=false routes tenant through a restricted egress cluster that terminates outbound to a proxy layer (TLS-inspecting egress proxy where required).
+- Static peering for low-latency tenants: module creates BGP/privatelink peering entries (automated via Terraform) but requires a manual approval step for the peering endpoint in the tenancy security gate.
+- Per-tenant SNAT IP mapping: Persisted in the module outputs; ops uses this to reconcile firewall rules for customer integrations.
+
+Shard assignment and capacity allocation algorithm (high level):
+- Shard keys are computed from tenant_id via stable hashing to N shards where N is warm-pool count (default 32).
+- Placement policy uses workload_profile to bias towards dedicated nodes for low-latency and burst-tolerant pools for batch workloads.
+- Autoscaler is signaled to reserve fractional capacity at onboarding time: default reserve = min(2, max_fractional_gpus) for low-latency tenants.
+
+CI/CD promotion pipeline (Terraform modules + GPU image):
+1) Developer pushes module change -> CI validates fmt, tfsec, unit tests for templates.
+2) Plan job runs against a staging tenant-account (immutable sandbox).
+3) Integration tests: full apply + smoke-run of kube manifest that deploys a small GPU workload validating nvml/kernel driver compatibility.
+4) If tests pass, the pipeline creates a promotion PR to the module registry branch (tagging with semver).
+5) Release workflow then promotes module to the global-managed registry and creates a release artifact (plan.json, tfstate drift snapshot).
+6) Golden-image pipeline for GPU runtime images follows a separate promotion (image -> signed digest -> canary -> global roll).
+
+Sample CI YAML (abbreviated):
+```
+jobs:
+  - name: terraform-plan-stage
+    steps:
+      - run: tfenv install 1.5.6 && terraform init
+      - run: terraform validate && terraform plan -out=plan.tfplan
+  - name: integration-apply
+    steps:
+      - run: terraform apply -auto-approve plan.tfplan
+      - run: ./scripts/smoke_gpu_workload_test.sh --kube-context staging
+```
+
+Preflight checks (pipeline gating rules):
+- Cost guardrail: requested max_fractional_gpus must not exceed tenant-class quota; total across tenants in shard must remain under thermal fill threshold (80%).
+- Network guardrail: if allow_public_egress=true, require security approval ticket; otherwise auto-fail if egress policies would expose unrestricted outbound.
+- Image compatibility: runtime image digest must be listed in the approved GPU-image registry for selected cluster kernel version.
+
+Canary & rollout rules:
+- Canary allocation: allocate one fractional GPU pod instance in the shard for 4 hours. Monitor GPU metrics: memory errors, GPU driver crashes, nvml failures, and latency percentiles (p50/p95 token-serving).
+- Canary success criteria: no driver crashes, p95 latency within 1.5x baseline, no unexplained OOMs.
+- On success, full quota is assigned and tenant marked Active.
+
+Rollback guidance:
+- If onboarding fails during apply: the CI job runs terraform destroy on the partial resources and raises a ticket with the plan artifact to infra owners.
+- If canary detects high error rate: automatic throttle reduces assigned_fractional_gpus to 0 and leaves network/NAT resources intact. A rollback create-ticket runbook triggers incident oncall.
+
+Day-2 runbook (incident triage steps):
+1) Symptom: tenant reports inability to reach external API (egress failure).
+   - Check: tenant_network_id and per-tenant SNAT mapping in the module outputs.
+   - Verify: NAT gateway health dashboards, route tables, and Cloud NAT logs for dropped connections.
+   - Mitigation: if NAT exhausted, increase ephemeral NAT capacity for shard and notify tenant.
+2) Symptom: sudden GPU driver failures on tenant workload.
+   - Check: node-level GPU driver logs, kernel versions, and kube-device-plugin logs. Correlate with recent kernel/driver rollouts.
+   - Mitigation: cordon nodes in affected shard, drain workloads to warm-pool nodes with verified driver versions, rollback image if new image was promoted.
+3) Symptom: unauthorized outbound to an external CIDR detected.
+   - Check: egress proxy logs, tenant SA usage, and iptables mappings.
+   - Mitigation: flip the egress fence to block mode for the tenant (automated policy toggle) and open investigation with security team.
+
+SLOs and metrics to monitor (dashboard primitives):
+- Onboarding success rate: 99% of self-service onboarding completes within 2 hours.
+- Canary stability: 99.5% of canaries remain healthy for 4h.
+- Egress policy enforcement: 100% of tenants with allow_public_egress=false must have traffic routed through egress-proxy.
+- Capacity allocation latency: 95th percentile time to reserve fractional GPUs <= 10 minutes after approval.
+
+Operational run cadence:
+- Weekly capacity runbook review: review shard utilization heatmap and re-shard keys if >70% shards exceed 85% thermal usage.
+- Monthly security review: audit peering approvals and NAT IP allocations.
+- Postmortem: any onboarding failure that causes >30m customer impact triggers a blameless postmortem with remedial actions recorded.
+
+Maintenance and drift detection:
+- Terraform plan diffs are stored as artifacts and scanned weekly for drift between registry-managed modules and tenant state.
+- A scheduled job reconciles per-tenant NAT mappings and flags any SNAT IP reuse conflicts.
+
+Checklist for product teams (before enabling self-service):
+- Provide workload profile and billing_tag.
+- Confirm approved egress destinations or accept egress-proxy routing.
+- Test with staging tenant (use provided staging_quotas).
+- Sign off on surfaced plan.json and cost estimate.
+
+Appendix: Useful commands and helpers
+- Fetch module plan artifact: curl -H "Authorization: Bearer $TOKEN" https://artifact-store.internal/plan/{plan-id}
+- Re-run canary test on a shard: ./scripts/retrigger_canary.sh --shard=shard-12 --tenant=acme-corp
+- Quick NAT exhaustion check (gcloud example): gcloud compute routers get-status ROUTER_NAME --region REGION
+
+Related pages and artifacts:
+- Terraform module repo: git::https://git.internal.redwood/terraform/tenant-gpu-env.git
+- Golden GPU image registry: registry.internal.redwood/gpu-runtime
+- Capacity allocator metrics: dashboards/capacity-allocator/shard-heatmap
+
+Revision history:
+- 2024-07-10: Initial draft by Mariana Costa
+- 2024-10-02: Added shard assignment algorithm details and preflight constraints (reviewed by James Patel)
+- 2025-01-18: CI/CD promotion workflow clarified; added daily run cadence and canary gating thresholds (reviewed by Rita Huang)

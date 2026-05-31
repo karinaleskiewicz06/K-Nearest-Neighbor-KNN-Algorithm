@@ -1,0 +1,152 @@
+infrastructure-resilience-for-spot-and-burst-workloads
+
+Title: Infrastructure resilience for spot and burst workloads
+Space: eng-infra
+Author: Aisha Patel
+Owner team: engineering
+Status: published
+Last updated: 2025-01-18
+
+Summary:
+This runbook describes operational patterns, IaC guardrails, telemetry thresholds, and on-call play procedures for Redwood clusters that use preemptible/spot GPU instances, burst credit pools, and multi-account egress sharding. The goal is to maintain customer-facing SLOs (p99 latency, throughput per tenant, and tail error rates) during burst and preemption events while minimizing cost.
+
+Scope and audience:
+- Applies to: GPU fleet pools (ephemeral and warm), burst credit orchestrator, tenant egress shapers, autoscalers, and relevant Terraform modules.
+- Intended audience: oncall infra, SREs, platform engineers responsible for autoscaler/IaC, and release engineers managing CD pipelines.
+
+Key SLAs and thresholds (operational targets):
+- Customer-facing SLOs: 99th percentile latency under P95 target for interactive workloads: 300ms token-step (hosted API)
+- Warm-pool hit-rate target: >= 85% for dedicated tenants during business hours
+- Preemption-induced error budget burn ceiling: 2% of error budget per 24h window (escalate if exceeded)
+- Egress saturation alarm threshold: NAT average utilization > 70% for 5m or > 90% for 1m
+
+Ownership and escalation path:
+- Primary owner: infra/gpu-fleet team
+- Secondary owner: infra/networking team (egress shaping & NATs)
+- Pager rotation: infra-oncall -> infra-sre (see Oncall rota)
+- Escalation: If incident not acknowledged in 5 minutes, page team lead and Platform eng manager. If SLO breach projected for >1h, page Director of Infra.
+
+Failure modes covered:
+1) Spot preemption storm (many VMs preempted in short window)
+2) Warm-pool depletion causing large cold-start latencies
+3) Autoscaler thrash or stuck scale-up (API or IAM permission issues)
+4) Egress NAT saturation / path failover causing healthy requests to drop
+5) CI/CD accidental IaC drift causing incorrect instance types or ASG sizes
+
+Quick detection (telemetry / alerts):
+- Spot preemption storm: cloud-metadata events spike + kernel reserve churn metric > 500 instances / 5m
+- Warm-pool depletion: warm_pool_fill_rate < 0.6 for 10m AND cold_start_latency_p95 > 2s
+- Autoscaler stuck: scaling_lag > configured target (e.g., desired - actual > 3 nodes for 10m)
+- Egress saturation: nat_utilization_5m > 0.7 OR increased 5xx across tenants with egress tag
+
+Play: Spot preemption storm (step-by-step)
+1) Acknowledge the page and open the incident channel (inc/spot-preempt-YYYYMMDD).
+2) Run immediate triage commands:
+   - List affected ASGs/pools: curl -s "https://infra-metadata/api/v1/pools?state=preempting" | jq .
+   - Check warm-pool capacity: redis-cli -h warmpool-cache.hq "HGETALL warmpool:status"
+   - Identify hot tenants: query telemetry: SELECT tenant, count(*) FROM requests WHERE outcome IN ("preempted","failed") GROUP BY tenant LIMIT 20
+3) If warm-pool_fill_rate is low: trigger emergency warm-pool top-up: runbook tool command:
+   - rwpctl topup --pool {pool-name} --count 20 --reason "preempt-storm"
+   - Note: topup will allocate on-demand fallbacks and mark warmed images with tag emergency_topup=true (TTL 4h).
+4) If preemptions continue and on-demand capacity exhausted: enable quota fallback routing by flipping runtime route policy:
+   - api patch /routing/policies/{policy} -d '{"fallback_mode":"lower-capacity-safe","max_qps_per_tenant":50}'
+5) If error budget burn > 2% in 24h or SLO breach imminent: declare Sev2 and page product/SRE leads. Begin mitigation timeline and customer comms.
+6) Start a preempt-event audit: gather provider event IDs, instance IDs, and terraform plan diffs.
+
+Play: Warm-pool depletion causing cold starts
+1) Verify warm-pool agent health: systemctl status warmpool-agent on orchestration host.
+2) If agent crashed: try restart: sudo systemctl restart warmpool-agent; monitor logs: journalctl -u warmpool-agent -f --lines=200
+3) If automatic reconstruction fails, run manual reconcile: terraform apply -var="warmpool_count=desired" --target=module.warmpool --auto-approve (see safety checklist below).
+4) Safety checklist before manual IaC ops:
+   - Confirm plan changes with at least one reviewer (via GitHub PR)
+   - Ensure cost-center tag applied to created nodes (tag: "burst-incident")
+   - Notify SRE oncall and set maintenance-window flag in telemetry to suppress non-actionable alerts
+
+Runbook: Autoscaler stuck / IAM permission errors
+- Symptom: desired nodes are increasing but actual nodes remain unchanged; autoscaler error log contains 403 / AccessDenied for instance creation.
+Steps:
+1) Check autoscaler logs: kubectl -n infra logs deployment/autoscaler --since=15m | grep -i error
+2) Verify STS role mapping and IAM: aws sts get-caller-identity; compare with expected role in secrets manager path: /infra/autoscaler/role-arn
+3) If IAM drift: rotate temporary credentials and re-run reconciler: terraform apply -target=module.autoscaler-iam --auto-approve
+4) If underlying quota exceeded (API limit): open cloud ticket for quota bump and enable temporary burst to alternate region (see Cross-region fallback section).
+
+Network failure: NAT / egress saturation play
+- Detection: NAT pool 5xx rate climbing, per-tenant latency spikes, and nat_utilization > 0.9 for >1m
+Mitigation steps:
+1) Divert non-critical tenants to degraded egress path: rroute set --egress-shard alternate-egress-1 --label "degraded-path" --filter "tenant in (dev, internal)"
+2) Enable traffic shaping for high-bandwidth tenants: echo "shard:egress-a
+qps_limit:5000" | kubectl apply -f -
+3) If NAT instance is unresponsive: scale NAT fleet: terraform apply -var='nat_count=3' --target=module.nat-fleet --auto-approve (follow IaC safety checklist)
+4) For cross-account bursting: confirm peering routes and transit-gateway attachments via infra-admin: ./network-check --validate-peering --region us-west-2
+
+CI/CD and IaC guardrails (preventative):
+- Mandatory PR checks for terraform modules: plan must be reviewed by two approvers if change affects module variables marked as "prod-impact".
+- Implement "dry-run canaries": every merge to main triggers a non-prod apply in ephemeral env for 15 minutes and auto-rolls back (pipeline step name: "terraform-canary-apply").
+- Enforce policy-as-code with OPA: any module that increases warmpool_count > 50 triggers a warning and requires a security override.
+
+Terraform safety checklist (use before any manual apply during incident):
+| Step | Command / Check | Required action |
+|------|------------------|-----------------|
+| 1 | git status | Ensure clean tree and branch off incident-YYYYMMDD |
+| 2 | terraform plan -out=plan.tfplan | Save plan and attach to incident channel |
+| 3 | terraform show -json plan.tfplan > plan.json | Optional: upload plan.json to secure artifact store |
+| 4 | Review cost impact | Attach cost estimate from cost-modeler tool |
+| 5 | Apply with target | terraform apply -target=module.warmpool --auto-approve |
+| 6 | Post-apply smoke tests | curl -s https://health-check/pool/{pool}/status | grep OK |
+
+Post-incident checklist and required artifacts (for postmortem):
+- Attach: provider event logs, terraform plans and diffs, warm-pool audit entries, autoscaler logs, and decision timeline.
+- Owner: the oncall who executed manual steps must file a postmortem within 72 hours. Include root cause, contributing factors, and three actionable remediation items with owners and deadlines.
+
+Automation recommendations (longer-term):
+- Implement preemptive capacity hedging algorithm in burst orchestrator: allocate small steady-state on-demand fraction (e.g., 5%) when preemption rate trend > 0.8
+- Add predictive warm-pool seeding based on scheduled calendar events and tenant QPS forecasts (CRON + ML predictor job).
+- Integrate provider preemption stream into our alerting with weighted scoring so we only trigger top-up when combined preemption score > 0.7.
+
+Example IaC snippet (emergency topup module usage):
+```hcl
+module "warmpool_emergency_topup" {
+  source = "git::ssh://git@github.com/redwood-infra/terraform-modules.git//warmpool?ref=emergency-topup-v1"
+  pool_name = var.pool_name
+  count     = 20
+  tags = {
+    incident = "preempt-storm-20250118"
+  }
+}
+```
+
+Safety notes and operational constraints:
+- Never increase warmpool_count without tagging cost center and recording justification in the incident channel.
+- Avoid changing instance AMIs or kernel settings during an active incident; prefer node replacement with identical image unless explicit rollback plan exists.
+- All manual cloud console operations MUST be recorded (screenshot or short blurb) in the incident timeline.
+
+Telemetry and dashboards to monitor (recommendations):
+- Warm pool dashboard: warm_pool_fill_rate, pool_replenish_rate, cold_start_latency_p95, topup_count
+- Preemption dashboard: preempt_event_rate (1m/5m), provider_event_ids, instance_lifetime_histogram
+- Autoscaler dashboard: desired_vs_actual_nodes, scaling_lag, create_failure_rate
+- Network dashboard: nat_utilization, per-tenant_egress_qps, egress_5xx_rate
+
+Postmortem template (required fields):
+1) Incident summary (TL;DR)
+2) Timeline with timestamps and actor notes
+3) Root cause analysis
+4) Contributing factors (people/process/tech)
+5) Action items (owner + due date)
+6) Validation plan for each action item
+
+Appendix: quick commands and helpers
+- rwpctl status --pool {pool-name}  # warm-pool CLI
+- rroute set --egress-shard {shard} --filter "tenant in (...)" # runtime routing tool
+- ./network-check --validate-peering --region {region}  # network validation helper
+- terraform plan -out=plan.tfplan && terraform show -json plan.tfplan > plan.json  # save plan artifact
+
+Related docs and references:
+- See module documentation for warmpool in terraform-and-iac folder for variable reference and example usage.
+- See cross-region failover playbook in eng-infra/runbooks for multi-region steps.
+
+Document history:
+- 2024-09-10: Created by Aisha Patel (initial draft).
+- 2024-11-12: Added NAT/egress mitigation steps after us-west-2 saturation incident.
+- 2025-01-18: Expanded IaC safety checklist and automated canary recommendations (reviewers: Marco Rivera, Lin Zhao).
+
+End of runbook.

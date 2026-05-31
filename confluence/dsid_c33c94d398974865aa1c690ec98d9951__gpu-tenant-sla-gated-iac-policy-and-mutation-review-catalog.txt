@@ -1,0 +1,169 @@
+GPU Tenant SLA-gated IaC Policy and Mutation Review Catalog
+
+Overview
+--------
+This document defines the policy and operational playbook used to gate Terraform/Helm/Flux mutations that affect tenant-facing GPU provisioning and capacity allocation. It codifies the safety checks, CI gating steps, approval flows, and automatic rollback policies needed to protect tenant SLAs and prevent noisy-neighbor or egress-bleed incidents during infrastructure changes.
+
+Scope
+-----
+Applies to any IaC changes (Terraform modules, Helm charts, Flux manifests, Kustomize overlays) that:
+- Modify gpu-allocator-operator, tenant-claim CRDs, or autoscaler resources
+- Change IAM, VPC egress, or egress NAT gateway rules tied to GPU pools
+- Adjust tenant quota, fair-share, or preemption thresholds
+- Introduce or remove node / instance types from GPU pool launch templates
+
+Non-goals
+--------
+- Changes to purely developer sandbox namespaces (covered by self-serve policy)
+- Application-level configuration that does not impact cluster/node scheduling
+
+Goals and Safety Objectives
+--------------------------
+- Ensure no merge to main can cause a tenant-facing provisioning regression exceeding the Provision Latency SLO (P95 ≤ 120s) for Dedicated and Hosted pools.
+- Prevent accidental widening of egress paths or KMS policy changes without explicit security review.
+- Minimize blast radius: changes that touch global allocators must require canary and measured rollout.
+- Establish a deterministic rollback path when quotas or allocator behaviors regress.
+
+Ownership and Roles
+-------------------
+- IaC Owners: eng-infra/terraform-and-iac team (primary)
+- Service Owners: eng-infra/gpu-fleet-and-capacity (secondary)
+- Approvers: 2 approvers required from (Terraform owners OR GPU fleet oncall)
+- Emergency Approver: SRE lead (when oncall unreachable)
+
+Mutation Classification
+-----------------------
+1. Low-risk: doc updates, non-scheduling tag changes.
+2. Medium-risk: variable tuning (batch sizes, TTLs) not touching launch templates.
+3. High-risk: capacity, instance types, allocator algorithm, egress/KMS/IAM changes.
+
+Policy-as-Code (gating rules)
+-----------------------------
+All high-risk changes must satisfy the following automated checks before allowing a merge to main:
+- Terraform plan diff must show < 5% change in active GPU node count per-region OR be explicitly annotated with a capacity-change label and run through the capacity playbook.
+- No direct changes to NAT/egress rules or KMS key attachments without a security label and an approved security PR review.
+- Rego policy (OPA) runs in CI and must pass. Example policy objectives below.
+
+Example OPA rego snippets (reference)
+-------------------------------------
+# Deny direct modification of gpu_pool.launch_template.image unless flagged
+package redwood.iac.gpu
+
+deny[msg] {
+  input.change.kind == "terraform"
+  resource := input.change.resources[_]
+  resource.type == "aws_launch_template" 
+  resource.after != resource.before
+  not input.labels[_] == "launch-template-allowed"
+  msg = sprintf("launch_template change blocked: %v", [resource.address])
+}
+
+# Ensure per-region delta guard
+package redwood.iac.capacity
+
+deny[msg] {
+  delta := input.plan.gpu_node_delta_percent
+  delta > 5
+  not input.labels[_] == "capacity-exempt"
+  msg = sprintf("proposed GPU capacity delta is %v%% (greater than 5%%) and requires capacity runbook", [delta])
+}
+
+Mutation Review and CI Pipeline
+-------------------------------
+1. Developer opens PR in terraform-gitops repo. PR must include:
+   - change-intent.md describing reason, expected capacity impact, rollout plan
+   - labels: [low-risk|medium-risk|high-risk] and any mitigations
+2. CI (Buildkite) runs:
+   a. tflint / tfsec
+   b. terraform init/plan using remote state read-only
+   c. opa eval using policies from infra-policy repo
+   d. integration tests: namespace-claim smoke tests in a staging GPU cluster (ephemeral)
+   e. synthetic quota simulation: a dry-run that computes per-region delta and warns
+3. If OPA denies, CI fails and PR requires changes. If OPA passes and PR labeled high-risk, block merge until 2 approvers and a canary plan are scheduled.
+
+Canary and Rollout Procedure (for high-risk)
+--------------------------------------------
+- Step 0: Schedule 30-minute maintenance window and notify customers listed in the affected tenant alpha set.
+- Step 1: Merge to main -> GitOps applies to canary cluster(s) (subset per-region defined in module:canary-targets).
+- Step 2: Run automated canary validation for 30 minutes:
+  - Provision latency (P95) measured against baseline; allowed regression <= +10% absolute and <= +20% relative
+  - No increase in preemption_rate > 0.5% absolute
+  - Egress connection counters and KMS audit logs verified for no anomalous patterns
+- Step 3: If canary passes, continue staged rollout to 10% of regions -> 50% -> 100% with 15-minute validation gates.
+- Step 4: If any stage fails, automated rollback is triggered (see Rollback section).
+
+Rollback and Emergency Procedures
+--------------------------------
+Immediate rollback criteria (auto-trigger):
+- Provision latency (P95) breach > 20% absolute
+- Error budget burn > 40% sustained for 5 minutes for a service impacted by change
+- Unexpected egress/KMS policy modifications detected by security probes
+
+Rollback steps (ordered):
+1. GitOps revert: create emergency revert PR in terraform-gitops and tag emergency-rollback.
+2. Trigger patch apply to revert commit in canary clusters immediately via the operator pipeline.
+3. Notify oncall channels: #gpu-oncall, #incidents, and page SRE oncall if rollback fails.
+4. Postmortem trigger: owner team must open a postmortem within 48 hours if rollback was executed.
+
+Testing Matrix and CI Jobs
+--------------------------
+- Unit: tflint, terraform fmt, tfsec (fast)
+- Plan-time: terraform plan and opa policy validation
+- Staging apply: apply to ephemeral staging cluster via terra-test-runner
+- Integration: namespace-claim smoke test (create tenant, request fractional GPU, assert KV cache warm / claim binds)
+- Chaos: optional (nightly) preflight that replays canary failing scenarios
+
+Table: Minimum gating thresholds
+--------------------------------
+| Change type | Required CI checks | Required approvers | Canary required |
+|-------------|--------------------|--------------------|----------------|
+| Low-risk    | unit               | 1 infra owner      | No             |
+| Medium-risk | plan + opa + smoke | 1 infra owner + 1 gpu owner | Optional (team discretion) |
+| High-risk   | plan + opa + smoke + staging-apply + quota-simulation | 2 approvers (incl. gpu oncall) | Yes |
+
+Observability and Alerting Hooks
+--------------------------------
+- CI emits events to observability pipeline: ci-events -> infra-tracing
+- Canary dashboards: gpu-provisioning-canary (Grafana) with panels for P95 latency, preemption rate, node churn, egress connection count
+- Alerting rules:
+  - GPUProvisioningSloBreach (P95 > 120s) -> Severity P1
+  - GPUPreemptionSpike (rate delta > 0.5%) -> Severity P2
+  - IaCChangeSecurityAlert (KMS/NAT diff) -> pager to security oncall
+
+Canary Validation Playbook (checklist)
+--------------------------------------
+- [ ] Ensure maintenance notice published to customers in affected alpha set
+- [ ] Snapshot baseline metrics (last 24h) and upload to change ticket
+- [ ] Monitor canary for 30 minutes, run smoke tests every 3 minutes
+- [ ] Run egress audit: verify no new public endpoints opened
+- [ ] Approve or rollback
+
+Emergency and Pre-authorized Exceptions
+--------------------------------------
+- An emergency exception may be granted by the SRE lead; emergency merges must include a rollback window and explicit revert plan in the PR.
+- Pre-authorized exception: for scheduled capacity expansion aligned to contractual Dedicated customer commitments — must be recorded in change-intent.md with a signed ticket from sales/CS.
+
+Resources and Commands
+----------------------
+- GitOps repo: git@github.com:redwood-infra/terraform-gitops
+- Capacity simulator: scripts/capacity-simulate.py --plan plan.out
+- OPA test: make opa-test
+- Apply to staging (dev cluster): bk pipeline infra-staging-apply --commit=$PR_COMMIT
+
+Related Pages
+-------------
+- eng-infra/gpu-fleet-and-capacity/gpu-scaling-decision-framework-and-burst-policy
+- eng-infra/terraform-and-iac/gpu-provisioning-immutable-state-and-disaster-recovery
+
+Change log
+----------
+- 2025-03-15 (Priya Menon): Initial draft and policy-as-code examples
+- 2025-05-02 (Priya Menon): Added canary validation thresholds and CI job matrix
+
+Appendix: Example change-intent.md template
+-------------------------------------------
+Title: Short description
+Description: Why this change is needed
+Impact: Regions, estimated % node delta, affected services
+Rollout plan: Canary targets, validation windows, fallback steps
+Stakeholders: owner, approvers, SRE/Oncall

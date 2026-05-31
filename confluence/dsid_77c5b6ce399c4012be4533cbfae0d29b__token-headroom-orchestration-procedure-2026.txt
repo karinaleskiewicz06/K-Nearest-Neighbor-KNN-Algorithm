@@ -1,0 +1,128 @@
+Token Headroom Orchestration Procedure
+
+Summary:
+This procedure defines the Token Headroom Orchestration model — a deterministic process for maintaining probabilistic reserve capacity across Redwood Inference multi-tenant inference clusters. The goal is to keep SLOs stable under bursty traffic and model hot-swaps while minimizing reserved idle GPU cycles. This is an operational protocol for SREs, capacity planners, and the autoscaling/orchestrator tooling team.
+
+Scope:
+- Applies to all model-serving clusters that host shared-tenant workloads (hosted API and Dedicated pooled clusters).
+- Integrates with the Capacity Orchestrator (internal service: capacity-orch), the SLO telemetry pipeline (prometheus->observability-bus), and rdxctl for emergency actions.
+- Does NOT replace per-tenant contractual reservations (Dedicated reserved capacity) but sits above autoscale policies to coordinate short-term reserve.
+
+Principles:
+1) Economy-first reserves: prefer probabilistic short-term reserve (30–120s headroom) over always-on GPU allocation.
+2) Observable and auditable: every reserve decision must be supported by telemetry and persisted to the capacity ledger.
+3) Graceful demotion: when reserve is exhausted, services must degrade along documented fallback lanes (quantized serving, model fallback, reduced batch sizes) — see "Fallback Lanes" section.
+4) Ownership clarity: capacity-orch is the authoritative actor for reserve placement; SREs operate the policy and run emergency overrides.
+
+Definitions:
+- Token: a billing/priority unit representing an inference request affinity (roughly 1k input tokens for text-generation workloads). Tokens are used by capacity-orch to reason about headroom allocation across tenants.
+- Headroom: short-term excess capacity measured in tokens or GPU-seconds reserved for bursts.
+- Reserve Tier: a named bucket (green/amber/crimson) representing probability bands for reserve sizing.
+- Reserve Ledger: persistent store recording each reserve allocation with timestamps, owner, and rationale.
+
+Reserve Tiers (table):
+| Tier | Time horizon | Target confidence | Typical sizing rule | Activation trigger |
+| Green | 30s | 95% | 5–15% of observed short-term token rate per-cluster | transient P95 request-rate spike or cold-start |
+| Amber | 2m | 99% | 15–35% of short-term token rate or 1–2 warm models | sustained burn-rate > SLO_alert_threshold for 1m |
+| Crimson | 10m | 99.9% | 35–80% of short-term token rate or reserve hot-pool of N models | cross-region failover or primary cluster degradation |
+
+Key SLOs and thresholds (example defaults):
+- API success rate (per-tenant): 99.95% over 7d; error budget: 0.05%
+- P50 latency (generation): target 120ms
+- P95 latency (generation): target 320ms (quantized variants allowed to 450ms under amber)
+- Burn-rate triggers:
+  - advisory: 3x expected burn-rate sustained for 5m
+  - corrective: 5x expected burn-rate sustained for 2m (initiate amber reserves)
+  - emergency: sustained burn-rate > 10x or P95 > 2x SLO for 1m (initiate crimson)
+
+Computation algorithm (high level):
+1) Ingest traffic profile window W = last 120s (sliding). Calculate token_rate_t = tokens/sec aggregated by cluster and by tenant class.
+2) Compute short-term variance sigma and the Poisson/negative-binomial tail estimate for burst probability.
+3) For each cluster, compute headroom_h = quantile(q, token_rate_t * W) where q maps to tier confidence (green=0.95, amber=0.99, crimson=0.999).
+4) Translate headroom_h to GPU reservation delta using model-specific cost coefficients (GPU-seconds per token) stored in model-catalog.
+5) Emit a reserve intent to capacity-orch with TTL = tier horizon and store entry in Reserve Ledger.
+
+Pseudocode (conceptual):
+- inputs: window W, cluster C, tenant groups G, model coefficients Mcoef
+- sample token_rate_t over W
+- sigma = estimate_variance(token_rate_t)
+- q = choose_quantile(based_on_burn_rate_and_SLO)
+- headroom_tokens = quantile_estimate(token_rate_t, q) - current_capacity_tokens
+- gpu_delta = ceil(headroom_tokens * Mcoef / tokens_per_gpu_second)
+- capacity-orch.reserve(cluster=C, gpus=gpu_delta, ttl=TTL, labels=[tier,q_reason])
+
+Operational run: step-by-step
+1) Detection: SLO pipeline raises advisory/corrective/emergency alerts. On advisory, capacity-orch suggests a Green reserve.
+2) Review: SRE on-call reviews the suggested reserve in the capacity-orch UI and checks the reserve ledger entry and supporting telemetry.
+3) Apply: If auto-approve is enabled (night mode off), capacity-orch performs a soft-reserve (eviction-safe allocation) and updates the cluster scheduler to spin warm model workers.
+4) Monitor: After reserve application, monitor P50/P95 latency, batch sizes, and per-tenant token burn. If metrics don’t improve within 60s, escalate to amber.
+5) Escalate: For amber/crimson, follow the emergency checklist: notify CS-cadence channel, pre-allocate additional GPU nodes (capacity-orch), and stage tenant throttles (token-priority-arbiter).
+
+Rollout and change control:
+- Feature flags: headroom orchestration has two toggles: auto-suggest (observability->capacity-orch) and auto-apply (orchestrator->scheduler). Initially run with auto-suggest on and auto-apply off during canary.
+- Canary window: run green-only automated suggestions in non-production clusters for 14 days, compare simulated cost and SLO improvements.
+- Metrics to validate during canary: SLO burn-rate reduction > 30% at 95% confidence, incremental GPU-hours < 12% increase.
+
+Incident review integration and evidence capture:
+- Every reserve action correlates to an incident tag that must be attached to the post-incident review (PIR). Reserve Ledger entries must include: incident_id (if any), triggering_signal, telemetry_snapshot_link, and decision_author.
+- PIRs must evaluate: correctness of quantile selection, time-to-apply, observed mitigation, and any downstream tenant impact.
+
+Runbook snippets (for on-call use):
+1) Apply green soft-reserve (cli):
+- rdxctl capacity reserve --cluster $CLUSTER --gpus $N --type soft --ttl 30s --reason "green-auto-suggest"
+2) Force amber immediate (cli):
+- rdxctl capacity reserve --cluster $CLUSTER --gpus $N --type hard --ttl 2m --reason "amber-oncall-apply" --notify "#sre-ops"
+3) Revoke reserve and record rationale:
+- rdxctl capacity revoke --reserve-id $ID --comment "revoke: mitigated via batch-tuning"
+
+Telemetry queries (examples):
+- Token rate (PromQL): sum(rate(inference_tokens_total[1m])) by (cluster, tenant)
+- Reserve utilization: capacity_orch_reserve_allocated_gpus - capacity_orch_reserve_active_gpus
+- Burn-rate (per-tenant): increase(inference_tokens_total[1h]) / expected_tokens_per_hour_from_baseline
+
+Fallback lanes (ordered):
+1) Model variant fallback: switch to a lighter quantized variant (fast path).
+2) Batch-size squeeze: temporarily reduce batch size to improve tail-latency stability.
+3) Token-priority shedding: deprioritize low-priority token classes with customer-notice.
+4) Read-only degradation: respond with cached completions for idempotent requests.
+
+Verification & validation checklist (pre-apply):
+- [ ] Reserve intent has matching telemetry snapshot link and quantile rationale
+- [ ] Reserve Ledger entry includes owner and runbook reference
+- [ ] Affected tenants and downstream services are enumerated and tagged
+- [ ] Rollback procedure and revoke command copied to incident channel
+
+SLO and error budget governance impact:
+- Reserves consumed to prevent SLO breaches are treated as mitigations and must be accounted against the service error budget review. During postmortem, account for whether reserve action was consistent with product contracts (e.g., did reserve mask a larger capacity problem?).
+
+Ownership and escalation matrix:
+- Primary: Cluster SRE (on-call) — initial review and apply green reserves.
+- Secondary: Capacity Orchestration Team — validate GPU provisioning and amber/crimson escalations.
+- Tertiary: Product Reliability Lead — invoked when cross-cluster reserves > 25% of fleet.
+
+Change log and auditing:
+- All reserve intents and actions are logged to Reserve Ledger with immutable IDs. Daily compliance job exports reservations to the billing-cadence job for cost reconciliation.
+
+Appendix A — Example incident timeline (abridged):
+- 2026-02-15T11:03:00Z: advisory alert — P95 increased 2.1x; suggested green reserve 8 GPUs.
+- 11:03:20: on-call reviews reserve intent and accepts.
+- 11:03:40: capacity-orch issues soft-reserve; warm workers start.
+- 11:04:30: P95 returns to target; reserve 6/8 utilized; entry persisted to ledger.
+
+Appendix B — Notes on modelling coefficients:
+- Model coefficients are periodically calibrated by the serving runtime team. Typical values: 0.00025 GPU-second per token for large autoregressive models (depends on sequence length and kv-cache reuse). Keep coefficients in model-catalog and re-evaluate monthly.
+
+Related artifacts and links:
+- capacity-orch runbook: /confluence/eng-sre/operational-tooling/capacity-orchestrator-and-slo-reconciliation-cookbook-2026
+- reserve ledger spec: infra://reserve-ledger/v1/spec (internal)
+- telemetry dashboards: observability://dashboards/cluster-headroom-ops
+
+Questions and contact:
+- For policy clarifications: @Miguel Alvarez (capacity-orch)
+- For telemetry and queries: @Priya Desai (observability)
+- For escalation: #sre-escalations channel
+
+Document history:
+- 2026-01-12: Created by Hannah Chen
+- 2026-02-14: Added crimson tier and command examples (reviewer: Priya Desai)
+- 2026-03-01: Published after canary validation summary

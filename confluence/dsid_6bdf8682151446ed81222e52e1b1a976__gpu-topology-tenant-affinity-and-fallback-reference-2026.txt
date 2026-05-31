@@ -1,0 +1,186 @@
+GPU topology, tenant affinity, and fallback reference
+
+Summary
+
+This reference describes recommended GPU topology patterns, tenant affinity controls, and automated fallback strategies for private (VPC / on-prem) Redwood deployments. The goal is to balance latency SLOs, cost efficiency, and tenant isolation while making operator decisions predictable and auditable. This doc covers: design patterns, configuration matrix, operational runbook, testing & validation, and monitoring/metrics recommended for SREs and operators.
+
+Audience
+
+- Operators running private Redwood control/data planes
+- Platform engineers designing tenant placement policies
+- Solutions and field engineers responsible for customer failovers and operator handoffs
+
+1. Why GPU topology + tenant affinity matters
+
+Modern inference workloads vary widely by model size, batch profile, and tail-latency sensitivity. Poor placement decisions cause: noisy-neighbor latency spikes, excessive KV-cache churn, higher unit cost from suboptimal packing, and complex forensic evidence during incidents. Explicit topology + affinity rules reduce these risks by:
+
+- Keeping low-latency tenants on homogeneous, small-batched pools
+- Co-locating model families that share KV cache semantics
+- Pinning tenants with regulatory constraints to dedicated hardware pools
+
+2. Topology patterns (reference)
+
+Pattern A — Latency-isolated pools (recommended for SLO-sensitive tenants)
+- Description: Pools sized to provide 95th p99 latency targets with headroom for prefix caching. No heterogeneous GPU packing.
+- Typical use: consumer chat, product search reranking, interactive UIs.
+- Topology: 4–16 GPUs per pool, identical GPU types (A100s / H100s), local NVMe for model shards.
+- Affinity rule: tenant.affinity: strict
+- Fallback: synchronous regional fallback to equivalent pool in another AZ; asynchronous model-quantized fallback only if synchronous capacity exhausted.
+
+Pattern B — Cost-optimized mixed pools (recommended for batch/embeddings)
+- Description: Heterogeneous GPU packing allowed (mixed memory profiles). Priority on throughput and bin-packing.
+- Typical use: high-volume embedding workloads, offline reranking, nightly indexing.
+- Topology: 16–64 GPUs per pool, mixed GPU types, centralized model cache with larger KV cache sizes.
+- Affinity rule: tenant.affinity: soft
+- Fallback: queue-based throttling + degraded-model routing (quantized variants)
+
+Pattern C — Compliance-dedicated pools (recommended for regulated customers)
+- Description: Single-tenant or small-tenant pools with strict network & KMS boundaries. Immutable image bootstrapping and signed model artifacts.
+- Topology: depends on customer commit; keep odd/even node redundancy for N+1.
+- Affinity rule: tenant.affinity: hardware-pinned
+- Fallback: operator-initiated cross-tenant fallbacks disabled by default (require approval flow).
+
+3. Affinity and placement knobs (config matrix)
+
+The following table describes the most-used placement knobs and their operator-visible rewrite rules. Operators should expose these as part of the tenant provisioning API.
+
+| Config key | Allowed values | Effect | Default | Owner |
+|------------|----------------|--------|---------|-------|
+| tenant.affinity | strict | Pin tenant to homogenous pool, deny heterogeneous packing | true | platform |
+| | soft | Prefer same pool but allow fallback packing | | |
+| | hardware-pinned | Use explicit node list in pool | | |
+| placement.memory_margin_pct | 5–40 | Reservation to avoid OOMs when loading quantized weights | 15 | infra |
+| placement.max_native_models | integer | Max different model artifacts per GPU before eviction | 1–4 | 2 | runtime |
+| fallback.quantized_variant_enabled | true/false | Allow model fallback to quantized variant when capacity insufficient | true | product |
+| fallback.synchronous_timeout_ms | 50–2000 | How long to wait for cross-AZ synchronous fallback before invoking async fallback | 300 | 300 | infra |
+
+(Operators: map these keys to API fields: placement.policy, placement.constraints, fallback.policy)
+
+4. Runtime behaviors and examples
+
+- KV cache preservation: when migrating a tenant between pools, the runtime will attempt a KV cache warm transfer for values older than 30s using the routing-service. If warm transfer fails, mark tenant.state:kvc_old and apply cold-start safeguards.
+
+Example placement API payload (YAML):
+
+placement_policy:
+  pool_selector: "latency-isolated-us-west2"
+  affinity: strict
+  memory_margin_pct: 20
+  max_native_models: 2
+  fallback_policy:
+    synchronous_timeout_ms: 500
+    allow_quantized_variant: true
+
+CLI snippet (operator):
+
+# preview placement decision for tenant T-123
+$ redwoodctl placement-preview --tenant T-123 --policy latency-isolated-us-west2
+Preview: pool=latency-isolated-us-west2-02, node_affinity=[gpu-3,gpu-4], estimated_p99_latency=95ms
+
+5. Fallback hierarchy and decision tree
+
+Design principle: prefer automated, safe fallbacks that preserve customer SLAs and evidence trails. Fallbacks must be auditable and reversible.
+
+Fallback order (runtime):
+1) Synchronous cross-zone routing to an equivalent latency-isolated pool
+2) Synchronous cross-region routing (if tenant allows cross-region placement)
+3) Degraded model routing (quantized or smaller architecture) with per-tenant quality scoring enabled
+4) Queue + backpressure (apply 429 with Retry-After)
+5) Operator failover with explicit audit entry and customer notification
+
+Decision tree notes:
+- If fallback step 1 is used, emit event: fallback.synchronous.az with tags (tenant, src_pool, dst_pool).
+- If degraded model routing occurs, include quality_score delta in response metadata: x-rw-quality-delta: -0.07.
+
+6. Operator runbook (day-2 playbook for placement incidents)
+
+Alert symptoms (examples):
+- spike in runtime.p99 for tenant > 2x baseline for 5 minutes
+- runtime.kv_cache.hit_rate drops > 30% after a placement change
+- OOM events reported by node exporter for model loader
+
+Immediate steps (0–15 minutes):
+1. Run placement preview: redwoodctl placement-preview --tenant <id>
+2. Check pool utilization: kubectl top nodes -l pool=<pool>
+3. Query routing-service audit: curl -sS http://routing-service.internal/audit?tenant=<id>&window=30m
+4. If candidate target pool with spare capacity present, trigger automated migrate: redwoodctl tenant-migrate --tenant <id> --dst-pool <pool> --dry-run=false
+
+Mitigation steps (15–60 minutes):
+- If migration fails due to model-artifact limit, increase placement.max_native_models for the tenant and retest.
+- If KV cache cold-start would cause user-visible errors, schedule a staged traffic mirror (10% -> 50% -> 100%) while warming caches. Use: redwoodctl traffic-mirror --src <pool> --dst <pool> --percent 10 --duration 10m
+
+Post-incident (within 24 hours):
+- Record incident in the incident tracker with fallback events attached.
+- Run forensics: collect node-level traces /tmp/runtime-dumps, routing audit, and tenant response diffs. Place artifacts in S3 evidence: s3://redwood-evidence/<incident-id>/
+- Run a placement policy review: was affinity misconfigured? Update placement policy and communicate to platform owners.
+
+7. Testing matrix and validation harness
+
+Every placement policy change must be validated against the following synthetic tests:
+- Latency microbench: 1–10 QPS per thread, 128 token prompt, validate p95/p99 budgets
+- KV-cache resiliency: simulate 30% model-switch churn and validate hit_rate recovery within 10 minutes
+- Affinity violation test: attempt to schedule a hardware-pinned tenant onto mixed pool and assert failure with relevant audit log
+
+Suggested CI job names: placement-unit-tests, placement-integration-chaos, placement-latency-benchmark. Include model artifacts with different quantization levels for realistic validation.
+
+8. Monitoring and SLO implications
+
+Key metrics to emit and dashboards to maintain:
+- runtime.p99.{tenant} (ms)
+- runtime.kv_cache.hit_rate.{pool} (percent)
+- placement.evictions.{pool} (count / minute)
+- fallback.invocations.{type} (count) — types: synchronous_az, synchronous_region, degraded_model, queued, operator
+
+SLO guidance (example decomposition for tenant SLO 99.5% availability, p99 <= 150ms):
+- Placement margin: keep spare capacity >= 10% to absorb transient spikes
+- KV-cache warming budget: aim to keep warm-transfer success >= 90% for synchronous migrations
+- Fallback quality cap: degraded model routing may be invoked no more than 0.5% of requests in steady state without customer approval
+
+9. Audit and compliance controls
+
+- All automated fallback and migration decisions must create an auditable event with: timestamp, operator_id (system or user), src_pool, dst_pool, reason_code, and a checksum of model artifacts moved.
+- For compliance pools (Pattern C), operator-initiated cross-tenant action must include a signed approval token and be recorded in the customer evidence bundle.
+
+10. Upgrade & rollback considerations for topo changes
+
+When changing pool topology (e.g., adding heterogeneous GPUs or increasing placement.max_native_models):
+1. Rollout to canary pool with synthetic traffic for 48h
+2. Monitor key metrics and run KV-cache resiliency tests
+3. If rollback required, run operator rollback: redwoodctl topology-rollback --token <rollback-id>
+4. Preserve evidence artifacts: keep routing audit and model checksums for at least 90 days for forensics
+
+Appendix A — Common failure modes and mitigations
+
+- Failure: Excessive eviction storms
+  Mitigation: reduce placement.max_native_models, increase memory_margin_pct by 5–10, or isolate offending tenant to custom pool.
+
+- Failure: Cross-AZ synchronous fallback flapping
+  Mitigation: raise fallback.synchronous_timeout_ms to allow stable handshakes and add backpressure at ingress for brief window.
+
+- Failure: Operator accidentally allows hardware-pinned tenant on mixed pool
+  Mitigation: enforce pre-commit validation hook in provisioning pipeline and add automated policy gate in CI.
+
+Appendix B — Example metrics dashboard panels (grafana queries)
+
+- Panel: Tenant latency heatmap
+  Query: rate(runtime.p99{tenant=~"$tenant"}[5m])
+
+- Panel: Pool KV cache health
+  Query: avg(runtime.kv_cache.hit_rate{pool=~"$pool"}) by (pool)
+
+Contacts and ownership
+
+- Architecture owner: Diego Morales (eng-infra)
+- Runtime owner: Marcus Liu (eng-serving-runtime)
+- Oncall contact: eng-private-deployments pager rotation
+
+Related reading
+
+- regional-model-fallback-topology-and-dataflow-2028
+- tenant-aware-kv-cache-reconciliation-and-model-refresh-playbook-2026
+
+Revision history
+
+- 2025-11-12: Created by Diego Morales
+- 2025-12-10: Added operator runbook and metrics per Markus review
+- 2026-01-15: Finalized testing matrix and compliance controls

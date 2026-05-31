@@ -1,0 +1,444 @@
+Nsight Systems/Compute + CUPTI profiling for FP8/INT8 (quantized) kernels
+
+h1. Overview
+
+This page is the step-by-step profiling playbook for *quantized kernel* work (FP8 / INT8) during the serving-runtime performance sprint. It focuses on:
+
+* Capturing *repeatable* Nsight Systems (nsys) traces for end-to-end inference (prefill + decode) and isolating GPU vs scheduler/launch overhead.
+* Capturing *actionable* Nsight Compute (ncu) reports for specific kernels/shapes to understand Tensor Core utilization, memory bandwidth, occupancy, and instruction mix.
+* Using CUPTI-based counters (via runtime/benchmark instrumentation) to compare baselines vs FP8/INT8 variants without pulling full traces for every case.
+* Comparing runs safely and consistently (same driver/CUDA/container, clocks, shape regime, and benchmark config).
+
+This playbook is intended for engineers working on kernel integration (dispatch/registry) and scheduler interactions where quantized kernels show mixed outcomes.
+
+h2. When to use this playbook
+
+Use profiling when you observe one of the following in microbench or end-to-end serving benchmarks:
+
+* FP8/INT8 shows *microbench wins* but *end-to-end* (TTFT/TPOT) regressions.
+* FP8 attention path regresses *TTFT* for short prompts (suspected launch overhead / extra staging / scheduler interaction).
+* INT8 matmul path is faster for some shapes but slower for others (suspected alignment/packing, memory bound, or fallback behavior).
+* High run-to-run variance (suspected clock drift, thermal throttling, shared-node contention, or debug logging).
+
+If the issue is primarily correctness (bad outputs, NaNs), start with the regression triage playbook and only profile after correctness is stable.
+
+h1. Prerequisites & guardrails
+
+h2. Access / tooling
+
+You will need:
+
+* Nsight Systems CLI: *nsys*
+* Nsight Compute CLI: *ncu*
+* CUDA toolkit compatible with the fleet image you are using (do *not* mix versions)
+* Permissions to run on the benchmark fleet (H100/A100/L4 as applicable) and to upload artifacts to the benchmark bucket/Drive location
+
+h2. Reproducibility requirements (do these first)
+
+Before capturing any trace/report, ensure:
+
+1. *Pinned container image* (same digest) and *pinned driver/CUDA* version (see benchmark runner pinning guidance).
+2. *GPU clocks locked* when feasible (avoid boosting variability). If clocks cannot be locked, record clocks + power limits in the artifact metadata.
+3. Dedicated node / no co-tenancy when collecting deep traces.
+4. Stable benchmark configuration (prompt distribution, generation length, concurrency, batching window).
+
+If you cannot guarantee these, your trace may be misleading and not comparable.
+
+h2. Data handling
+
+* Do not capture or upload customer prompts.
+* Use the benchmark suite prompts only (approved internal sets) or synthetic prompts.
+* Treat Nsight traces as *internal artifacts*; do not attach to customer tickets.
+
+h1. Quick-start checklist (10 minutes)
+
+*Goal:* Determine if a regression is GPU kernel time, launch overhead, memory bound, or scheduler-induced.
+
+1) Reproduce the regression with the benchmark harness (same seed/config). Save the benchmark JSON config.
+
+2) Capture a short *Nsight Systems* trace around a single run window (10–30s).
+
+3) Inspect:
+* GPU kernel time vs CPU time
+* CUDA API call overhead (launches, memcpys)
+* Stream utilization + overlap
+* Context switches / host-side stalls
+
+4) Identify the top 1–3 kernels by total time for the regressing case.
+
+5) Capture *Nsight Compute* for those kernels only (filter by kernel name regex). Compare baseline vs quantized.
+
+6) If kernel time is not the problem: look at scheduler metrics (queue depth, prefill/decode split, backpressure counters) and/or reduce launch count.
+
+h1. Capturing Nsight Systems traces (nsys)
+
+h2. What nsys is best for
+
+* End-to-end timeline: CPU threads, CUDA API overhead, GPU kernel overlap, memcpy/memset, synchronization points.
+* Diagnosing *launch overhead* and host-side stalls.
+* Understanding if kernels are serialized due to stream usage or sync.
+
+h2. Recommended capture profiles
+
+*Short capture (default):* for most investigations
+* Duration: 10–30 seconds
+* Use case: identify where time is going, find top kernels
+
+*Deep capture:* only when you need detailed CUDA API breakdown and NVTX ranges
+* Duration: 30–90 seconds (keep it short; large traces are painful)
+
+h2. Required NVTX ranges (benchmark + runtime)
+
+To make traces comparable, ensure the run includes NVTX ranges (or equivalent annotations) for:
+
+* request lifecycle: enqueue → schedule → prefill → decode → response
+* per-phase ranges: prefill and decode
+* kernel-mode tag: baseline / fp8 / int8
+
+If ranges are missing, file an issue against the harness/runtime instrumentation (this is required for the sprint’s reproducibility bar).
+
+h2. Command template (containerized benchmark run)
+
+Replace placeholders in ALL CAPS.
+
+1) Run the target benchmark case without profiling to confirm it reproduces:
+
+*BENCH (no profiling)*
+
+- Ensure you are using the same runner options used for the matrix.
+- Save the resolved config and artifact metadata.
+
+2) Run with nsys enabled (example):
+
+nsys profile \
+  --output nsys-QUANT-MODE-MODEL-GPU-CASE \
+  --force-overwrite true \
+  --trace=cuda,nvtx,osrt,thread \
+  --cuda-memory-usage=true \
+  --sample=none \
+  --capture-range=nvtx \
+  --capture-range-end=stop \
+  --stop-on-exit true \
+  --export=sqlite \
+  --stats=true \
+  ./bench_runner \
+    --model MODEL_NAME \
+    --gpu-sku GPU_SKU \
+    --quant-mode {baseline|fp8|int8} \
+    --workload WORKLOAD_ID \
+    --concurrency N \
+    --seed SEED \
+    --duration-seconds 20
+
+Notes:
+* Prefer *capture-range=nvtx* so you only capture the window around the benchmark iteration.
+* Avoid CPU sampling unless needed; it increases overhead and file size.
+* Keep profiling overhead in mind: always rerun a non-profiled case to confirm you didn’t change behavior.
+
+h2. What to look for in nsys (common patterns)
+
+h3. Pattern A: FP8/INT8 kernel is faster, but TTFT regresses
+
+Look for:
+
+* Increased *CUDA API call* time (lots of small launches)
+* Additional memcpys/memsets (packing/unpacking, scale/zero-point transforms)
+* Synchronization between streams causing serialization
+
+Actions:
+
+* Reduce launch count (kernel fusion, persistent kernels, larger tiles)
+* Move preprocessing to GPU or fuse into matmul/attention epilogue
+* Validate scheduler isn’t forcing smaller batch slices (which increases launches)
+
+h3. Pattern B: Decode TPOT regresses only under concurrency
+
+Look for:
+
+* Increased time in scheduling/queueing ranges (NVTX)
+* Kernel overlap decreases (GPU has bubbles)
+* Frequent context syncs (cudaStreamSynchronize/cudaEventSynchronize)
+
+Actions:
+
+* Inspect scheduler metrics: queue depth histograms, backpressure counters, prefill/decode interleaving
+* Validate that quantized decode doesn’t introduce extra sync points (e.g., KV cache alignment fixes)
+
+h3. Pattern C: Kernel looks memory bound
+
+Look for:
+
+* High DRAM throughput but low SM/Tensor Core utilization
+* Kernels dominated by global memory loads/stores
+
+Actions:
+
+* Move to Nsight Compute to confirm memory vs compute bound
+* Evaluate layout changes, better vectorization, reduced precision/staging, or using Tensor Core-friendly formats
+
+h1. Capturing Nsight Compute reports (ncu)
+
+h2. What ncu is best for
+
+* Per-kernel deep dive: Tensor Core utilization, achieved occupancy, memory throughput, instruction mix, launch configuration.
+* Comparing baseline vs FP8/INT8 kernel variants for the *same shape*.
+
+Use ncu only after you have identified *which* kernels matter from nsys (or from a kernel time breakdown in microbench).
+
+h2. Keep ncu scoped
+
+ncu overhead can be high. Always:
+
+* Restrict to a single request or a small number of iterations.
+* Filter kernels by name.
+* Collect a limited set of sections first; expand only if needed.
+
+h2. Command template (kernel-filtered)
+
+Example: capture only attention and matmul kernels for a single benchmark iteration.
+
+ncu \
+  --set full \
+  --target-processes all \
+  --kernel-name-base function \
+  --kernel-name "regex:.*(attention|gemm|matmul|wgmma|cutlass).*" \
+  --launch-skip 5 \
+  --launch-count 20 \
+  --export ncu-QUANT-MODE-MODEL-GPU-CASE \
+  ./bench_runner \
+    --model MODEL_NAME \
+    --gpu-sku GPU_SKU \
+    --quant-mode {baseline|fp8|int8} \
+    --workload WORKLOAD_ID \
+    --concurrency 1 \
+    --seed SEED \
+    --max-iterations 1
+
+If the run is too slow or generates too much output:
+
+* Use a lighter set: `--set speedOfLight` or explicitly pick sections.
+* Narrow the kernel regex.
+* Reduce launch-count.
+
+h2. Metrics & questions to answer (quantized kernels)
+
+Use ncu to answer the following for each top kernel:
+
+1) *Is it compute-bound or memory-bound?*
+* Achieved memory bandwidth vs roofline
+* Tensor Core utilization / HMMA/WGMMA usage
+
+2) *Are we getting the expected Tensor Core path?*
+* FP8: are we on Tensor Core FP8 instructions (architecture dependent)?
+* INT8: are we using IMMA / Tensor Core INT8 paths or falling back to SIMT?
+
+3) *Is occupancy limiting us?*
+* Registers per thread, shared memory usage, occupancy
+* Too-small tiles leading to low SM utilization
+
+4) *Is the kernel dominated by type conversion/packing?*
+* Excessive instructions for quant/dequant, scale application, or layout transforms
+
+5) *Are launches too small (launch overhead dominated)?*
+* Very short kernel durations repeated many times
+
+h2. Common bottlenecks & fixes (cheat sheet)
+
+h3. Launch overhead dominates (common for short prompts / small batches)
+
+Symptoms:
+
+* nsys shows lots of small kernels with gaps
+* CPU thread shows heavy CUDA API time
+
+Mitigations:
+
+* Fuse epilogues / reduce intermediate kernels
+* Increase work per launch (tile size, persistent scheduling)
+* Ensure scheduler batching window is not too small for the target SLO
+
+h3. Memory bound (common when quantization adds extra reads/writes)
+
+Symptoms:
+
+* High DRAM throughput, low Tensor Core utilization
+* Many global loads/stores for scale/zero-point or layout conversion
+
+Mitigations:
+
+* Fuse quant/dequant with compute
+* Prefer formats that avoid extra transposes
+* Reuse scales/metadata from cache where possible
+
+h3. Tensor Core underutilization (wrong path or shape misalignment)
+
+Symptoms:
+
+* Low HMMA/WGMMA/IMMA utilization
+* ncu shows non-TC instruction mix
+
+Mitigations:
+
+* Validate alignment constraints (K dimension, leading dimensions)
+* Confirm shape guardrails/fallbacks aren’t forcing a slower path
+* Adjust kernel selection heuristic to pick baseline for unsupported regimes
+
+h3. Occupancy limited by registers/shared memory
+
+Symptoms:
+
+* High registers per thread, low occupancy
+* Performance sensitive to compiler flags / unrolling
+
+Mitigations:
+
+* Reduce register pressure (tuning, smaller unroll, different pipeline)
+* Adjust shared memory staging strategy
+
+h1. CUPTI-based profiling (lightweight counters)
+
+h2. Why CUPTI counters
+
+CUPTI-based counters provide a *low-friction* way to compare baseline vs quantized modes across many benchmark cases without collecting full nsys/ncu artifacts.
+
+Use CUPTI counters to:
+
+* Validate that a microbench win translates to higher GPU utilization end-to-end.
+* Identify if regressions correlate with higher kernel launch counts, more memcpy/memset, or lower achieved occupancy.
+* Gate canary decisions with supporting evidence.
+
+h2. What to capture (minimum set)
+
+For each run (baseline/fp8/int8), capture and record:
+
+* GPU kernel time total (and top kernels if available)
+* CUDA launch count
+* memcpy/memset count and bytes
+* SM utilization (or proxy) and achieved memory throughput (or proxy)
+* Per-phase: prefill vs decode breakdown where available
+
+If the harness provides “CUPTI summary” output, attach it to the run artifacts alongside the benchmark metadata.
+
+h2. Recommended workflow
+
+1) Run baseline vs fp8/int8 with CUPTI summary enabled (no nsys/ncu).
+2) Compare deltas:
+* If launch count increases meaningfully, suspect launch overhead / kernel fragmentation.
+* If memcpy bytes increase, suspect packing/unpacking.
+* If GPU utilization drops, suspect scheduler fragmentation or sync.
+3) Only if needed, collect nsys/ncu for the top regressing cases.
+
+h1. How to compare baseline vs FP8/INT8 runs (do this consistently)
+
+h2. Pick apples-to-apples cases
+
+When comparing modes:
+
+* Same model revision / weights hash
+* Same prompt distribution, generation length, and tool-calling/structured output settings
+* Same concurrency and batching configuration
+* Same GPU SKU and cluster (or same driver/CUDA/image)
+
+h2. Compare at two levels
+
+1) *Kernel-level* (microbench or isolated kernels)
+
+* Compare time per kernel for identical shapes
+* Verify the selected kernel path matches expectation (no hidden fallback)
+
+2) *System-level* (end-to-end serving)
+
+* TTFT and TPOT deltas
+* Scheduler metrics (queue depth, prefill/decode split)
+* Error rates/timeouts (quantized modes can surface new failure modes)
+
+h2. Reporting template (paste into PR/issue)
+
+Use this structure when posting results:
+
+*Case:* MODEL / GPU / workload / concurrency / quant-mode
+
+*Repro details:*
+* container digest:
+* driver/CUDA:
+* clocks/power limits:
+* git SHA:
+* benchmark config link:
+
+*Observed delta:*
+* TTFT p50/p95:
+* TPOT p50/p95:
+* tokens/s:
+
+*Profiling artifacts:*
+* nsys trace: (link)
+* ncu export: (link)
+* CUPTI summary: (link)
+
+*Conclusion:* (launch overhead / memory bound / TC underutilization / scheduler)
+
+*Next action:* (kernel fix, heuristic update, scheduler tuning, or disable for shape)
+
+h1. Artifact naming, storage, and metadata
+
+h2. Naming convention
+
+Use the following in all filenames:
+
+`{tool}-{mode}-{model}-{gpu}-{workload}-{concurrency}-{date}-{gitsha}`
+
+Examples:
+
+* `nsys-fp8-llama3_70b-h100-mixA-c16-2026-02-18-a1b2c3d`
+* `ncu-int8-mistral_7b-a100-decodeHeavy-c1-2026-02-18-a1b2c3d`
+
+h2. Metadata file (required)
+
+Alongside the trace/report, include a small text metadata file containing:
+
+* model id + model hash
+* quant mode + kernel selection flag states
+* GPU SKU + MIG/partitioning status
+* driver/CUDA/container digest
+* clocks/power
+* git SHA + build id
+* benchmark config (resolved)
+
+This is required for reruns and for variance investigations.
+
+h1. Troubleshooting
+
+h2. “My nsys trace is empty / no CUDA kernels show up”
+
+* Ensure `--trace=cuda,nvtx` is set.
+* Ensure the workload actually executed during the capture window.
+* If using `--capture-range=nvtx`, confirm NVTX ranges are emitted and the capture stop event is reached.
+
+h2. “ncu fails with permissions / attach issues”
+
+* Check container capabilities and that you are allowed to access performance counters on the target node.
+* If running in Kubernetes, ensure the pod has the required security context.
+* Try `--target-processes all` if the process forks/execs.
+
+h2. “Profiling changes performance too much”
+
+* That is expected in some cases.
+* Use CUPTI summaries first.
+* Keep nsys duration short and avoid CPU sampling.
+* Reduce ncu scope (fewer kernels, fewer launches).
+
+h2. “Variance is still high even when profiling is off”
+
+* Verify clocks are pinned and there is no thermal throttling.
+* Confirm dedicated node / no background jobs.
+* Check for debug logging paths and disable.
+* Escalate to the variance investigation task if needed.
+
+h1. Ownership & escalation
+
+* Primary owner: Isabella Rossi (Serving Runtime)
+* Kernel escalation: Hiro Tanaka / Grace Kim
+* Scheduler instrumentation escalation: Julian Moore
+* Perf regression architecture: Noah Patel
+
+If you believe a quantized kernel should be disabled for a shape regime, open a runtime issue and link: the benchmark config, CUPTI summary, and at least one nsys trace for the problematic case.

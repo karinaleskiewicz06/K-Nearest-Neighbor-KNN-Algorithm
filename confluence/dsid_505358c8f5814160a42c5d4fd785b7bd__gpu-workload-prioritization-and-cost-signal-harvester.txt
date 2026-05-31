@@ -1,0 +1,163 @@
+GPU workload prioritization and cost signal harvester
+
+Summary
+
+This document describes the design, implementation, and operational playbook for the "cost-signal harvester" service and the GPU workload prioritization decision matrix. The goal is to surface actionable cost signals (billing, token-level cost, preemption risk, thermal load) into scheduling and autoscaling decisions so that GPU-backed inference and eval workloads are routed and throttled with predictable unit economics.
+
+Why this exists
+
+- We have increasing variance in per-token and per-hour cost across instance types, preemptible pools, and regions.
+- Current allocation is capacity-first and lacks a feedback loop from billing/telemetry to scheduling and IaC.
+- Teams need controlled degradation (e.g., prefer cheaper pools for batch evals, reserve guaranteed pools for customer-facing latency-sensitive routes).
+
+Scope
+
+In-scope:
+- Harvester service that ingests cost & allocation signals and emits per-tenant/per-job priority scores.
+- Integration with gpu-allocator and spot-fallback-autoscaler for real-time routing.
+- Terraform modules for tagging and IAM required by harvester.
+- CI/CD and observability changes to ship, test, and monitor the feature.
+
+Out-of-scope:
+- Model-level quantization recommendations (handled in Optimize).
+- Billing invoice reconciliation (finance owns accounting).
+
+Signal sources and weightings
+
+The harvester consumes the following signals. Each signal is normalized to [0,1] and combined with configurable weights per deployment tier. Example default weights are shown.
+
+- Billing-rate-per-gpu-hour (metric: billing.gpu_hour_usd) — weight 0.35
+- Tokenized-cost-estimate (metric: inference.token_cost_est) — weight 0.25
+- Preemption-risk-score (metric: node.preempt_prob_5m) — weight 0.2
+- Thermal / power headroom (metric: node.thermal_headroom_pct) — weight 0.05
+- Tenant-priority (static tag: tenant.priority_level) — weight 0.15
+
+Decision matrix (text table)
+
+Priority score => scheduling action:
+
+| Priority range | Action | Typical use case | Default pool |
+|---------------|--------|------------------|--------------|
+| 0.85 - 1.00   | Guaranteed reservation + warm-pool | Customer-facing low-latency APIs | dedicated-gpu-24/7 |
+| 0.60 - 0.84   | Preferred spot with warm fallback | Batch-critical evals with SLAs | spot-high-availability |
+| 0.35 - 0.59   | Spot pool only, aggressive bin-packing | Best-effort background evals | spot-cheap |
+| 0.00 - 0.34   | Delay & queue or pre-warm during low-cost window | Nightly archives/cheap retraining | deferred-batch |
+
+Note: the table above is evaluated per request/job with fallback policy that will attempt a higher-cost pool if SLA deadlines approach.
+
+Harvester architecture overview
+
+- Ingest layer: pulls from billing sink (BigQuery export), Prometheus metrics (via telemetry-pipeline), and internal tenant metadata (ConfigDB).
+- Normalizer: converts metrics to a common scale using percentile baselines (p50/p95 windows configurable per-tenant).
+- Scorer: weighted combination + hysteresis to avoid flapping. Emits tenant_job.priority_score to the scheduler topic (Kafka) and writes historical snapshots to cost-harvester.events (retention 90d).
+- API & SDK: lightweight gRPC API for gpu-allocator to request delta decisions and for the console to visualize signals.
+- Auth & RBAC: service principal with least privilege to read billing exports and tenant metadata.
+
+Implementation details and Terraform changes
+
+Required Terraform changes (high-level):
+
+1) New IAM roles and data connectors: cost-harvester-read-only role that can read billing exports and project-level Prometheus metrics.
+2) Tagging enforcement module: ensure tenant resources include required tags (tenant.id, tenant.priority_level, cost_center).
+3) Kafka topic and ACL provisioning: cost-harvester-events (retention configurable) and scheduler-decisions topics.
+
+Example snippet (Terraform HCL pseudocode):
+
+resource "google_project_iam_member" "cost_harvester" {
+  project = var.billing_project
+  role    = "roles/bigquery.dataViewer"
+  member  = "serviceAccount:${local.cost_harvester_sa}"
+}
+
+module "required_tags" {
+  source = "git::ssh://git@repo/terraform-modules.git//tenant-tags"
+  tenant_id = var.tenant_id
+  enforced_tags = {"tenant_id" = var.tenant_id, "priority_level" = var.priority_level}
+}
+
+CI/CD and testing strategy
+
+- Unit tests: scoring and normalization logic with synthetic telemetry vectors.
+- Integration tests: deploy a test harvester into ephemeral test account using the ephemeral-gpu-pools pipeline. Confirm emitted Kafka messages schema and topic ACLs.
+- Canary: rollout to a single non-production region and 10% of batch jobs. Monitor cost delta and job success rate for 72 hours before broader rollout.
+- CI gating: terraform plan must include tagging enforcement and key rotation changes.
+
+Observability and SLOs
+
+Metrics to publish (Prometheus):
+- cost_harvester.score_compute_seconds (histogram)
+- cost_harvester.signals_processed_total
+- cost_harvester.emit_latency_ms (p95 < 200ms target)
+- scheduler.decision_applied_ratio (target 99% after backoff)
+
+Dashboards and alerting:
+- Dashboard: "Cost Harvester — Score Distribution by Tenant" (p50/p95).
+- Alerts:
+  - P1: cost_harvester.emit_latency_ms p95 > 1s for 5m -> paging oncall infra-core
+  - P2: scheduler.decision_applied_ratio < 90% for 10m -> paging eng-allocator
+  - P3: sudden >30% increase in billed GPU-hours for a tenant over rolling 24h -> notify tenant owner and finance slack channel #billing-ops
+
+Runbook: detection, mitigation, and rollback
+
+Detection:
+1) Alert fires for emit latency or applied ratio.
+2) Check Kafka lag for cost-harvester-events topic.
+3) Query last 24h scoring distribution: SELECT * FROM cost_harvester.snapshots WHERE tenant_id='...' ORDER BY ts DESC LIMIT 100
+
+Mitigation steps:
+1) If emit latency high -> scale harvester deployment replicas + check Prometheus scrape intervals and BigQuery query quotas.
+2) If Kafka lag exists -> scale consumer group, or temporarily redirect scheduling to static fallback policy (gpu-allocator -> prefer dedicated pools).
+3) If incorrect scores observed -> switch scoring weights to last-known-good via feature-flag:
+   curl -X POST https://config-api.internal/flags/cost_harvester_weights -d '{"weights": {"billing":0.3, "token":0.3, "preempt":0.2, "tenant":0.2}}'
+
+Rollback options:
+- Rollback HARVESTER to previous image using canary pipeline.
+- Disable harvester by applying a Terraform toggle (module.cost_harvester.enabled = false) and revert scheduler to static priority rules.
+
+Operational playbook for oncall
+
+1) Owner: infra-core team (primary), eng-allocator (secondary).
+2) On page-call: follow Detection steps.
+3) If paging alert escalates >30m, open incident in statuspage and run the multi-region failover playbook.
+4) Post-incident: add root cause and remediation to /confluence/eng-infra/runbooks/postmortems and update the scoring hysteresis parameters if needed.
+
+Rollout and migration plan
+
+- Phase A (2 weeks): deploy harvester read-only in 1 non-prod region, collect signals and verify baseline normalization.
+- Phase B (4 weeks): enable scoring for non-critical tenants and add traffic shaping for batch job queues.
+- Phase C (6 weeks): enable for all batch jobs and soft-apply to customer-facing routes with 10% traffic.
+- Phase D (2 weeks): full enablement with monitoring and finance validation.
+
+Security and compliance considerations
+
+- Access to billing exports is sensitive; harvester service account is audited and must rotate keys every 90 days.
+- Ensure logs do not contain PII or API keys; sanitize before writing cost-harvester.events.
+- Mark any tenant-specific anomaly data as restricted if correlating with customer identifiers.
+
+Ownership and open questions
+
+- Primary owner: infra-core (Marisol Rivera)
+- Secondary owner: eng-allocator (Ethan Zhao)
+
+Open questions:
+- Should tenant-priority be writable by self-serve teams or fenced behind platform engineering? Recommendation: fenced for first 6 months.
+- What SLA does finance require for cost reporting accuracy? Action: coordinate with finance to agree on 1% error tolerance for aggregated 24h windows.
+
+Related pages and references
+
+- "GPU scaling decision framework and burst policy" — background on autoscaling tiers.
+- "GPU cost centre mapping and tagging IAM policies" — required tags and billing mapping.
+- Terraform modules: //git/repo/terraform-modules//tenant-tags and //git/repo/terraform-modules//kafka-topics
+
+Appendix: quick diagnostics commands
+
+- Kafka lag check:
+  kubectl -n infra exec -it kafka-consumer-0 -- kafka-consumer-groups --bootstrap-server kafka:9092 --describe --group cost-harvester-group
+
+- Harvester logs (last 2 hours):
+  kubectl -n infra logs -l app=cost-harvester --since=2h | jq -r '.message' | head -n 200
+
+- Verify recent scores for tenant:
+  curl -s "https://api.internal/cost-harvester/v1/scores?tenant_id=tenant-123&limit=50" | jq '.'
+
+End of document.

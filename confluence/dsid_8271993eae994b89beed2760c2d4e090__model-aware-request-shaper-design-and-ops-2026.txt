@@ -1,0 +1,183 @@
+Model-aware Request Shaper — Design and Operations
+
+Overview
+
+This document defines the design, operational procedures, and observability requirements for the Model-aware Request Shaper (MARS): a cross-layer runtime component that adapts admission, batching, and kernel hints based on the target model variant, request class, and active fidelity constraints.
+
+MARS is intended to reduce SLA violations and improve unit cost by making shaping decisions informed by model characteristics (sequence length distribution, KV cache friendliness, quantization profile) rather than treating all requests uniformly. This page covers: design goals, architecture diagrams, scheduler interactions, telemetry and profiling playbook, benchmark procedure, rollout checklist, runbook for common incidents, configuration reference, and ownership.
+
+Goals and non-goals
+
+Goals:
+- Reduce 95th/99th token-latency SLO violations for multi-model fleets by coordinating batching and kernel selection per model variant.
+- Preserve strict fairness across tenants while enabling cost-aware prioritization for Reserved/Dedicated pools.
+- Provide actionable telemetry and knobs for on-call and SRE to react to model-specific regressions quickly.
+- Allow per-customer/model feature flags (prefetching, aggressive batching, relaxed latency window) and safe fallbacks.
+
+Non-goals:
+- MARS does not replace global admission controllers that enforce account-level rate limits; it augments them with model-aware signals.
+- MARS does not attempt to change model weights or quantization at runtime; it surfaces suggestions to the Optimize team only.
+
+High-level architecture
+
+(ASCII diagram)
+
+Client -> API Gateway -> Router -> MARS -> Admission Controller -> Scheduler -> Kernel Executor
+
+Components:
+- Model Hint Registry: Stores per-model metadata (expected token distribution, hot prefix likelihood, kv-cache sensitivity, preferred kernel families). Populated from model-onboarding pipeline and updated by profiling jobs.
+- Request Classifier: Lightweight classifier that attaches a request signature (model_id, prompt-length-bucket, customer-tier, op_type) to each request. Runs in the front-line router.
+- Shaping Policy Engine (MARS Core): Evaluates policies to decide shaping actions: permit/queue/reject, batch slicing keys, kernel hints, kv-prefetch directives, and expected tail-fallthrough rules. Uses declarative policy profiles authored by scheduler team.
+- Telemetry Enricher: Adds model-aware fields to traces and metrics (model.variant, hint_version, predicted_sequence_bucket, chosen_kernel_hint).
+- Feedback Loop: Periodic job that reconcilies actual latency/cost vs predicted and updates Model Hint Registry (signal back to Profiling Playbooks).
+
+Policy model and examples
+
+Policies are expressed in our scheduler policy DSL (see scheduler-policy-language-declarative-profiles) and are composed of conditions and actions. Example policies (pseudo-DSL):
+
+1) Low-latency small prompt policy:
+when model.family == "redwood-compat-tiny" and prompt_bucket in [0-64]:
+  - set kernel_hint = "fast-small-ctx"
+  - max_batch_size = 16
+  - admission_priority = "interactive"
+
+2) Cost-sensitive long-seq policy for batch windows:
+when model.quant_profile == "int4" and median_length > 256:
+  - enable_kv_prefetch(true)
+  - set_kernel_hint = "concat-friendly"
+  - target_batch_latency_ms = 120
+  - admission_priority = "best-effort"
+
+Scheduler interactions and kernel handshake
+
+MARS communicates intent to the scheduler and kernel executor via:
+- Kernel hint header: structured token the scheduler maps to kernel families (sharded vs fused attention, prepacked weights).
+- Batch-slice key: chosen to optimize packing (e.g., same prompt_bucket + kv-cache affinity).
+- Preferred prefetch directive: instruct kernel to pre-issue KV cache lookups or to use lazy prefetch.
+
+The scheduler must validate kernel hints against the current kernel compatibility matrix. If a hint is incompatible with the node (e.g., missing kernel plugin), the scheduler will either map to a nearest compatible hint or follow the MARS-declared fallback priority list.
+
+KV cache coordination
+
+MARS can request coordinated KV prefetch windows for long-running sessions. Coordination rules:
+- Prefetch is gated by per-node memory watermarks (see config table below).
+- Prefetch concurrent limit default: 4 per-GPU.
+- When prefetch window is enabled, MARS will mark the request as heavy; admission priority may be lowered unless the customer tier is Reserved.
+
+Telemetry and profiling playbook (operational)
+
+Purpose: ensure model-aware shaping decisions are observable and profile their impact on latency, cost, and fidelity.
+
+1) Enrichment fields (required):
+- model.id, model.variant
+- request.predicted_seq_bucket (0-64, 65-256, 257-1024, >1024)
+- kernel_hint, hint_version
+- batch_slice_id, batch_size_actual
+- kv_prefetch_enabled (bool), kv_prefetch_duration_ms
+- scheduling_latency_ms, kernel_enqueue_ms, kernel_exec_ms
+
+2) Key dashboards and alerts:
+- Model-level SLO rollup: 95th/99th token-latency per model.variant. Alert if 95th > SLO*1.1 for 5m.
+- Hint-compatibility mismatch: rate of rejected/translated kernel hints > 0.5% over 10m.
+- Prefetch OOM signal: memory.watermark_eviction_count > 0 in window. Critical alert.
+- Batch-slice starvation: fraction of requests assigned to native batch < 90% for an active model.
+
+3) Profiling procedure (when suspect model-level regression):
+- Step 1: mirror 1% of production traffic for the target model into the profiling cluster (shadow-run) with same MARS policy.
+- Step 2: collect 1,000 representative requests per prompt_bucket for 30 minutes.
+- Step 3: run kernel-level microbenchmarks for the exact kernel_hint variants observed (use microbenchmark-suite).
+- Step 4: analyze traces to attribute latency to scheduling vs kernel vs serialization (use causal-latency-attribution playbook).
+- Step 5: propose policy adjustment (e.g., reduce target_batch_latency_ms, change kernel_hint) and run A/B shadow test for 24 hours.
+
+Benchmark protocol for validating MARS effects
+
+Objective: quantify cost/latency/fidelity tradeoffs introduced by MARS policies.
+
+Benchmark setup:
+- Use the operational workload simulator (service: workload-synth) and a corpus of request templates grouped by prompt_bucket and op_type.
+- Baseline: scheduler with model-agnostic shaper (current mainline).
+- Treatment: scheduler + MARS with policy profile X.
+- Metrics: p50/p95/p99 token latency, per-token GPU utilization, per-request cost estimate, kernel queue time distribution.
+
+Run script (short):
+1) seed the model hint registry with profile X.
+2) run 60-minute steady-state at target QPS for mid-tier pool.
+3) collect traces and aggregate.
+4) compute relative delta and run statistical significance (t-test) per metric.
+
+Acceptance criteria:
+- p95 delta <= -10% (reduced) or <= +2% (acceptable increase) AND per-request cost delta <= -5% OR there is a documented product tradeoff.
+
+Configuration reference (example table)
+
+| key | default | description | notes |
+|-----|---------|-------------|-------|
+| mars.max_prefetch_per_gpu | 4 | Max concurrent kv-prefetch per GPU | Soft limit enforced by scheduler |
+| mars.max_batch_latency_ms | 150 | Maximum batch formation latency target | Lower improves latency, raises cost |
+| mars.policy_reload_interval_s | 60 | How often MARS refreshes policy and hints | Use 60s in prod |
+| mars.hint_fallback_ttl_s | 300 | Time to trust a mapped fallback hint | Set to 5m to allow smooth conversions |
+| mars.prefetch_memory_watermark_pct | 0.7 | Node-level watermark to allow prefetch | 0.7 recommended |
+
+Operational runbook (common incidents)
+
+Incident: Elevated model p99 for model.variant A after policy rollout
+1) Immediately open a remediation incident and tag "mars-incident".
+2) Check alert dashboard: confirm p95/p99 increase and affected prompt_buckets.
+3) Abort rollout: set policy flag to previous version via policy rollback API:
+   curl -X POST -H "Authorization: Bearer $OPS_TOKEN" \
+     https://internal-control-plane/api/mars/policy/rollback 
+   Confirm policy reload succeeded (logs in /var/log/mars/reloader.log).
+4) Run profiling replay for 15 minutes using captured requests for each affected bucket.
+5) If kernel_hint mismatch rate non-zero: check kernel plugin health on nodes (svc: kernel-plugin-manager).
+6) If kv-prefetch caused OOMs: drain prefetch windows by toggling mars.max_prefetch_per_gpu=0, then roll forward with reduced prefetch.
+7) Postmortem scope: include hypothesis, root cause (policy misclassification/kernal incompatible/misprofiled), timeline, and mitigations.
+
+Incident: Hint-compatibility spike (translated-to-fallback count rising)
+- Check Model Hint Registry: ensure hint_version is the same across front-line routers. If not, force reload:
+  kubectl rollout restart deployment/mars-reloader -n runtime
+- If nodes lack plugin: schedule kernel-plugin-manager restart on affected node pool.
+
+Rollout checklist (safe rollout matrix)
+
+- Canary: deploy policy to 0.5% traffic for model variant; monitor 1h.
+- Shadow: mirror 1% traffic to a MARS-enabled staging cluster and compare traces for 24h.
+- Gradual increase: 0.5 -> 1 -> 5 -> 20 -> 100% with 1h holds and automated rollback if p95 > SLO*1.1.
+- Post-rollout validation: run benchmark protocol for 60m.
+
+Ownership and contacts
+
+- MARS Core Owner: Maya Patel (eng-serving-runtime).
+- Scheduler integration: Daniel Chen (kernel-and-scheduling).
+- Profiling and lab: Sofia Martinez (applied-ml-and-evals).
+- On-call: runtime-sre rotation (link to oncall page).
+
+Appendix: sample policy JSON (examples)
+
+{
+  "policy_name": "interactive-small-ctx-v1",
+  "conditions": ["model.family == 'rwd-tiny'", "prompt_bucket == '0-64'"],
+  "actions": {
+    "kernel_hint": "fast-small-ctx",
+    "max_batch_size": "16",
+    "target_batch_latency_ms": "30",
+    "admission_priority": "interactive"
+  }
+}
+
+Notes and future work
+
+- Integrate MARS with Optimize to allow policy suggestions based on cost budgets.
+- Explore per-tenant adaptive learning of target_batch_latency using automatic feedback.
+- Work with Private Deployments team to expose a restricted subset of MARS policies for self-hosted customers.
+
+Related resources
+
+- scheduler-policy-language-declarative-profiles (internal)
+- runtime-microbenchmark-suite and kernel-hinting-matrix
+- profiling-playbook/causal-latency-attribution-and-signal-enrichment-playbook-2026.json
+
+Revision history
+
+- 2026-02-14: Created (Maya Patel)
+- 2026-04-07: Added telemetry enrichment and runbook sections (Daniel Chen)
+- 2026-06-01: Tuned rollout thresholds and benchmark acceptance criteria (Sofia Martinez)

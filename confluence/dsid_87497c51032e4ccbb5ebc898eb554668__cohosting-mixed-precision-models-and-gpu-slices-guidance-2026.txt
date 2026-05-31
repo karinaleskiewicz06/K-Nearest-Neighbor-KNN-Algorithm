@@ -1,0 +1,126 @@
+Cohosting mixed-precision models and GPU slices: guidance for safe colocation
+
+Summary
+-------
+This document provides operational guidance and engineering standards for safely cohosting models that use different numeric precisions (FP32, FP16, BF16, INT8) on shared GPU hosts using logical GPU slicing and soft partitioning. It covers resource accounting, scheduling hints, runtime guardrails, fallback behavior, testing requirements, and an example config for the Redwood serving runtime.
+
+Scope
+-----
+Applies to: Redwood hosted and Dedicated inference clusters where multiple model variants may be scheduled on the same GPU node. Excludes air-gapped Private deployments that have customer-specific partitioning policies unless they opt into these defaults.
+
+Motivation
+----------
+- Mixed-precision models reduce memory and compute cost but introduce cohabitation complexity: memory fragmentation, kernel interference, and scheduling head-of-line blocking.
+- Logical GPU slicing (NVIDIA MIG-like or software slices) enables higher utilization but requires deterministic QoS guarantees for latency-sensitive workloads.
+- This guidance yields consistent, repeatable rules teams must follow to avoid noisy-neighbor failures and performance regressions.
+
+Guiding principles
+------------------
+1) Safety first: prioritize per-request latency SLOs and KV-cache correctness over maximal packing.
+2) Transparent accounting: every slice must report utilization and attributed cost to caller metadata.
+3) Predictability: prefer conservative slice sizes for tail-sensitive routes and aggressive packing for background/batch routes.
+4) Graceful fallback: runtime must detect capacity pressure and safely relocate or degrade model variants without request loss.
+
+Definitions
+-----------
+- Slice: a logical partition of GPU resources (memory + compute budget) allocated to one or more model workers.
+- Mixed-precision model: a model shipped with a precision profile (e.g., fp32, fp16, bf16, int8).
+- Guaranteed slice: minimum resources reserved for SLA-protected routes.
+
+Recommended slice profiles (baseline)
+------------------------------------
+| profile-name | vRAM-reserved | compute-share | target-use | tail-latency-sensitivity |
+| conservative-32 | 32GB | 50% | interactive chat, high-SLA | high |
+| balanced-24 | 24GB | 35% | multi-turn chat, standard generation | medium |
+| packed-12 | 12GB | 15% | background rerank, batch embeddings | low |
+| int8-dedicated | 8GB | 10% | quantized-serving (int8) | low |
+
+Notes: the vRAM-reserved column is illustrative for a 48–80GB GPU class. Teams must translate to absolute byte counts for each hardware SKU.
+
+Precision-aware placement rules
+-------------------------------
+- Disallow colocating FP32-dominant workloads with INT8-dominant workloads on the same physical PCIe domain unless the node is explicitly tainted for mixed-precision testing.
+- Prefer colocating FP16/BF16 with INT8 when models are memory-bound but not heavily compute-bound; this reduces preemption frequency.
+- Enforce a max of 3 slices per GPU for latency-first deployments unless experimental flags are enabled and approved by SRE.
+
+Runtime safeguards and checklist
+-------------------------------
+1) Admission control: slice allocator must reject allocation if projected sustained memory pressure > 85% for the node over a 5-minute window.
+2) Proactive warmup: on deployment, prefetch KV-cache and run 3 synthetic warmup inferences for 95th percentile sequence lengths to populate kernels and memory pages.
+3) Kernel isolation: runtime must pin hot CUDA streams per slice and limit cross-slice priority inversions via CUDA stream priorities or CPU-side pacing.
+4) Soft eviction policy: implement two-stage eviction — (a) gentle throttle (rate-limit new requests), (b) migrate-to-dedicated fallback (spin up dedicated worker).
+5) Telemetry: emit slice-level metrics: slice.vram.used, slice.compute.share, slice.tail_50/95/99, slice.eviction_count.
+
+Operational playbook (oncall steps)
+----------------------------------
+1) SIGNS: elevated slice.tail_99 >= SLO * 1.5 and node.vram.used > 90%.
+2) Immediate action: identify slices with highest eviction_count and top memory contributors: `rdctl node top-slices --node $NODE`
+3) Short-term mitigation (5–15m): mark lowest-priority slices for throttling: `rdctl slice update --id $SLICE --priority lower`
+4) Medium-term (15–60m): migrate one high-memory model to a dedicated pool using canary migration policy.
+5) Post-incident: open a runbook ticket and link to the deployment: include kernel traces and slice-level metrics for a 1-hour window.
+
+Testing & validation requirements (pre-deploy)
+----------------------------------------------
+- Unit tests: precision manifest validation, config parsing, and allocator boundary checks.
+- Integration tests: deploy mixed-precision scenario with synthetic traffic generator that exercises 10–90 token lengths and asserts slice.tail_95 < 1.5x baseline.
+- Chaos test: simulate node memory fragmentation via synthetic allocations; assert runtime triggers soft eviction policy properly.
+- Nightly regression: run packing stress job that tries 1,000 random packing combinations and logs any tail-latency violations.
+
+Configuration example (serving runtime YAML)
+-------------------------------------------
+# example: model-variant slice hint in variant manifest
+model_variants:
+  - name: llama-13b-fp16
+    precision: fp16
+    slice_hint: balanced-24
+    min_slices: 1
+    max_slices: 2
+  - name: llama-13b-int8
+    precision: int8
+    slice_hint: int8-dedicated
+    min_slices: 0
+    max_slices: 1
+
+Implementation notes for runtime engineers
+-----------------------------------------
+- Allocator simulation: implement a bin-packing simulator that predicts memory fragmentation and kernel contention; expose this as an internal API used by the admission controller.
+- Accounting tags: responses must include: `X-Redwood-Slice-Id`, `X-Redwood-Precision`, and `X-Redwood-Slice-Cost` for downstream cost attribution and debugging.
+- Backpressure propagation: clients should receive structured 429 responses with `retry_after` and `recommended_model_variant` fields when soft eviction occurs.
+
+Rollout plan for existing fleets
+--------------------------------
+1) Canary: enable mixed-precision colocation on 2% of Dedicated fleet nodes with conservative-32 profile for 72 hours. Monitor slice.tail_99, node.vram.used, and customer error rates.
+2) Gradual ramp: 2% -> 10% -> 30% over 2 weeks, enabling balanced-24 and packed-12 profiles selectively for non-SLA routes.
+3) Safeguards: automatic rollback if aggregate tail_99 exceeds baseline by 20% for more than 30 minutes.
+
+Ownership & metrics
+-------------------
+- Owner: Serving Runtime team (primary), SRE (secondary).
+- Key metrics to monitor: slice.tail_95, slice.e2e_error_rate, node.vram_frag_ratio, slice.eviction_rate, migration_success_rate.
+
+Open items & future work
+------------------------
+- Formalize a cost-model that maps slice.compute-share to per-token cost for internal billing.
+- Explore hardware-enforced slices (MIG) vs software slicing tradeoffs and publish a migration guide.
+- Add per-model kernel hotlist to reduce cold-kernel jitter during mixed workloads.
+
+References
+----------
+- Internal: runtime-architecture/adaptive-kv-coordinator-and-eviction-contract-2026
+- External: GPU vendor whitepapers on MIG and multi-instance isolation
+
+Appendix: quick debugging commands
+----------------------------------
+- `rdctl node inspect $NODE --metrics 5m` — aggregate slice-level metrics
+- `rdctl slice list --filter precision=int8` — list int8 slices and their hosts
+- `rdctl trace --slice $SLICE_ID --duration 60s` — collect runtime kernel traces
+
+Contributors
+------------
+Priya Nandakumar (author), Diego Alvarez (SRE reviewer), Maya Chen (runtime reviewer), Oliver Park (benchmarks)
+
+Document history
+----------------
+- 2025-11-12: Created
+- 2026-01-06: Added runtime allocator simulation requirements
+- 2026-02-18: Finalized rollout plan and operational playbook

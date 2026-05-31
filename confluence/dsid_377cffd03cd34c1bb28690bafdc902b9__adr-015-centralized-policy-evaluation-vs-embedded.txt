@@ -1,0 +1,193 @@
+ADR-015: Centralized policy evaluation vs. embedded authorization evaluation (RBAC v2)
+
+## Status
+Published (supersedes informal guidance in early RBAC v2 design drafts).
+
+## Decision
+**We will evaluate authorization policies in-process (“embedded evaluation”) using a shared, versioned authorization library**, rather than requiring services to call a centralized online policy-evaluation service on the request path.
+
+We will still use **centralized policy distribution and lifecycle management** (policy bundle repository + signed artifacts + rollout tooling), but **the allow/deny decision for a request will be computed locally** by the component enforcing authorization (API Gateway and/or the target service).
+
+## Context
+RBAC v2 requires deny-by-default enforcement with consistent semantics across:
+- API Gateway (edge enforcement for Hosted API + Console)
+- Control Plane services (org/project/env/deployment management)
+- Dedicated + Private admin operations (including restricted environments)
+
+We considered two architectural approaches for policy evaluation:
+1) **Centralized online evaluation**: services call an internal “AuthZ Policy Service” to compute allow/deny.
+2) **Embedded evaluation**: services run a shared evaluator library locally; policies are fetched/distributed out-of-band.
+
+Key constraints and requirements:
+- **Latency**: authorization must add negligible overhead. Target is <2 ms p95 added latency at Gateway and <1 ms p95 for service-local checks for typical requests.
+- **Reliability**: authz must not introduce a new hard dependency that can take down traffic. Deny-by-default is required for security; availability must be addressed without widening implicit allow.
+- **Multi-deployment**: Private deployments can be air-gapped or have constrained connectivity. Dedicated and Private customers also demand predictable failure modes.
+- **Auditability**: we must log consistent decision context (subject/action/resource/scope/policy version/decision/denial reason).
+- **Operational simplicity**: minimize new always-on services and on-call surface area, while enabling safe policy updates and fast rollback.
+
+## Decision drivers
+- Minimize request-path dependencies (avoid a new “authz” microservice that all other services must call).
+- Support Private/on-prem deployments without requiring a highly available central service.
+- Keep semantics consistent and testable (same evaluator code everywhere).
+- Enable policy rollouts/rollbacks with clear versioning, validation, and visibility.
+- Maintain strong security posture: deny-by-default, least privilege, and no “fail open” behavior.
+
+## Considered options
+
+### Option A — Centralized policy evaluation service (online)
+**Description:** Every protected operation calls an internal policy evaluation endpoint (e.g., `POST /v1/evaluate`) with subject, action, resource scope, and context. The service returns allow/deny + reasons.
+
+**Pros**
+- Single decision point; easiest to change logic centrally.
+- Simplifies clients (no policy parsing, fewer local caches).
+- Centralized metrics and logging possible.
+
+**Cons / risks**
+- Introduces a new high-QPS dependency on the request path for all critical routes.
+- Requires HA, multi-region routing, and strict SLOs; authz service becomes a Tier-0 system.
+- Failure modes are hard: to preserve security we must deny on failure, which can become a global outage. To preserve availability we’d be pressured to fail open, which violates secure defaults.
+- Challenging for Private deployments (air-gapped or restricted networking): would require bundling/running another always-on service and its HA plan.
+- Potential for thundering-herd and cascading failures during incident conditions (authz QPS spikes during retries, partial outages, or latency regressions).
+
+**Operational implications**
+- New on-call rotation / escalation path.
+- Needs dedicated capacity planning (p95, p99, tail latencies) and strict dependency management.
+- Requires careful changes to avoid fleet-wide incidents.
+
+### Option B — Embedded policy evaluation (in-process) with centralized distribution
+**Description:** Gateway and services link a shared `authz-evaluator` library. Policies are distributed as signed, versioned bundles. Evaluation happens in-process using local caches and a local policy snapshot.
+
+**Pros**
+- Removes request-path dependency on a centralized service.
+- Works naturally in Hosted, Dedicated, and Private environments.
+- Predictable latency (CPU-only local computation; no network hop).
+- Scales horizontally with existing services; avoids one global bottleneck.
+- Enables deterministic behavior for incident response: if policies are available locally, traffic continues even during control-plane partial outages.
+
+**Cons / risks**
+- Requires robust policy distribution and versioning.
+- Risk of policy drift if distribution is misconfigured; must track and surface policy versions in telemetry.
+- Library upgrades must be managed across many services (though this is standard for Redwood shared libraries).
+- Need consistent caching semantics and invalidation triggers across components.
+
+**Operational implications**
+- Fewer Tier-0 services; more emphasis on release discipline for shared libraries and policy artifacts.
+- Requires strong CI validation and runtime diagnostics (e.g., “policy version loaded”, “cache hit rate”, denial reason codes).
+
+## Decision details
+We choose **Option B (embedded evaluation)**.
+
+### Reference architecture (text diagram)
+Request path (Hosted/Dedicated):
+
+1. Client → **API Gateway**
+2. Gateway authenticates subject (API key / session / SSO)
+3. Gateway determines `action` + `resource_scope` (org/project/env/deployment/cluster)
+4. Gateway calls embedded evaluator: `Evaluate(subject, action, scope, context)`
+5. If allowed: forward to service; if denied: return standardized 403 with denial reason code
+6. **Target service** performs a second check for service-owned sensitive operations (defense in depth) using the same library.
+
+Policy path:
+- Policy bundles are authored in `rbac-policy-bundle` repo, linted, signed, and released as versioned artifacts.
+- Each environment (Hosted region, Dedicated cluster, Private install) runs a lightweight **Policy Bundle Distributor** job (or equivalent mechanism) that fetches artifacts, verifies signatures, and stores them in a local, read-optimized store.
+- Services/Gateway load the current policy snapshot at startup and refresh on a controlled cadence (plus event-driven refresh where available).
+
+### Enforcement boundaries
+- **Gateway enforcement:** required for all external-facing endpoints. Deny-by-default applies when an endpoint is annotated as “requires permission X”.
+- **Service enforcement:** required for control-plane mutations and any endpoint that can be invoked through internal paths or that affects security-relevant state (e.g., org/user/role bindings, routing policies, key rotation, audit export). This prevents bypass if a route is exposed internally or via misconfiguration.
+
+### Caching and staleness
+- Evaluator uses **scoped caching** keyed by:
+  - subject principal ID + org ID
+  - action
+  - scope tuple (org/project/env/deployment/cluster)
+  - policy bundle version
+  - evaluator schema version
+- Default cache TTL target: **30–60 seconds** for high-QPS endpoints, with immediate invalidation on:
+  - role binding changes
+  - role template updates
+  - policy bundle version update
+
+Rationale: small TTL reduces risk of stale allows after revocation while preserving latency goals.
+
+### Failure modes
+- **Policy snapshot missing/unloadable**: deny-by-default for protected operations; emit a high-severity alert (S1) and include `authz_error=POLICY_UNAVAILABLE` in decision logs.
+- **Policy refresh failure**: continue using last-known-good snapshot; alert if refresh is stale beyond threshold (e.g., >30 minutes Hosted; configurable for Private).
+- **Evaluator errors** (bug/exception): treat as deny for protected operations; include `authz_error=EVALUATOR_EXCEPTION` and capture stack fingerprint to error tracking.
+
+### Audit logging impact
+Embedded evaluation must still generate evidence-grade logs. All enforcement points (Gateway and services for sensitive mutations) must log:
+- subject (principal type + id)
+- action (permission string)
+- resource scope (org/project/env/deployment/cluster)
+- decision (allow/deny)
+- denial reason code(s)
+- policy bundle version + evaluator version
+- request correlation identifiers (trace/span, request id)
+
+This aligns with the audit log schema extension defined in `authz-decision-logging-schema`.
+
+## Rationale
+Embedded evaluation best satisfies Redwood’s core requirements:
+- **Latency**: eliminates extra network hop and tail latency risks.
+- **Reliability**: avoids turning a central authz service into a global choke point. Authorization remains available as long as the service instance is available.
+- **Private deployments**: supports air-gapped and constrained environments with artifact-based policy distribution.
+- **Security**: deny-by-default remains enforceable; “last-known-good” snapshot is acceptable when refresh fails, but “no policy loaded” is a deny condition.
+- **Consistency**: a single shared library provides consistent semantics, denial reason codes, and audit fields.
+
+## Consequences
+
+### Positive
+- Reduced request-path dependencies and improved blast-radius isolation.
+- Consistent semantics across Gateway and services.
+- Easier to support Dedicated/Private without running an additional always-on service.
+
+### Negative / trade-offs
+- Policy distribution and versioning become critical; we must invest in:
+  - artifact signing and verification
+  - bundle integrity checks
+  - rollout tooling and safe rollback
+  - clear visibility into “which policy version is running where”
+- Shared library upgrades require coordination and release management.
+
+### Required follow-ups
+1. Implement/standardize a policy evaluator client library with safe caching and metrics (owner: Jordan Lee).
+2. Add policy version reporting to health endpoints and telemetry dashboards (owner: Logan Wright).
+3. Update API standards to require endpoint permission annotations and deny-by-default middleware/interceptors (owner: Amara Diallo / Ethan Park).
+4. Ensure audit-log exporter maps authz decision fields for SIEM export (owner: Kevin Osei).
+
+## Implementation notes (non-normative)
+- Library API (illustrative):
+  - `Evaluate(subject, permission, scope, context) -> {decision, denial_reasons, policy_version}`
+  - `Explain(subject, permission, scope, context) -> debug trace` (admin-only; gated and rate-limited)
+- Policy bundles should be immutable; updates are new versions.
+- Services must treat policy bundle version as part of their “runtime config” and include it in incident reports.
+
+## Security considerations
+- No “fail open” behavior for protected actions.
+- Debug/explain output must be admin-gated and avoid leaking sensitive policy details to unprivileged users.
+- Policy bundle artifacts must be signed and verified in all deployment modes.
+
+## Operational considerations
+- Define SLOs for policy distribution freshness (Hosted vs Private configurable).
+- Alerting:
+  - `policy_snapshot_age_seconds` above threshold
+  - `policy_load_failures` non-zero
+  - spikes in `authz_denied_total` (with breakdown by denial reason)
+  - evaluator latency p95/p99 regressions
+
+## Alternatives not chosen
+We explicitly did not choose an online centralized evaluator on the request path. If a centralized component is introduced later, it should be limited to:
+- policy authoring/validation
+- bundle signing/releasing
+- out-of-band distribution and version orchestration
+
+Any future online evaluator proposal must include a hard reliability plan that does not require fail-open semantics.
+
+## Open questions
+- For ultra-high-QPS inference endpoints, should we allow gateway-only enforcement for a subset of read-only actions to reduce duplicate checks? (Default remains defense-in-depth for sensitive mutations.)
+- Do we need push-based invalidation for role changes in Hosted to reduce revocation latency below 30 seconds in certain enterprise SKUs?
+
+## Changelog
+- 2025-02-07: Clarified failure mode behavior (last-known-good vs missing policy snapshot) and required follow-ups for telemetry + SIEM mapping.
+- 2025-01-22: Initial ADR drafted and circulated for review.

@@ -1,0 +1,189 @@
+Self‑Service GPU Enrollment and Egress Guard Terraform Contracts
+
+Summary
+-------
+This playbook defines the Terraform contract and CI gating required to enable self-service GPU enrollment for tenant teams while enforcing per-tenant egress safety and cost accountability. The goal is to allow product and infra teams to provision accelerator capacity quickly without risking large cross-account egress spikes, runaway billing, or network saturation.
+
+Scope
+-----
+- Declarative Terraform module contract for tenant GPU enrollment and egress policy attachment.
+- CI contract tests that validate module outputs, IAM boundaries, and egress guard integration.
+- Runtime telemetry and alert thresholds used by SRE to detect policy violations.
+- Runbook for elevated egress events and remediation steps.
+
+Goals and non‑goals
+-------------------
+Goals:
+- Standardized Terraform contract that every tenant onboarding flow must satisfy.
+- Enforce egress quotas and safe fallback routing for burst events.
+- CI gating that prevents Terraform PRs from merging if contract checks fail.
+
+Non‑goals:
+- This doc does not prescribe hardware SKU procurement. See "gpu-provisioning-immutable-state-and-disaster-recovery" for capacity lifecycle.
+
+Principles
+----------
+1. Safe defaults: newly enrolled tenants get conservative egress budgets and burst allowances.
+2. Observable by design: Terraform modules must emit metadata that maps to billing and telemetry pipelines.
+3. Contract-first: CI must assert the module API surface and policy hooks before deployment.
+4. Least privilege networking and IAM for cross-account access.
+
+Architecture & Flow
+-------------------
+1. Tenant creates a PR against the self-service inbox repository with a minimal enrollment HCL using the shared module.
+2. CI runs contract tests (unit + integration) that validate the module outputs, checksums, and a dry-run against a sandbox account.
+3. On successful CI, the Terraform apply is executed into a staging environment where a smoke test triggers a synthetic egress trace.
+4. If smoke tests pass and egress telemetry is within budget, the change is promoted to production via the gated release pipeline.
+
+Required outputs from the enrollment Terraform module
+--------------------------------------------------
+The shared module must expose these outputs (names and types are enforced by CI):
+- tenant_id (string)
+- billing_tag (string)
+- gpu_pool_id (string)
+- egress_policy_id (string)
+- egress_budget_bytes_per_hour (number as string)
+- egress_burst_window_seconds (number as string)
+- owner_contact (string)
+- monitoring_service_endpoint (string)
+
+These outputs are consumed by the egress guard operator and the billing exporter. CI contract tests will fail if any output is missing or malformed.
+
+Terraform contract rules (must pass CI checks)
+---------------------------------------------
+- Module must be pinned to a canonical version: module.source = "git::ssh://git@github.com/redwood-internal/tf-gpu-enroll.git?ref=v<MAJOR>.<MINOR>"
+- No hardcoded credentials or long‑lived keys in module parameters.
+- All networking attachments must use approved VPC connectors and NATs defined in org modules.
+- Egress budget must be explicitly set; if omitted, CI will set it to the platform default and require an owner approval.
+- Outputs mapping for telemetry must include billing_tag and monitoring_service_endpoint.
+
+CI/CD contract tests (pipeline: enroll-contract-checks)
+----------------------------------------------------
+The enrollment pipeline must run the following stages:
+1. fmt_check: terraform fmt and HCL lint; fail fast.
+2. unit_validate: static schema validate of enrollment HCL/variables.
+3. module_hash_check: ensure the module ref matches pinned SHA (prevent accidental float).
+4. plan_and_diff_check: terraform plan against a sandbox account; parse plan for any disallowed resources (e.g., internet-exposed load balancer).
+5. output_contract_asserts: run a small harness that executes terraform output and asserts presence + basic patterns of required outputs.
+6. smoke_egress_simulation: run a synthetic workload in a staging account that emits traffic up to 10% of the configured egress_budget to verify telemetry plumbing.
+7. cost_estimate_verify: run the cost estimator; if estimated monthly egress > $X (configurable, default $200), require manual approval.
+
+The pipeline must return structured artifacts: plan.json, outputs.json, cost_estimate.json, smoke_result.json. These artifacts are archived and linked to the PR.
+
+Example Terraform enrollment snippet
+----------------------------------
+(Example provided for onboarding teams; CI expects the exact output names)
+
+```
+module "tenant_gpu_enrollment" {
+  source = "git::ssh://git@github.com/redwood-internal/tf-gpu-enroll.git?ref=v1.2"
+
+  tenant_id                     = "acme-io"
+  owner_contact                 = "oncall+acme@redwood.com"
+  requested_gpu_count           = 4
+  requested_machine_profile     = "a2-highmem"
+  egress_budget_bytes_per_hour  = 1073741824 # 1 GiB/hour
+  egress_burst_window_seconds   = 300
+  billing_tag                   = "team:acme"
+  vpc_connector                 = "org-vpc-connector-prod"
+}
+```
+
+Example expected outputs.json (CI will validate keys exist)
+---------------------------------------------------------
+```
+{
+  "tenant_id": "acme-io",
+  "billing_tag": "team:acme",
+  "gpu_pool_id": "gpool-42",
+  "egress_policy_id": "egp-9",
+  "egress_budget_bytes_per_hour": "1073741824",
+  "egress_burst_window_seconds": "300",
+  "owner_contact": "oncall+acme@redwood.com",
+  "monitoring_service_endpoint": "https://telemetry.prod.redwood/v1/streams/egp-9"
+}
+```
+
+Telemetry and alerts (SRE integration)
+-------------------------------------
+Metric names (required):
+- infra.egress.bytes{tenant_id, gpu_pool_id, region}
+- infra.egress.burst_rate{tenant_id, gpu_pool_id}
+- infra.egress.policy_violations{tenant_id, reason}
+
+Recommended alerting thresholds (defaults):
+| Alert name | Signal | Trigger | Severity | Owner |
+|------------|--------|---------|----------|-------|
+| EgressBudgetApproach | infra.egress.bytes per hour vs budget | >= 85% of budget sustained for 10m | P3 | tenant oncall |
+| EgressBurstExceeded | infra.egress.burst_rate > budget/burst_window | single spike > 3x burst allowance | P2 | infra-networking oncall |
+| EgressPolicyViolation | infra.egress.policy_violations > 0 | any violation | P1 | infra-security oncall |
+
+When an alert fires, the following tags must be attached to the incident: tenant_id, gpu_pool_id, commit_sha (from enrollment), pipeline_run_id. Attach smoke_result.json and plan.json.
+
+Runbook: Elevated egress event (summary)
+--------------------------------------
+1. Acknowledge the alert and attach artifacts from the enrollment pipeline.
+2. Check infra.egress.policy_violations for explicit blocks (e.g., unapproved NATs). If present: immediately activate egress-policy circuit breaker (see step 5).
+3. If violations absent, consult recent flows in the packet telemetry dashboard for signs of data exfil or runaway inference evals.
+4. Contact tenant owner_contact; request immediate throttling of synthetic/traffic jobs.
+5. Circuit breaker options (ordered):
+   a. Apply egress-policy emergency patch that reduces egress_budget_bytes_per_hour by 80% (fast path for critical incidents).
+   b. Reroute tenant public traffic through the egress-scrubber proxy to enforce rate limits and TLS termination.
+   c. As last resort, detach the tenant from the shared GPU pool and move to a quarantined warm pool with no external egress.
+6. After stabilization, run forensics, create post-incident report, and require the tenant to provide remediation and long-term plan.
+
+Ownership and escalation
+-----------------------
+- Module ownership: infra/terraform-team (primary)
+- Egress guard operator: infra/networking-team (primary)
+- Billing tag and cost pipeline: finance-infra (secondary)
+- Oncall routing: infra-sre (escalation for P1/P2)
+
+Rollout plan for existing tenants
+--------------------------------
+1. Publish module v2.0 with backward-compatible outputs and deprecation notices.
+2. Run a compatibility scanner across existing Terraform state to detect missing outputs.
+3. Create a migration PR template that populates conservative egress budgets and adds owner_contact.
+4. Run a phased enforcement: 30% tenants (canary) -> 50% -> 100% over 8 weeks.
+5. Enforce strict CI contract checks at 100% enforcement.
+
+Operational notes and caveats
+---------------------------
+- The cost estimator is intentionally conservative; tenants with high egress patterns should be counseled to use dedicated networking or compress payloads.
+- The smoke_egress_simulation must not exceed 10% of the tenant egress budget; CI enforces this upper bound to avoid billing surprises.
+- For air-gapped/private deployments, the monitoring_service_endpoint is a stub that the Private team wires to customer telemetry. CI still validates the URL format.
+
+Appendix A: CI job definitions (high level)
+-----------------------------------------
+- enroll-contract-checks: runs on PR; required status check.
+- enroll-staging-deploy: gated by enroll-contract-checks; runs terraform apply in staging and triggers smoke simulation.
+- enroll-prod-promote: manual approval required if cost_estimate.json > $200; otherwise automatic after 24h successful smoke in staging.
+
+Sample CI command snippets
+-------------------------
+- terraform init -backend-config="bucket=tf-state-sandbox"
+- terraform plan -out=plan.binary | jq -r '.planned_values.root_module' > plan.json
+- python tools/validate_outputs.py outputs.json --schema schemas/enrollment_outputs.json
+- ./tools/smoke_simulator --endpoint $MON_ENDPOINT --bytes 10485760 --duration 60
+
+Appendix B: Contact matrix
+--------------------------
+- infra/terraform-team: infra-terraform@redwood.com
+- infra/networking-team: infra-networking@redwood.com
+- infra-sre: infra-sre-oncall@redwood.com
+- finance-infra: infra-billing@redwood.com
+
+Revision history
+---------------
+- 2024-02-14: Initial draft (Maya Chen)
+- 2024-06-20: Added CI contract stages and cost gating (Ravi Patel)
+- 2025-08-12: Finalized runbook and escalation paths, updated alert thresholds (Lena Ortiz)
+
+References
+---------
+- See org modules: org-vpc-connector, nat-gateway-shared, tf-cost-estimator.
+- Related runbooks: preflight-gpu-deployment-validation-and-rollback-playbook.json, egress-fairness-request-shaper-and-proxy-patterns.json
+
+Feedback and next steps
+-----------------------
+Open action: add an automated remediation playbook that can reduce egress_budget_bytes_per_hour automatically when the platform detects sustained elevated cost for 3 hours. Assign to infra/automation for Q4 2025.

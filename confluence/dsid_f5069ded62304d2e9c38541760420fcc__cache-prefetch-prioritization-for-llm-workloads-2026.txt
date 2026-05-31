@@ -1,0 +1,218 @@
+Cache prefetch prioritization for LLM workloads
+
+Summary
+
+This document describes the recommended design, configuration, observability, and operational playbook for cache prefetch prioritization and eviction policies used by Redwood's inference runtime KV/prefix cache. It is written for platform engineers and runtime owners responsible for production latency, cost, and memory stability for multi-tenant LLM traffic.
+
+Goals
+
+- Maintain stable tail latency SLOs for text generation and chat routes while minimizing GPU/memory cost.
+- Reduce cold-start token-generation overhead via targeted prefetching, but avoid unbounded memory growth.
+- Provide clear, actionable dashboards and alerts for cache health and automatic safeties for incidents.
+
+Scope
+
+- Applies to the GPU-backed runtime prefix/KV cache (global and per-tenant pools).
+- Covers prefetch heuristics, prioritization, eviction policies, config knobs, dashboards, alerts, incident runbook, and rollout checklist.
+- Does NOT cover application-layer user caches (edge caches) or embeddings caches.
+
+Context and motivation
+
+As models with large context windows and high per-request prefix reuse enter production, prefix/KV caching yields significant per-token cost reductions. However, naive prefetch of all observed prefixes leads to memory pressure, eviction thrashing, and worst-case latency spikes (observed during the 2025-09 incident). This doc balances aggressive warm-up with safety controls and tenant fairness.
+
+Design principles
+
+1. Cost-aware prioritization: prefetch only prefixes with estimated return-on-cost (expected tokens saved * cost_per_token) above a threshold.
+2. Memory guardrails: soft and hard memory thresholds with gradual eviction aggressiveness and emergency hard-evict step.
+3. Tenant fairness: weight prefetch budgets by tenant SLA tier and recent hit-rate contribution.
+4. Observability-first: every heuristic must have a dashboard panel and an alert mapping.
+
+Key metrics (prometheus / telemetry names)
+
+- runtime_cache_hit_rate{pool, model, tenant} (ratio)
+- runtime_cache_miss_rate{pool, model, tenant} (ratio)
+- runtime_cache_memory_bytes{pool} (gauge)
+- runtime_cache_eviction_count_total{pool,reason} (counter)
+- runtime_prefetch_queue_length{pool} (gauge)
+- runtime_prefetch_latency_seconds_bucket (histogram)
+- runtime_eviction_reclaim_bytes_per_minute (rate)
+
+Config knobs and example values
+
+| Setting | Type | Example | Description |
+|---|---:|---|---|
+| prefetch.enabled | boolean | true | Master switch for prefetching |
+| prefetch.max_concurrent_per_pool | int | 16 | Max concurrent prefetch requests per cache pool |
+| prefetch.min_rps | float | 1.0 | Minimum observed route RPS to consider prefetching |
+| prefetch.estimated_roi_threshold | float | 0.25 | Minimum estimated cost-savings ROI to prefetch (0..1) |
+| memory.soft_threshold_ratio | float | 0.75 | Soft memory fraction to begin aggressive eviction |
+| memory.hard_threshold_ratio | float | 0.92 | Hard limit to trigger emergency evictions and backpressure |
+| eviction.strategy | string | weighted_lru | Weighted LRU that includes tenant priority and key size |
+| eviction.weight_tenant_priority | float | 1.5 | Multiplier for SLA-priority in eviction scoring |
+| ttl.default_seconds | int | 7200 | Default TTL for prefetched keys (2h) |
+
+Prefetch prioritization algorithm (summary)
+
+1. Candidate selection: when a route observes repeated prefix patterns (n > 3 within sliding window), and route_rps >= prefetch.min_rps, mark the prefix as candidate.
+2. Estimate benefit: compute expected_tokens_saved = avg_tokens_per_call * expected_subsequent_calls_in_window.
+3. Compute estimated_cost_savings = expected_tokens_saved * model_cost_per_token.
+4. Compute estimated_roi = estimated_cost_savings / prefetch_cost_est (network + memory + prefetch cpu).
+5. Enqueue candidate if estimated_roi >= prefetch.estimated_roi_threshold, and if pool concurrency budget allows.
+6. Apply tenant budget: reduce priority for tenants exceeding prefetch_budget_window.
+
+Eviction policy (weighted LRU)
+
+Score(key) = recency_score * key_size_penalty * tenant_priority_factor * access_frequency_boost
+- recency_score: time since last access, exponential decay, higher = older.
+- key_size_penalty: 1 + (size_bytes / 1MB) (so very large keys get penalized).
+- tenant_priority_factor: <1 for high-priority tenants (protects them), >1 for low-priority.
+- access_frequency_boost: small factor if a key is frequently accessed in the last window.
+
+Memory guardrails and automated actions
+
+- Soft threshold (memory.soft_threshold_ratio): when reached for a pool, increase eviction aggressiveness by +20% and pause prefetch for non-SLA tenants for 5 minutes. Notify runtime-oncall (P2).
+- Hard threshold (memory.hard_threshold_ratio): if reached, immediately stop prefetch globally for 60s, trigger emergency eviction to reclaim to 70% of soft threshold, and page SRE (P1).
+- OOM protection: evict largest keys first until memory usage falls below soft threshold. If eviction rate > X (configurable) and memory not decreasing, scale down pool's max_clients and mark pool degraded.
+
+Dashboards and panels (recommended panels for Grafana)
+
+- Cache overview (per-region, per-pool): memory used, memory capacity, used_ratio, hit_rate (1h/30m/5m), evictions_per_minute.
+- Top 10 keys by memory usage (table).
+- Prefetch queue length and avg prefetch latency.
+- Hit-rate delta vs baseline: median latency with cache vs median no-cache latency.
+- Tenant fairness heatmap: per-tenant hit_rate normalized by allocated budget.
+
+Suggested alert rules (Prometheus expr + firing window)
+
+1) P1: cache_hard_threshold_exceeded
+- expr: runtime_cache_memory_bytes / runtime_cache_memory_capacity_bytes > 0.92
+- for: 1m
+- labels: severity=critical, pager_team=eng-sre
+- summary: "Cache pool {{ $labels.pool }} exceeded hard memory threshold"
+
+2) P1: cache_eviction_thrash
+- expr: increase(runtime_cache_eviction_count_total[5m]) > 1000 and runtime_cache_hit_rate < 0.5
+- for: 5m
+- labels: severity=critical, pager_team=eng-sre
+- summary: "High eviction rate with low hit-rate in pool {{ $labels.pool }}"
+
+3) P2: cache_hit_rate_degraded
+- expr: runtime_cache_hit_rate{pool="primary"} < 0.85
+- for: 5m
+- labels: severity=high
+- summary: "Hit rate for pool {{ $labels.pool }} dropped below 85%"
+
+4) P2: prefetch_queue_growth
+- expr: runtime_prefetch_queue_length > 50
+- for: 10m
+- labels: severity=high
+
+Operational runbook (triage for cache-induced latency regressions)
+
+1. Initial triage (15 mins)
+   a. Look at Cache Overview dashboard: memory used, hit_rate, evictions, prefetch queue.
+   b. Check recent deploys / config rollouts (ID and timestamp).
+   c. If memory usage > 92% -> follow emergency eviction steps (step 3).
+   d. If eviction_rate spike with low hit_rate -> consider disabling prefetch and revert recent eviction changes.
+
+2. Short-term mitigations (5–30 mins)
+   a. Disable prefetch globally: curl -X POST https://runtime-api/_admin/prefetch/disable (auth required).
+   b. Reduce per-pool prefetch concurrency: set prefetch.max_concurrent_per_pool=4.
+   c. Increase eviction aggressiveness: set eviction.score_multiplier=1.4.
+   d. If a single tenant is dominant, throttle that tenant's prefetch budget: runtime-admin set-tenant-prefetch --tenant=TENANT_ID --budget=0.2
+
+3. Emergency memory reclaim (immediate)
+   a. Activate emergency eviction: runtime-admin evict --pool=POOL --strategy=largest-first --target-ratio=0.7
+   b. If eviction does not reduce memory, reduce pool max_clients: runtime-admin set-pool-max-clients --pool=POOL --max=20
+   c. If still failing, take affected pool out of rotation (scale down service discovery weight to 0) and failover to alternate region.
+
+4. Post-incident analysis (24–72 hours)
+   a. Capture timeline: deploys, config changes, traffic anomalies, and metric spikes.
+   b. Run retrospective template (see "Postmortem checklist" below).
+   c. Implement follow-ups: stricter prefetch ROI threshold, per-key maximum size limit, and test suite for large-key regression.
+
+Example configs (YAML snippet)
+
+prefetch:
+  enabled: true
+  max_concurrent_per_pool: 16
+  min_rps: 1.0
+  estimated_roi_threshold: 0.25
+  per_tenant_window_seconds: 600
+memory:
+  soft_threshold_ratio: 0.75
+  hard_threshold_ratio: 0.92
+eviction:
+  strategy: weighted_lru
+  weight_tenant_priority: 1.5
+  score_multiplier: 1.0
+  max_key_size_bytes: 10485760 # 10MB
+
+Prometheus alert example (YAML text)
+
+- alert: CacheHardThresholdExceeded
+  expr: runtime_cache_memory_bytes / runtime_cache_memory_capacity_bytes > 0.92
+  for: 1m
+  labels:
+    severity: critical
+  annotations:
+    summary: "Cache pool over hard memory threshold"
+
+Rollout checklist (canary -> global)
+
+1. Unit tests for eviction scoring and prefetch ROI estimator.
+2. Integration test in staging with synthetic multi-tenant traces and one tenant with 10x traffic. Verify memory stays below 70% within 1h.
+3. Canary deploy to 2% of traffic on non-critical region for 24h. Monitor: hit_rate, evictions, prefetch_latency, memory_ratio.
+4. If canary is green (no P1/P2 alerts and hit_rate >= baseline -2%), increase to 20% for 24h.
+5. Global rollout in 3 steps: 50%, 80%, 100% with 60m watch windows.
+
+Postmortem checklist (template)
+
+- Incident summary: one-paragraph description.
+- Timeline: 1-minute resolution for the first hour, 5-minute thereafter.
+- Metrics snapshot: pre/post values for hit_rate, eviction_rate, memory_ratio, request_latency_p99.
+- Root cause analysis: config/deploy/traffic pattern.
+- Action items: owners and ETA.
+- Validation plan: how we'll confirm mitigations work.
+
+Retrospective note (learned from 2025-09 incident)
+
+- Root cause: a new heuristic prefetched very large (>20MB) keys for a chat route with unusual reply formatting. The ROI estimator ignored key size and prefetched multiple giant keys, causing memory blowout and eviction thrashing.
+- Fixes applied: max_key_size_bytes default 10MB, eviction penalizes large keys, prefetch estimator introduces size penalty.
+- Culture change: all heuristics that affect memory must have a staged canary and a "size safety" review (runtime + infra) before rolling to prod.
+
+Open roadmap items (Q2–Q4 2026)
+
+- Q2 2026: ML-driven prefetch predictor (lightweight classifier to predict next-prefix probability).
+- Q3 2026: Per-tenant prefetch budgeting with billing-aware enforcement.
+- Q3 2026: Dynamic key-size-aware compression for low-value large prefixes.
+- Q4 2026: Integrate cache SLOs with Console (expose per-route hit_rate and cost-savings breakdown).
+
+Ownership and contact points
+
+- Runtime team (primary): runtime-ops@redwood.com, owners: Aisha Verma, Oliver Grant
+- Eng SRE (pager): eng-sre-oncall@redwood.com
+- Platform observability: dashboards-team@redwood.com
+
+References and related reading
+
+- Predictive scale and eviction playbook (internal): /confluence/eng-platform/runbooks/predictive-scale-and-eviction-playbook-2026
+- Runtime architecture overview: /confluence/eng-serving-runtime/runtime-architecture-2025
+- Incident 2025-09 postmortem: /confluence/eng-platform/postmortems/cache-oom-2025-09
+
+Appendix: quick commands
+
+- Disable prefetch (admin):
+  curl -X POST -H 'Authorization: Bearer <token>' https://runtime-api/_admin/prefetch/disable
+
+- Evict largest keys from pool:
+  runtime-admin evict --pool=primary --strategy=largest-first --target-ratio=0.7
+
+- Set per-pool prefetch concurrency:
+  runtime-admin set-config --pool=primary --key=prefetch.max_concurrent_per_pool --value=4
+
+Document history
+
+- 2026-02-15: Draft created by Aisha Verma.
+- 2026-03-01: Incorporated reviewer feedback and clarified soft/hard thresholds.
+

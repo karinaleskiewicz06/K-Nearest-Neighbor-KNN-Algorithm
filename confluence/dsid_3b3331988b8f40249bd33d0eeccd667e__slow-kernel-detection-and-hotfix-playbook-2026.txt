@@ -1,0 +1,162 @@
+Slow Kernel Detection and Hotfix Playbook
+
+Overview
+
+This playbook describes detection, automated containment, and manual hotfix procedures for incidents where a GPU kernel (or small set of kernels) regress in latency or CPU/GPU time and produce sustained throughput degradation. It focuses on actionable detection signals, escalation thresholds, immediate mitigations to protect SLAs, and validated release steps for kernel hotfixes.
+
+Scope
+
+- Applies to production inference runtime kernels (attention, fused-matmul, kv-cache ops, rotary/rope ops) across hosted and dedicated clusters.
+- Does NOT cover hardware faults (power/thermal fails) or driver-level crashes — those are handled by infrastructure runbooks.
+
+Ownership and contacts
+
+- Incident owner: eng-serving-runtime oncall (primary).
+- Kernel lead: @Maya Chen (runtime-kernels).
+- Escalation: runtime-arch-sre@redwood.internal.
+
+When to use this playbook
+
+Use this playbook when:
+1) Kernel latency spike or variance is correlated with increased end-to-end p95/p99 serving latency for >5 minutes.
+2) Throughput drop or request queuing increases by >30% while GPU utilization is not saturated.
+3) Automated regression detection (see Alerting rules) fires.
+
+Detection signals and telemetry
+
+Primary metrics to monitor (examples):
+- kernel.exec_time_ms (histogram per kernel): sudden shift in median or tail.
+- kernel.cpu_time_ms and kernel.gpu_time_ms: divergence indicates scheduling/serialization issues.
+- runtime.request_queue_depth: sustained increase suggests backpressure.
+- gpu_utilization_pct: if <85% while queue depth grows => kernel stalls/serialization.
+- kernel.retry_count / kernel_ejection_count: raised ejection counts.
+
+Suggested alert rules (promQL-like pseudocode):
+
+- name: KernelTailLatencyExceeded
+  expr: histogram_quantile(0.95, sum(rate(kernel_exec_time_ms_bucket[2m])) by (le,kernel)) > 12
+  for: 4m
+
+- name: KernelVarianceSpike
+  expr: (quantile_over_time(0.95, kernel_exec_time_ms[10m]) / quantile_over_time(0.5, kernel_exec_time_ms[10m])) > 4
+  for: 3m
+
+- name: QueueGrowthWithLowUtil
+  expr: (increase(runtime_request_queue_depth[5m]) > 30) and (avg_over_time(gpu_utilization_pct[5m]) < 85)
+  for: 5m
+
+Investigation timeline (first 30 minutes)
+
+1) Triage (0–5m):
+   - Acknowledge alert in PagerDuty and tag with incident channel.
+   - Attach the alert graph and note the affected model(s)/cluster(s).
+
+2) Quick checks (5–12m):
+   - Confirm whether regression is per-kernel or broad: query kernel.exec_time_ms grouped by kernel_name and host.
+   - Check recent releases or kernel rollouts in the last 60 minutes.
+   - Inspect kernel ejection logs and driver warnings.
+
+3) Decide containment (12–20m):
+   - If kernel impact is limited to a subset of workers, use targeted quarantine (see Automated mitigations).
+   - If impact is global or affects control-plane operations, follow full degradation playbook and notify product & CS.
+
+Automated mitigations (safe by default)
+
+We prefer automated, reversible actions to avoid manual intervention during noisy transient spikes. Typical automated mitigations:
+
+- Kernel quarantine: mark kernel variant as degraded and route traffic to next-compatible variant (e.g., fallback quantized kernel or older kernel build).
+- Per-host kernel disable: use runtime-agent to toggle kernel blacklist on affected hosts.
+- Graceful request shed: temporarily reduce concurrency for affected hosts and redirect to healthy pools.
+
+Automation pseudocode (internal operator):
+
+# Example internal CLI commands
+redwood-runtimectl quarantine-kernel --kernel-name fused_attn_v2 --reason "p95 regression 2026-02-28" --scope hosts=pool-3b
+redwood-runtimectl set-concurrency --host host-12 --max-concurrency 2
+
+Containment decision matrix (summary):
+| Impact pattern | Immediate action | Rationale |
+|---|---:|---|
+| Single-host / single-kernel | Kernel quarantine + local restart | Limits blast radius |
+| Multi-host same kernel | Route to fallback variant + scale healthy pool | Prevents large SLA violations |
+| Global performance regression | Activate degradation SLOs and roll back recent kernel rollout | Protect customer-facing SLAs |
+
+Manual hotfix procedure (if automation insufficient)
+
+1) Create incident branch and patch:
+   - Branch from release-tag: git checkout -b hotfix/kernel-<id>-<date> release/<tag>
+   - Add guard-logging (timestamps + kernel id) and revert recent non-essential optimizations if needed.
+
+2) Build and smoke test in staging:
+   - Build: make -C runtime kernels && ./tools/build-kernel --name hotfix-kernel --ccache
+   - Unit smoke: ./tools/smoke-runner --kernel hotfix-kernel --profile micro-latency
+   - Perf microbench: ./bench/kernel-bench --kernel hotfix-kernel --seq-lens 8,64,512 --shots 200
+
+3) Canaried rollout (targeted pattern):
+   - Canary to 2–3 hosts with mirrored traffic for 10m.
+   - Metrics to watch during canary: p50/p95 kernel.exec_time_ms, request_queue_depth, gpu_utilization, error_rate.
+   - Canary acceptance criteria: no >5% regression vs baseline on p50 and <3% change in p95.
+
+4) Gradual ramp: 20% -> 50% -> 100% or by host pools depending on topology. Evaluate at each step for 10–15 minutes.
+
+Rollback criteria and steps
+
+Rollback if any of the following occurs during canary or ramp:
+- p95 increases by >10% relative to the pre-incident baseline.
+- request queue depth increases by >2x.
+- error rate (5xx) increases above SLO thresholds.
+
+Rollback steps:
+1) Immediately set routing to previous kernel variant using runtime controller.
+2) Drain canary hosts and reboot agent if necessary: systemctl restart runtime-agent on canary hosts.
+3) Mark hotfix branch for postmortem and revert patch in mainline if necessary.
+
+Verification checklist after rollback/hotfix
+
+- Verify kernel.exec_time_ms histograms have returned to baseline over 30 minutes.
+- Validate no increase in request_retries or request_timeouts.
+- Confirm logs show no new driver warnings.
+- Close incident with updates to relevant oncall and product teams.
+
+Post-incident follow-up
+
+- Owner prepares postmortem within 72 hours: root cause, timeline, mitigations, action items.
+- If kernel regression was caused by a code change, add mandatory microbench in CI for the offending kernel with 95th percentile assertions.
+- Schedule a retro with kernel authors and SRE to adjust thresholds or automation if false positives/negatives caused disruption.
+
+Testing and benchmark additions
+
+When a kernel shows instability add these tests to the CI pipeline:
+- Deterministic microbenchmark for sequence lengths: 8, 32, 128, 512 (200 iterations each).
+- Telemetry spike test: inject synthetic jitter and assert no >2x increase in hardware stall markers.
+- Multi-host soak test: run 60-minute concurrent-run against a mirrored traffic profile.
+
+Quick reference commands
+
+- Query per-kernel tail latency (internal monitoring):
+  curl -H "Authorization: Bearer $MONITOR_TOKEN" "https://monitoring.internal/api/query?q=kernel_exec_time_ms%7Bcluster%3D%5C\"prod%5C\"%7D"
+
+- Quarantine kernel: redwood-runtimectl quarantine-kernel --kernel-name <kernel> --scope hosts=<pool>
+- Re-enable kernel: redwood-runtimectl unquarantine-kernel --kernel-name <kernel>
+- Canary rollout: redwood-runtimectl deploy-kernel --image hotfix-kernel:canary --hosts host-12,host-13
+
+Appendix: recommended thresholds (editable)
+
+| Setting | Default value | Notes |
+|---|---:|---|
+| p95_kernel_latency_alert_ms | 12 | Trigger for KernelTailLatencyExceeded rule |
+| kernel_variance_ratio_alert | 4 | Ratio of p95/p50 over 10m window |
+| queue_growth_pct_alert | 30 | Percent growth over 5 minutes |
+| canary_observe_window | 10m | Observation window for canary acceptance |
+
+Related artifacts and links
+
+- Kernel perf harness: git:/repo/runtime/kernels/bench/
+- Quarantine controller docs: /eng-serving-runtime/runtime-architecture/quarantine-controller-2025
+- Incident tracker template: /oncall-and-incident-response/postmortem-template
+
+Revision history
+
+- 2026-01-15: Initial draft by Maya Chen.
+- 2026-02-10: Added automated mitigation examples and CLI snippets.
+- 2026-02-28: Finalized thresholds and canary acceptance criteria (published).

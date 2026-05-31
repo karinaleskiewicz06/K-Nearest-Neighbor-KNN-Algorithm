@@ -1,0 +1,168 @@
+GPU affinity and eviction strategies for high-density inference
+
+Summary:
+This runbook defines recommended GPU affinity, placement, and eviction strategies for Redwood’s serving runtime when operating high-density multi-tenant inference fleets. It is intended for on-call SREs, runtime engineers, release engineers, and platform owners who configure tenant isolation, capacity packing, and preemption policies.
+
+Scope:
+- Applies to Redwood Hosted and Dedicated pools that share GPUs across model deployments.
+- Covers affinity labeling, node packing heuristics, eviction triggers, graceful preemption, and post-eviction recovery.
+- Does NOT replace tenant-level quota or billing policies; those are handled by the billing & quota service.
+
+Why this matters:
+High-density packing improves utilization and reduces unit cost, but increases risk of tail-latency spikes and OOM-induced kernel failures. A clear affinity and eviction policy balances cost and reliability by:
+- Preserving SLOs for latency-sensitive customers (p99 < configured target).
+- Ensuring memory-heavy workloads do not cause noisy-neighbor OOMs.
+- Allowing controlled preemption for lower-priority workloads during capacity pressure.
+
+Key concepts and terminology:
+- Affinity label: a runtime label attached to a workload that constrains placement (e.g., "affinity:latency-critical", "affinity:batch-heavy").
+- Hard affinity: placement must satisfy the label or request is rejected/queued.
+- Soft affinity: placement prefers matching nodes but falls back if needed.
+- Eviction: the act of terminating or pausing a workload to reclaim resources.
+- Preemption: a planned eviction triggered by a higher-priority request.
+- Graceful drain: process to checkpoint and resume model state (KV cache/weights) before killing a process.
+
+Policy overview (recommended defaults):
+1) Affinity tiers:
+   - latency-critical: p99 SLO tighter than 250ms; hard affinity to isolated pools (1–2 models per GPU).
+   - standard: p99 SLO 250–600ms; soft affinity with controlled packing (3–6 models per GPU depending on quantization and KV usage).
+   - best-effort: batch/async jobs and low-SLA workloads; packed aggressively and preemptible.
+
+2) Memory headroom thresholds (per GPU):
+   - WARNING: 75% memory usage -> emit alert to capacity dashboard.
+   - THROTTLE: 85% memory usage -> stop admitting soft-affinity placements; begin queueing new requests.
+   - EVICT: 95% memory usage OR repeated kernel OOMs (>=3 within 5m) -> trigger eviction policy.
+
+3) CPU/IO headroom: systems-level throttle triggered at 80% CPU on the host or when PCIe tx/rx saturates sustained > 120s.
+
+Operational runbook: detection and automated response
+1) Detection (automatic):
+   - Metric sources: gpu.memory.used, gpu.memory.total, runtime.kernel.oom_count, host.cpu.utilization, kvcache.eviction_rate.
+   - Alert rules (examples):
+     - ALERT RuntimeGPUHighMemory: gpu.memory.used / gpu.memory.total > 0.75 for 2m -> Severity: P3
+     - ALERT RuntimeKernelOOMSpike: runtime.kernel.oom_count >= 1 for 30s or >=3 within 5m -> Severity: P2
+
+2) Immediate automated responses (system):
+   - At WARNING: emit alert, mark node as "packing-candidate: low" in scheduler metadata, do not evict.
+   - At THROTTLE: switch scheduler to "admit-restricted" mode: only hard-affinity and latency-critical workloads are allowed on node; soft-affinity attempts go to other nodes or queue.
+   - At EVICT: begin eviction pipeline (see Eviction flow). If kernel OOMs are observed, route traffic to fallback model variants in <region> if configured.
+
+Eviction flow (automated, with manual override):
+1) Evaluate candidates (automated):
+   - Rank running tasks by eviction_score = (priority_weight * tenant_priority) + (mem_factor * gpu_mem_used_ratio) + (slo_factor * p99_violation_count). Lower score -> preferred to keep.
+   - Preferred eviction candidates: best-effort workloads, long-running batch jobs without checkpointing, and tenants with explicit preemption=true.
+
+2) Graceful preemption attempt (30s window):
+   - Notify container: POST /runtime/v1/tasks/<task_id>/preempt?deadline=30s
+   - Container should respond with status: checkpointing / draining / refused. If checkpointing: wait for checkpoint success (<=30s) and then terminate. If refused or timeout: proceed to force-kill.
+
+3) Force-kill fallback (immediate):
+   - kill -9 <pid> (as last resort). Record cause in task metadata and emit event to audit log: "eviction.forced".
+
+4) Post-eviction healing:
+   - Mark node as under-healing for 10s and block new soft-affinity placements for 60s to allow memory stabilisation and kernel cache cleanup.
+   - If repeated evictions (>=3) happen on a single node within 10m, mark node as cordoned for manual investigation and escalate to runtime on-call.
+
+Manual triage checklist (on-call):
+1) Verify alert context: check graph of gpu.memory.used, kernel.oom_count, kvcache.eviction_rate, and host.cpu.utilization for the previous 30m.
+2) Identify which tasks were evicted: runtime audit log -> search events with "eviction.*" and cross-reference task IDs to tenant and model.
+3) If eviction of latency-critical tenant occurred: immediately open incident and run rollback (route traffic to designated standby model or region).
+4) If node shows repeated kernel failures: collect traces (see Telemetry section) and capture kernel logs: journalctl -u runtime-service, nvidia-smi pmon, /var/log/nvml.log.
+5) If cluster-level resource pressure: consider expanding dedicated pool or enabling burst capacity per capacity plan.
+
+Configuration reference (sample table):
+- Name | Default | Purpose
+- affinity.labels | ["latency-critical","standard","best-effort"] | Affinity categories used by scheduler
+- memory.warning_threshold | "0.75" | Memory usage fraction to emit warning
+- memory.throttle_threshold | "0.85" | Memory fraction to stop admitting soft-affinity placements
+- memory.evict_threshold | "0.95" | Memory fraction to trigger eviction pipeline
+- eviction.preempt_timeout_s | "30" | Seconds to wait for graceful checkpointing
+- node.healing_block_s | "60" | Seconds to block new soft-affinity placements after eviction
+
+Example CLI and API snippets:
+- List affinity labels for a node:
+  rcli node describe --id node-123 --fields affinity_labels,mem_used,mem_total
+
+- Trigger a manual preempt for a task:
+  curl -X POST "https://runtime.internal/api/v1/tasks/<task_id>/preempt?deadline=30s" -H "Authorization: Bearer $RUNTIME_TOKEN"
+
+- Sample policy YAML (appendix contains full example):
+  scheduler:
+    affinity:
+      tiers:
+        - name: latency-critical
+          hard: true
+        - name: standard
+          hard: false
+    thresholds:
+      memory_warning: 0.75
+      memory_throttle: 0.85
+      memory_evict: 0.95
+    eviction:
+      preempt_timeout_s: 30
+      node_healing_block_s: 60
+
+SLOs and thresholds (operational impact):
+- Latency-critical pools: p99 <= 250ms (target), error budget 99.9% uptime.
+- Standard pools: p99 <= 600ms, error budget 99.0% uptime.
+- Eviction tolerance: latency-critical tenants should have eviction_rate < 0.01% monthly. Best-effort eviction_rate can be up to 20% monthly.
+
+Telemetry and dashboards (what to monitor):
+- Per-node: gpu.memory.used, gpu.memory.total, kernel.oom_count, host.cpu.utilization, pci.tx/rx, container_start_failures.
+- Per-task: task_id, tenant_id, model_version, kv_cache_size, last_checkpoint_time, p50/p95/p99 latency buckets.
+- Dashboards to check: "Runtime / Node Health", "Eviction Events by Tenant", "KV Cache Pressure", "Admission Control / Requeued Requests".
+
+Testing and rollout plan for policy changes:
+1) Canary (1% of capacity): deploy new thresholds to a small labeled pool with synthetic workloads that simulate KV-heavy and latency-critical traffic.
+2) Observe key metrics for 6h: p99 latency, admission_rejects, eviction_count.
+3) Gradual ramp: 1% -> 10% -> 50% -> 100% over 48–72h with human gating and automated rollback if p99 or eviction rate increases > 2x baseline.
+
+Escalation and ownership:
+- Primary owner: eng-serving-runtime (oncall: runtime-oncall rotation).
+- Secondary: eng-sre (oncall: sre-runtime-rotation).
+- Escalate to runtime-sre leads (Diego Alvarez) for repeated node cordons or unexplained kernel OOMs.
+- For customer-impacting events (latency-critical evictions), follow incident process in oncall-and-incident-response/postmortems.
+
+Helpful troubleshooting commands and artifacts to attach to incidents:
+- rcli node top --id node-123 --window 30m --metrics gpu.memory.used,host.cpu.util
+- docker inspect <container_id> | jq '.State, .Config'
+- sudo cat /var/log/dmesg | tail -n 200
+- nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv -l 5
+
+FAQ and common scenarios:
+Q: A node is repeatedly hitting 95% memory and evicting best-effort tasks. Should we cordon it?
+A: Not immediately. Confirm whether pack density or a new model caused increased memory. Cordoning recommended after 3 forced evictions in 10m.
+
+Q: A latency-critical tenant was evicted. What to do?
+A: Immediately open an incident, run rollout to standby model/region, and start a hotfix: reduce packing on latency-critical pool and increase headroom by +10% temporarily.
+
+Appendix: sample eviction policy YAML:
+---
+scheduler:
+  affinity:
+    tiers:
+      - name: latency-critical
+        hard: true
+      - name: standard
+        hard: false
+      - name: best-effort
+        hard: false
+  thresholds:
+    memory_warning: 0.75
+    memory_throttle: 0.85
+    memory_evict: 0.95
+  eviction:
+    preempt_timeout_s: 30
+    node_healing_block_s: 60
+    candidate_selector: |
+      # Python-like expression evaluated by scheduler to rank eviction candidates
+      (tenant_priority * 100) + (gpu_mem_used_ratio * 100) + (p99_violation_count * 1000)
+
+Related pages:
+- /confluence/eng-serving-runtime/runbooks/production-rollout-tuning-checklist-2026
+- /confluence/eng-serving-runtime/runtime-architecture/dynamic-request-orchestration-and-fallthrough-2026
+
+Document change log:
+- 2025-11-10: created by Maya Patel (initial draft).
+- 2026-02-15: expanded eviction flow and added node healing block; reviewer feedback incorporated by Priya Nair.
+

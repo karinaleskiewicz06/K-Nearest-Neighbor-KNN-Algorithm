@@ -1,0 +1,539 @@
+Cost Model API v1 — Design Spec
+
+## Summary
+This document specifies Cost Model API v1 for Redwood Inference. The API provides a single, canonical interface to compute and serve standardized inference cost primitives for:
+- Redwood Console (dashboards, cost breakdown views)
+- Redwood Optimize (what-if projections and recommendation ROI estimates)
+- Finance/unit-economics reporting (through shared primitives; not the billing system of record)
+
+The v1 API is internal-only (service-to-service) and is designed to be:
+- Deterministic (given identical inputs, schema version, and policy)
+- Bounded (responses and computation time must remain bounded under high-cardinality workloads)
+- Versioned (schema + semantics are versioned; compatible evolution is enforced)
+
+## Goals (v1)
+1) Provide stable endpoints for:
+   - Per-request cost estimate
+   - Aggregated cost breakdowns over a time window
+   - What-if projections for config changes (batching/caching/quantization)
+2) Establish version negotiation rules between callers (Console/Optimize) and the service.
+3) Define authentication/tenancy and authorization checks, including finance-adjacent access constraints.
+4) Define request bounding, rate limits, and performance/latency targets.
+5) Define errors and failure modes (including telemetry lag, schema mismatch, and drift safeguards).
+
+## Non-goals (v1)
+- Replacing billing/RevRec or becoming the system of record for invoicing.
+- Building a customer-facing pricing calculator.
+- Supporting arbitrary ad-hoc cube-style slicing over all dimensions in a single query.
+
+## Terminology
+- Request-attributable cost: cost components directly attributable to a request (e.g., GPU time for prefill/decode, tokenization overhead if metered).
+- Allocated overhead: shared costs allocated via policy (e.g., idle capacity, control plane overhead). Shown explicitly in breakdown output as a separate bucket.
+- Prefill vs decode: the two stages of generation cost attribution.
+- Cache hit: request stages that were served from cache (prefix/KV cache), reducing incremental compute.
+- Quantization profile: a stable identifier describing runtime execution path and expected throughput/memory characteristics.
+
+## System architecture (high-level)
+Callers (Console backend, Optimize backend) call Cost Model Service via an internal client library.
+
+Dependencies:
+- Telemetry/usage store: token accounting, cache metrics, batching efficiency, queue time.
+- Model catalog: model IDs, hardware compatibility, quantization profile metadata.
+- Runtime metrics contract: stable identifiers for execution path and stage accounting.
+
+The service performs:
+1) Input validation + policy validation (bounds, allowed parameters, tenancy)
+2) Enrichment (lookup model + quant profile metadata)
+3) Cost computation (deterministic functions with versioned semantics)
+4) Optional aggregation (bounded grouping and top-K selection)
+
+## API surface
+Base URL (internal):
+- https://cost-model-service.redwood.internal
+
+Base path (v1):
+- /internal/cost-model/v1
+
+### Endpoints (v1)
+1) POST /estimate
+   - Purpose: compute a per-request cost estimate/breakdown for a single inference event (or a small batch of events).
+   - Used by: Console request inspector, near-real-time debug flows, integration tests, validation harness.
+
+2) POST /breakdown
+   - Purpose: compute bounded aggregated cost breakdowns for dashboards (grouping and time windows).
+   - Used by: Console cost pages and dashboards.
+
+3) POST /what-if
+   - Purpose: compute counterfactual projections for workload summaries under alternative configs (batching/caching/quantization).
+   - Used by: Optimize ROI estimates and recommendation preview.
+
+Notes:
+- We intentionally avoid a generic query language in v1. The breakdown endpoint supports a constrained set of groupings and bounded outputs.
+- All endpoints accept and return a schema_version block for negotiation.
+
+## Common request headers
+All endpoints require the following headers:
+- Authorization: Internal service token (mTLS + JWT identity) issued by Redwood Service Identity.
+- X-RW-Request-Id: caller-provided request id (for tracing; echoed back).
+- X-RW-Caller: service name (e.g., console-backend, optimize-backend).
+
+Tenancy context (required for all cost computations):
+- X-RW-Org-Id
+- X-RW-Project-Id
+- X-RW-Environment: prod | staging | dev
+
+Optional:
+- X-RW-Workspace-Id (if the caller operates at workspace scope)
+
+Tenancy and authorization rules:
+- The service MUST verify the caller identity and enforce that the caller can access the provided org/project.
+- Finance-adjacent views (e.g., allocated overhead) may be restricted by role; v1 supports hiding restricted buckets by default unless the caller is authorized.
+
+## Versioning and negotiation
+We version:
+1) API path version (v1): breaking changes require a new path version.
+2) Cost model schema/semantics version: evolves within v1 via compatible additions and clarifications.
+
+### Schema version fields
+Each request includes:
+- requested_cost_model_version: a string (e.g., "1.0"), or "latest".
+- accepted_cost_model_versions: a comma-separated list (or repeated field via client library) of versions the caller can accept.
+
+Each response includes:
+- resolved_cost_model_version: the version actually used to compute results.
+- schema_hash: a stable hash of the resolved schema + semantics package (for debugging and drift analysis).
+
+Rules:
+- If requested_cost_model_version is provided and supported, the service uses it.
+- If requested is "latest", the service selects the newest non-deprecated version compatible with caller accepted versions.
+- If no overlap exists, return 412 PRECONDITION_FAILED with error code COST_MODEL_VERSION_NOT_ACCEPTABLE.
+
+Backwards compatibility within v1:
+- Additive fields are allowed (callers must ignore unknown fields).
+- Semantics changes are NOT allowed without a new cost_model_version.
+
+Deprecation policy:
+- Versions are marked deprecated but remain served for at least 90 days after deprecation notice.
+- Console/Optimize must adopt version N within the deprecation window; the client library will surface warnings in logs/metrics.
+
+## Data model: inputs and outputs (v1)
+The canonical schemas live in the versioned schema package (monorepo). This document describes the wire shape and semantics.
+
+### 1) /estimate
+#### Request: EstimateRequest
+- tenant: org_id, project_id, environment
+- cost_model_version: requested/accepted
+- request_event: a single event OR an array of events (bounded)
+
+Bounded batch support:
+- v1 supports either a single event or up to 50 events per call.
+- If more than 50, return 413 REQUEST_ENTITY_TOO_LARGE (COST_MODEL_REQUEST_TOO_LARGE).
+
+Example (single event):
+```json
+{
+  "requested_cost_model_version": "1.0",
+  "accepted_cost_model_versions": ["1.0"],
+  "tenant": {
+    "org_id": "org_123",
+    "project_id": "proj_456",
+    "environment": "prod"
+  },
+  "request_event": {
+    "event_time": "2026-02-18T19:03:21Z",
+    "request_id": "req_9c9f...",
+    "deployment_mode": "hosted",
+    "region": "us-east-1",
+    "model": {
+      "model_id": "rw-llama-3-70b",
+      "model_revision": "2026-02-01",
+      "quant_profile_id": "q4_kv8"
+    },
+    "runtime": {
+      "hardware_sku": "h100-sxm-80gb",
+      "runtime_build_id": "rt_2.18.0",
+      "execution_path_id": "flashattn2_contbatch"
+    },
+    "metering": {
+      "prefill_tokens": 1800,
+      "decode_tokens": 220,
+      "cache": {
+        "prefix_cache_hit_tokens": 600,
+        "kv_cache_hit_tokens": 0
+      },
+      "batch": {
+        "effective_batch_size": 12,
+        "batch_efficiency": 0.78,
+        "queue_time_ms": 8
+      }
+    },
+    "policy": {
+      "overhead_allocation": "show_separately"
+    }
+  }
+}
+```
+
+Required fields (v1 minimum):
+- deployment_mode, region
+- model_id, model_revision, quant_profile_id (or explicit "unknown" with degraded behavior)
+- hardware_sku
+- prefill_tokens, decode_tokens
+
+Optional but strongly recommended:
+- cache hit token counts
+- batch efficiency and effective batch size
+- runtime build/execution path id
+
+#### Response: EstimateResponse
+- resolved_cost_model_version
+- request_id (echo)
+- total_cost_usd
+- breakdown: list of line items with taxonomy keys
+- confidence: low/medium/high + reasons
+- warnings: list of warning strings
+
+Breakdown taxonomy keys (v1):
+- compute.prefill
+- compute.decode
+- compute.cache_savings (negative cost; only when modeled)
+- overhead.allocated
+- other.control_plane
+
+Example:
+```json
+{
+  "resolved_cost_model_version": "1.0",
+  "schema_hash": "sha256:3d8a...",
+  "request_id": "req_9c9f...",
+  "total_cost_usd": 0.01284,
+  "breakdown": [
+    {"key": "compute.prefill", "cost_usd": 0.00920, "units": "gpu_ms", "quantity": 41.8},
+    {"key": "compute.decode", "cost_usd": 0.00410, "units": "gpu_ms", "quantity": 18.4},
+    {"key": "overhead.allocated", "cost_usd": 0.00054, "units": "usd", "quantity": 0.00054}
+  ],
+  "confidence": {"level": "medium", "reasons": ["batch_efficiency_missing_defaulted"]},
+  "warnings": ["cache metrics missing; cache_savings not computed"]
+}
+```
+
+Determinism requirements:
+- For a given request_event payload and resolved_cost_model_version, the service must return identical results (within floating-point formatting) for at least 30 days.
+- If the computation depends on external lookups (e.g., model catalog price table), those tables must be versioned and referenced by immutable identifiers in the schema_hash.
+
+### 2) /breakdown
+#### Purpose
+Compute aggregated cost breakdowns for Console dashboards over a specified time range.
+
+#### Request: BreakdownRequest
+Key fields:
+- tenant: org_id, project_id, environment
+- time_range: start, end (ISO timestamps)
+- filters: bounded set (model_id, deployment_mode, region)
+- group_by: limited dimension set
+- limit: max groups (top-K)
+- metrics: cost_usd, tokens, requests
+
+Supported group_by dimensions (v1):
+- model_id
+- deployment_mode
+- region
+- quant_profile_id
+- breakdown_key (taxonomy key)
+
+Bounding rules:
+- Maximum time window: 24 hours per request (Console should page by day for longer ranges).
+- Maximum group_by dimensions: 2.
+- Maximum groups returned: 200.
+- If the query would exceed bounds, return 422 UNPROCESSABLE_ENTITY with COST_MODEL_QUERY_NOT_BOUNDED.
+
+Top-K behavior:
+- If the result set exceeds limit, return the top-K groups by total_cost_usd.
+- Return an additional group labeled "other" that aggregates remaining groups (optional; enabled by request flag include_other_bucket).
+
+Example:
+```json
+{
+  "requested_cost_model_version": "latest",
+  "accepted_cost_model_versions": ["1.0"],
+  "tenant": {"org_id": "org_123", "project_id": "proj_456", "environment": "prod"},
+  "time_range": {"start": "2026-02-18T00:00:00Z", "end": "2026-02-19T00:00:00Z"},
+  "filters": {"deployment_mode": ["hosted"], "region": ["us-east-1", "us-west-2"]},
+  "group_by": ["model_id", "breakdown_key"],
+  "limit": 100,
+  "include_other_bucket": true
+}
+```
+
+#### Response: BreakdownResponse
+- resolved_cost_model_version
+- time_range echo
+- rows: list of aggregated rows (bounded)
+- totals: overall totals
+- warnings: telemetry lag indicators, partial data flags
+
+Example row fields (v1):
+- group: string key (e.g., "rw-llama-3-70b|compute.prefill")
+- total_cost_usd
+- request_count
+- prefill_tokens_total
+- decode_tokens_total
+
+### 3) /what-if
+#### Purpose
+Compute counterfactual projections given a workload summary and an alternative configuration.
+
+#### Request: WhatIfRequest
+The request must not include high-cardinality raw request lists. v1 uses workload summaries.
+
+Workload summary inputs (v1):
+- time_range (for reference)
+- model_id + model_revision
+- region + deployment_mode
+- token distribution summary:
+  - p50/p90/p99 prefill_tokens
+  - p50/p90/p99 decode_tokens
+  - requests_per_minute (or total_requests)
+- observed caching state summary:
+  - prefix_cache_hit_rate (0–1)
+  - kv_cache_hit_rate (0–1)
+- observed batching summary:
+  - effective_batch_size_p50
+  - batch_efficiency_p50
+
+What-if knobs (v1):
+- batching:
+  - target_effective_batch_size (bounded integer range)
+  - target_batch_efficiency (0–1)
+- caching:
+  - target_prefix_cache_hit_rate (0–1)
+  - target_kv_cache_hit_rate (0–1)
+- quantization:
+  - target_quant_profile_id (must exist in model catalog)
+
+Guardrails:
+- The service enforces allowed parameter ranges per model + hardware SKU.
+- If a target is invalid, return 422 with COST_MODEL_WHATIF_INVALID_PARAMETER.
+- The service must return confidence intervals when model uncertainty is non-trivial (e.g., quantization throughput estimates).
+
+Example:
+```json
+{
+  "requested_cost_model_version": "1.0",
+  "accepted_cost_model_versions": ["1.0"],
+  "tenant": {"org_id": "org_123", "project_id": "proj_456", "environment": "prod"},
+  "workload": {
+    "deployment_mode": "dedicated",
+    "region": "us-east-1",
+    "model_id": "rw-llama-3-70b",
+    "model_revision": "2026-02-01",
+    "hardware_sku": "h100-sxm-80gb",
+    "requests_per_minute": 240,
+    "prefill_tokens": {"p50": 1200, "p90": 2200, "p99": 4000},
+    "decode_tokens": {"p50": 180, "p90": 350, "p99": 700},
+    "observed": {
+      "prefix_cache_hit_rate": 0.22,
+      "kv_cache_hit_rate": 0.00,
+      "effective_batch_size_p50": 10,
+      "batch_efficiency_p50": 0.74,
+      "quant_profile_id": "fp16"
+    }
+  },
+  "what_if": {
+    "target_effective_batch_size": 14,
+    "target_prefix_cache_hit_rate": 0.35,
+    "target_quant_profile_id": "q4_kv8"
+  }
+}
+```
+
+#### Response: WhatIfResponse
+- baseline: projected baseline cost (using observed state)
+- scenario: projected cost under what-if knobs
+- delta: absolute and percent delta
+- confidence_interval: for delta (when applicable)
+- constraints: any violated or binding constraints (e.g., memory headroom)
+- warnings: e.g., “quality guardrail not evaluated”
+
+Confidence semantics (v1):
+- If the scenario relies on learned/empirical throughput estimates (quant profile deltas), return a confidence interval for savings.
+- If the scenario uses purely deterministic arithmetic with fully observed metrics, confidence interval may be omitted.
+
+## Authentication, authorization, and data access
+### Service-to-service authentication
+- mTLS required between internal services.
+- JWT service identity must include:
+  - caller service name
+  - environment
+  - allowed org/project scopes (or a capability to request scoped tokens)
+
+### Authorization checks
+The service enforces:
+- Caller can only request computations for tenants it is authorized to serve.
+- Console backend: may request org/project scoped breakdowns for its own UI.
+- Optimize backend: may request what-if projections for tenants it is authorized to serve.
+- Finance-restricted buckets (allocated overhead visibility) require an explicit capability (e.g., cost_model:overhead:read). If absent:
+  - overhead line items are omitted OR replaced with "overhead.hidden" depending on request policy.
+
+### Audit logging
+All requests must write an audit log entry including:
+- caller identity
+- tenant scope
+- endpoint + resolved cost model version
+- whether overhead was included
+
+## Rate limits and quotas
+We enforce both caller-level and tenant-level limits.
+
+Default limits (v1; adjustable via config):
+- /estimate: 200 RPS per caller service per region; 2,000 RPS global hard cap per tenant.
+- /breakdown: 20 RPS per caller; 60 requests/minute per tenant.
+- /what-if: 10 RPS per caller; 30 requests/minute per tenant.
+
+Request size limits:
+- Max request payload: 256 KB.
+- /estimate: max 50 events per call.
+
+Client behavior under rate limiting:
+- Respect Retry-After.
+- Use exponential backoff with jitter.
+- Console hot paths should use caching and avoid per-request calls in list views.
+
+## Performance targets
+Latency targets (service-side; p95):
+- /estimate: <= 120 ms
+- /breakdown: <= 300 ms
+- /what-if: <= 500 ms
+
+Availability targets (v1):
+- 99.9% monthly availability (excluding planned maintenance).
+
+Time budget assumptions:
+- Telemetry reads should be served from a low-latency store or pre-aggregated tables for breakdown.
+- Model catalog lookups should be cached in-memory (TTL 5 minutes) and keyed by immutable revision.
+
+Bounded computation requirements:
+- Any query that risks unbounded cardinality (e.g., group_by=request_id) is rejected.
+- The service must cap intermediate aggregation state (memory) and return a bounded error rather than OOM.
+
+## Caching strategy
+- Caller caching:
+  - Console may cache /breakdown results for 30–120 seconds for dashboard tiles (per tenant + filters + time bucket).
+  - Optimize should cache what-if responses for the same input workload summary for 5 minutes (UX flows).
+
+- Service caching:
+  - Cache model catalog + price table by (model_id, model_revision, hardware_sku, quant_profile_id) for 5 minutes.
+  - Cache common /breakdown queries by normalized key for 30 seconds when safe.
+
+Determinism note:
+- Caches must not change semantics; responses include resolved_cost_model_version and schema_hash so callers can detect version shifts.
+
+## Errors and failure modes
+### Error response shape
+All errors return JSON:
+- error_code: stable string
+- message: human-readable
+- request_id: X-RW-Request-Id echo
+- details: optional strings (bounded)
+
+Example:
+```json
+{
+  "error_code": "COST_MODEL_QUERY_NOT_BOUNDED",
+  "message": "group_by exceeds maximum dimensions (max=2)",
+  "request_id": "req_9c9f...",
+  "details": ["group_by=[model_id,region,quant_profile_id]"]
+}
+```
+
+### Standard error codes (v1)
+- COST_MODEL_VERSION_NOT_ACCEPTABLE (HTTP 412)
+- COST_MODEL_REQUEST_TOO_LARGE (HTTP 413)
+- COST_MODEL_QUERY_NOT_BOUNDED (HTTP 422)
+- COST_MODEL_WHATIF_INVALID_PARAMETER (HTTP 422)
+- COST_MODEL_TENANT_UNAUTHORIZED (HTTP 403)
+- COST_MODEL_DEPENDENCY_UNAVAILABLE (HTTP 503)
+- COST_MODEL_TELEMETRY_LAGGING (HTTP 206 or 200 with warnings; see below)
+- COST_MODEL_INTERNAL_ERROR (HTTP 500)
+
+### Telemetry lag / partial data handling
+Breakdown and what-if are sensitive to telemetry lag.
+- If telemetry freshness is outside the acceptable window (default: >10 minutes behind wall clock), the service:
+  - returns 200 with warnings including lag_seconds and affected metrics, OR
+  - returns 206 PARTIAL_CONTENT when a material portion of the time range is missing (configurable).
+
+Console behavior:
+- Display a UI banner when warnings include telemetry lag.
+- Prefer cached/previous results during partial states.
+
+Optimize behavior:
+- If telemetry lag is present, either block recommendation publish or degrade confidence.
+
+### Dependency outages
+If model catalog is unavailable:
+- /estimate may continue in a degraded mode only when the request provides explicit pricing inputs (NOT supported in v1; therefore treat as hard dependency).
+- Return 503 with COST_MODEL_DEPENDENCY_UNAVAILABLE.
+
+If telemetry store is unavailable:
+- /estimate may still work if request_event contains all metering inputs needed (supported).
+- /breakdown and /what-if must fail fast with 503.
+
+### Schema mismatch and unknown fields
+- Unknown input fields: ignored.
+- Missing required fields: 400 BAD_REQUEST with COST_MODEL_INVALID_INPUT.
+
+### Cardinality explosion protection
+- Reject queries with high-cardinality group_by.
+- Enforce max groups returned and max intermediate state.
+- Emit a metric cost_model.query_rejected{reason=...}.
+
+## Observability
+Required service metrics:
+- Request count, errors by code, latency p50/p95/p99 per endpoint
+- Schema version distribution (resolved_cost_model_version)
+- Query rejection counts by reason
+- Telemetry lag seconds distribution
+- Drift SLI export: predicted vs observed spend deltas (computed by offline job; surfaced for dashboards)
+
+Tracing:
+- Propagate X-RW-Request-Id into downstream calls.
+- Include resolved_cost_model_version and schema_hash as span attributes.
+
+Logging:
+- Structured logs (no customer content; avoid prompts).
+- Log warnings emitted in responses for correlation.
+
+## Client library requirements
+The shared client library (used by Console/Optimize) must:
+- Set timeouts (default: 1s; endpoint-specific overrides)
+- Implement retries for 503/429 (max 2 retries with jitter)
+- Support version negotiation fields and surface warnings
+- Provide circuit breaker hooks for Console hot paths
+
+## Rollout and compatibility plan (v1)
+- Stage 1: shadow mode for Console breakdown tiles (call API, compare to legacy aggregation; do not display).
+- Stage 2: feature flag on for internal users; monitor latency/error budgets and drift.
+- Stage 3: gradual tenant rollout; keep fallback to legacy for Console.
+- Stage 4: Optimize reads what-if from API for recommendation preview; require confidence + warnings gating.
+
+Rollback:
+- All callers must keep a feature-flagged fallback path for at least one release cycle.
+- If cost-model API is degraded, Console should fall back to cached/legacy values and show “data delayed” messaging.
+
+## Open questions / follow-ups
+1) 206 vs 200-with-warnings for partial telemetry: finalize default behavior for Console.
+2) Overhead allocation visibility policy: confirm the default redaction rules for product surfaces.
+3) Quantization uncertainty: standardize confidence interval representation across what-if scenarios.
+4) Price table version pinning: ensure schema_hash captures immutable price inputs for determinism.
+
+## Appendix A: HTTP status code mapping
+- 200 OK: full results (may include warnings)
+- 206 PARTIAL_CONTENT: partial data due to telemetry lag (optional; config-driven)
+- 400 BAD_REQUEST: malformed input or missing required fields
+- 403 FORBIDDEN: caller not authorized for tenant/scope
+- 412 PRECONDITION_FAILED: version negotiation failed
+- 413 REQUEST_ENTITY_TOO_LARGE: payload or batch too large
+- 422 UNPROCESSABLE_ENTITY: boundedness/guardrail violations
+- 429 TOO_MANY_REQUESTS: rate limit exceeded
+- 500 INTERNAL_SERVER_ERROR: unexpected error
+- 503 SERVICE_UNAVAILABLE: dependency outage or service overload

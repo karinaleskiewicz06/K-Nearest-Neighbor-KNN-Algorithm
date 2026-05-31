@@ -1,0 +1,159 @@
+Request Multiplexing & Backpressure Architecture (v1.0)
+
+Overview
+
+This document describes the design, operational guidance, and diagnostic playbooks for request multiplexing and backpressure controls in the Redwood serving runtime. It explains how multiplexing interacts with kernel scheduling, KV cache behavior, and autoscaling; defines telemetry to collect for profiling; and includes runbook procedures and benchmarking guidance for validating changes.
+
+Goals and non-goals
+
+- Goals:
+  - Improve GPU utilization via request multiplexing without violating latency SLOs.
+  - Provide stable, predictable backpressure behavior across mixed-priority workloads (hosted + dedicated + private).
+  - Expose observability and debugging surfaces so regressions are rapidly triaged.
+- Non-goals:
+  - Replace per-tenant rate limiting or high-level routing policies.
+  - Eliminate all tail latency; aim is to bound and make it observable.
+
+Design overview
+
+1) Architectural components
+
+- Multiplexer (MUX): in-memory request coalescer that forms micro-batches from ray/connection-level requests before kernel enqueue. Resides inside the runtime worker process.
+- Scheduler: decides which micro-batch enters the device queue next. Implements priority buckets, aging, and SLO-aware admission.
+- Admission & Backpressure Controller: converts runtime queue pressure signals into API-level backpressure (HTTP 429 / 202 or connection-level signals for streaming).
+- Kernel Mapper: maps micro-batches to specific kernel paths (FP16/INT8/sharded attention). Provides cost estimates used by Scheduler.
+- KV Cache Coordinator: manages per-shard KV cache occupancy and preferential eviction for multiplexed requests.
+
+2) Throughput vs. latency tradeoffs
+
+- The MUX increases throughput by aggregating prefix tokens across concurrent requests; however, large, heterogeneous micro-batches can amplify worst-case token latency for high-priority requests. The Scheduler therefore enforces a max-aggregate-seqlen bound per-priority bucket and a preemption threshold.
+
+3) Priority model
+
+- Requests carry a priority header (P0..P3). Typical mapping: P0 = system critical (control plane), P1 = enterprise SLAs, P2 = standard hosted, P3 = best-effort/batch.
+- Scheduler uses a weighted deficit round robin with aging to prevent starvation. Weights configurable per deployment (defaults shown in table below).
+
+Config (recommended defaults)
+
+| Key | Default | Notes |
+|-----|---------|-------|
+| mux.min-batch-ms | 3ms | Minimum time window to collect requests before forcing dispatch |
+| mux.max-batch-tokens | 4096 | Hard cap on total tokens in a micro-batch |
+| scheduler.preempt-pct | 25% | If a high-priority request waits > preempt-pct of its SLO, it preempts the current kernel slot |
+| admission.queue-high-water | 4000 | Number of pending tokens across worker before backpressure triggers |
+| admission.queue-critical | 8000 | Hard limit that causes immediate 429s on P2/P3 |
+| kvcache.prefetch-window | 8 | Number of next-token steps to prefetch into cache on micro-batch commit |
+| kernel.estimate-latency-ms | 1.8 | Baseline single-token kernel latency estimate used for admission heuristics |
+
+Operational sequences (runbooks)
+
+1) Normal request path (submit -> serve)
+
+1. API layer annotates request with priority, customer-tier, and model-variant tags.
+2. Runtime worker accepts request and appends to MUX holding queue.
+3. MUX groups requests by model-variant and priority, respecting mux.min-batch-ms.
+4. Scheduler selects next micro-batch based on weighted DRR and kernel cost estimates.
+5. KV Cache Coordinator reserves prefetched segments for chosen micro-batch.
+6. Micro-batch dispatched to kernel; kernel emits per-token traces and completion.
+7. Admission Controller updates backlog telemetry and may throttle by returning API-level backpressure signals if thresholds crossed.
+
+2) Backpressure escalation (runbook, incident quick steps)
+
+- Trigger: sustained worker backlog > admission.queue-high-water for > 30s or a GPU queue depth > 90% for > 60s on more than 2 nodes in the pool.
+- Immediate mitigation steps:
+  1. Remove P3 (best-effort) traffic from this pool via routing rule (Console -> Routing -> Pool Overrides).
+  2. Lower mux.min-batch-ms by 50% on affected workers to favor latency.
+  3. If backlog persists, enable conservative admission (admission.queue-high-water = 2000) and return 429s for P2/P3.
+  4. Notify SRE on-call and document node IDs and pool label in incident ticket.
+- Postmortem actions: adjust weight/aging parameters, run benchmark (see Benchmarking guidance) against a mixed-priority workload.
+
+Profiling guidance (how to profile multiplexed workloads)
+
+- Required traces/metrics to enable for experiments:
+  - mux.hold_time_ms (histogram by priority)
+  - mux.batch_token_count (gauge)
+  - scheduler.select_latency_ms (percentiles)
+  - kernel.exec_time_ms (per-kernel, per-seqlen)
+  - kvcache.hit_ratio (per-shard, per-tenant)
+  - admission.backlog_tokens and admission.drop_rate (by priority)
+  - per-request tail token latency (p50/p95/p99)
+
+- Profiling recipe (local reproducer):
+  1. Recreate the production request mix using the perf-replay tool with --priority-dist and --seq-dist knobs.
+  2. Enable verbose mux and scheduler traces (runtime flag: --trace-mux --trace-sched).
+  3. Capture kernel timeline with nvprof/rocprof or the lightweight kernel-timeline agent (-k).
+  4. Run for a minimum of 5 minutes at target QPS or until steady-state backlog appears.
+  5. Post-process traces with tools/trace-aggregator --mux-view to visualize per-batch composition.
+
+Benchmarking guidance
+
+- Workloads to include in the standard suite:
+  - Homogeneous short sequences (64 tokens) at high QPS (tests batching efficiency).
+  - Mixed-priority realistic traffic: 10% P1, 60% P2, 30% P3 with sequence-length distribution sampled from production traces.
+  - Long-prefix streaming scenario (512 prefix tokens then incremental).
+
+- Validation metrics and thresholds for passing:
+  - p50 token latency <= baseline * 1.15 for P1 requests
+  - p95 end-to-end latency <= 1.8x baseline for P2 under multiplexing
+  - throughput uplift >= 1.25x vs. no-mux baseline at same hardware cost
+  - KV cache hit ratio >= 70% on mixed workloads
+
+Release notes snippet (v1.0 multiplexing rollout)
+
+- Added MUX v1.0: configurable request multiplexing with priority buckets and scheduler-aware preemption.
+- New runtime flags: --mux.min-batch-ms, --mux.max-batch-tokens, --scheduler.preempt-pct.
+- Observability: mux.* and scheduler.* metrics, traceable batch composition in trace-aggregator v0.9.
+
+Known issues and mitigations
+
+- Issue: Priority inversion under heterogeneous micro-batches.
+  - Symptom: P1 requests see elevated p99 when coalesced into large batches dominated by P2 text.
+  - Mitigation: Enforce per-priority max-aggregate-seqlen and lower mux.min-batch-ms for affected pools.
+
+- Issue: KV cache thrash when working set overlaps heavily across tenants.
+  - Symptom: Increased kernel latency due to repeated prefetch and eviction churn.
+  - Mitigation: Enable tenant-aware cache windows (kvcache.tenant-isolation = true) for dedicated pools; tune kvcache.prefetch-window and kvcache.eviction-sensitivity.
+
+- Issue: Unexpected 429 bursts after autoscaler events.
+  - Symptom: When nodes are removed, admission controller returns 429s in waves instead of smoothing.
+  - Mitigation: Add a 30s graceful-drain window with backlog redistribution; ensure autoscaler uses drain annotation (autoscaler.drain-window=30s).
+
+Operational checklist for releases
+
+1. Canary rollout: enable mux on 1–2 small canary pools with mixed-priority traffic for 72 hours.
+2. Run the benchmarking suite and confirm thresholds.
+3. Run chaos scenarios: node drain, kernel stalls, KV cache pressure.
+4. If regressions observed, rollback by setting --mux.enabled=false and revert routing overrides.
+
+Diagnostic examples (CLI snippets)
+
+- Query backlog and batch composition (metrics API):
+  curl -s "http://metrics:9200/query?m=mux.hold_time_ms,p90&pool=pool-1" | jq .
+
+- Trigger a controlled eviction-friendly test:
+  perf-replay --config tests/multiplex-eviction.yaml --qps 1200 --priority-dist 10,60,30
+
+Team wiki and further reading
+
+- See the runtime team wiki page for live dashboards: /confluence/eng-serving-runtime/team-wiki/runtime-observability-data-model-and-tracebook-2025
+- See kernel mapper design notes for cost model details: /confluence/eng-serving-runtime/kernel-and-scheduling/sharded-attention-execution-guidelines-2026
+
+Appendix: tuning knobs quick reference
+
+- Latency-sensitive pools: mux.min-batch-ms = 1ms; mux.max-batch-tokens = 2048; scheduler.preempt-pct = 15%
+- Throughput-optimized pools: mux.min-batch-ms = 5–8ms; mux.max-batch-tokens = 8192; scheduler.preempt-pct = 40%
+- Mixed SLA pools (default): see Config table above.
+
+Owners and escalation
+
+- Component owners:
+  - Multiplexer & Scheduler: Marco Ruiz (runtime-serving)
+  - KV Cache Coordinator: Priya Desai (runtime-storage)
+  - Admission Controller: Evan Thompson (sre-runtime)
+- On-call escalation: runtime-sre -> infra-sre -> eng-serving-runtime leads.
+
+Change log
+
+- 2025-09-15: v0.1 initial draft (A. Patel)
+- 2025-11-02: Added profiling recipe and CLI snippets (M. Ruiz)
+- 2026-02-10: Finalized operational checklist and released default conservative configs (A. Patel)

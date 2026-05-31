@@ -1,0 +1,139 @@
+Sequencing Fence and Slot Coordination Manual
+
+Summary:
+This manual describes the sequencing fence and slot coordination model used by the execution coordinator and kernel scheduler to preserve SLOs under mixed workloads. It combines the admission (rate-fence) model, slot reservation semantics, and reactive backpressure with practical tuning steps, diagnostics, and a short benchmarking protocol for validating changes.
+
+Scope and goals:
+- Define semantics: what a sequencing fence is, how slots are reserved/released, and guarantees provided to callers.
+- Provide configuration table of key knobs with safe default ranges.
+- Give step-by-step tuning recipes for common workload classes (conversational, batch embeddings, long-completion document generation).
+- Runbook for operational incidents involving slot exhaustion, priority inversion, and noisy-tenant interference.
+- Benchmark and profiling procedure to validate changes to marshaling and coordination paths.
+
+Audience:
+- Runtime engineers (primary), SREs oncall, platform PMs, and solutions engineers who operate Dedicated/Private deployments.
+
+Background and motivation:
+Redwood's serving runtime multiplexes heterogeneous requests across a pool of kernels. Without coordinated sequencing and slot fencing, high-concurrency short requests can starve long-running kernels (priority inversion) or fragment GPU resources causing KV-cache churn. The sequencing fence enforces a deterministic execution order for critical request classes and exposes quota/slot accounting so higher layers can make routing/fallback decisions.
+
+Concepts and definitions:
+1) Slot: an opaque capacity unit representing a kernel execution entitlement (not a single GPU thread). Slots have attributes: affinity (GPU type), duration_hint (ms), priority, and cohort_id (cohort for routing).
+2) Sequencing fence: a lightweight barrier injected by the execution coordinator that serializes the order of token-emit critical sections across slots in a shard. Fences are soft (preemption allowed) or hard (no preemption while holding).
+3) Rate-fence (admission): policy layer that rejects/queues requests based on token cost projection and current active_slots. It is evaluated pre-scheduling and periodically recomputed from telemetry.
+4) Reservation lease: ephemeral lease recorded in slot ledger; auto-renewed by the kernel operator or released on heartbeat loss.
+
+Architecture (text diagram):
+- Frontend API -> admission layer (rate-fence) -> execution coordinator -> slot ledger -> scheduler -> kernel dispatcher -> GPU kernels
+- Observability hooks: admission.decisions, slot.ledger.delta, fence.events, kernel.handoff.trace
+
+Key metrics and SLO guardrails:
+- slot_utilization_pct (SLO: >= 60% and <= 90% under steady state)
+- fence_hold_time_p50/p95 (target < 3ms / < 25ms for soft fences)
+- admission_reject_rate (target < 1% for premium tenants; overall < 5%)
+- priority_inversion_incidents (count; alarm if > 0 over 15m for dedicated clusters)
+
+Configuration table (knobs and safe defaults):
+- admission.window_seconds: 1 - 60 (default 5) — sliding window used to project token cost.
+- slot.max_concurrent_per_gpu: 8 - 256 (default 64) — soft cap, tuned per-GPU family.
+- fence.type: soft | hard | hybrid (default hybrid) — hybrid uses soft by default, switches to hard for long duration ops.
+- reservation.lease_ms: 2000 - 30000 (default 8000)
+- priority.boost_threshold_ms: 50 - 200 (default 100) — if a request waits longer than this, it receives temporary priority boost.
+
+Tuning recipes (high-level):
+1) Conversational (many short requests, strict p95 latency):
+   - Reduce admission.window_seconds to 2s.
+   - Enable fence.hybrid with soft locked for inference emission.
+   - Lower slot.max_concurrent_per_gpu for the cohort serving chat to 32 to reduce kernel contention.
+   - Observe fence_hold_time_p95; if > 20ms, increase per-cohort isolation (dedicated slots).
+
+2) Embeddings batch (large batch throughput):
+   - Increase admission.window_seconds to 10s to allow batching.
+   - Set reservation.lease_ms to 12000 to reduce churn.
+   - Use hard fences for batch completion steps to ensure KV-cache coherency.
+
+3) Long-document generation (high duration, medium concurrency):
+   - Use hybrid fences that escalate to hard when duration_hint > 2000ms.
+   - Pre-reserve slots at admission time (reservation.preallocate=true).
+   - Enable priority_boost_threshold_ms for tail mitigation.
+
+Operational runbook: Slot exhaustion incident
+1) Detection: alert if slot_utilization_pct > 95% OR admission_reject_rate > 10% sustained for 5m.
+2) Immediate mitigation actions (oncall):
+   - Identify noisy cohort: query slot.ledger.delta for top 5 cohort_id by delta_slots over last 5m.
+   - If noisy tenant is non-critical, apply temporary quota reduction: curl -XPOST $COORDINATOR/admin/quota -d '{"cohort_id":"X","max_slots":N}'
+   - If widespread, enable emergency shedding: admission.mode=reject-nonpremium
+3) Root-cause steps:
+   - Pull kernel traces: use ingest tool: ./tools/collect-trace --trace-type kernel-handoff --since 15m > /tmp/handoff.trace
+   - Inspect fence.events for hard fence hold durations: query metrics.fence_hold_time_p95
+   - Check slot lease churn: count heartbeat timeouts in slot.ledger events.
+4) Post-incident: run traffic-simulation to reproduce the spike and iterate tuning (see Benchmarking section).
+
+Priority inversion detection & mitigation
+- Detection signal: priority_inversion_incidents > 0 OR slow_p99 among high-priority cohort increases > 3x baseline.
+- Fast mitigation: enable short preemption window (fence.preempt_window_ms = 25) and run a micro-eviction for low-priority ephemeral slots.
+- Longer remediation: adjust scheduler.policy_weights to favor latency-sensitive cohorts and schedule gradual capacity increase for that cohort.
+
+Diagnostics and observability guidance:
+- Traces to collect: admission.decisions, slot.ledger.snap, fence.events, kernel.handoff.trace. Collect correlated traces for a single request id (request_id in logs).
+- Dashboards: "Slot Ledger Health" (shows active slots by cohort, lease churn, heartbeat failures) and "Fence Latency" (p50/p95 across shard regions).
+- Useful log queries (example):
+  - Find requests that waited > 200ms in admission:
+    kubectl logs -l app=coordinator | jq -r 'select(.admission_wait_ms>200) | .request_id, .cohort'
+
+Benchmarking & profiling protocol (short):
+1) Goal: validate scheduler change does not regress p95 for conversational and does improve throughput for batching.
+2) Setup: shadow cluster with identical kernel profiles; use synthetic traffic generator (tools/traffic-gen) with two profiles: conversational (10–200 tokens, 100–600 rps) and batch_embeddings (batch_size 256–1024, 5–20 feeds/s).
+3) Measurements: p50/p95/p99 latency, admission_reject_rate, slot_utilization_pct, fence_hold_time_p95.
+4) Pass criteria: conversational p95 <= baseline * 1.05 and batch throughput >= baseline + 8% with comparable slot_utilization.
+5) Profiling tips: capture kernel-level nvprof traces for a sample of > 100 high-latency events and use trace-annotator to correlate with fence.events.
+
+Safe rollout checklist for config changes:
+1) Feature flag behind runtime-sandbox and canary cohort.
+2) Unit-level canary: enable on single shard and run 30m synthetic load.
+3) Canary-level: enable on 10% of shards; run 2h with auto-rollback threshold set (conversational_p95_increase>3%).
+4) Full rollout: staged 25% increments with 30m observation windows.
+
+Sample config snippets (YAML):
+---
+admission:
+  window_seconds: 5
+  mode: adaptive
+slot:
+  max_concurrent_per_gpu: 64
+  reservation:
+    lease_ms: 8000
+fence:
+  type: hybrid
+  preempt_window_ms: 25
+  priority_boost_threshold_ms: 100
+---
+
+CLI utilities (examples):
+- Reserve slots for cohort: rslot reserve --cohort chat-pt1 --slots 20 --duration-ms 600000
+- Dump ledger snapshot: rslot dump --shard shard-3 --out /tmp/ledger.snap
+- Apply quota: curl -XPOST $COORD_ADMIN/quota --data '{"cohort_id":"chat-pt1","max_slots":20}'
+
+Troubleshooting checklist (when p95 regresses):
+- Are fence_hold_time_p95 or p99 elevated? If yes, inspect kernel.handoff.trace for hot kernels.
+- Is slot_utilization saturated? If > 95%, consider throttling noncritical cohorts.
+- Check for heartbeat/lease thrashing (slot.ledger.heartbeat_failures). If present, increase reservation.lease_ms temporarily.
+- Validate admission.window_seconds; too-short windows can cause over-eager rejection, too-long windows delay batching opportunities.
+
+Security and safety considerations:
+- Reservation ledger writes are audited; changes to quota must be performed through admin APIs (audit.log entries created).
+- Do not set reservation.lease_ms > 60s in multi-tenant clusters — leads to allocation hoarding under failure.
+
+Appendix A — Change validation checklist for scheduler kernel rollouts:
+- Confirm kernel ABI compatibility via kernel-compat-matrix.
+- Run end-to-end shadowing with live traffic sampling (1% of traffic) for 24h.
+- Verify no increase in priority_inversion_incidents and no >5% increase in admission_reject_rate.
+
+Appendix B — Contact and ownership:
+- Primary owner: Priya Ramanathan (serving-runtime team)
+- Oncall escalation: eng-sre oncall -> public slack #runtime-oncall -> PagerDuty (runtime-sre)
+- Feedback loop: open an ADR or a runtime-team RFC and link the simulation results.
+
+Revision history:
+- 2025-11-03: Initial draft and reviewed by Marcus Li.
+- 2025-12-14: Added benchmarking protocol and CLI examples.
+- 2026-01-12: Expanded runbook and tuned defaults after production experiment.

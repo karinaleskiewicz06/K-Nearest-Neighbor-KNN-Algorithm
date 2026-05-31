@@ -1,0 +1,328 @@
+SLI Specification: API Gateway + Smart Routing (Tiered SLO Program)
+
+## Purpose
+This document defines the canonical measurement standard (SLIs) for Redwood’s customer-facing inference request path across the **API Gateway** and **Smart Routing / Control Plane policy evaluation**.
+
+This specification is used to:
+- Compute tiered SLOs and error budgets for **Hosted (shared)** and **Dedicated (reserved capacity)**.
+- Ensure consistent accounting across regions, endpoints, retries, routing fallback, and streaming.
+- Prevent metric/cardinality explosions while preserving debuggability.
+
+**Non-goals:** This document does not define the SLO targets themselves. Refer to the tiered SLO definition page for targets and reporting windows.
+
+## Scope
+### In-scope components
+- API Gateway (public edge): authentication, request validation, rate limiting, request forwarding, streaming relay.
+- Routing / Control Plane policy evaluation: tier-aware routing decision, region/model selection, fallback selection, capacity-aware shedding decisions.
+- Observability pipeline (metrics/traces/logs) required to compute SLIs.
+
+### In-scope request classes
+- Chat/Completions (non-streaming)
+- Chat/Completions (streaming)
+- Embeddings
+- Rerank (if served via the same gateway+routing path; otherwise track separately)
+
+### Out of scope (for SLI computation)
+- Customer-side SDK behavior and client networks (except for classification of disconnect causes as described below).
+- Private (VPC/on-prem) SLO enforcement (referenced for future extension only).
+
+## Canonical concepts and identifiers
+### Request identity (deduplication key)
+To correctly handle retries and fallback, all events must include:
+- **request_id**: UUID minted at the API Gateway at ingress; stable across downstream hops.
+- **attempt**: integer, starting at 1; increments when the platform initiates a retry or fallback attempt.
+- **trace_id**: distributed tracing identifier.
+
+**Rule:** For SLI accounting, we compute success/failure primarily at the **request_id** level (logical request), with attempt-level attributes retained for debugging.
+
+### Tier and deployment mode
+Tier labels must be set at ingress and propagated end-to-end.
+- **deployment_mode**: `hosted` | `dedicated` | `private` (private may be present but not enforced in this phase)
+- **tier**: `hosted_shared` | `dedicated_reserved`
+- **tenant_id**: internal account identifier (restricted use; not permitted in high-cardinality global metrics)
+- **dedicated_cluster_id** (for dedicated only): stable identifier for the reserved capacity pool
+
+**Source of truth:** Gateway auth context + account configuration service. Routing must not “guess” tier.
+
+**Propagation requirement:** tier fields must be copied into:
+- Metrics labels (tier-safe form; see cardinality rules)
+- Trace attributes
+- Structured logs
+
+## Event taxonomy (what we measure)
+We measure SLIs using a combination of:
+- **Metrics** (authoritative for SLOs/error budgets)
+- **Traces** (debugging; sampled)
+- **Structured logs** (debugging; filtered)
+
+### Canonical metric events
+The following metric series are normative. Names are representative; actual names should match the telemetry registry.
+
+1) `gw_request_total`
+- Increment once per ingress request after auth/validation completes.
+- Labels (approved): `tier`, `region`, `endpoint_class`, `http_method`, `status_class`, `error_category`, `is_streaming`.
+
+2) `gw_request_duration_seconds`
+- Observed once per request at completion (or terminal failure).
+- Latency is **end-to-end at gateway** (see Latency definition section).
+- Labels (approved): `tier`, `region`, `endpoint_class`, `is_streaming`, `status_class`.
+
+3) `gw_stream_session_total`
+- Increment when gateway successfully opens a stream to client (i.e., headers flushed / first SSE frame allowed).
+- Labels: `tier`, `region`, `endpoint_class`.
+
+4) `gw_stream_disconnect_total`
+- Increment when a streaming session ends abnormally.
+- Labels: `tier`, `region`, `endpoint_class`, `disconnect_cause`.
+
+5) `routing_decision_total`
+- Increment per attempt when routing makes a decision.
+- Labels: `tier`, `region`, `endpoint_class`, `decision` (e.g., `primary`, `fallback`, `shed`), `fallback_reason` (low-cardinality enum).
+
+6) `upstream_attempt_total`
+- Increment per attempt when gateway forwards to a serving backend (or region).
+- Labels: `tier`, `region`, `endpoint_class`, `attempt_outcome` (e.g., `success`, `timeout`, `connect_error`, `upstream_5xx`).
+
+### Endpoint class labeling
+All request metrics must map request paths into a stable enum:
+- `chat_completions`
+- `completions`
+- `embeddings`
+- `rerank`
+
+**Rule:** Do not label metrics with raw URL paths.
+
+## SLI definitions (authoritative formulas)
+### 1) Request Success Rate (Availability / Error-rate SLI)
+**Intent:** Measure the probability a customer request completes successfully.
+
+**Numerator (successful requests):**
+- Requests that result in HTTP **2xx** at the gateway.
+- For streaming: a request is successful if the stream is established and ends with a platform “clean end” (see streaming section). This is represented via `status_class=2xx` and no counted disconnect.
+
+**Denominator (valid requests):**
+- All ingress requests that pass authentication and request validation.
+
+**Exclusions (do not count in denominator):**
+- `4xx` due to invalid input or authentication/authorization failures.
+- Explicit, expected throttling outcomes: `429` rate limit / quota (tracked separately).
+- Customer-canceled requests classified as `client_abort` (streaming/non-streaming rules differ; see below).
+
+**Inclusions (count against SLI):**
+- `5xx` at the gateway.
+- `504` gateway timeout.
+- Routing “shed” that results in 503/429-like overload response **for SLO accounting** must be counted as failure unless explicitly documented as an SLO exclusion for the tier (default: count as failure).
+
+**Recommended metric computation:**
+- Success rate per tier/region/endpoint_class:
+  - `success = sum(rate(gw_request_total{status_class="2xx"}[window]))`
+  - `total = sum(rate(gw_request_total{counted_in_sli="true"}[window]))`
+  - `sli = success / total`
+
+### 2) Latency SLI
+**Intent:** Measure customer-perceived latency at the gateway boundary.
+
+**Latency measurement point:**
+- **Non-streaming:** `request_received_at_gateway` to `response_last_byte_sent`.
+- **Streaming:** `request_received_at_gateway` to `time_to_first_stream_byte` (TTFSB) is tracked separately, and **stream session reliability** is measured as a separate SLI.
+
+**Canonical latency metrics:**
+- Non-streaming latency: `gw_request_duration_seconds{is_streaming="false"}`
+- Streaming TTFSB: `gw_stream_ttfb_seconds` (if not present, implement; do not approximate TTFSB using request duration).
+
+**Percentiles:** Compute p50/p95/p99 by tier, region, endpoint_class.
+
+**Important:** Do not include client network transfer time after the gateway has handed off the last byte (we do not control it).
+
+### 3) Streaming Reliability SLI
+**Intent:** Measure whether a streaming response remains stable and completes without platform-caused disconnects.
+
+**Unit:** A stream session.
+
+**Denominator:** `gw_stream_session_total`.
+
+**Failures (count against SLI):** any `gw_stream_disconnect_total` where `disconnect_cause` is one of:
+- `upstream_reset` (backend reset / gRPC reset)
+- `gateway_error` (gateway closed due to internal error)
+- `idle_timeout` (platform-enforced idle timeout while tokens expected)
+- `router_failover_midstream` (routing policy switched backend mid-stream leading to disconnect)
+- `proxy_write_error` (gateway cannot write to client due to internal proxy issues)
+
+**Not counted as failures (excluded from denominator or treated separately):**
+- `client_abort` where the client intentionally closes the connection (see classification rules).
+- `client_network_error` if positively identified as client-side TCP reset without correlated gateway/backend error signals.
+
+**Classification rule:** Only classify as `client_abort` if both:
+1) Gateway observes a client-initiated close/reset, and
+2) There is no coincident upstream failure for the attempt (no upstream 5xx/timeout/reset) in a short correlation window (default 2 seconds).
+
+If ambiguous, classify as platform-caused (counts against SLI). This reduces undercounting of real platform streaming instability.
+
+## Retries, fallback, and SLI accounting
+### Definitions
+- **Retry:** The platform re-attempts the same request to the same or different backend after a retriable failure.
+- **Fallback:** Routing selects a compatible alternative (e.g., model variant or region) to preserve availability/latency.
+
+### Accounting rules
+1) **Customer-visible outcome is authoritative.**
+- If the final response at gateway is 2xx, it is a success for the request success-rate SLI, even if earlier attempts failed.
+
+2) **Attempts are still measured.**
+- Attempt-level failure rates are tracked via `upstream_attempt_total` and are used to detect degradations and routing churn.
+
+3) **Do not double-count a single logical request as multiple SLI samples.**
+- `gw_request_total` increments once per ingress request (request_id).
+- Attempt metrics increment per attempt.
+
+4) **Fallback should not hide instability.**
+- If fallback occurs, label `routing_decision_total{decision="fallback"}` and include `fallback_reason`.
+- Dedicated tier reporting should include a separate “fallback rate” view; however, fallback does **not** by itself count as failure unless it results in a 5xx/timeout or streaming disconnect.
+
+5) **Mid-stream fallback is treated as failure unless seamless.**
+- If a routing change causes a stream disconnect, it counts against streaming reliability SLI.
+- “Seamless resume” (future feature) must emit explicit `resume_success=true` signals before we can exclude from failure accounting.
+
+### Recommended retriable failure taxonomy
+Use a low-cardinality enum `error_category` / `attempt_outcome`:
+- `timeout`
+- `connect_error`
+- `tls_error`
+- `upstream_5xx`
+- `upstream_reset`
+- `overloaded_shed`
+- `policy_denied`
+- `bad_request`
+- `auth_failed`
+- `unknown`
+
+**Rule:** `error_category` must never include raw exception messages.
+
+## Tier tags and cardinality control
+### Mandatory tags (metrics)
+Every SLI-relevant metric must include:
+- `tier` (hosted_shared / dedicated_reserved)
+- `region` (cloud region, e.g., us-east-1 / eu-west-1)
+- `endpoint_class`
+- `is_streaming`
+
+### Allowed additional tags (metrics)
+- `status_class` (2xx/3xx/4xx/5xx)
+- `error_category` (enum)
+- `disconnect_cause` (enum)
+- `decision` and `fallback_reason` (enum)
+
+### Forbidden tags (metrics)
+To avoid cardinality blowups, the following are forbidden in global metrics:
+- `tenant_id` (account id)
+- raw `model` name (use model_family if needed and approved)
+- `request_id`, `trace_id`
+- user identifiers
+
+### Where to put high-cardinality fields
+- **Traces:** `tenant_id`, `model`, `dedicated_cluster_id`, `request_id`, `attempt`, `policy_name`.
+- **Logs (structured):** full routing decision payloads, policy evaluations, backend identifiers.
+
+### Dedicated customer-level SLO views
+Dedicated account dashboards may compute account-level SLIs using a **separate metric pipeline** with strict access controls and retention rules.
+- Use `dedicated_cluster_id` as the primary partition key.
+- Avoid per-tenant metrics in shared Prometheus; prefer pre-aggregated rollups in the dedicated SLO dataset.
+
+## Sampling and retention rules
+### Metrics
+- **Collection:** 100% (no sampling) for the canonical SLI metrics.
+- **Resolution:** 10s scrape/emit preferred; 30s acceptable.
+- **Retention:** 13 months for SLO computation and SLA mapping audits.
+
+### Traces
+- Default sampling: 0.5–1% of requests, with dynamic upsampling on errors.
+- Always-sample for:
+  - All gateway 5xx
+  - All streaming disconnects counted against SLI
+  - Routing fallbacks with `fallback_reason` in {`capacity_constrained`, `regional_degradation`}
+
+### Logs
+- Structured logs required for classification of disconnects and correlation with upstream failures.
+- Retention: 30 days hot, 90 days cold (unless extended for an incident).
+
+## Streaming-specific implementation guidance
+### Required gateway signals
+Gateway must emit:
+- `stream_opened=true` when the client stream is established.
+- `first_token_time_ms` (TTFSB) for streaming endpoints.
+- Terminal classification of stream end:
+  - `end_reason=clean` | `end_reason=disconnect`
+  - `disconnect_cause` (enum)
+
+### Clean end definition
+A stream end is “clean” if:
+- Gateway sent a terminal event (e.g., `[DONE]` or protocol-specific completion), AND
+- Connection closed after the terminal event without error.
+
+### Client abort definition (streaming)
+Only classify as `client_abort` if the connection closed before terminal event and the correlation rule indicates no platform-side error.
+
+## Regional attribution
+SLIs must be attributed to the region that served the request attempt that produced the customer-visible outcome.
+- For success-rate and latency SLIs: use `served_region` determined by routing for the winning attempt.
+- For attempt metrics: use the attempt’s target region.
+
+**Note:** The ingress region (edge POP) may differ from served region; do not use edge POP to compute region SLIs.
+
+## Data quality requirements
+### Required fields for SLI correctness
+The following must be non-null on SLI metrics:
+- `tier`, `region`, `endpoint_class`, `status_class`.
+
+### Backfill / gaps
+- If a metric pipeline outage prevents correct SLI computation for >15 minutes, SRE must:
+  1) Declare an observability incident (internal severity based on impact),
+  2) Document the missing intervals,
+  3) Apply the approved backfill procedure or mark the interval as “unknown” per SLO tooling policy.
+
+**Rule:** Do not silently drop intervals; unknown must be visible in the SLO UI.
+
+## Validation and change management
+### Before shipping changes to SLI metrics
+- Run SLO toolkit validation to ensure all required series exist per tier/region/endpoint_class.
+- Verify that tier tagging matches account configuration in at least one Hosted and one Dedicated test account.
+- Confirm that adding any new label does not exceed cardinality budgets (review by Metrics Aggregation/Cardinality owner).
+
+### Versioning
+- Changes to SLI formulas, exclusions, or classification rules require:
+  - An ADR (if semantics change) OR a minor revision logged on this page (if clarifying only)
+  - Review by SRE + Telemetry platform owners
+  - Communication to Product owners for SLA mapping impact
+
+## Appendix A: Reference classification tables
+### Status code handling
+- 2xx: success
+- 3xx: treat as success only if used intentionally (rare). Default: exclude from SLI until confirmed.
+- 4xx:
+  - 400/401/403/404: exclude (invalid/auth)
+  - 408: include (counts as failure)
+  - 429: exclude from SLI denominator; track as a separate “throttling rate” indicator
+- 5xx: include (counts as failure)
+
+### Disconnect cause enum (streaming)
+- `client_abort`
+- `client_network_error`
+- `gateway_error`
+- `proxy_write_error`
+- `upstream_reset`
+- `idle_timeout`
+- `router_failover_midstream`
+- `unknown`
+
+## Appendix B: Common pitfalls
+- Counting per-attempt failures as request-level failures (inflates error rates).
+- Using raw model name as a metric label (cardinality explosion).
+- Treating all stream disconnects as client aborts (hides platform instability).
+- Measuring streaming latency using full request duration (misrepresents “time to first token”).
+
+## Owners
+- Observability standards: Allison Grant
+- Telemetry platform: Logan Wright
+- SLI/error budget implementation: Aisha Bello
+- Routing semantics: Mina Haddad
+
+Questions or proposed changes should be filed against the Tiered SLO program and linked here.

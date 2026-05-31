@@ -1,0 +1,156 @@
+Runtime Fallback & Graceful Degradation Playbook
+
+Operational runbook and engineering guidance for automatic fallback and graceful degradation behaviors in the Redwood serving runtime. Covers triggers, architecture interactions, scheduler implications, profiling and benchmarking guidance, and step-by-step incident remediation.
+Overview:
+
+This playbook describes the intended behavior and operational steps for runtime-level fallback and graceful degradation across Redwood Inference deployments. It targets on-call SREs, runtime engineers, and platform product owners who must ensure applications meet latency and availability SLOs under degraded conditions (e.g., spot evictions, model OOMs, regional capacity constraints, extreme tail-latency events).
+
+Goals and SLO impact:
+
+- Primary goals:
+  - Keep requests successful and bounded in latency by applying controlled degradation rather than failing hard.
+  - Maintain transparency to customers (logs, metrics, traces) when fallbacks occur.
+  - Provide deterministic, testable fallback policies that interact cleanly with kernel scheduler decision-making.
+- SLO considerations:
+  - Availability SLO: keep request success rate >= 99.9% across primary+fallback flows.
+  - Latency SLO: p95 <= 250ms and p99 <= 600ms for standard small-response routes; fallback flows may relax latency SLO but must be documented in per-route dashboards.
+  - Error budget accounting: fallback-induced higher latency counts against the latency error budget but not necessarily the availability budget if response semantics are preserved (200 OK with degraded payload).
+
+When to engage fallback layer:
+
+Fallback layer should be applied when one or more of the following triggers fire (automated):
+1) Serving node failure modes: GPU OOMs, VMM crashes, container restarts above threshold (>=3 in 5m).
+2) Resource saturation: queue length > config.queue_threshold or CPU/GPU utilization sustained > 92% for 60s.
+3) Tail-latency surge: p99 request latency for a model > configured model.p99_threshold for 60s.
+4) Regional capacity shortage: target region has < 10% of baseline free capacity and cross-region failover policy exists.
+5) Model regression detection: quality monitoring signals output regression (eval set drop > 3% absolute) and defined auto-fallback rule is enabled.
+
+Architecture integration (how fallback fits in the runtime):
+
+- Placement: Fallback logic lives in the routing and execution orchestration layer (service: runtime-router). The runtime-worker accepts policy decisions (serve, downgrade, cache-hit, reject) returned by router.
+- Policy store: Policies (per-route) are defined in the control plane config-store and propagated as immutable rollout keys. Each policy key maps to a fallback strategy bundle.
+- Execution paths:
+  - Normal path: route -> schedule -> worker -> model -> response.
+  - Fallback path examples:
+    - Model-variant downgrade: route -> schedule -> worker -> quantized-or-smaller-model -> response.
+    - Cached-prefix reply: route -> cache-check -> cached-response -> response.
+    - Short-circuit: route -> runtime-synthesizer -> short-summary response (used for long-running synth).
+    - Regional fallback: route -> alt-region-router -> remote-worker -> response.
+- Observability: All fallback decisions emit a fallback.reason tag and fallback.variant tag on traces and metrics. Billing and cost analytics receive a fallback.flag to attribute cost differences.
+
+Fallback strategies and recommended order (policy template):
+
+1) Prefetch & Cache (least-visibility change)
+  - Serve cached completion or prefix when TTL not expired.
+  - Use for high-QPS, low-variance routes (embeddings, re-ranking).
+2) Quantized / Smaller model variant
+  - Serve from a model variant with smaller memory footprint or int8 quantization.
+  - Keep model-variant performance profile available in model catalog.
+3) Partial-response / Synthesis
+  - Return partial tokens up to configured token limit + summary flag.
+  - Mark response with metadata: degraded: true, reason: partial-response.
+4) Cross-region routing
+  - Use only when network latency increase is acceptable vs local unavailability.
+5) Hard reject / 503 fallback
+  - Final resort when no compatibility policy exists; provide diagnostics link in body.
+
+Kernel-scheduler considerations:
+
+- Prioritization policy: The kernel scheduler should expose preemption hints for fallback flows. For example, models used in fallback (smaller quantized variants) receive lower CPU/GPU priority class so that primary models reclaim resources first.
+- Eviction thresholds: Scheduler must support two eviction windows: graceful and immediate. Graceful eviction attempts to flush in-flight KV caches and migrate small models; immediate eviction kills the process when node health is compromised.
+- Continuous batching interaction: When switching to smaller model variant, kernel should recompute batching windows (batch_size, batch_timeout) because per-token latency and throughput profiles change. The runtime must trigger a batching reconfigure hook on model-switch.
+
+Profiling & benchmarking guidance during fallback mode:
+
+- Benchmark plan: Run a paired A/B microbenchmark comparing normal variant vs fallback variant across the following axes: cold-start latency, steady-state latency, p99, throughput at target concurrency, memory footprint, and token throughput.
+- Profiling checklist (oncall):
+  1) Capture perf traces (nvprof / nsight) and runtime traces (OpenTelemetry) for both normal and fallback variants.
+  2) Compare KV-cache hit rate and batching efficiency before/after fallback.
+  3) Measure syscall and GPU kernel latencies; look for stall patterns indicating memory pressure.
+- Metrics to surface on dashboards: fallback.count, fallback.latency.delta, fallback.impact_pct_of_requests, fallback.model_variant, fallback.trigger_reason.
+
+Operational runbook (step-by-step):
+
+Detection:
+1) Alert fires: FALLBACK_POLICY_TRIGGERED OR model.p99_exceeded.
+2) Oncall acknowledges and posts to incident channel (ops/runtime-fallback).
+
+Immediate triage (first 10 minutes):
+1) Confirm scope: run queries:
+   - curl -sS "https://runtime-metrics.internal/api/v1/route_status?route=<route>"
+   - rtfctl route inspect <route> --fields=queue_len,model_variant,uptime
+2) Check node and scheduler health:
+   - kubectl get pods -n runtime -l app=runtime-worker -o wide 
+   - k8s node metrics: kubectl top nodes | sort -nr -k3
+3) Determine fallback type currently in use via logs/traces (search for fallback.reason tag).
+4) If fallback variant is active and correctness is acceptable, follow stabilization steps below.
+
+Stabilization steps (10–60 minutes):
+1) If queue backpressure is root cause, temporarily increase per-route max_workers or enable short-burst scaling (config: autoscale.burst=true) for up to 30 minutes. Document change and set timer.
+2) If model OOMs triggered fallback, scale up node group (add nodes) or enable model eviction order: evict large non-critical models first.
+3) If degradation due to bad model quality (detected by eval alerts), toggle model.quality_block to stop rollout and enable previously-validated variant.
+4) Apply temporary route-level policy: set fallback.strategy=cache-first, max_tokens=128, respond_with_degradation_flag=true.
+
+Rollback and permanent fix (1–24 hours):
+1) If configuration/rollout caused the issue, revert the rollout using the control-plane rollback CLI: cpctl rollout revert <rollout_id>.
+2) If capacity is root cause, schedule a capacity bump and update scaling policy: infra-iac PR to increase gpu_pool.capacity by recommended amount.
+3) If kernel scheduler misbehavior suspected, collect scheduler dump and escalate to runtime-scheduler team: runtime-scheduler@redwood.ai. Include scheduler dump path and most recent kernel-profile tarball.
+
+CLI and debug commands (common):
+- rtfctl policy get <route>
+- rtfctl model variants <model_id>
+- curl -sS https://runtime-router.internal/healthz
+- kubectl logs -n runtime <pod> -c worker --since=15m | grep fallback
+- oc promql 'sum(rate(fallback_total[5m])) by (route)'
+
+Config snippet (example policy - YAML):
+
+---
+route: /v1/generate/summarize
+policy_key: minor-degrade-v1
+fallback_policy:
+  order: [cache, quantized_variant, short_response, cross_region]
+  cache_ttl_s: 30
+  quantized_variant: model-xy-q8
+  short_response_max_tokens: 64
+  cross_region: us-west-2
+  circuit_breaker:
+    consecutive_errors: 5
+    reset_after_s: 300
+---
+
+Post-incident checklist:
+- Create incident summary and link telemetry artifacts (traces, perf tarballs, scheduler dump).
+- Run regression tests for the route(s) impacted.
+- Schedule a postmortem within 3 business days.
+- Add unit/e2e tests for new fallback behavior to prevent regressions.
+- Review related model onboarding checks (ensure quantized/variant profiles exist).
+
+Ownership and escalation:
+- Primary oncall: runtime-sre team (alias: oncall-runtime@redwood.ai).
+- Scheduler and kernel issues: runtime-scheduler@redwood.ai.
+- Model quality regressions: applied-ml-and-evals@redwood.ai.
+- Product and customer notifications: customer-success@redwood.ai.
+
+Release notes and change history: 
+- 2025-11-10 (Lena Hart): Initial draft of playbook.
+- 2026-01-08 (Marisol Vega): Added kernel-scheduler preemption guidance and batching reconfigure hook.
+- 2026-02-14 (Priya Nair): Expanded operational runbook and added config examples and CLI debug commands.
+
+Appendix A — Known edge cases and mitigation: 
+- Cached prefix staleness: Ensure cache invalidation hooks run on model rollout. Add checks: cache_version == model_variant_version.
+- Quantized variant mismatch: Validate outputs with a lightweight semantic-similarity check before enabling in routed traffic.
+- Cross-region data residency: Cross-region fallback must be disabled for routes marked with confidentiality: restricted.
+
+Appendix B — Test plan for changes to fallback policies:
+1) Unit tests for policy evaluation logic.
+2) Integration tests simulating node failures and verifying fallback paths (run in staging with chaos tests).
+3) Performance benchmark: 48-hour soak with periodic simulated OOMs to verify no latent memory leak in fallback variants.
+
+Related artifacts: 
+- Telemetry dashboards: runtime/fallbacks-overview, runtime/fallback-latency-impact.
+- Perf artifacts stored at: s3://redwood-test-artifacts/runtime/profiles/fallback-tests/
+- Playbook canonical ID: RBWF-2026-04
+
+Contact & feedback:
+If you find gaps or incorrect thresholds, please file a PR against this page or email the document owner (Lena.Hart@redwood.ai). For urgent escalations contact oncall-runtime@redwood.ai.

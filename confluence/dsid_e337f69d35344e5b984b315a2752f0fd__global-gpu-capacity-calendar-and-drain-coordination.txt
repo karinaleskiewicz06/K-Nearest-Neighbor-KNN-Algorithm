@@ -1,0 +1,153 @@
+Global GPU capacity calendar and drain coordination
+
+Purpose
+-------
+This document defines the Global GPU Capacity Calendar and the operational runbook for scheduling, coordinating, and executing node drains and capacity maintenance across Redwood’s multi-region GPU fleet. It standardizes preflight checks, IaC/CI gating, drain sequencing, and post-maintenance verification to minimize customer impact and maintain SLOs.
+
+Scope
+-----
+- Applies to all production GPU pools (hosted &dedicated) that serve inference traffic: `gpu-allocator`, `capacity-sentry`, `burst-orchestrator`
+- Regions: us-west-2, us-east-1, eu-west-1, ap-southeast-1
+- Changes covered: kernel upgrades, driver updates, instance image rotation, topology changes, and bulk node retirements
+
+Definitions & stakeholders
+------------------------
+- Maintenance window: scheduled 2-hour block reserved for non-emergency drains
+- Drain lead: oncall eng-infra engineer responsible for coordination during a window
+- Rollout owner: service or team owning the change (e.g., runtime, kernel team)
+- Stakeholders: Runtime team, SRE, Capacity planning, Customer Success (for enterprise tenants)
+
+Maintenance cadence & global calendar (operational policy)
+-----------------------------------------------------
+- Safe weekly windows per region (default):
+  - US: Tue 02:00–04:00 UTC, Thu 03:00–05:00 UTC
+  - EU: Wed 01:00–03:00 UTC
+  - APAC: Mon 22:00–00:00 UTC
+- Major batch operations (>=10% pool): coordinate 14 days prior, limit to 1 window/week/region
+- Emergency windows: ad-hoc; must follow emergency drain protocol below
+
+Maintenance risk matrix (SLO / capacity guidance)
+-----------------------------------------------
+| Change size | Expected capacity impact | Preflight target | Rollback threshold |
+|---|---:|---:|---:|
+| Small (<2% of pool) | Negligible | smoke tests green | auto-rollback on >1% error increase |
+| Medium (2–10%) | Minor | full canary traffic for 30m | manual rollback if p95 latency spikes >20% |
+| Large (>10%) | Risk of SLO violations | staged rollout + capacity reserve | abort and restore capacity if errors >5% for 15m |
+
+Preflight checklist (runbook)
+----------------------------
+1. Announce window in #infra-maintenance and to affected customers 72/48/24 hours out.
+2. Verify capacity runway: `capacity-sentry` target reserve >= 20% for large changes, >=10% for medium.
+3. Terraform plan & diff approved: run `terraform plan -var-file=env.tfvars` and attach plan to change ticket.
+4. CI/CD health gates: all dependent CI pipelines pass for the last successful image and the candidate image.
+5. Canary provisioning: spin canary pool with new image/config (1–2 instances); run end-to-end suite for 30 minutes.
+6. Monitoring baseline snapshot: capture current metrics (p50/p95 latency, 5xx rate, KV cache hit ratio).
+
+Terraform / IaC patterns for safe drains
+--------------------------------------
+- Use blue/green-friendly node group naming and immutable image promotion. Example snippet for terraform variables and strategy: 
+
+```hcl
+variable "gpu_node_pool_strategy" {
+  description = "rolling | bluegreen"
+  default     = "bluegreen"
+}
+
+module "gpu_node_pool" {
+  source = "git::ssh://git@repo/infra-modules.git//gpu-node-pool?ref=v2.3"
+  name   = "gpu-pool-${var.region}-${var.stage}"
+  strategy = var.gpu_node_pool_strategy
+  desired_capacity = var.desired_capacity
+}
+```
+
+- Flags to include in CI/CD: `--approve-canary`, `--constrain-drain-concurrency=3`, `--dry-run`
+- Locking: use remote-state seat reservation `seat_reservation=true` before applying large-scale changes
+
+CI/CD gating & automation (how changes are promoted)
+--------------------------------------------------
+- Pipeline stages: plan -> canary-apply -> canary-smoke -> gradual-rollout -> verification -> finalize-apply
+- Gating checks (automated):
+  - `kube-smoke` pass against canary nodes (latency, qps, error-rate)
+  - `alloc-check` ensures `gpu-allocator` has available slots >= requested concurrency
+  - `batch-sim` simulates burst traffic for 10 minutes against canary fleet
+- Human approval required for Medium/Large changes after canary-smoke
+
+Drain coordination runbook (step-by-step)
+--------------------------------------
+1. Ownership & communication
+   - Drain lead confirms roster and primary backup. Post start time in #infra-maintenance.
+2. Verify preflight: confirm checklist items 1–6 are green.
+3. Reserve capacity: temporarily increase warm-pool by % reserve if needed: `rwdctl capacity set --pool ${POOL} --reserve 20%`
+4. Begin staged drains (concurrency limit = 3 unless emergency):
+   a. Select node subset (label `maintenance=true`) 
+   b. For each node:
+      i. `kubectl cordon <node>`
+      ii. `rwdctl drain-node --node <node> --grace-period 120s --wait-for-active-sessions=false`
+      iii. Monitor `runtime.request_latency` and `service.5xx_rate` for 5m before moving to next node
+5. If any metric breach occurs (see thresholds): pause rollout, scale up warm-pool, or trigger rollback.
+6. Post-drain validation: run end-to-end smoke tests, confirm KV cache warm ratio >= 90% for top 10 tenants.
+7. Finalize: update terraform state for drained instance group, close maintenance ticket, and publish summary.
+
+Automated rollback & emergency mitigation
+---------------------------------------
+- Abort conditions (example):
+  - sustained p95 latency increase >20% for 15m
+  - 5xx rate increase >2% absolute for 10m
+  - Pod OOM or executor restarts >3x within 15m
+- Immediate actions:
+  1. Halt further drains: `rwdctl rollouts pause --project infra`
+  2. Restore capacity via warm-pool or fallback to lower-cost model variant: `rwdctl capacity override --pool ${POOL} --type burst`
+  3. If required, reverse node changes by reattaching previous instance image via Terraform (see rollback CLI snippet):
+
+```bash
+# restore previous image by forcing terraform apply with previous AMI variable
+TF_VAR_ami=ami-previous terraform apply -var "force_replace=true" -auto-approve
+```
+
+Post-maintenance verification checklist
+-------------------------------------
+- All nodes in pool show `Ready` and expected kernel/drivers.
+- Telemetry: p50/p95 back to baseline ±5%, 5xx at pre-maintenance levels.
+- KV cache hit ratio restored to target for top tenants.
+- Billing/scheduling sanity: no sustained cost increase >3% over baseline.
+- Release notes: short summary posted to #infra-maintenance and ticket closed with links to telemetry graphs.
+
+Monitoring & dashboards to watch
+-------------------------------
+- Dashboards: `GPU Fleet Overview`, `Capacity Sentry`, `KV Cache Heatmap`, `Per-tenant Latency`
+- Critical alerts: `gpu_pool_capacity_below_reserve`, `allocator_p95_surge`, `node_drain_failures_rate`
+- SRE runbook for paging: page on-call SRE when any critical alert persists for >10 minutes during window.
+
+Ownership & escalation
+----------------------
+- Drain lead (oncall) is primary during window.
+- If rollback >15 minutes to execute or ambiguity in root cause, escalate to the runtime owner and SRE lead.
+- For customer-impacting regressions, notify Customer Success immediately and begin enterprise incident process.
+
+Change log (summary of recent updates)
+------------------------------------
+- 2024-09-12: Initial draft published.
+- 2024-11-04: Added terraform seat-reservation pattern and canary gate `batch-sim`.
+- 2025-02-07: Updated global calendar and adjusted rollback thresholds for large changes.
+
+Appendices
+----------
+A. Example `rwdctl` commands
+```
+# check pool reserve
+rwdctl capacity get --pool gpu-prod-usw2
+
+# set reserve
+rwdctl capacity set --pool gpu-prod-usw2 --reserve 20%
+
+# drain a node
+rwdctl drain-node --node ip-10-0-5-23 --grace-period 120s --wait-for-active-sessions=false
+```
+
+B. Contact matrix
+- Runtime lead: runtime-team@redwood.ai
+- SRE oncall: pagerduty-sre
+- Capacity planning: capacity@redwood.ai
+
+If you have feedback or see gaps in this runbook, open a PR against this page and notify the reviewers listed in the metadata.

@@ -1,0 +1,180 @@
+Predictive slotting and quota orchestration: multi-tenant SLA-aware scheduler playbook
+
+Summary
+
+This playbook documents the predictive slotting and quota orchestration subsystem: an extension of the kernel-level scheduler that enforces per-customer SLAs while optimizing for cluster efficiency and cost. It is intended for runtime engineers, SREs, and on-call responders responsible for scheduling, capacity planning, and incident triage.
+
+Goals
+
+- Ensure tenant-level latency SLOs (p50/p95) are met with automated slot allocation and predictive adjustments.
+- Provide fairness across tenants while honoring reserved quotas (Dedicated pools) and burstable capacity.
+- Reduce cold-start-related tail latency by pre-slotting based on forecasted request patterns.
+- Offer safe rollout and emergency rollback procedures for scheduler policy changes.
+
+Scope and non-goals
+
+- In-scope: kernel scheduling decisions, slot/quota bookkeeping, admission control, eviction policies, telemetry hooks, and runbook actions.
+- Out-of-scope: long-term capacity procurement, billing integration, and data-plane model weight placement (handled by the placement controller).
+
+Key terminology
+
+- slot: a logical reservation of GPU dispatch capacity for a tenant for a time window (e.g., 100ms quantum).
+- quota: the steady-state allocation (tokens/sec or slots/min) assigned to a tenant.
+- predictive slotting: proactively creating temporary slots based on short-term forecasts.
+- soft-reserve: slots that can be preempted with a predefined grace window.
+- hard-reserve: non-preemptible slots used by Dedicated customers.
+
+Architecture overview
+
+The subsystem sits between the admission controller and the kernel dispatcher. Flow: request -> request-classifier -> admission controller (quota check + predictive slot lookup) -> slot allocator -> dispatch queue -> kernel.
+
+Diagram (text):
+- Cluster nodes (GPU pool) -> dispatcher cluster
+- Control plane: forecasting service -> quota-orchestrator -> slot-index (consistent hash)
+- Telemetry: per-slot metrics -> time-series DB -> anomaly detector
+
+Decision matrix: when to create predictive slots
+
+1) Input signals:
+   - recent per-tenant QPS (sliding 60s and 5m)
+   - sequence length distribution heatmap (recent window)
+   - KV-cache hit ratio trend for tenant
+   - announcement of scheduled traffic (customer webhooks)
+2) Heuristics and thresholds (example):
+   - If 60s QPS > quota * 1.15 and predicted 3-min moving avg > quota: create up to min(ceil(excess / slot_capacity), burst_cap).
+   - If KV hit ratio improving and tail latency stable -> prefer soft-reserve slots for better multiplexing.
+
+Policies and constraints
+
+- Hard-reserve tenants always get hard-reserve slots first; predictive slotting does not create hard-reserve slots.
+- Total predictive slots per node limited to 25% of dispatch capacity by default (configurable).
+- Eviction priority: predictive soft-reserve > predictive hard-reserve (if misconfigured) > best-effort.
+- Maximum predictive slot lifetime: default 120s.
+
+Policy config example (YAML)
+
+scheduler_policy: |
+  default_predictive_window: 180  # seconds
+  max_predictive_fraction_per_node: 0.25
+  slot_quantum_ms: 100
+  eviction_order: ["predictive_soft", "predictive_hard", "best_effort"]
+  per_tenant_overcommit_factor: 1.15
+
+Predictive algorithm (high-level)
+
+- Input: timeseries X_t (QPS), KV_hit_t, latency_t, historical pattern templates.
+- Forecast: use exponential smoothing + recent pattern matching to produce 3-minute forecast F.
+- Decide: required_slots = ceil(max(0, (F - quota) * average_request_cost / slot_capacity)).
+- Rate-limit creations: only create N slots per 10s per node to avoid thrash.
+
+Pseudocode
+
+1. window = last 180s samples
+2. F = forecast(window)
+3. if F <= quota * overcommit_factor: return no-op
+4. required = ceil((F - quota)/slot_capacity)
+5. create up to min(required, tenant_burst_limit, node_remaining_predictive_slots)
+
+Telemetry and SLOs to monitor
+
+- Per-tenant: p50_latency_ms, p95_latency_ms, request_drop_rate, quota_breach_count, predictive_slots_active
+- Per-node: dispatch_utilization, predictive_slot_fraction, eviction_rate
+- SLO targets (example): p95_latency < 250ms for tier=standard; p95_latency < 120ms for tier=enterprise
+
+Alerting rules (examples)
+
+- SEV2 if per-tenant p95 latency > SLO for 5m and predictive_slots_active > 0 AND eviction_rate > 10/min
+- SEV3 if predictive_slot_fraction > 0.4 on more than 3 nodes for 10m
+
+Operational runbook: common incidents
+
+1) Symptom: Tenant experiences repeated quota_breach and 5xx errors
+   - Step 1: Check tenant quota and recent QPS (dashboard: tenant/overview).
+   - Step 2: Inspect predictive slot creation logs (control-plane job: quota-orchestrator).
+   - Step 3: If orchestrator is not creating slots but QPS is high -> verify forecasting service health (service/forecast-service).
+   - Step 4: For immediate mitigation, increase soft-reserve grace window or temporarily bump per_tenant_overcommit_factor for tenant via runtime flag.
+   - Step 5: If 5xx persists, open incident and attach kernel dispatch traces.
+
+2) Symptom: Cluster-wide predictive thrash (rapid slot create/evict loops)
+   - Step 1: Disable predictive slotting globally: curl -XPOST $CONTROL/scheduler/flags -d '{"predictive_enabled":false}'.
+   - Step 2: Revert to conservative static quotas and set max_predictive_fraction_per_node=0.0.
+   - Step 3: Run a slow reenable with a 10% fraction and observe for 30m.
+
+Canary rollout checklist (scheduler policy changes)
+
+1. Code: ship feature gate behind runtime flag.
+2. Unit tests: synthetic forecast unit tests, eviction scenarios, and fairness invariants.
+3. Canary: enable on dev cluster -> perf test with synthetic burst profile.
+4. Gradual roll: enable for 1% of production tenants with low-risk label for 1h, then 10% for 4h, 25% for 24h, 100% if metrics stable.
+5. Metrics to watch during canary: per-tenant p95, eviction_rate, predictive_slot_fraction, sequence throughput, and kernel queue depth.
+
+Benchmarking scenarios (for the perf-suite)
+
+- Synthetic burst mix: 90% short sequences (16–64 tokens), 10% long (512+), varying QPS spike from baseline to 5x for 60s.
+- Steady-state overcommit test: run at 120% aggregate quota for 30m and measure tail latency and fairness (Jain's index).
+- Cold-start alignment test: simulate cold KV caches to validate that predictive slotting reduces p99 tail by at least 15% compared to baseline.
+
+Profiling guidance
+
+- Required traces: request timeline (classification -> admission -> slot allocation -> dispatch -> kernel start/stop), slot lifecycle events, kernel occupancy samples.
+- Use lightweight sampling at 1% in production; 100% tracing during large canary windows.
+- Profiling targets: mean slot creation latency < 50ms, slot lookup < 5ms, eviction decision < 10ms.
+
+Configuration table (defaults)
+
+| parameter | default | notes |
+| slot_quantum_ms | 100 | quantum used for slot accounting |
+| max_predictive_fraction_per_node | 0.25 | fraction of node reserved for predictive slots |
+| default_predictive_window | 180s | history window for forecasts |
+| per_tenant_overcommit_factor | 1.15 | multiplier to allow short bursts |
+| max_predictive_lifetime_s | 120s | safety cap on predictive slots |
+
+Known issues and mitigations
+
+- Issue: Oscillation when multiple tenants emit correlated bursts -> wavefront overcommit.
+  Mitigation: add jittered backoff and inter-tenant dampening in the forecasting step; cap cross-tenant slot creation rate.
+
+- Issue: Predictive slots can increase GPU fragmentation leading to slight throughput loss.
+  Mitigation: enforce a defragmentation window where predictive slots are consolidated every 5 minutes; measure via dispatch_utilization.
+
+- Issue: Misclassified request classes cause slot misuse (e.g., background eval traffic labeled as interactive).
+  Mitigation: tighten classifier rules and add a sampling verifier that checks top-1 model ID and path for mismatches.
+
+Maintenance and tuning guidance
+
+- Quarterly: review per-tenant eviction trends and update per_tenant_overcommit_factor baseline.
+- Monthly: run fairness simulation from perf-suite and evaluate Jain's index; target >= 0.95 for active tenants.
+- After each major model onboarding: validate that average_request_cost estimates are correct, or the scheduler will over/under-allocate slots.
+
+Release notes snippet (v2.3.0)
+
+- Added predictive slotting subsystem with pluggable forecasting backends (ETS, ARIMA, and lightweight RNN).
+- New runtime flags for max_predictive_fraction_per_node and per_tenant_overcommit_factor.
+- Telemetry: added per-slot lifecycle metrics and eviction_reason labels.
+
+Ownership and contacts
+
+- Primary owners: eng-serving-runtime/kernel-scheduling team (oncall alias: #kernel-scheduler-oncall).
+- Pager escalation: eng-sre -> runtime oncall -> kernel-scheduler oncall.
+
+Appendix: quick CLI snippets
+
+- Disable predictive slotting:
+  curl -XPOST https://control.internal/scheduler/flags -H 'Content-Type: application/json' -d '{"predictive_enabled":false}'
+
+- Inspect slots for tenant ID t-12345:
+  curl https://control.internal/slot-index?tenant=t-12345 | jq '.'
+
+- Force-create a soft-reserve slot for testing:
+  curl -XPOST https://control.internal/slots -d '{"tenant":"t-12345","type":"predictive_soft","duration_s":60}'
+
+Related pages and references
+
+- Scheduler policy language and declarative profiles (link above).
+- Tiered fallback routing documentation for eviction interplay (link above).
+
+Changelog
+
+- 2025-11-04: Initial draft and design sketches by Aisha Park.
+- 2025-12-18: Added canary checklist and benchmarking scenarios (review: Marco Liu).
+- 2026-02-10: Hardened runbook steps, added YAML policy example, updated defaults after perf run.

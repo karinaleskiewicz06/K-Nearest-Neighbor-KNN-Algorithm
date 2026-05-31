@@ -1,0 +1,174 @@
+Runtime Decision Replay and SLO Forensics Manual
+
+Overview
+========
+
+This document describes the decision-replay pipeline and a structured forensic playbook for investigating SLO violations that originate in the serving runtime. It ties scheduler/kernel choices, KV cache hits/warmness, model variant routing, and cross-tenant admission decisions to downstream SLO impact. The goal is to provide a repeatable investigation path for engineers on-call and owners of runtime subsystems.
+
+Scope
+-----
+- Applies to Hosted, Dedicated, and Private runtimes managed by the Redwood serving runtime.
+- Focuses on latency and availability SLOs for synchronous generation / streaming endpoints (per-request SLOs: p50/p95/p99).
+- Excludes model quality regressions; see quality-guardrails docs for signal correlation.
+
+Key concepts and services
+-------------------------
+- runtime-dispatcher: front-line routing service that maps requests to execution slots and chooses model variants.
+- slot-manager: tracks GPU resources and admission credits across heterogeneous pools.
+- kernel-orchestrator: selects kernel/attention plan and preemption policy per request.
+- kvcache-proxy: global KV cache coordinator for prefix and session caches; exposes cache_warmness metadata.
+- replay-indexer: storage + query layer for deterministic decision replays (see Decision Replay format section).
+
+Required telemetry and artifacts (must be present for replay)
+---------------------------------------------------------
+1) request-trace (full event timeline, request_id) — retention: 30d
+2) scheduler-decision-record (slot, priority, preemption_token) — retention: 90d
+3) kernel-hint-record (kernel_id, tile_plan, estimated_cycles) — retention: 90d
+4) kvcache-stats (hit/miss, warmness, evicted_keys) — retention: 7d (aggregates) / 30d (per-session)
+5) system-metrics at 1s resolution (GPU utilization, mem pressure, nvlink errors) — retention: 14d
+6) request-payload (prompt length, sequence length, truncated flag) — retention: 7d
+
+Decision Replay format (canonical JSON)
+--------------------------------------
+A single replay bundle is stored as newline-delimited JSON (NDJSON). Each line is a flat object, sample keys below; the replay-indexer exposes a /replay API that returns NDJSON to feed local deterministic replays. Example snippet: 
+
+{
+  "request_id": "r-20251201-6843",
+  "timestamp": "2025-12-01T14:23:45.123Z",
+  "dispatcher_decision": "pool-a:slot-42",
+  "kernel_choice": "matmul-tiling-v3",
+  "kvcache_warmness": "cold",
+  "estimated_tokens": "512",
+  "observed_latency_ms": "1245"
+}
+
+(Keep fields flat and string-typed to simplify ingestion across languages.)
+
+Triggering conditions for a forensics replay
+-------------------------------------------
+- Automated: SLO alert fires (p95 or p99 breach sustained for 5m) and the incident playbook triggers replay-indexer ingestion.
+- Manual: engineer on-call suspects an event (e.g., sudden p95 spike correlated with kernel rollout). Use the manual replay steps below.
+
+Forensic investigation playbook (step-by-step)
+----------------------------------------------
+1) Triage and scope (5–15 minutes)
+   - Pull the SLO alert timeline from alerting-dashboard (time window T = alert start - 10m to alert end + 10m).
+   - Identify a representative set of request_ids (prefer p99 offenders and a small sample of p95/p50).
+   - Record business impact: request types, customers affected, percent traffic impacted.
+
+2) Bulk metadata unlock (5 minutes)
+   - Query replay-indexer for the request_ids: /api/v1/replay?ids=r-...
+   - Confirm required artifacts exist for each request (scheduler record, kernel hint, kv state). If missing, mark as partial replay; annotate possible blind spots.
+
+3) Deterministic local replay (10–30 minutes)
+   - Use the replay harness (runtime-replayer CLI) which accepts NDJSON. Example: runtime-replayer --input bundle.ndjson --mode dry-run
+   - Validate the harness reproduces the observed kernel_choice and dispatcher_decision. If divergence occurs, capture the divergence snapshot: 
+     - runtime-replayer --input bundle.ndjson --emit-divergence=divergence.log
+
+4) Attribution pass (30–60 minutes)
+   - Compare baseline vs observed: create a delta matrix across factors: kvcache_warmness, kernel_choice, slot_latency, preemption events.
+   - Use the causal scoring heuristic (see table below) to rank likely root causes.
+
+5) Hypothesis testing (minutes to hours)
+   - If kvcache coldness is top candidate: re-run replay with kvcache_warmness forced to "warm" and measure simulated latency delta.
+   - If kernel_choice is suspect: re-run with previous kernel (kernel-v2) and compare per-step cycle counts.
+   - If scheduling/preemption suspected: re-run multiple requests in a batch to surface contention effects.
+
+6) Remediation and rollback (variable)
+   - If a kernel rollout caused regression: open an urgent kernel-rollback PR to kernel-orchestrator and schedule canary rollback.
+   - If admission policy misconfiguration: update slot-manager policy and monitor SLOs for 30m.
+
+Causal scoring heuristic (illustrative)
+-------------------------------------
+Score factors (0-100 each):
+- kvcache_delta_score: function(hit_rate_change, warmness)
+- kernel_regress_score: function(est_cycles_increase, memory_pressure)
+- schedule_contention_score: function(queue_depth_change, preemptions)
+- infra_fault_score: function(nvlink_errors, gpu_throttle_count)
+
+Rank = weighted_sum([kvcache:0.25, kernel:0.35, schedule:0.25, infra:0.15])
+
+Quick reference SLO thresholds (applies to core-generation-route)
+---------------------------------------------------------------
+| SLO metric        | Target   | Alert threshold          | Escalation window | Owner          |
+|-------------------|----------|-------------------------|-------------------|----------------|
+| p50 latency       | 60ms     | >120ms for 5m           | Pager (P1)        | runtime-sre    |
+| p95 latency       | 220ms    | >350ms for 3m           | Pager (P0)        | runtime-sre    |
+| p99 latency       | 850ms    | >1200ms sustained 2m    | Pager (P0)        | runtime-sre    |
+| availability      | 99.95%   | drop 0.2% in 1h         | Incident (P0)     | runtime-sre    |
+
+(These thresholds are per-route and subject to per-customer SLA overrides; always check route-level overrides in token-config DB.)
+
+Common root causes and signposts
+--------------------------------
+- Cold KV cache (signs: kvcache_warmness==cold, cluster-wide recent evictions, per-session miss spikes)
+- Kernel regression (signs: kernel_hint shows new kernel id, estimated_cycles >> baseline, p95 increase tied to rollout window)
+- Admission pressure (signs: queue_depth spike, preemption_count increment, allocation_timeouts)
+- Infra flakiness (signs: nvlink/PCIe errors, GPU thermal throttling alarms)
+- Telemetry sampling artifacts (signs: trace gaps, missing scheduler records)
+
+Playbook checklists and commands
+-------------------------------
+- Commands:
+  1) Fetch replay bundle: curl -sS "https://replay-indexer.internal/replay?range=2026-02-09T10:00:00Z,2026-02-09T11:00:00Z&route=core-gen" > bundle.ndjson
+  2) Run deterministic replay: runtime-replayer --input bundle.ndjson --log-level debug --emit-metrics
+  3) Query kv cache state: redis-cli -h kvcache-proxy-01 info | grep Evicted
+  4) Inspect kernel rollout timeline: ksctl rollout history kernel-orchestrator | tail -n 50
+
+- Minimal investigation checklist (tick-box):
+  - [ ] Representative p99 request_ids collected
+  - [ ] Replay bundle exists and replays without missing artifacts
+  - [ ] Divergence snapshot captured (if any)
+  - [ ] Ranked causal candidates and hypothesis list documented in incident ticket
+  - [ ] Remediation planned and annotated with rollback plan
+
+Testing the replay pipeline (how to validate a new trace source)
+----------------------------------------------------------------
+1) Add synthetic trace producer: runtime-test-harness can emit controlled divergence scenarios (flags: --fault kvcache-evict --burst 100).
+2) Run in staging: inject 1K synthetic requests from the harness for 30s.
+3) Validate replay-indexer stores NDJSON bundles and the runtime-replayer reproduces the divergence.
+4) Add a unit test in replay-indexer that asserts schema completeness for required keys.
+
+Operating agreements and ownership
+----------------------------------
+- runtime-sre: incident lead and primary pager for production SLO breaches. Responsible for running this playbook during incidents.
+- runtime-serving: owner for dispatcher_decision logic, kernel-orchestrator changes, and rollout gating.
+- infra-stability: owns hardware-related investigations (nvlink, thermal, EC errors).
+- telemetry-platform: maintain replay-indexer SLAs (ingest latency <30s) and schema stability.
+
+Rollout guidance for changes that affect decision-collapse surface
+----------------------------------------------------------------
+- Always include a deterministic replay diff in PRs that touch dispatcher, slot-manager, or kernel-orchestrator. The PR template must include: before.ndjson, after.ndjson, and a 1-page summary of delta.
+- Canary policy: run kernel and dispatcher changes at 0.5% traffic for 30 minutes, compare causal score distributions.
+
+Appendix A: Example incident timeline (annotated)
+------------------------------------------------
+1) 10:03 UTC - Alert: p99 latency exceeds 1200ms
+2) 10:04 UTC - runtime-sre triage: fetch 200 p99 request_ids
+3) 10:06 UTC - replay-indexer returns bundle; 40% of reqs missing kvcache state -> mark partial
+4) 10:12 UTC - deterministic replay shows kernel-v3 increased estimated_cycles by 2.8x relative to baseline
+5) 10:22 UTC - rollback of kernel-v3 to v2 initiated; p99 improves toward baseline within 12 minutes
+
+Appendix B: Troubleshooting tips
+--------------------------------
+- If replay diverges immediately: check schema version mismatches between runtime and replay-indexer (header field: replay_schema_v).
+- If kvcache artifacts missing for customers on Private deployments: confirm replay-agent sidecar is enabled in the customer manifest.
+- If preemption_count is high but queues are not deep: investigate cross-tenant quota bleed; consult tenant-throttle logs.
+
+References and related reading
+----------------------------
+- runtime-dispatcher design doc (internal link): /confluence/eng-serving-runtime/runtime-architecture/delta-routing-and-cost-partitioning-architecture-2026
+- Kernel rollout policy: /confluence/eng-serving-runtime/kernel-and-scheduling/kernel-handshake-and-adaptive-fallback-patterns-2026
+- SLO runbook canonical page: /confluence/eng-sre/slo-and-error-budgets/p99-slo-handbook
+
+Contact and escalation
+----------------------
+- Primary on-call: runtime-sre rotation (pager duty team: @runtime-sre)
+- Slack channels: #runtime-ops, #kernel-rollouts, #kvcache
+- Emergency escalation path: runtime-sre -> Head of Infra -> CTO (as per incident policy)
+
+Change log
+----------
+- 2025-11-12: Created by Jordan Matthews (initial draft).
+- 2026-01-08: Added causal scoring heuristic and replay CLI examples (reviewed by Ava Martinez).
+- 2026-02-10: Finalized SLO thresholds and testing protocol; published.

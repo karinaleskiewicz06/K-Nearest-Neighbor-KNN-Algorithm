@@ -1,0 +1,177 @@
+GPU Incident Splay and Capacity Signal Taxonomy
+
+Summary
+
+This runbook defines the capacity signal taxonomy used by the GPU fleet teams, prescribes an incident-splay response model for capacity-related degradations, and documents the IaC and CI/CD controls used to adjust capacity safely. It is intended for oncall, SRE, and infra engineers who operate Redwood's inference GPU pools and automation.
+
+Goals
+
+- Standardize alarms and noisy-signal reduction so paging is focused on true customer impact.
+- Provide a deterministic splay (escalation and remediation) for capacity incidents with clear ownership.
+- Provide safe, auditable Terraform + operator actions to scale, rehome, or cordon GPU capacity.
+- Ensure actions respect SLOs, budget constraints, and tenancy isolation.
+
+Scope
+
+Applies to: Dedicated and hosted inference GPU pools, warm/standby pools, and cross-region bursting lanes. Does NOT cover: on-prem private deployments where customer runbooks apply (see eng-private-deployments).
+
+Signal taxonomy (high level)
+
+The taxonomy maps raw telemetry to normalized signals used by alerting and runbooks. Each signal includes the typical detection windows, owner, and recommended initial action. Use the normalization rules in the "Normalization examples" section when creating or changing alerts.
+
+1) Capacity pressure signals
+
+- gpu_utilization_spike
+  - Description: sudden, sustained per-GPU utilization > 85% for the majority of cards in a pool for 3+ minutes.
+  - Detect window: 3m aggregation, 1m resolution.
+  - Owner: gpu-fleet (primary), infra-sre (secondary).
+  - Initial action: evaluate queue depth and eviction rate; throttle non-critical eval/test tenants.
+
+- kv_cache_evictions_rate
+  - Description: KV cache evictions per second > baseline * 4 for 5 minutes. Correlates with expensive prefix misses that increase token compute.
+  - Detect window: 5m rolling.
+  - Owner: serving-runtime (primary), gpu-fleet (secondary).
+  - Initial action: roll back recent runtime quantized-kernel changes (if deployed in last 15m) and enable KV-prefetch diagnostic mode.
+
+- latent_enqueue_backlog
+  - Description: request enqueue latency spikes resulting in queuing backlog > SLO buffer (default 200ms).
+  - Detect window: 1m burst, persistent > 2m.
+  - Owner: gpu-routing (primary), infra-sre.
+  - Initial action: open temporary canary route to lower-capacity variant or region, escalate if fallback fails.
+
+2) Capacity loss signals (hard failures)
+
+- node_offline_mass
+  - Description: > 3 nodes in a cluster report GPU driver disconnect within 5m, or a single rack loses > 30% of GPU capacity.
+  - Detect window: 2m to 10m.
+  - Owner: infra-sre (primary), gpu-fleet.
+  - Initial action: automatic cordon of affected nodes, evict workloads to reserve warm lanes, begin hardware remediation workflow.
+
+- pcie_fatal_errors_rate
+  - Description: hardware-level errors per card exceeding 0.5 errors/minute averaged across the pool.
+  - Owner: infra-sre, hw-ops.
+  - Initial action: isolate cards, schedule off-host repro tests, set capacity-safety-bucket marker to prevent new allocations.
+
+3) Cost/credit saturation signals (billing-aware)
+
+- spot_shortfall_warning
+  - Description: spot capacity reclaim rate leads to projected 24hr deficit > 10% of tenant demand.
+  - Owner: gpu-finops (primary), gpu-fleet (secondary).
+  - Initial action: trigger reserved spillover, enable transient burst policy and notify tenants via internal annotation APIs.
+
+Normalization examples
+
+To reduce duplicate alerts and separate noise from signal, runbooks and alert playbooks must map raw metric thresholds to the signals above. Example mapping rules:
+
+- If gpu_utilization_spike is detected but kv_cache_evictions_rate is normal and enqueue_backlog < 100ms, mark as runway-burst (no immediate page) and schedule non-urgent capacity review.
+- If node_offline_mass and pcie_fatal_errors_rate both exceed thresholds in same region within 10m, escalate to page-level incident and begin rack-level quarantine protocol.
+
+Incident splay — severity mapping and actions
+
+We use a simple severity scale mapped from signals and impact windows:
+
+- Sev3 (investigate): single-pool utilization spike with no user-visible latency breaches. Owner: gpu-fleet. Actions: metric review, telemetry enrichment, non-blocking scaling.
+- Sev2 (partial degradation): enqueue backlog > SLO buffer OR 5–10% increase in tail latency across tenants for 15m. Owner: infra-sre + gpu-fleet. Actions: activate capacity-safety-bucket, throttle eval lanes, route heavy tenants to lower-cost variants, prepare Terraform scale plan.
+- Sev1 (major outage): persistent region-level capacity loss OR >20% user traffic experiencing latency regression >50% of SLO for 10m. Owner: eng-oncall leads, incident commander. Actions: invoke cross-region failover, execute emergency capacity promotion, notify Product & Customer Success.
+
+Runbook: immediate checklist for oncall (quick triage)
+
+1) Confirm the normalized signal(s) and severity using PagerDuty and the Metrics SLO dashboard.
+2) Add incident label: capacity-splay/YYYYMMDD-<region>-<bucket> to the incident ticket.
+3) Capture evidence: upload 1) a short metric snapshot (last 30m) via internal CLI, 2) recent deployment hashes, 3) recent Terraform apply IDs.
+
+Commands (examples)
+
+- Capture metrics snapshot via internal tool: rmetrics capture --scope gpu-pool:<pool-id> --window 30m --out /tmp/snapshot.json
+- Check recent Terraform applies: tf-ops list-applies --workspace gpu-pool-<pool-id> --since 24h
+- Pin rollback candidate for runtime: runtime-deploy rollback --deployment <deploy-id> --reason "kv-evictions-regression"
+
+Safe scale procedure (if allowed by budget/safety)
+
+Prereqs: incident severity must be Sev2 or Sev1, finance approval tag present on incident ticket for ad-hoc bursts unless in pre-approved emergency budget.
+
+1) Validate SLO impact and confirm the scale target (nodes or fractional-GPU count). Recommended: prefer launching small groups (2–4 nodes) with placeme nt diversity.
+2) Draft a terraform plan using the pool operator module (see terraform snippet). Capture plan ID and attach to the incident ticket.
+
+Terraform snippet (example, described in text):
+- module "gpu_pool_node_group" {
+    source = "git::ssh://git.internal/company/tf-modules.git//gpu-pool-node-group"
+    count = 2
+    region = "us-west-2"
+    instance_profile = "gpu-worker-v2"
+    tags = { incident = "capacity-splay-2025" }
+  }
+
+3) Apply with phased rollout: apply to a single availability zone, wait 5m for telemetry, then stagger to other AZs.
+
+4) Post-apply verifications: ensure nodes register within 10m, GPU health checks show <1% fatal errors, and request enqueue latency returns to baseline.
+
+Emergency cordon and eviction policy (fast path)
+
+When node_offline_mass or pcie_fatal_errors_rate triggers a Sev1 and immediate isolation is required:
+
+- cordon nodes: gitops-run cordon --nodes node-ids --reason "pcie-error-quarantine"
+- evict workloads with prioritized preemption: evictionctl evict --selector affected-pool --priority preemptible-first --dry-run=false
+- mark capacity-safety-bucket: capacity-bucket add --pool <pool-id> --marker "quarantine-<timestamp>" --until +2h
+
+CI/CD and gating controls to avoid noisy rollouts
+
+- Kernel/quantization changes: must pass mixed-precision kernel canary matrix (see ci-cd/quantized-kernel-canary-matrix doc) and run 2h warmup traffic simulation before rollout to production.
+- Terraform changes to pool sizes: all tf plans that increase capacity by >10% require a separate auto-approve flag and at least one peer reviewer from infra-sre.
+- Image changes: golden image promotion pipeline must run the sensitivity harness that simulates worst-case KV miss patterns.
+
+Telemetry enrichment and automated mitigations
+
+- Add runbook annotations to alerts with quick links: example: "Quick mitigation: route:canary-region".
+- Automated mitigations: platform will perform a single automatic fallback route change when enqueue_backlog crosses threshold for 6m. Automated actions log a synthetic change request for later human review.
+
+Owner matrix and escalation contacts
+
+- gpu-fleet: primary for utilization and soft-capacity incidents. PagerDuty: #gpu-fleet-page. Email: gpu-fleet@redwood.ai.
+- infra-sre: primary for hardware and cross-region incidents. PagerDuty: #infra-sre. Email: infra-sre@redwood.ai.
+- serving-runtime: primary for kv-cache and runtime regressions. Email: runtime-eng@redwood.ai.
+- gpu-finops: owner for spot and budget warnings. Email: gpu-finops@redwood.ai.
+
+Post-incident: blameless postmortem & capacity adjustments
+
+- Create a postmortem within 72 hours when any Sev2/Sev1 event results in SLO burn > 0.5% or costs > $2k/day extra.
+- Include: timeline (UTC), associated Terraform apply IDs, deployment hashes, scaling actions taken, and corrective action items.
+- If the root cause relates to IaC, open a PR to the tf-module repo with a test that reproduces the unsafe change and require a tf-module owner approval.
+
+Key templates and snippets (copyable)
+
+- Incident ticket title template: "capacity-splay | <region> | <primary-signal> | <short-impact>"
+- Terraform plan tag example: tf-ops plan --workspace gpu-pool-<pool-id> --var incident_tag=capacity-splay-<id> --out tfplan-<id>
+- Slack notification snippet: /incident create --title "capacity-splay" --severity Sev2 --assignee @gpu-fleet --automated_tags capacity-splay
+
+Governance and safety knobs
+
+- Capacity safety buckets: logical limits assigned per pool to prevent runaway scale. Safety buckets are enforced by the allocation API and can only be modified by infra-sre with peer review.
+- Budget guardrail: ad-hoc burst above reserved commits requires an internal finance approval unless the incident is declared Sev1 and marked emergency.
+
+Change process for taxonomy or thresholds
+
+- Proposals for new signals or threshold changes: open an RFC in the eng-infra repo and tag gpu-fleet and infra-sre.
+- Required reviewers: gpu-fleet lead, infra-sre lead, one runtime engineer if the change touches kv_cache heuristics.
+- Rollout plan: staged alert enablement (dev -> staging -> prod) with 7-day observation windows between stages.
+
+Appendix: troubleshooting checklist (for fast triage)
+
+- Step 1: Identify whether impact is compute (GPU) vs serving (runtime) vs network. Use rmetrics topologies: rmetrics top --pool <pool-id> --by {gpu,enqueue,kv}
+- Step 2: Correlate with recent deploys: tf-ops list-applies --since 60m; runtime-deploy list --since 60m
+- Step 3: If hardware errors present, coordinate with hw-ops for slot-level replacement and set capacity-bucket to prevent allocations
+- Step 4: If enqueue_backlog persists after scale-by-2, fall back to cross-region routing and open a Sev1 incident if customer latency is >50% SLO
+
+Contacts and references
+
+- Primary docs referenced: gpu-capacity-safety-budgeting-whitepaper-2025, preflight-gpu-deployment-validation-and-rollback-playbook, quantized-kernel-canary-matrix.
+- Slack channels: #gpu-fleet, #infra-sre-oncall.
+- PagerDuty escalation: see internal pagerduty page (link in console).
+
+Revision history
+
+- 2024-03-12 (Ava Martinez): created initial runbook and taxonomy draft.
+- 2024-06-04 (Daniel Kwan): added Terraform safe-scale procedure and CI/CD gating notes.
+- 2025-11-02 (Ava Martinez): updated severity mapping and added budget guardrail language for ad-hoc bursts.
+
+End of document

@@ -1,0 +1,153 @@
+Multiregion latency-aware tenant routing guide
+
+Overview
+
+This guide defines a practical, production-ready approach for routing tenant requests across multiple regions with the explicit goal of meeting latency SLOs while controlling cost and preserving regulatory constraints. It covers policy design, telemetry signals, routing decision logic (including tie-breakers), testing and rollout steps, and operator runbook actions for degraded conditions.
+
+Use case and scope
+
+- Audience: platform engineers, SREs, product/platform PMs who own traffic steering and deployment policies.
+- Scope: HTTP/gRPC inference requests routed by the traffic director layer (service: traffic-director), across hosted regions (us-west-2, us-east-1, eu-west-1, ap-northeast-1). Does not cover batch background jobs or offline embeddings.
+- Goals: meet p99 latency <= 350ms for latency-sensitive SKU; p50 <= 80ms; keep cross-region egress cost under budget target.
+
+Principles
+
+1. SLO-first: routing decisions should prefer regions where a tenant's recent p99 and p50 meet their configured SLO window (5m and 1h).
+2. Respect constraints: honor tenant geo-residency and legal flags (legal_zone).
+3. Cost-awareness: when multiple regions satisfy SLOs, choose lower-cost region unless explicit affinity exists.
+4. Stable routing: avoid flapping by introducing dampening and minimum affinity durations.
+5. Graceful fallback: if primary region degrades, fallback to next-best region with canary traffic initially.
+
+Key concepts and data model
+
+- tenant_id (string): unique tenant.
+- affinity_tag (enum): {sticky, best_effort}. Sticky pins to a region for min_affinity_minutes.
+- legal_zone (enum): {global, eu-only, us-only, apac-only}.
+- routing_profile (string): latency-sensitive | cost-sensitive | balanced.
+- region_score: computed per-region value combining latency headroom, capacity headroom, egress_cost_index, and penalty for cross-az hops.
+
+Telemetry signals required
+
+- telemetry source: traffic-director.metrics, runtime-proxy.metrics, region-kv-cache.metrics.
+- Per-region metrics (per-tenant if available): request_count, p50_latency_ms, p95_latency_ms, p99_latency_ms, error_rate_5m, queue_depth, available_slots.
+- Synthetic probe metrics: synthetic_p99_ms_{region} measured every 15s against representative prompt sets.
+- Cost signals: egress_cost_per_token_{region} (USD/token) and model-execution-cost-index.
+
+Routing decision algorithm (high-level)
+
+1. Candidate filtering: remove regions disallowed by legal_zone or regions marked degraded (error_rate_5m > 2% or p99_latency_ms > SLO_threshold * 1.5).
+2. Score computation per region:
+   - latency_headroom = max(0, SLO_p99_ms - observed_p99_ms) normalized to [0,1]
+   - capacity_headroom = sigmoid(available_slots / expected_qps) in [0,1]
+   - cost_factor = 1 / (1 + egress_cost_index) so cheaper regions score higher
+   - affinity_bonus = 0.2 if affinity_tag == sticky and region == current_affinity_region
+   - region_score = 0.5 * latency_headroom + 0.3 * capacity_headroom + 0.2 * cost_factor + affinity_bonus
+3. Tie-breaking: if top two regions within 0.03 score, pick the region with lower recent error_rate_5m; if still tied, prefer the region with longer historical affinity.
+4. Minimum hold time: once a tenant is moved, enforce min_affinity_minutes (default 30m) before another automatic move.
+
+Sample routing policy (YAML)
+
+- name: default-latency-aware
+  min_affinity_minutes: 30
+  s2s_slo_p99_ms: 350
+  allowed_regions_global: [us-west-2, us-east-1, eu-west-1, ap-northeast-1]
+  fallback_canary_percentage: 5
+  scoring_weights: {latency_headroom: 0.5, capacity_headroom: 0.3, cost_factor: 0.2}
+
+Operational knobs and configuration table
+
+| Setting | Default | Purpose | Owner | Notes |
+|---|---:|---|---|---|
+| min_affinity_minutes | 30 | Prevents oscillation | traffic-platform | Increase during high-flap scenarios |
+| fallback_canary_percentage | 5 | Start small when moving tenants | sres | Increase to 20% after 15 minutes if stable |
+| degraded_error_rate_threshold | 0.02 | Mark region degraded | sres | Based on 5m window |
+| synthetic_probe_interval_s | 15 | Frequency of probes | observability | Use representative prompt set per tenant class |
+
+Dashboard and alerting guidance
+
+Required panels (traffic-director dashboards):
+- Tenant routing map: current_affinity_region per active tenant, last_switch_ts, routing_profile.
+- Per-region health: p99, error_rate_5m, available_slots, synthetic_p99.
+- Scoring breakdown: top-3 region_score components for a selected tenant.
+
+Alerts (examples):
+- P0: region-degraded (trigger): region.error_rate_5m > 4% OR region.p99_latency_ms > 2x SLO for 2m. Pager duty to platform-oncall (P0).
+- P1: tenant-flap-detected: tenant.switch_count_1h > 3. Notify assigned tenant-owner Slack channel.
+- P2: cross-region-cost-exceed: 24h rolling egress spend for tenant > budget_threshold. Email to cost-ops.
+
+Runbook excerpts: degraded-region -> fallback flow
+
+1. Detection
+   - Alert: region-degraded fires; check region dashboard.
+   - Confirm: compare synthetic_p99, production p99, and available_slots.
+2. Immediate actions (platform oncall)
+   - Increase fallback_canary_percentage to 10% for affected tenants via traffic-director CLI:
+
+     traffic-directorctl set-policy --name default-latency-aware --fallback_canary_percentage 10 --region us-east-1
+
+   - For critical tenants with sticky affinity, create manual override to move to target region and set min_affinity_minutes=120:
+
+     traffic-directorctl override-tenant --tenant-id T-1234 --target-region eu-west-1 --min-affinity-minutes 120 --reason "region-degraded"
+
+3. Monitoring after action
+   - Watch synthetic_p99 and tenant p99 for 15 minutes; if p99 improves below SLO, increment canary by 10% every 10 minutes until 100%.
+   - If error rates increase in fallback region, revert immediately and escalate to engineering.
+
+Testing and rollout plan
+
+- Staging: validate policy logic against production-sampled telemetry in staging using traffic-simulator job (job: routing-sim) with 48-hour replay. Ensure no flip > 5% of tenants during replay.
+- Canary: enable routing_policy in us-west-2 for 2% of tenants (random subset) for 24h. Monitor tenant-flap-detected and top-3 scoring reasons.
+- Gradual rollout: increase to 25% for 12h, then 100% in 6h increments if signals healthy.
+
+Safety and limiters
+
+- Global switch limit: limit number of automatic tenant moves to 50 per 5 minutes to protect downstream services.
+- Per-tenant protection: do not move tenants that have active long-running streaming sessions (flag: streaming_active=true).
+- Manual override precedence: any manual override sets a hard lock with an expiry timestamp.
+
+Operational examples and diagnostics commands
+
+- Show current affinity for tenant:
+
+  traffic-directorctl tenant-status --tenant-id T-1234
+
+- Compute region score debug output for tenant (dev-only, returns JSON):
+
+  traffic-directorctl debug-score --tenant-id T-1234 --window=5m
+
+- Re-run synthetic probe for region and prompt set:
+
+  probesctl run --region eu-west-1 --prompt-set latency-sensitive --count 50
+
+Ownership and escalation
+
+- Policy owner: traffic-platform (primary: @sofia.mendel).
+- Observability: metrics-team (primary: @arjun.patel).
+- Oncall escalation: platform-oncall -> platform-eng -> runtime-sre.
+
+Retrospective triggers
+
+Create a retrospective when any of these happen:
+- >500 tenant switches in 24h window.
+- Any tenant experiences p99 > 2x SLO for more than 30m.
+- Manual overrides exceed 10% of tenants in a region in one week.
+
+Appendix: example scoring debug output (text)
+
+Tenant T-1234, window=5m
+- observed_p99_ms[us-west-2]=120, headroom=230 -> latency_headroom=0.86
+- available_slots=40, expected_qps=25 -> capacity_headroom=0.75
+- egress_cost_index=1.2 -> cost_factor=0.45
+- affinity_bonus=0.2 (sticky)
+- region_score(us-west-2)=0.5*0.86 + 0.3*0.75 + 0.2*0.45 + 0.2 = 0.805
+
+References and related documentation
+
+- See platform runbooks: /confluence/eng-platform/runbooks/cold-start-warmup-orchestration-runbook-2026
+- Observability SLI guide: /confluence/eng-platform/dashboards-and-alerts/platform-observability-sli-onboarding-playbook-2026
+
+Change log
+
+- 2025-09-15: initial draft by Sofia Mendel.
+- 2025-11-02: added synthetic probe guidance and scoring weights (reviewers: Arjun, Marta).
+- 2026-02-08: clarified rollback steps and introduced global switch limit.

@@ -1,0 +1,368 @@
+Residency Policy Service (RPS) — Control Plane System Documentation
+
+## Overview
+Residency Policy Service (RPS) is the control-plane system of record for **Hosted API data residency policies** (region pinning). RPS stores policy objects, enforces validation rules, provides deterministic policy evaluation for in-path services, and emits **audit events** for create/update/delete and overrides.
+
+RPS is part of the Enterprise Security & Compliance Foundation initiative: **Hosted data residency enforcement**. It enables:
+- Customer-configurable **allowed region set** and **primary region** at org/project scope (and optionally API key).
+- Deterministic request-time enforcement by downstream services (API Gateway + Smart Routing).
+- Auditable configuration changes and operational observability.
+
+RPS does **not** route traffic. It only provides configuration and a consistent evaluation contract.
+
+## Service ownership
+- Primary owner: Platform Control Plane (Ethan Park)
+- Policy model/architecture: Jordan Lee
+- Implementation lead: Benji Okafor
+- Security review: Marcus Lin
+- SRE readiness: Sean Gallagher
+
+## High-level architecture
+**Control plane write path**
+1) Admin (Console / Admin API) calls RPS to create/update residency policy.
+2) RPS validates the policy, persists it, and emits audit-log events.
+3) RPS publishes a policy-change notification (internal event bus) so caches can refresh.
+
+**Runtime read path (request-time)**
+- API Gateway and Smart Routing query RPS (or use cache) to compute the **effective policy** for a request context (org_id, project_id, api_key_id, requested_region, endpoint).
+- The requesting service performs enforcement locally (block vs allow) and includes decision context in logs/metrics.
+
+Notes:
+- Request-time components must be able to operate when RPS is degraded. The system design favors **cached reads** and **fail-closed/ fail-open modes** controlled by feature flags (see Rollout and Failure Modes).
+
+## Data model
+RPS stores a single logical object: **ResidencyPolicy**.
+
+### ResidencyPolicy fields
+Each policy is attached to exactly one scope: org, project, or api key.
+
+**Core identifiers**
+- policy_id: globally unique identifier (prefix `rpol_`)
+- scope_type: `org` | `project` | `api_key`
+- scope_id: corresponding identifier (e.g., `org_…`, `proj_…`, `key_…`)
+- org_id: owning org (always present; for project/api_key scopes, derived)
+
+**Configuration**
+- allowed_regions: ordered, unique list of internal region codes (e.g., `eu-west-1`, `eu-central-1`)
+- primary_region: must be a member of allowed_regions
+- allow_cross_region_fallback: boolean (default `false` for pinned policies)
+- enforcement_mode: `monitor` | `enforce`
+  - `monitor`: calculate decision + log, but do not block. Intended for staged rollout.
+  - `enforce`: downstream services must block on violations.
+
+**Operational metadata**
+- status: `active` | `disabled`
+- version: monotonically increasing integer (used for cache coherence)
+- etag: opaque hash computed from canonicalized policy (used for conditional GET)
+- created_at, updated_at
+- created_by, updated_by: principal identifier (admin user id, service principal, or automation)
+- change_reason: free-text (required for updates from Console)
+
+**Notes on region codes**
+- RPS stores Redwood’s internal “runtime region code” strings. Mapping to cloud provider regions and failover groups is maintained separately (see `residency-enforcement-region-mapping-sheet`).
+
+### Policy precedence
+When multiple policies exist, the effective policy is selected via precedence:
+1) API key policy (scope_type = `api_key`)
+2) Project policy (scope_type = `project`)
+3) Org policy (scope_type = `org`)
+4) No policy => default behavior (see Defaults)
+
+Tie-breakers:
+- If more than one active policy exists at the same scope (should not happen), RPS returns `409 conflict` on creation/update to prevent ambiguity.
+
+### Defaults (no policy)
+- allowed_regions: `*` (all hosted regions)
+- primary_region: computed by routing policy / customer’s default region preference
+- allow_cross_region_fallback: controlled by existing routing behavior (pre-residency baseline)
+- enforcement_mode: `monitor` (no blocks)
+
+## Validation rules
+RPS applies validation at create/update time. Downstream services must treat RPS as the source of truth and may perform a subset of validations defensively.
+
+### Region validation
+- allowed_regions must be non-empty for pinned policies.
+- Every entry in allowed_regions must be a known hosted region code.
+- primary_region must be set and must exist in allowed_regions.
+- allowed_regions must not contain duplicates.
+
+### Scope validation
+- Exactly one scope_type + scope_id per policy.
+- api_key policies must reference an api_key belonging to the provided org_id.
+- project policies must reference a project belonging to the provided org_id.
+
+### Conflict validation
+- One active policy per (scope_type, scope_id).
+- You cannot create a project policy that is identical to the inherited org policy unless `change_reason` indicates explicit pinning intent (prevents accidental “no-op” configs that users assume are enforced).
+
+### Enforcement mode validation
+- enforcement_mode transitions `monitor -> enforce` require:
+  - allowed_regions is non-empty
+  - primary_region is set
+  - status is `active`
+- enforcement_mode transitions `enforce -> monitor` are permitted but generate a high-severity audit event.
+
+### Dedicated alignment (where applicable)
+RPS may be used to store policy objects for Dedicated projects to provide a consistent admin surface area. However, Dedicated region behavior is enforced primarily by deployment topology. If a policy is attached to Dedicated scope:
+- allowed_regions must match the dedicated deployment’s region set (validated by a control-plane integration).
+
+## Storage and persistence
+- Primary store: Postgres (control-plane cluster), table `residency_policies`
+- Indices:
+  - unique(scope_type, scope_id) where status = 'active'
+  - index(org_id)
+- Soft delete:
+  - Deletes mark status=`disabled` and preserve record for auditability. Hard deletes are not supported.
+
+## Public/internal APIs
+RPS is an internal control-plane service. Console and internal services access it via service-to-service auth. There is no direct end-customer access.
+
+### 1) Admin APIs (CRUD)
+Base path: `/v1/residency-policies`
+
+**Create policy**
+- `POST /v1/residency-policies`
+- Auth: admin principal (Console) or service principal with `residency_policy:write`
+
+Request body (example):
+{
+  "scope_type": "project",
+  "scope_id": "proj_7Jp3...",
+  "org_id": "org_g2k1...",
+  "allowed_regions": ["eu-west-1", "eu-central-1"],
+  "primary_region": "eu-west-1",
+  "allow_cross_region_fallback": false,
+  "enforcement_mode": "monitor",
+  "change_reason": "EU-only requirements for payments workload"
+}
+
+Response (example):
+- `201 Created`
+- Body includes policy_id, version, etag, created_at
+
+**Get policy**
+- `GET /v1/residency-policies/{policy_id}`
+- Supports `If-None-Match: <etag>`
+
+**List policies by org**
+- `GET /v1/residency-policies?org_id=...&scope_type=project&status=active`
+
+**Update policy**
+- `PATCH /v1/residency-policies/{policy_id}`
+- Concurrency:
+  - `If-Match: <etag>` required to prevent lost updates
+
+**Disable policy**
+- `DELETE /v1/residency-policies/{policy_id}`
+- Performs a disable (soft delete) and emits an audit event
+
+### 2) Evaluation API (read path for runtime services)
+Base path: `/v1/residency-policies:evaluate`
+
+- `POST /v1/residency-policies:evaluate`
+- Intended callers: API Gateway, Smart Routing, selected background job dispatchers.
+- Auth: service principal with `residency_policy:evaluate`
+
+Request fields:
+- org_id (required)
+- project_id (optional)
+- api_key_id (optional)
+- requested_region (optional; if present, supports deterministic “would this be allowed?” checks)
+- endpoint_family (optional; e.g., `chat.completions`, `embeddings`, `rerank`)
+
+Response fields:
+- effective_policy:
+  - policy_id (or empty if none)
+  - scope_type, scope_id
+  - allowed_regions (or `*`)
+  - primary_region (if configured)
+  - allow_cross_region_fallback
+  - enforcement_mode
+  - version, etag
+- decision:
+  - decision_result: `allow` | `block` | `allow_with_constraints`
+  - block_reason_code (if blocked; stable internal enum)
+  - selected_region_hint (primary region when applicable)
+
+Important: **The public error contract for end customers is owned by API Gateway** (see ADR-022). RPS decision codes are internal and may be mapped to public error codes.
+
+### 3) Health and introspection
+- `GET /healthz` (liveness)
+- `GET /readyz` (readiness incl. DB)
+- `GET /metrics` (Prometheus)
+
+## Authentication and authorization
+### Service-to-service auth
+- mTLS enforced at the mesh / gateway layer.
+- JWT service tokens issued by the control-plane identity provider.
+- RPS enforces audience + scope claims.
+
+### RBAC model
+- Console admins:
+  - org_admin: can manage org, project, and api_key policies within their org
+  - compliance_admin: can view policies + change history; cannot disable enforcement without explicit permission
+- Service principals:
+  - `residency_policy:read` for listing/getting
+  - `residency_policy:write` for create/update/disable
+  - `residency_policy:evaluate` for evaluate endpoint
+
+### Data access restrictions
+- All list endpoints require org_id scoping.
+- Cross-org access is blocked at the service layer (not only in the Console).
+
+## Integration points
+### API Gateway
+API Gateway is the **first enforcement point** and the owner of the customer-facing error contract.
+
+Gateway responsibilities:
+- Resolve request context (org_id/project_id/api_key_id).
+- Fetch/evaluate effective policy (cache-first; RPS as source of truth).
+- If enforcement applies and the request would violate policy, return a deterministic residency error:
+  - consistent HTTP status
+  - stable `error_code`
+  - `request_id`
+  - guidance + help link
+- Attach “residency decision context” headers to downstream services when allowed:
+  - `x-rw-residency-policy-id`
+  - `x-rw-residency-allowed-regions`
+  - `x-rw-residency-primary-region`
+  - `x-rw-residency-enforcement-mode`
+  - `x-rw-residency-decision-id` (opaque id for tracing)
+
+### Smart Routing
+Smart Routing must ensure:
+- Region selection stays within allowed_regions.
+- Cross-region fallback is **disabled by default** for pinned policies unless allow_cross_region_fallback is true.
+- Any routing attempt outside policy is treated as an enforcement violation (block or fail-closed based on current mode).
+
+Routing uses RPS data for:
+- Primary region selection and allowed region constraint set.
+- Decision logging fields to correlate enforcement and routing.
+
+### Console / Admin UX
+Console uses Admin APIs to:
+- Configure pinning at org/project (and API key where enabled).
+- Show “configuration history” (from audit log events) and “recent blocked requests” (from runtime logs/metrics; not from RPS directly).
+
+### Audit Log Exporter
+RPS emits audit events consumed by audit-log-exporter. Events are used for:
+- Customer audit log exports (where enabled)
+- Internal compliance evidence
+
+## Audit logging
+RPS emits structured audit events for every configuration change:
+- `residency_policy.created`
+- `residency_policy.updated`
+- `residency_policy.disabled`
+- `residency_policy.enforcement_mode_changed`
+
+Event payload fields (high level):
+- event_id, event_time
+- org_id
+- actor_principal_id, actor_type (human/service)
+- action
+- policy_id
+- before (redacted summary)
+- after (redacted summary)
+- change_reason
+
+Redaction guidance:
+- Residency policies do not include customer prompt/content. No customer content should ever appear in RPS audit events.
+
+## Caching strategy
+RPS is not on the hot path for every request.
+
+Recommended cache strategy for callers:
+- Cache key: (org_id, project_id, api_key_id)
+- TTL: 60s default; may be tuned per service
+- Invalidation: subscribe to policy-change notifications (best-effort)
+- Stale-while-revalidate: permitted for `monitor` mode; not permitted for `enforce` mode unless the cached policy is still within TTL
+
+RPS supports conditional reads via ETag to reduce payload and CPU.
+
+## Failure modes and service-level behavior
+### RPS unavailable
+Caller behavior depends on enforcement_mode and feature flags:
+- If no cached policy exists:
+  - In `monitor` rollout: allow request, emit metric `residency.policy_lookup_failed`.
+  - In `enforce` rollout (GA target): fail closed for pinned customers, return residency error indicating temporary inability to validate policy (Gateway-owned contract).
+- If cached policy exists and TTL is valid: proceed.
+- If cached policy exists but TTL expired:
+  - In monitor: proceed + refresh async.
+  - In enforce: block unless `residency_enforcement_allow_stale_cache=true` emergency flag is enabled.
+
+### Invalid policy state
+RPS prevents invalid policies at write time. If a caller encounters an invalid policy payload (should not happen), treat as:
+- `monitor`: allow + log internal error
+- `enforce`: block + emit high-severity alert
+
+## Observability
+RPS emits:
+- Metrics:
+  - `rps_requests_total{route,code}`
+  - `rps_request_latency_ms{route}`
+  - `rps_db_latency_ms`
+  - `rps_evaluations_total{decision_result}`
+  - `rps_cacheable_responses_total`
+  - `rps_authz_denied_total`
+- Logs:
+  - Structured JSON logs including request_id, org_id, policy_id, scope_type, version, decision_result
+- Tracing:
+  - Propagates `x-request-id` and emits spans for DB operations
+
+Alerting (owned by SRE; see monitoring page):
+- Elevated 5xx rate
+- Increased evaluate latency (p95)
+- Authz denied spikes
+
+## Rollout and migration strategy
+RPS rollout is coordinated with Gateway and Routing enforcement.
+
+### Phase 0: Dark launch
+- Deploy RPS with Admin APIs and Evaluation API.
+- Enable policy creation in internal-only Console.
+- No enforcement; only `monitor` mode allowed.
+
+### Phase 1: Monitor mode for allowlisted orgs
+- Allowlisted orgs can set policies (org/project scope).
+- Gateway/Routing call evaluate and log decision context.
+- Collect baseline metrics: block-rate would-have-blocked, evaluation latency.
+
+### Phase 2: Enforce mode for allowlisted orgs
+- Enable `enforcement_mode=enforce` transition behind feature flag.
+- Turn on deterministic block behavior in Gateway.
+- Disable cross-region fallback by default in routing for pinned orgs.
+
+### Phase 3: Progressive GA
+- Expand org allowlist and then default availability.
+- Enable API key policies after project/org policies are stable.
+
+### Migration for existing customers
+- No automatic pinned policies are created.
+- Existing customer configuration remains unchanged until they opt in.
+- For customers with legacy “preferred region” settings, Console will offer a guided flow to convert preference -> pinned policy.
+
+## Backward compatibility and versioning
+- Policy representation returned by RPS is versioned implicitly via fields; clients must ignore unknown fields.
+- Breaking changes require a new endpoint version (`/v2/...`).
+
+## Security considerations
+- RPS stores configuration only; it must not receive or store customer prompts/completions.
+- All endpoints require authentication; list endpoints require org scoping.
+- Audit events must not include secrets (API keys) or customer content.
+
+## Runbook pointers
+- On-call triage for false positives and emergency flags is documented in: `residency-enforcement-false-positives`.
+- Staging configuration how-to: `configure-region-pinning-in-staging`.
+
+## Appendix: Error handling (service-level)
+RPS returns standard control-plane errors:
+- `400 invalid_argument`: validation failures
+- `401 unauthenticated`: missing/invalid token
+- `403 permission_denied`: authz failed
+- `404 not_found`: policy id not found
+- `409 conflict`: duplicate active policy for scope or ETag mismatch
+- `429 resource_exhausted`: rate limited
+- `500 internal`: unexpected
+
+Note: Customer-visible residency violation errors are produced by API Gateway per ADR-022; RPS errors are not directly exposed externally.

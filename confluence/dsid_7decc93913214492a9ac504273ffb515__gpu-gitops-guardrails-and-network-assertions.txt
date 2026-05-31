@@ -1,0 +1,156 @@
+GPU GitOps guardrails and network assertions
+
+Summary
+
+This playbook documents the GitOps-oriented guardrails and automated network assertions we use to safely provision and modify GPU fleet resources and related networking (VPCs, subnets, route tables, egress NAT, and security groups). The goal is to make each merge to infra repositories produce an auditable, testable plan that enforces tenant isolation, egress constraints, and preflight capacity checks before any cloud change is applied.
+
+Why this exists
+
+- GPU infrastructure changes are high-risk: machine types, quotas, and egress rules can cause region-wide outages or unexpected billing.
+- GitOps provides a reliable single source of truth, but needs automated policy checks (assertions) to prevent unsafe merges.
+- This doc binds together Terraform module conventions, CI test patterns, OPA/conftest policies, and runtime checks against Canary tenants.
+
+Scope
+
+Applies to changes in the following repositories and module namespaces:
+- infra/gpu-* (terraform modules for pools, node groups, launch templates)
+- infra/networking/* (VPC, subnet, NAT gateway, route options used by GPU clusters)
+- infra/gitops-clusters (cluster manifests that reference GPU node pools)
+
+Out of scope: single-tenant customer config stored in customer repos (customer-sensitive templates require the private deployment playbooks).
+
+High-level guardrail patterns
+
+1) Declarative assertions (pre-merge)
+- Enforce minimal required labels on GPU pools: owner-team, cost-center, sla-tier.
+- Prohibit wide-open security groups attached to GPU node pools.
+- Require explicit egress policy for evaluation jobs (allowed egress CIDR list).
+
+2) Capacity & quota checks (pre-apply and pre-merge)
+- Require a "quota-budget" file for any pool increase > 20% of region capacity.
+- Simulate spot/preemptible drain impact via the GPU capacity simulator test (see CI steps).
+
+3) Network safety assertions
+- Prevent changes that remove cross-account VPC peerings used for monitoring/backup.
+- Disallow changes that expand public subnet allocation for GPU subnets without an approved security review.
+
+Detailed CI pipeline pattern
+
+This is the recommended GitHub Actions pipeline for infra modules touching GPU or network resources:
+
+1) lint (fast)
+- terraform fmt -check
+- tflint --module
+- check-docs-snapshot.sh
+
+2) plan + snapshot
+- terraform init -backend=false
+- terraform plan -out=plan.binary
+- terraform show -json plan.binary > plan.json
+
+3) policy checks (conftest/OPA)
+- conftest test plan.json --policy ./policies/gpu-network
+- return non-zero on any policy violation
+
+4) unit/simulation tests (terratest / in-memory simulator)
+- go test ./test/sim -run TestGpuCapacitySimulator -v
+- simulators validate eviction rate, warm-pool size impact, and preemption hedging
+
+5) integration (optional gated)
+- apply to sandbox account using a short-lived run (feature-branch environment)
+- run smoke checks against Prometheus/alertmanager endpoints that assert new nodes join and health checks pass
+
+6) human approval required for large changes
+- If the diff increases target_pool_size by > 200 GPUs or egress CIDR widens, require the security-reviewers group approval.
+
+Policy examples (human-readable)
+
+- Block: any security_group allowing 0.0.0.0/0 tcp:22 attached to gpu_node_group resource.
+- Block: subnet.az_count < 2 for a production GPU cluster.
+- Allow only approved AMI IDs for GPU nodes (map maintained in modules/ami-allowlist.yaml).
+
+Sample conftest policy (text description)
+
+We use Rego policies with conftest. Example checks:
+- rego/gpu/allowlist.rego: verifies instance types are in the supported list (A100, H100, etc.).
+- rego/network/egress-CIDR.rego: enforces that any new egress CIDR intersects the allowed-egress list in org-config.
+
+Preflight assertions run by the CI (commands)
+
+- Generate plan JSON
+  terraform init -backend=false && terraform plan -out=tfplan && terraform show -json tfplan > plan.json
+- Run policies
+  conftest test plan.json --policy ./policies || exit 1
+- Run simulator tests (requires Go + docker)
+  go test ./test/sim -run TestGpuCapacitySimulator -v || exit 1
+
+Runtime assertions (post-apply)
+
+After apply (automated via the CD process), a short-lived probe validates that the change behaves as expected. The CD job will:
+- Wait for new nodes to register with the cluster for up to 15 minutes.
+- Run the following checks (examples):
+  - kubectl get nodes --selector=pool=<new-pool> --no-headers | wc -l >= expected_count
+  - curl -fsS http://prometheus-api:9090/api/v1/query?query=up{job=\"gpu-exporter\",pool=\"<new-pool>\"} and ensure > 0 results
+  - Check NAT gateway allocation: aws ec2 describe-nat-gateways --filter Name=tag:pool,Values=<new-pool>
+
+Failure handling and automatic rollback
+
+- If any runtime assertion fails, the CD job marks the deployment as failed and triggers an automated rollback to the previous terraform state using the saved state snapshot.
+- Alerting: page oncall-sre and open an incident in PagerDuty with runbook link. The CD job should annotate the PR with failure reasons and links to logs.
+
+SLOs and thresholds to enforce in assertions
+
+| Assertion | Warning threshold | Failure threshold | Action |
+|---|---:|---:|---|
+| Node join latency | 60s | 300s | mark rollback after 300s; create ticket on warning |
+| Pod scheduling success rate (first 2m) | 95% | 80% | rollback and scale back pool |
+| Egress connection success to monitoring endpoints | 98% | 90% | open incident and isolate network change |
+
+Operational runbook (short)
+
+1) On failed CI policy check:
+   - Click the failed check and inspect conftest output.
+   - If the violation is legitimate, revert the change and create an RFC describing the exception.
+
+2) On apply failure / runtime assertion fail:
+   - CD job will try to rollback automatically. Follow the CD job link and confirm rollback completed.
+   - If rollback failed, escalate to infra-oncall and run the manual rollback procedure (apply previous state snapshot and force-replace nodes).
+
+3) For suspected network regressions:
+   - Run a targeted traceroute from the failing node to the monitoring endpoint.
+   - Verify route tables and NACLs in the account: aws ec2 describe-route-tables --filters Name=tag:Name,Values=<vpc-name>
+
+Developer guidance for creating safe module changes
+
+- Small, isolated diffs are safer. Prefer adding a new module version that exercises the new behavior in a sandbox account rather than altering the production module directly.
+- Add a unit test in test/sim for any capacity change logic. The GPU capacity simulator must exercise at least 3 preemption scenarios.
+- Add a policy comment in policies/README.md if you need to request a policy exception. Track exceptions in the exceptions.csv with an owner and expiration.
+
+Ownership and escalation
+
+- Primary owners: infra/gpu-team (oncall rotation: infra-gpu-oncall).
+- Secondary owners: infra/networking-team.
+- Security reviewers: security-cloud (required for egress widening or public subnet changes).
+
+Related pages
+
+- infra/terraform-and-iac/gpu-provisioning-immutable-state-and-disaster-recovery (for state snapshot procedures)
+- eng-infra/runbooks/preflight-gpu-deployment-validation-and-rollback-playbook (detailed step-by-step rollback)
+
+Appendix: quick checklist for reviewers
+
+- Does the plan avoid introducing permissive security groups?
+- Does the plan include an explicit quota-budget entry for pool size increases?
+- Are AMI and kernel versions in the allowlist?
+- Has the change been exercised in a sandbox with the simulator tests passing?
+- Is a security reviewer included if required?
+
+If the answer to any checklist item is no, request changes and do not merge.
+
+Document history
+
+- 2024-04-12: created by Daniel Kim.
+- 2024-07-09: added conftest policies and sample rego references (review by Aisha Patel).
+- 2025-01-15: clarified runtime assertion thresholds and automated rollback behavior.
+
+End of document.

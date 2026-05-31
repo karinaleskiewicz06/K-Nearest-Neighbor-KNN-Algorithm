@@ -1,0 +1,164 @@
+Service profiling experiment matrix and SLO extrapolation playbook
+
+Summary
+-------
+This playbook describes a standardized experiment matrix, data schema, measurement methodology, and extrapolation techniques for predicting service-level objective (SLO) behavior at scale. It is intended to help engineering teams validate capacity changes, quantify expected P50/P95/P99 latency shifts when scaling QPS or changing kernel/quantization profiles, and produce evidence for release decisions.
+
+Goals and non-goals
+-------------------
+- Goals:
+  - Provide a repeatable set of profiling experiments for inference services (inference-proxy, runtime-batcher, variant-router).
+  - Define minimum data quality and sample sizes for reliable quantile estimates.
+  - Offer an extrapolation method to estimate SLOs at higher QPS and alternate batch/sequence distributions.
+  - Produce a clear runbook for diagnosing and mitigating regressions discovered by experiments.
+- Non-goals:
+  - This is not a full capacity planner for fleet-level autoscaling (see eng-sre capacity-planning).
+  - It does not replace real production chaos testing; it's a controlled profiling toolset.
+
+Scope and applicable services
+----------------------------
+This playbook applies to services that are on the inference request path:
+- inference-proxy (edge -> ingress point, request enrichment)
+- runtime-batcher (continuous batching layer that aggregates requests to model shards)
+- model-executor (per-GPU inference process; capture as aggregate metrics where direct instrumentation is unavailable)
+
+Key SLOs targeted
+----------------
+- Request latency (P50, P95, P99) measured at the API boundary (inference-proxy) with tokenized request/response timestamps.
+- Token throughput (tokens/sec) and model-level throughput (inferences/sec) as secondary metrics.
+- Error rate (5xx) and circuit-breaker invocations.
+
+Experiment matrix (canonical)
+----------------------------
+Run experiments across a Cartesian product of the following dimensions. Each cell is a single experiment run (30–60 minutes steady state recommended).
+1) QPS target: [10, 50, 200, 500, 1000]
+2) Sequence length buckets: [short (<=64), mid (65-512), long (>512)]
+3) Batch size behavior: [no-batching, observed-batching, forced-batch=16, forced-batch=32]
+4) Model runtime profile: [fp32, int8-quant, kernel-optimized]
+5) Hardware class: [A100, H100, T4] (if available)
+6) KV/prefix cache hit-rate: [0%, 50%, 90%]
+
+Minimum experiment duration and sample sizes
+-----------------------------------------
+- Warmup: 5 minutes to allow KV caches and batchers to stabilize.
+- Steady-state collection: 30 minutes per cell.
+- Minimum successful requests per cell: 50,000 or 30 minutes whichever yields more samples.
+- For quantile stability, target at least 1,000 samples in the P99 tail bucket.
+
+Data schema and required telemetry
+--------------------------------
+Collect both aggregated time-series and per-request traces/samples. Required fields for per-request samples (CSV/JSON):
+- timestamp_utc
+- request_id
+- service (inference-proxy | runtime-batcher | model-executor)
+- request_qps_target
+- sequence_length_tokens
+- batch_size
+- kernel_profile (string)
+- hardware_type
+- kv_cache_hit (true|false)
+- latency_ms_total
+- latency_ms_ingress
+- latency_ms_batching
+- latency_ms_inference
+- success (true|false)
+- error_code (if any)
+- sample_tags (comma-separated labels)
+
+Example CLI commands
+--------------------
+- Start a canonical profile collection (example):
+  rinfer profile collect --service inference-proxy --duration 45m --qps 200 --seq-dist mid --batch-policy observed --out /tmp/profiles/ip-qps200-mid.json
+- Convert profile to aggregated metrics:
+  rinfer profile summarize --input /tmp/profiles/ip-qps200-mid.json --out /tmp/summary/ip-qps200-mid.summary.json
+
+Extrapolation methodology
+-------------------------
+We provide a pragmatic, defensible extrapolation approach rather than a single black-box model. Two levels of extrapolation are supported:
+A) Dimension-preserving interpolation/extrapolation (statistical):
+  - For each metric (P50/P95/P99), fit a smooth monotonic function over QPS (use log(QPS) as independent variable).
+  - Use quantile regression (e.g., linear quantile regression on log-QPS) to estimate the quantile at an unseen QPS.
+  - Provide bootstrap confidence intervals (95%) using sampled experiment runs.
+B) Queueing-informed extrapolation (system-aware):
+  - Model runtime-batcher as M/G/1 queue with service time distribution derived from sampled latency_ms_inference.
+  - For each QPS target, compute expected queueing delay and add to measured inference latency to estimate end-to-end latency.
+  - Apply correction factor for batching nonlinearities observed in profiling (empirically derived multiplier).
+
+Operational pseudocode (high-level)
+-----------------------------------
+```
+# inputs: list of experiment summaries M = [{qps, p50, p95, p99, service_profile}]
+# step 1: fit quantile_regression models on log(qps) -> quantile
+models = fit_quantile_regression(M, quantiles=[0.5,0.95,0.99])
+# step 2: if queueing extrapolation requested:
+service_time_dist = estimate_service_time_distribution(latency_samples)
+queue_delay(qps) = mg1_expected_wait(service_time_dist, qps)
+predicted_p95 = models['p95'](log(qps)) + queue_delay(qps) * correction_factor
+# output: predicted quantiles + 95% bootstrap CI
+```
+
+Quality gates and acceptance criteria
+------------------------------------
+- Calibration check: when extrapolating to a QPS for which an experiment exists, predicted P95 must be within ±12% of measured P95 for the same cell. If not, rerun experiments and review data collection fidelity.
+- Minimum CI width: if 95% bootstrap CI for P95 is wider than ±25% relative, mark the cell as low-confidence and increase sample duration or repeat runs.
+- Regression triage: any predicted increase in P95 > 20% compared to baseline must open a triage ticket (label: perf-regression) and follow the runbook below.
+
+Regression runbook (for predicted or observed regressions)
+--------------------------------------------------------
+1) Verify instrumentation and data integrity: check timestamps, clock skew, and sampling consistency across services.
+2) Reproduce minimal failing experiment: isolate single dimension (e.g., keep QPS and seq-length constant) and run targeted 15m test.
+3) Compare span-level breakdown: ingress vs batching vs inference.
+4) If batching contribution > 40% of delta: inspect runtime-batcher logs for scheduling delays and nonideal batch composition.
+5) If inference contribution dominant: capture model-executor telemetry and check kernel selection, quantization toggles, GPU utilization, and memory pressure.
+6) Temporary mitigations: reduce max batch size, enable forced prefix caching, degrade to lower model variant, or redirect traffic to dedicated capacity pool.
+7) Permanent fixes: raise follow-up engineering story with root cause and rollout plan.
+
+Owner and responsibilities
+--------------------------
+- Experiment design and execution: Performance Platform (perf-platform) team (primary).
+- Data ingestion and summary tooling: Observability Platform team (metrics and traces).
+- Runtime-level changes (batcher/kernel): Eng Serving Runtime (owners: runtime-batcher, kernel-and-scheduling).
+- Decision to change customer-facing SLOs: Product and SRE leadership.
+
+Templates and artifacts to attach
+--------------------------------
+- experiment-matrix.csv (columns: qps, seq_bucket, batch_policy, kernel, hw, cache_hit_rate, run_id)
+- sample-schema.json (per-request sample definition)
+- example-summary.json (expected aggregator output)
+- artifact naming convention: svc-experiment-<service>-<qps>-<seq>-<batch>-<kernel>-<hw>-<timestamp>.json
+
+Example aggregated table (one line per experiment)
+-------------------------------------------------
+| run_id | qps | seq_bucket | batch_policy | kernel | hw | p50_ms | p95_ms | p99_ms | err_rate | comments |
+| r-20260203-01 | 200 | mid | observed | int8 | H100 | 34 | 112 | 240 | 0.02% | steady-state 40m |
+
+Testing checklist before release
+-------------------------------
+- All target cells in experiment matrix executed at least once.
+- Calibration checks passed for holdout QPS points.
+- Extrapolation notebook and bootstrap artifacts attached to the run ticket.
+- Runbook and mitigation steps documented on the ticket.
+
+References and related docs
+---------------------------
+- Eng Serving Runtime: sequence-length-aware-kernel-selection-guidelines-2026
+- Performance: predictable-cost-latency-simulator-specification-2026
+- Observability: telemetry-ingestion-and-retention-guidelines-2025
+
+Appendix A — Quick checklist for engineers
+-----------------------------------------
+1) Pick canonical experiment cell and run warmup + 30m steady window.
+2) Ensure rinfer profile collect uses the --trace-sample-rate 0.01 for per-request traces.
+3) Upload artifact to perf-bucket with metadata tag run-owner.<owner> and link in ticket.
+4) Run extrapolation script and attach results: scripts/extrapolate_qps.py --input /tmp/summaries/*.json --target-qps 1000 --out /tmp/predictions.json
+
+Contact and escalation
+----------------------
+- Perf-platform oncall: perf-platform-oncall@redwood.com
+- Observability infra: observability-team@redwood.com
+
+Change log
+----------
+- 2025-11-12: Draft created (Asha Kapoor)
+- 2026-02-15: Added queueing-informed extrapolation and calibration gates (review feedback)
+

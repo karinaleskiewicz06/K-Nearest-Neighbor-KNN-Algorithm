@@ -1,0 +1,257 @@
+ADR: Audit Export Filtering Model (SIEM-ready audit export beta)
+
+## Status
+Published.
+
+## Context
+Redwood is building a beta “SIEM-ready audit export” capability with configurable filtering so enterprise customers can:
+- Reduce noise/cost in downstream SIEMs
+- Target specific compliance-relevant event types
+- Minimize exposure of potentially sensitive event content by exporting only what is needed
+
+The exporter is designed for at-least-once delivery with retries/backoff and checkpointing. Filtering interacts with delivery guarantees and operational behavior:
+- Filters must be deterministic and stable across retries/replays.
+- Filters must not introduce unbounded CPU/memory overhead in the exporter.
+- Filters must be safe to expose in the Console (admin workflows) and safe to evaluate at high event volumes.
+
+This ADR defines (1) the filter model and semantics (allowlist/denylist, event categories, actor/resource predicates, time windows), (2) where filters are validated vs evaluated (control plane vs exporter), and (3) performance and safety constraints.
+
+## Decision
+### 1) Filter model: allowlist-first with optional denylist overrides
+We will support a structured filtering model with the following properties:
+- **Default behavior:** export **all** audit events for a tenant/workspace unless a filter is configured.
+- **Allowlist (inclusive filter):** if configured, only events that match at least one allow rule are eligible for export.
+- **Denylist (exclusive filter):** if configured, any event that matches a deny rule is excluded even if it matches an allow rule.
+- **Precedence:** Denylist wins over allowlist.
+
+Rationale:
+- Allowlist is the primary mechanism for least-privilege export and cost control.
+- Denylist is required for quick suppression during incident response (e.g., noisy event subtype) without reworking allow rules.
+- Explicit precedence avoids ambiguous outcomes and simplifies customer expectations.
+
+### 2) Matching dimensions: stable, schema-driven fields only
+Filters can only reference canonical audit schema v2 fields that are stable and low-risk to expose for filtering. For beta, we support:
+- **Event classification:**
+  - `category` (enumeration) and optionally `action` (string, bounded to known actions)
+- **Actor predicates:**
+  - `actor.type` (e.g., `user`, `service_account`, `system`)
+  - `actor.id` (exact match only; no partial/regex)
+- **Resource predicates:**
+  - `resource.type` (e.g., `api_key`, `model_deployment`, `export_config`)
+  - `resource.id` (exact match only)
+- **Origin/network (where present in schema):**
+  - `source.ip` (CIDR allow/deny)
+
+We explicitly do **not** support free-form search over:
+- Request/response payloads, prompts, model outputs
+- Arbitrary JSON paths
+- Regex matching or substring matching
+
+Rationale:
+- Keeps evaluation predictable and performant.
+- Reduces risk of PII leakage via “filter probing” and avoids needing to index sensitive fields.
+- Ensures filters remain valid across schema evolution (category taxonomy + stable actor/resource identity are our compatibility contract).
+
+### 3) Time window controls are *export control*, not per-event predicates
+We will support two time-related controls:
+1. **Backfill window at enablement / config update** (one-time replay):
+   - `backfill_start_at` (bounded) or `backfill_last` (e.g., last 24h).
+   - Used to seed exports for new destinations.
+2. **Ongoing export behavior** is continuous from the exporter checkpoint forward.
+
+We will **not** support “export only during business hours” or arbitrary per-event time predicates in beta.
+
+Rationale:
+- Per-event time predicates create confusing behavior with retries/replays (events can be evaluated at different wall-clock times).
+- Backfill is the core enterprise need; scheduling can be revisited for GA.
+
+### 4) Validation and compilation in the control plane; evaluation in the exporter
+We split responsibilities:
+- **Control plane** is the source of truth for:
+  - Filter configuration storage
+  - RBAC enforcement for viewing/updating filters
+  - Schema-level validation (categories/actions/resource types exist; max rules; CIDR format)
+  - **Compilation** into a versioned, normalized filter spec that is safe and deterministic
+- **Exporter service** performs:
+  - Runtime evaluation of compiled filters against each audit event before sending to destination adapters
+  - Metrics emission for filter drops and rule match rates
+
+Rationale:
+- Exporter must decide per event; pushing evaluation fully into the control plane would require streaming events through the control plane (not acceptable for latency/cost/complexity).
+- Centralizing validation and compilation in the control plane prevents divergent implementations and reduces the risk of “filter accepted but ignored” behavior.
+
+## Detailed specification
+### Filter configuration object (conceptual)
+The API/Console stores a filter config per export destination, referenced by exporter config sync.
+
+Key semantics:
+- `allow` is optional; if absent, all events are allowed (subject to deny).
+- `deny` is optional; if present, it always applies.
+- A rule is a conjunction (AND) of its predicates; multiple rules are disjunction (OR).
+
+Example (conceptual JSON shown for clarity):
+
+```
+{
+  "allow": [
+    {
+      "categories": ["auth", "rbac"],
+      "actor_types": ["user"],
+      "actions": ["login.succeeded", "login.failed", "role.assigned"],
+      "resource_types": ["user", "role"],
+      "source_ip_cidrs": ["203.0.113.0/24", "198.51.100.4/32"]
+    },
+    {
+      "categories": ["audit_export"],
+      "actions": ["export_config.created", "export_config.updated", "export_config.deleted"]
+    }
+  ],
+  "deny": [
+    {
+      "actions": ["login.succeeded"],
+      "source_ip_cidrs": ["0.0.0.0/0"]
+    }
+  ]
+}
+```
+
+Notes:
+- This example includes an intentionally broad deny CIDR to illustrate precedence. In practice, customers would use deny to suppress a subset (e.g., a specific noisy actor).
+
+### Supported predicate operators (beta)
+- Arrays are treated as **set membership**:
+  - `categories`: event.category ∈ categories
+  - `actions`: event.action ∈ actions
+  - `actor_types`: event.actor.type ∈ actor_types
+  - `resource_types`: event.resource.type ∈ resource_types
+- Exact match:
+  - `actor_ids`: event.actor.id == any(actor_ids)
+  - `resource_ids`: event.resource.id == any(resource_ids)
+- CIDR match:
+  - `source_ip_cidrs`: event.source.ip ∈ any(CIDR)
+
+Any predicate list omitted in a rule means “no constraint” for that dimension.
+
+### Limits and safety constraints
+To bound evaluation cost and prevent pathological configs:
+- Max rules:
+  - `allow`: up to 25 rules
+  - `deny`: up to 25 rules
+- Max values per predicate list per rule: 100
+- Max total distinct strings per filter config: 1,000
+- Max CIDRs total per filter config: 200
+- No regex or wildcard matching.
+- Only validated enumerations for `category` and (where applicable) `resource.type`.
+
+If a config exceeds limits, the control plane rejects it with a structured validation error describing the offending field and limit.
+
+### Determinism and replay behavior
+Filtering must be deterministic for a given event and compiled filter version:
+- A retry of the same event must produce the same “included/excluded” outcome.
+- Evaluation must not depend on wall-clock time (hence no time-of-day predicates).
+- If a filter changes, we do **not** retroactively re-evaluate already-exported events.
+
+Operationally:
+- Filter changes apply to events **after** the config version becomes active in the exporter.
+- Backfill replays use the **current filter** at the time of replay request.
+
+### Where is filtering applied in the pipeline?
+Filtering is applied in the exporter after it reads the event from the internal audit event stream (or batch source), and before:
+- Batching/serialization
+- Destination adapter logic
+- Checkpoint advancement for “sent successfully” events
+
+This implies:
+- Events excluded by filters do not incur destination adapter cost.
+- Excluded events are treated as “successfully processed” for the exporter’s checkpoint progression.
+
+## Alternatives considered
+### A) Evaluate filters in the control plane (centralized evaluation)
+Pros:
+- Single evaluation implementation.
+- Potentially easier to keep consistent with schema changes.
+
+Cons:
+- Requires routing/streaming all audit events through the control plane, increasing cost and coupling.
+- Creates additional failure modes and can impact the control plane SLO.
+
+Decision: Not chosen.
+
+### B) Allow arbitrary JSONPath / CEL-like expressions
+Pros:
+- Powerful and flexible.
+
+Cons:
+- High risk of performance issues and complexity.
+- Difficult to validate safely, especially around sensitive fields.
+- Harder to provide a good UX and predictable customer experience.
+
+Decision: Not chosen for beta; reconsider for GA only if demanded and we can sandbox safely.
+
+### C) Denylist-only model
+Pros:
+- Simple mental model.
+
+Cons:
+- Poor for cost control (customers must know everything to deny).
+- Not aligned with least-privilege export.
+
+Decision: Not chosen.
+
+## Performance implications
+### Exporter CPU and memory
+- Rules are compiled into an in-memory matcher structure per tenant/destination.
+- Matching is designed to be O(1) membership checks (hash sets) plus CIDR checks.
+- No allocation-heavy operations in the hot path (no regex, no JSON parsing beyond schema decode already required).
+
+### Cardinality and metrics
+To avoid metric/cardinality explosions:
+- Exporter metrics will label with:
+  - `tenant_id` (already accepted cardinality for exporter metrics in beta dashboards)
+  - `destination_type` (s3/splunk/datadog)
+  - `filter_outcome` (included/excluded)
+  - `reason` (coarse: allow_miss, deny_match, invalid_source_ip)
+- We will **not** label metrics by action/resource_id/etc.
+
+### Config propagation and staleness
+- Exporter periodically syncs config with a bounded refresh interval.
+- Filter configs are versioned; exporter logs the active filter version per tenant/destination.
+- Control plane exposes a status surface so operators can detect “config updated but exporter not yet applied.”
+
+## Security and privacy considerations
+- Filters cannot reference prohibited fields (payloads, prompts, model outputs).
+- Control plane validation enforces allowed field set and enumerations.
+- RBAC: only privileged roles can create/update export filters; read access to filters is separately permissioned (because filters may reveal sensitive actor/resource identifiers).
+- Audit trail: changes to export filters are themselves audit logged under `category=audit_export`.
+
+## Consequences
+### Positive
+- Predictable, high-performance filtering.
+- Clear customer expectations and UI/UX feasibility.
+- Minimizes privacy risk surface.
+
+### Negative / tradeoffs
+- Some customers will request more complex conditions (e.g., “exclude service accounts except X” with patterns; time-of-day; regex). These are out of scope for beta.
+- Replaying/backfill with a changed filter can yield different included sets than earlier exports; this is acceptable but must be documented.
+
+## Rollout plan
+- Feature-flagged by tenant allowlist.
+- Beta defaults:
+  - No filter configured (export all) unless customer explicitly configures allow rules.
+  - Provide recommended starter filters per destination in Console templates.
+- Collect feedback from beta cohort about:
+  - Category taxonomy completeness
+  - Need for action-level filtering
+  - Backfill expectations
+
+## Open questions (tracked for GA)
+1. Do we need “export schedules” or per-event time predicates (and how to keep determinism with retries)?
+2. Should we support prefix matching for `action` or `resource.type` (e.g., `model_deployment.*`) without regex?
+3. Do we need workspace-level vs org-level filter inheritance across multiple destinations?
+4. How do we handle schema taxonomy evolution (new categories) with allowlist filters—should we offer an “include future categories under X” mechanism?
+
+## Appendix: glossary
+- **Allowlist:** rules that include matching events.
+- **Denylist:** rules that exclude matching events.
+- **Compiled filter spec:** normalized, versioned representation produced by control plane and evaluated by exporter.
+- **Deterministic evaluation:** same event + same filter version => same outcome, regardless of retry/replay timing.

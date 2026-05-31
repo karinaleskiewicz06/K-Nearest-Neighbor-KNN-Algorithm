@@ -1,0 +1,114 @@
+Adaptive Retry Scheduling and Cost-Aware Backoff (ADR)
+
+This ADR defines a cross-layer standard for adaptive retry scheduling and cost-aware backoff that coordinates client-side, gateway, and runtime behaviors to meet latency SLOs while preventing cost runaway and preserving correctness for idempotent and non-idempotent inference requests.
+Adopt a standardized adaptive retry/backoff contract that: (1) expresses retry semantics and idempotency requirements in request metadata; (2) enables SLO-driven dynamic backoff windows at the gateway and runtime; (3) integrates a tenant-cost-burn signal to throttle retries when budget risk is detected; and (4) provides deterministic deduplication semantics to avoid duplicate-output hazards for non-idempotent tool-calls.
+Redwood services operate across hosted, dedicated, and private deployments. During transient upstream faults, naive retry strategies create two recurring problems: (a) traffic amplification leading to cascading failures and flare-ups in GPU cost; and (b) correctness hazards for requests that trigger external side effects or tool-calls. We need a consistent runtime + client contract that is SLO-aware, cost-sensitive, and compatible with our existing observability and routing stacks.
+Must meet the following requirements:
+
+- Preserve user-visible correctness for idempotent and non-idempotent requests.
+- Bound retry amplification under high error or latency percentiles.
+- Allow runtime to reduce retries when cost budget or GPU pressure is high.
+- Emit telemetry for every retry decision (reason, actor, attempt number).
+- Support per-tenant and per-route overrides with safe defaults.
+- Be implementable in hosted gateway, dedicated edge proxies, and private runtime sidecars.
+Requests MUST carry the following headers/metadata (or SDK equivalents):
+
+- X-Req-Id (required): canonical request id for tracing/dedup.
+- X-Idempotency-Level (optional): values = {idempotent, best-effort, non-idempotent}. Default = best-effort.
+- X-Max-Retries (optional): integer cap from client; servers may lower. Default = 3.
+- X-Retry-Group (optional): logical group for dedup TTL (examples: chat.turn, embed.batch).
+- X-Retry-Hint (optional): one of {fast-retry, delayed-retry, do-not-retry}.
+
+The runtime MAY override X-Max-Retries downward and MUST annotate response metadata with the final retry policy used (Retry-Policy-Applied: {max_retries: N, strategy: name}).
+Core algorithm (gateway/runtime cooperative):
+
+1) Classify failure: transient (timeout, 5xx, upstream-unavailable), permanent (4xx), ambiguous (rate-limit).
+2) For transient failures: consult SLO health signal and cost burn signal. Compute effective backoff multiplier M = base * SLO_factor * Cost_factor, where base is exponential base (default 2.0), SLO_factor ∈ [0.5, 2.0] maps p95 latency and error budget consumption, Cost_factor ∈ [0.25, 3.0] maps short-term cost burn.
+3) Apply jittered exponential backoff with cap = min(client_cap, runtime_cap).
+4) Short-circuit immediate retry if failure classified as fast-recoverable and system signals (queue depth, GPU utilization) below low-water thresholds.
+5) If tenant cost burn exceeds threshold or GPU pressure is high, reduce retries to 0 and route to degraded path (lower-fidelity model variant) if configured.
+
+This algorithm is expressed via a single runtime config map (see examples) and must be versioned with runtime-config schema version metadata.
+# Example YAML for gateway/runtime policy (semantic, explanatory):
+policy_version: v1
+defaults:
+  max_retries: 3
+  base_backoff_ms: 100
+  cap_backoff_ms: 30000
+  jitter: full
+  idempotency_enforcement: strict
+scoring_parameters:
+  slo_p95_weight: 0.6  # how strongly p95 influences the SLO_factor
+  cost_burn_weight: 0.4
+cost_budgets:
+  tenant_override_enabled: true
+  default_cost_threshold_pct: 70
+routing_fallbacks:
+  low_fidelity_model: model-small-quantized-v2
+  degrade_after_retries: 0
+per_route_overrides:
+  /api/v1/chat:
+    max_retries: 1
+    base_backoff_ms: 200
+    idempotency_enforcement: relaxed
+
+Note: actual implementations will store equivalent config as typed protobufs or JSON schemas with validations.
+Instrumentation MUST include the following emitted fields on retry decisions:
+
+- retry.attempt (int)
+- retry.actor (string): {client, gateway, runtime} 
+- retry.reason (string): {timeout, transient-5xx, upstream-unavailable, rate-limit, cost-guard}
+- retry.final_policy (string): serialized policy id/version
+- retry.dedup_hit (bool)
+
+SLO integration: gateway/runtime will compute a real-time SLO_factor from: p95 latency window (5m), error budget consumption (30m), and recent retry amplification metric. When SLO_factor > 1.5, the system reduces retries aggressively.
+
+Alerting: create SLO alerts when retry amplification ratio (retries_sent / requests_received) > 0.2 over 5m for critical routes.
+Dedup semantics: For idempotent requests, dedup TTL = 60s by default (configurable per route). For non-idempotent requests, dedup MUST NOT be used unless the request includes an explicit idempotency token and the back-end declares safe-replay semantics.
+
+Implementation notes:
+- Gateway-level dedup uses X-Req-Id and X-Retry-Group to detect duplicate inflight requests and reply with cached streaming state when possible.
+- Runtime-level dedup uses deterministic request hashes and a small LRU ephemeral store scoped to the model shard. LRU entry lifetime = dedup TTL.
+
+Failure modes: If dedup store is lost during failover, requests may be reprocessed; fallback policy should be configured to prefer degraded output over blocking.
+Phase 0 (design & test): 2 weeks. Implement library-level SDK headers and unit tests.
+
+Phase 1 (gateway canary): Roll out adaptive backoff at gateway for 10% of traffic to non-critical routes. Monitor retry amplification, p95, cost burn for 72 hours.
+
+Phase 2 (runtime opt-in): Enable runtime-side lowering of retries for dedicated pools under GPU pressure; adopt for staging.
+
+Phase 3 (tenant opt-in): Allow selected large tenants to opt into vendor config controlling cost_budgets and special fallbacks.
+
+Phase 4 (global enable): After 4 weeks of stability and no correctness regressions, flip default policy to adaptive for all routes. Feature flags: gateway.adaptive_retry.enabled, runtime.cost_guard.enabled.
+
+Rollback knobs: instant disable on error budget breach or observed customer-impacting duplicated side effects. Rollback procedure documented in runbook (related_pages).
+Testing strategy:
+
+- Unit tests for policy arithmetic and deterministic backoff outputs.
+- Integration tests with synthetic latencies and injected 5xx to exercise policy paths.
+- Chaos tests: simulate dedup store loss and verify outputs for non-idempotent tokens.
+- Cost-simulation sandbox: run replayed production traces with adaptive policies to measure delta in cost and p95.
+- Contract tests: ensure SDKs send required metadata and servers respond with Retry-Policy-Applied header.
+
+Acceptance criteria: no >1% increase in undetected duplicate side effects in canary, 10–30% reduction in token-cost during burst-unavailability scenarios, and p95 not degraded >10% for critical routes.
+1) Client-only retries: rejected because clients lack global SLO/cost context and cause wide amplification.
+2) Fixed global backoff with per-route overrides: simple but brittle; cannot react to transient cost or GPU pressure.
+3) Full client-side token-bucket throttle: heavy lift for SDKs and cross-tenant fairness; deferred to future work.
+
+We chose a cooperative gateway+runtime approach for rapid safety and centralized observability.
+Operational impact: new telemetry increases cardinality — must apply sampling and aggregation suggestions in observability-standards. Cost control: this ADR enables active cost bailouts but requires clear product communication to tenants (possible degraded fidelity).
+
+Security: metadata must be authenticated (signed tokens for idempotency where provided) to avoid spoofing replay protections.
+
+Compatibility: private deployments may opt-out or tune parameters; the contract is intentionally lenient (defaults conservative) so as not to break older clients.
+Approvers:
+- Product: Priya Menon
+- Eng SRE: Elliot Harper
+- Runtime: Marcos Alvarez
+
+Document owner: Asha Gupta (Engineering)
+- Q1: Default dedup TTL tradeoff for large multi-turn chats (60s may be too short).
+- Q2: Should cost_budgets be absolute dollars or normalized units per tenant? Recommendation: use normalized cost units and expose both controls.
+- Q3: How to annotate streaming partials when dedup hits? Proposal: include Retry-Dedup-Partial: true header and stream resume token.
+
+Track these in the follow-up task board and link into the rollout runbook.

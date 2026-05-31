@@ -1,0 +1,430 @@
+Perf Regression Canary (Prod) — Design: Runtime + Kernel/Scheduler Attribution
+
+## 1. Summary
+We will deploy a lightweight, always-on **performance canary** in production to detect and alert on **per-model** serving regressions before they broadly impact customers. The canary continuously runs a **synthetic, privacy-safe workload** against a curated model list in each enabled region/tier and evaluates results against **versioned baselines**.
+
+Primary regression signals:
+- **p95 end-to-end latency** and **p95 runtime-only latency**
+- **tokens/sec** (throughput)
+
+Secondary signals used for attribution and fast triage:
+- Prefill vs decode latency
+- Scheduler **queueing time** and batch size distribution
+- KV cache hit rate (where applicable)
+- Runtime build id, kernel selection id, scheduler config id
+
+This document covers the architecture, workload model, metrics, baseline strategy, regression evaluation, attribution, and rollout plan.
+
+## 2. Problem statement
+Runtime performance regressions are often introduced by:
+- Kernel changes (new fused kernels, attention paths, quantization kernels)
+- Scheduler/batching heuristic changes (continuous batching decisions, token budget changes)
+- Model config updates (rope scaling, max context, kv cache settings)
+- GPU fleet changes (new driver, MIG layout, SKU mix)
+- Release/rollout sequencing and region-specific differences
+
+Customer traffic is too noisy and privacy-sensitive to use directly for early detection. We need a controlled, repeatable signal that is:
+- **Low overhead** (<0.5% GPU capacity per region for covered models)
+- **Low noise** (anti-flap, minimum sample sizes)
+- **Actionable** (clear attribution: kernel vs scheduler vs infra)
+- **Integrates** into dashboards, incident-bot, and rollout gates
+
+## 3. Goals / non-goals
+### 3.1 Goals
+1) Detect per-model regressions in production with low noise:
+- Latency: p95 and p99 (end-to-end and runtime-only)
+- Throughput: tokens/sec drop (decode throughput)
+
+2) Provide fast triage signals to classify regressions:
+- Kernel-level vs scheduler-level vs model-config-level vs infra/fleet-level
+
+3) Integrate into existing tooling:
+- Grafana dashboards and trace/log links
+- Alert routing to #eng-runtime and SRE on-call (tiered)
+- Rollout workflow gates (pause / rollback criteria)
+
+4) Keep overhead and risk low:
+- Strict QPS and token budgets
+- No customer prompts, no user identifiers
+
+### 3.2 Non-goals (initial)
+- Shadowing or sampling real customer prompts/traffic
+- Coupling to quality regression evaluation (handled by Applied ML eval harness)
+- GPU microbench replacement (this is an always-on canary; microbench remains pre-merge / pre-release)
+
+## 4. High-level architecture
+### 4.1 Components
+**Service:** `perf-canary`
+- Stateless service deployed per region
+- Generates synthetic requests (seeded workload)
+- Calls internal inference endpoints using restricted auth scope
+- Emits metrics + structured events
+- Evaluates regressions against baselines
+- Sends alert webhooks to incident-bot
+
+**Control plane config:** `canary_targets` (validated + audited)
+- Which models/versions per region/tier are covered
+- Workload profile to use (prompt buckets, target output lengths)
+- Safety limits (QPS/tokens budget)
+
+**Baseline store:** `perf-baseline-store`
+- Versioned baseline artifacts keyed by (model_id, model_version, runtime_build, hardware_sku, region?)
+- Read path: perf-canary fetches the baseline summary needed for regression evaluation
+- Write path: baseline generation job produces artifacts after controlled load runs
+
+**Telemetry pipeline:** Prometheus-compatible metrics + trace sampling
+- Metrics: histograms and counters (guarded cardinality)
+- Traces: limited sampling of canary requests only (no customer data)
+
+**Dashboards + alerts:** Observability pack + incident-bot
+- Grafana dashboards per model with breakdowns
+- Warning and paging alert rules with dampening
+- Incident-bot dedupe keys and runbook links
+
+### 4.2 Request flow (text diagram)
+1) `perf-canary` loads `canary_targets` for region `R` and tier `T`.
+2) For each enabled model target, it generates a synthetic prompt (seeded) and calls:
+   - `inference-gateway.internal/v1/chat/completions` (or equivalent internal route)
+3) Runtime emits request-scoped metrics including:
+   - runtime build id, kernel selection id, scheduler config id
+   - queueing time, batch size, prefill/decode timing
+4) `perf-canary` aggregates samples into a rolling window and evaluates against baseline.
+5) On regression, `perf-canary` posts a structured alert payload to `incident-bot`.
+6) Incident-bot posts to Slack and links to:
+   - Grafana dashboards
+   - Baseline artifact
+   - Runbook
+
+## 5. Canary workload model (synthetic, privacy-safe)
+### 5.1 Design principles
+- Represent common **shape** of production requests (prompt lengths and decode lengths) without using any customer content.
+- Be reproducible: deterministic seeding so changes are attributable.
+- Avoid pathological prompts that trigger unusual tokenization variance.
+- Cover multiple buckets because regressions often appear at specific sequence length or batch behavior.
+
+### 5.2 Prompt distribution (v0)
+We use a small set of prompt templates that are semantically inert and stable (e.g., “system: You are a helpful assistant.” + generated filler). The content is non-sensitive and generated in-service.
+
+Buckets are defined by **input tokens** (approximate) and **target output tokens**.
+
+Table: v0 buckets
+- Bucket A (short): input 32–64 tokens, output 64 tokens
+- Bucket B (medium): input 256–384 tokens, output 128 tokens
+- Bucket C (long prefill): input 1,024–1,536 tokens, output 64 tokens
+- Bucket D (long decode): input 256–384 tokens, output 512 tokens
+
+Target mix (initial): A 35%, B 35%, C 15%, D 15%
+
+Rationale:
+- A/B cover common chat sizes and batch behavior.
+- C is prefill-heavy and catches attention/prefill kernel regressions.
+- D is decode-heavy and catches tokens/sec and decode kernel regressions.
+
+### 5.3 Generation parameters
+Defaults (can be overridden per model target):
+- Temperature: 0.0 (reduce stochasticity)
+- Top_p: 1.0
+- Presence/frequency penalty: 0
+- Stop sequences: none
+- Streaming: off for primary canary (avoid client-side streaming variance). We may add a streaming track later.
+
+### 5.4 Scheduling and rate limiting
+The canary must be “always-on” but not disruptive.
+
+Per region, per model target:
+- Max QPS: 0.05–0.2 QPS (tuned by model cost)
+- Concurrency: 1 (initial)
+- Token budget guardrail: max 25k tokens/min/model (input+output)
+
+Global guardrails:
+- Hard cap of total canary tokens/min per region (config default: 200k tokens/min)
+- Automatic backoff on elevated error rates or increased queueing
+
+### 5.5 Isolation and routing
+- The canary uses an internal route that is isolated from customer auth scopes.
+- Targets are pinned to a specific **capacity tier** where possible (Hosted/Dedicated pools differ).
+- Requests include `x-redwood-canary: perf-regression` header for traceability and filtering.
+
+## 6. Metrics captured
+### 6.1 Required metrics (per model target)
+All metrics must be emitted for canary traffic only (filterable by header/service identity).
+
+Latency (histograms):
+- `canary_e2e_latency_ms` (client-observed; includes gateway + scheduler + runtime)
+- `runtime_total_latency_ms` (runtime-observed; excludes gateway)
+- `runtime_prefill_latency_ms`
+- `runtime_decode_latency_ms`
+- `scheduler_queueing_latency_ms`
+
+Throughput:
+- `runtime_tokens_generated_total` (counter)
+- `runtime_tokens_per_second` (derived; or emit as gauge per request)
+
+Batching / scheduler behavior:
+- `scheduler_batch_size` (histogram)
+- `scheduler_microbatch_count` (histogram or summary)
+- `scheduler_active_requests` (gauge; optional)
+
+Caching:
+- `runtime_kv_cache_hit_rate` (gauge; where applicable)
+- `runtime_prefix_cache_hit_rate` (gauge; where applicable)
+
+Reliability (for safety + correlation):
+- `canary_request_errors_total` labeled by error class (timeout, 5xx, 429)
+- `canary_request_timeouts_total`
+
+### 6.2 Required dimensions (labels) and cardinality rules
+We keep labels minimal and bounded.
+
+Required labels:
+- `model_id` (canonical)
+- `model_version` (canonical)
+- `region`
+- `capacity_tier` (hosted|dedicated|private where applicable)
+- `hardware_sku` (e.g., h100-sxm, a100-80gb, l40s)
+- `runtime_build_id` (short hash)
+- `kernel_selection_id` (bounded id, not raw kernel name list)
+- `scheduler_config_id` (bounded id)
+
+Explicitly not allowed:
+- request ids
+- tenant/customer ids
+- prompt hashes
+- raw prompt lengths as labels (use buckets/quantiles)
+
+Note: `kernel_selection_id` and `scheduler_config_id` must be stable enums with bounded cardinality (see §8).
+
+## 7. Baseline strategy
+### 7.1 Baseline keys
+Baselines are versioned and stored per:
+- `model_id`
+- `model_version`
+- `runtime_build_id`
+- `hardware_sku`
+- `capacity_tier`
+- optionally `region` (see §7.4)
+
+We intentionally do NOT baseline purely by “model” because:
+- Performance is sensitive to runtime build and hardware
+- Model version pinning matters for consistent expectations
+
+### 7.2 Baseline contents
+For each metric, the baseline artifact includes:
+- p50/p95/p99 estimates
+- dispersion/variance estimate (e.g., MAD or stddev) for noise-aware thresholds
+- sample size used and collection window metadata
+- reference links: baseline job run id, runtime release id
+
+### 7.3 How baselines are generated
+Baselines are produced by a controlled load job (benchmark-lab) that runs the same workload profile against a prod-like pool:
+- Warmup phase (discard)
+- Measurement phase (target N requests per bucket)
+
+Acceptance criteria to publish a baseline:
+- Minimum sample size per bucket (initial: 200 requests/bucket)
+- No elevated error rate (>0.5%)
+- Stable queueing (p95 queueing under defined cap for “baseline-quality”)
+
+### 7.4 Region handling
+Initial policy:
+- Baseline is **hardware SKU + tier scoped**, and region is treated as an attribute for monitoring.
+- We only split baselines by region when we have evidence of consistent region deltas (driver versions, fleet composition).
+
+Operationally:
+- The evaluator can apply region-specific multipliers if needed (config-based) without exploding baseline cardinality.
+
+### 7.5 Baseline updates and drift
+Baselines are updated when any of the baseline keys change (new runtime build, new model version, new hardware SKU).
+
+We avoid continuously rolling baselines in the first iteration because it can hide slow regressions and caused alert storms in prior systems. Instead:
+- Baselines are **fixed per release key** and explicitly advanced.
+- We monitor drift separately via a “baseline freshness” dashboard panel and a “slow drift” warning (non-paging).
+
+(See ADR: baseline computation and thresholds.)
+
+## 8. Regression evaluation and anti-flap logic
+### 8.1 Windowing and minimum samples
+`perf-canary` aggregates observations in a rolling evaluation window.
+
+Defaults (per model target):
+- Evaluation window: 30 minutes
+- Minimum samples: 80 total requests AND at least 15 requests in each of the top 2 buckets by weight
+- Cooldown: 45 minutes after an alert resolves before re-alerting on the same key
+
+### 8.2 Regression definitions (initial)
+We evaluate multiple conditions. A regression is raised if ANY “paging” condition is met, otherwise warning if “warning” conditions are met.
+
+Definitions use percent change from baseline:
+- Latency regression: `(observed_p95 / baseline_p95 - 1)`
+- Throughput regression: `(baseline_tokens_per_sec / observed_tokens_per_sec - 1)`
+
+Initial thresholds (subject to calibration):
+Warning:
+- p95 e2e latency >= +10% for 2 consecutive windows
+- OR p95 runtime latency >= +10% for 2 consecutive windows
+- OR tokens/sec drop >= 8% for 2 consecutive windows
+
+Paging (top models only; controlled by target list):
+- p95 e2e latency >= +20% for 2 consecutive windows
+- OR tokens/sec drop >= 15% for 2 consecutive windows
+
+Guardrails:
+- If scheduler queueing p95 increases by >30% AND runtime latency is flat (<= +5%), classify as “capacity/scheduler” and route as warning unless sustained > 90 minutes.
+
+### 8.3 Noise controls
+- Use histograms and compute quantiles server-side (Prometheus/Grafana) and evaluator-side using stable quantile estimator.
+- Apply a small smoothing factor for p95 comparisons (EWMA across windows) but never smooth raw metric emission.
+- Enforce “two-window confirm” for warning/paging.
+- Deduplicate alerts by: (model_id, model_version, runtime_build_id, hardware_sku, region, tier, metric_class).
+
+## 9. Attribution and triage signals
+When a regression triggers, we want immediate evidence pointing to the likely root cause.
+
+### 9.1 Kernel-level vs scheduler-level heuristics
+The alert payload includes a classification based on these decision rules:
+
+A) Likely kernel/runtime execution regression
+- `runtime_total_latency_ms` p95 increases materially (>= threshold)
+- AND `scheduler_queueing_latency_ms` is flat or minor
+- AND `kernel_selection_id` changed recently OR correlates with runtime_build_id change
+
+B) Likely scheduler/capacity regression
+- `scheduler_queueing_latency_ms` p95 increases materially
+- AND `runtime_total_latency_ms` p95 is flat or minor
+- AND batch size distribution shifts (lower effective batch) OR active requests increases
+
+C) Likely model-config regression
+- Regressions are isolated to a single model_version
+- AND kernel_selection_id and runtime_build_id unchanged
+- AND prefill/decode split changes consistent with config (e.g., max context / rope)
+
+D) Likely infra/fleet regression
+- Regressions correlate with hardware_sku or a single region
+- Increased variability + increased queueing + increased error rates
+- Correlated fleet signals (driver rollout, MIG config changes) if available
+
+### 9.2 Required tags for attribution
+To support the above, runtime telemetry MUST expose:
+- `runtime_build_id`
+- `kernel_selection_id` (bounded enum; e.g., “attn_v3_fp16”, “attn_v4_flash”, “int8_decode_v2”)
+- `scheduler_config_id` (bounded enum; ties back to scheduler heuristics)
+
+Implementation detail:
+- Do not emit raw kernel names or dynamic combinations as labels.
+- Maintain a mapping table in runtime code for stable ids.
+
+### 9.3 What goes in the alert payload
+Alert payload fields (sent to incident-bot):
+- model_id, model_version, region, tier, hardware_sku
+- runtime_build_id, kernel_selection_id, scheduler_config_id
+- baseline p95 and observed p95 (e2e and runtime)
+- baseline tokens/sec and observed tokens/sec
+- queueing p95 and batch size deltas
+- confidence level (based on samples and variance)
+- links: dashboards, baseline artifact, recent runtime release notes, runbook
+
+## 10. Dashboards (what we expect to see)
+For each model target, the dashboard provides:
+- p50/p95/p99 time series for e2e latency and runtime latency
+- Prefill/decode/queueing breakdown
+- tokens/sec and tokens/request
+- batch size histogram (over time)
+- KV cache hit rate (when enabled)
+- Annotation overlays for runtime releases and kernel flag flips
+
+Dashboards must include a single-click “Compare to baseline” panel showing percent deltas.
+
+## 11. Deployment, safety, and privacy
+### 11.1 Identity and permissions
+- `perf-canary` runs under a restricted service account scope: inference read + metrics write.
+- No access to customer metadata stores.
+- Config reads are audited.
+
+### 11.2 Data handling
+- Synthetic prompts only.
+- No prompt or completion text is persisted.
+- Logs are redacted and include explicit assertions:
+  - never log request payload
+  - never log auth tokens
+  - only log bucket id and token counts
+
+### 11.3 Overhead budget
+Target: <0.5% GPU capacity per region for covered models.
+
+Operational budget model (initial):
+- Per model target token budget: 25k tokens/min
+- If a region runs 10 covered models, total = 250k tokens/min
+- Convert to GPU utilization using measured tokens/sec per SKU and average batch behavior; enforce hard cap per region.
+
+Safety valves:
+- Global disable switch in control plane (`canary_enabled=false`)
+- Automatic backoff on:
+  - queueing p95 exceeding threshold
+  - elevated 429s
+  - elevated 5xx
+
+## 12. Rollout plan
+### Phase 0: Staging and prod-like bake
+- Run canary against staging pools and a prod-like dedicated environment
+- Validate metric correctness, label cardinality, and baseline stability
+- Acceptance: variance characterization complete, no unexpected overhead
+
+### Phase 1: Prod enablement (single region, small model set)
+Target: `us-east`
+- Enable 2–3 models:
+  - 1 “top model” (high traffic)
+  - 1 “high-risk model” (recent kernel/scheduler changes)
+  - 1 long-context model (prefill heavy)
+- Start with warning-only alerts for 7–14 days
+- Tune min sample sizes and dampening
+
+### Phase 2: Enable paging for top models
+- Gate on: low false positive rate and on-call readiness
+- Paging only for top-model list
+- Confirm incident-bot dedupe and runbook links
+
+### Phase 3: Expand coverage
+- Expand to top 10 models and additional regions (e.g., eu-west)
+- Re-evaluate whether region-specific baselines are needed
+
+### Phase 4: Rollout gates integration
+- Use canary as an automated signal in release workflow:
+  - “Pause expansion” when paging-level regression in canary
+  - Optional auto-rollback for runtime build when confidence is high
+
+## 13. Failure modes and mitigations
+- Canary causes queueing / interference:
+  - Mitigation: strict QPS/token caps, backoff on queueing, per-region hard caps
+
+- False positives due to baseline drift:
+  - Mitigation: fixed baselines per release key, drift monitoring as separate non-paging signal, two-window confirm
+
+- Metric label explosion:
+  - Mitigation: bounded enums for kernel/scheduler ids; no high-cardinality labels
+
+- Telemetry pipeline latency causes late alerts:
+  - Mitigation: evaluator uses direct client-observed metrics for quick checks; dashboards annotate ingestion delay
+
+- Canary fails silently:
+  - Mitigation: heartbeat metric `canary_runs_total` and “canary stopped” warning alert
+
+## 14. Open questions
+1) Should we maintain separate baselines for hosted vs dedicated pools when the hardware SKU is the same but scheduling policies differ?
+2) Do we need a streaming-mode canary track to catch gateway/streaming regressions (separate from runtime)?
+3) How should we represent and validate `kernel_selection_id` when kernel selection is partially dynamic?
+4) What is the long-term policy for baseline freshness (e.g., monthly re-baseline even without release key changes)?
+
+## 15. Ownership
+- Design/implementation lead: Noah Patel
+- Scheduler attribution + queueing metrics: Sofia Ivanova
+- Kernel tagging + correlation: Hiro Tanaka
+- Runtime instrumentation: Omar El-Sayed
+- Telemetry + baselines pipeline: Logan Wright, Nadia Rahman
+- Alerting standards + dashboard consistency: Allison Grant
+- SRE readiness + paging policy: Sean Gallagher, Rafael Mendes
+
+## 16. Appendix: Terminology
+- E2E latency: client-observed time from request submission to full response completion
+- Runtime latency: time measured inside the model runtime (excludes gateway)
+- Queueing latency: time spent waiting for scheduler admission / batch formation
+- Tokens/sec: generated tokens divided by decode time (or runtime decode phase time)

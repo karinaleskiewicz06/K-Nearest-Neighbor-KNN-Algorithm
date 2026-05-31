@@ -1,0 +1,177 @@
+Predictive GPU Scale & Eviction Playbook
+
+Summary
+
+This playbook defines Redwood's recommended approach for predictive scaling and graceful eviction of GPU-backed inference workloads. It describes the architecture, metrics and dashboards, alerting thresholds, operational runbook for incidents, and a short retrospective checklist for continuous improvement. This doc is intended for platform engineers, SREs, and owners of the gpu-orchestrator, scheduler-api, and capacity services.
+
+Goals and scope
+
+- Goal: Reduce customer-visible latency regressions during demand spikes while maximizing GPU utilization and minimizing cold-start cost.
+- Scope: Predictive horizontal scaling (pool-level & tenant-slice), priority-aware eviction, burst-credit accounting, and associated dashboards and alerts. Does not cover node lifecycle provisioning (see gpu-pool-live-shrink runbook).
+
+Ownership
+
+- Primary owner: eng-platform (platform-scheduling subteam)
+- Secondary owners: eng-infra (gpu-fleet team), eng-serving-runtime (runtime team)
+- On-call rotation: platform-scheduling primary pager; escalation to gpu-fleet after 30 minutes if capacity cannot be recovered.
+
+Key concepts and terminology
+
+- predictive scaler: Service that forecasts 10m/30m/2h demand and suggests scale actions (predictive-scaler).
+- eviction policy: Priority and fairness rules applied when GPU memory or compute is constrained.
+- burst credits: Short-term capacity allowance for latency-sensitive tenants.
+- KV cache warmup: Mechanism to prepopulate model KV caches after scale-up to reduce first-token latency.
+
+Metrics and SLOs (what we observe)
+
+- Core SLOs (global):
+  - 99th-percentile response latency <= configured target for latency-sensitive models (default 750ms)
+  - Error rate (5xx) < 0.2% per minute
+- Capacity/utilization targets (internal):
+  - Average GPU memory utilization target: 65%
+  - Average GPU compute utilization target: 55%
+  - Spare headroom target for burst: 10% of pool capacity
+
+Essential metrics to stream into Prometheus/metrics pipeline:
+
+- predictive_scaler.forecast_rate_{10m,30m,2h}
+- scheduler_api.pending_queue_length
+- gpu_pool.available_gpus
+- gpu_pool.memory_headroom_percentage
+- tenant_priority_burst_credit_{available,consumed}
+- runtime.kv_cache_hit_rate
+- inference_latency_ms_p50_p95_p99 (per model)
+
+Dashboards (recommended panels)
+
+1) Predictive Scaling Overview (grafana)
+- Forecast vs actual QPS (10m, 30m)
+- Scale actions timeline (scale-ups/scale-downs triggered by predictive-scaler)
+- Pending start time distribution after scale-up (bucketed in seconds)
+
+2) Eviction & Priority View
+- Eviction count by reason (memory_pressure, preemption, node_failure)
+- Evicted-tenant list (last 24h)
+- Burst-credit balance heatmap by tenant tier
+
+3) Cold-start & KV Warmup
+- First-token latency for sessions that start after scale-up
+- KV cache warmup success rate (jobs vs target)
+
+Alerting and thresholds (Prometheus-style examples)
+
+- Alert: predictive_scaler.misforecast_ratio > 1.25 for 3m
+  - Meaning: Forecast is underestimating actual QPS by 25% or more. Action: investigate recent traffic changes, consider increasing forecast sensitivity or enabling immediate scale-up.
+- Alert: gpu_pool.memory_headroom_percentage < 8% for 5m
+  - Meaning: Low memory headroom; risk of OOM/ejections. Action: prepare eviction runbook steps and notify SRE.
+- Alert: scheduler_api.pending_queue_length > 200 for 2m
+  - Meaning: Backlog indicates throttling or insufficient capacity.
+
+Sample PromQL (for alert translation)
+
+- gpu_pool.memory_headroom_percentage < 8
+- (sum(rate(inference_requests[1m])) by (pool) / predictive_scaler.forecast_rate_10m) > 1.25
+
+Eviction policy and priority rules
+
+Eviction is last-resort. Use the following ordered rules when memory/compute scarcity requires reclaiming:
+1. Preempt best-effort low-priority tenants (tier = dev/batch) with oldest idle timestamp > 5m.
+2. Reclaim ephemeral worker slots with no in-flight requests (safe to terminate immediately).
+3. If still constrained, preempt lowest-priority latency-sensitive sessions with active fallback model configured.
+4. As a final fallback, trigger graceful throttle for top consumers and notify product SLO owners.
+
+Priority attributes considered:
+- tenant_tier: enterprise | production | dev | batch
+- model_latency_sensitivity: high | medium | low
+- burst_credit_balance: numeric (clients with no credit are lower priority)
+
+Runbook: Incident — sudden spike causing memory headroom < 5%
+
+1) Pager fires on gpu_pool.memory_headroom_percentage < 8% sustained 5m.
+2) On-call acknowledges within 5m and posts to #platform-ops with summary and runbook link.
+3) Investigate: check predictive_scaler.forecast_rate and recent traffic source (kafka/topic, api-gateway logs).
+4) If forecast undershot, trigger immediate scale-up (CLI: rk scale pool --pool-id <id> --add-gpu 2).
+5) If scale-up unavailable or slow, run eviction step 1 (preempt dev/batch tenants):
+   - CLI: rk eviction run --pool <id> --policy preempt-dev-batch --dry-run=false
+6) After evictions, monitor inference_latency_p99 and error_rate for 10m.
+7) If errors persist, escalate to gpu-fleet on-call and consider rolling restart of scheduler-api (safe window: low traffic periods only).
+8) Prepare post-incident notes with timeline and corrective actions. Add to retrospective board.
+
+Operational runbook: graceful scale-up with KV warmup
+
+1) predictive-scaler computes a recommended scale-up for pool-A of +3 GPUs.
+2) scheduler-api reserves slots and instructs gpu-orchestrator to allocate instances (k8s/GKE workers or on-prem node allocator).
+3) Once nodes are healthy, run KV warmup jobs (job template below) against warmup-queue to prepopulate KV cache for high-priority models.
+4) Only publish new capacity to tenant routing (router-service) after kv_warmup.success_rate >= 95% or 60s elapsed.
+
+KV warmup job sample (yaml snippet):
+
+apiVersion: v1
+kind: Job
+metadata:
+  name: kv-warmup-job-pool-A-{{timestamp}}
+spec:
+  template:
+    spec:
+      containers:
+      - name: warmup
+        image: internal/warmup:stable
+        args: ["--pool=pool-A","--models=baseline-list","--concurrency=8"]
+      restartPolicy: Never
+
+Configuration table (recommended defaults)
+
+| config_key | default | notes |
+|------------|---------|-------|
+| predictive_scaler.lookback_window | 2h | training window for forecast model |
+| predictive_scaler.sensitivity | 0.2 | fraction of predicted change that triggers immediate action |
+| eviction.idle_threshold_seconds | 300 | min idle time before preempting dev/batch sessions |
+| kv_warmup.concurrent_jobs | 4 | number of parallel warmup jobs per pool |
+| burst_credit.default | 300 | seconds of burst credit for prod tenants |
+
+Rollout checklist for changes to predictive-scaler or eviction logic
+
+1) Feature branch and unit tests (include synthetic traffic tests).
+2) Canary deploy to staging pool; replay 72h of production metrics and validate forecast error < 15%.
+3) Deploy canary to a single small production pool during off-peak. Monitor dashboards for 1h.
+4) Gradual rollout to remaining pools at 15-minute intervals. Abort if eviction count increases by > 20% over baseline.
+
+Retrospective and continuous improvement items
+
+- After each incident, fill short-form retrospective in the platform-retros board with: what happened, timeline, root cause, mitigations, and follow-ups.
+- Quarterly review: compare forecast error distributions and consider model upgrades (LSTM -> Transformer time-series) where significant bias is observed.
+- KPI to track improvement: p99 latency violations caused by capacity constraints (target down 50% in 6 months).
+
+Implementation notes and tooling
+
+- predictive-scaler implementation recommendations: use a layered approach — short-term ETS/Prophet for 10m/30m, and a light Transformer for 2h+ forecasts when data is available. Keep model evaluation lightweight and explainable.
+- Use a feature-flag (feature.predictive_scaling_v2) to gate changes and allow fast rollback.
+- All scale actions and evictions must be audit-logged to kafka topic: ops.cluster.actions (schema: timestamp, actor, pool_id, action, reason, effected_tenants[]).
+
+Related pages
+
+- /confluence/eng-platform/runbooks/gpu-pool-live-shrink-and-maintenance-runbook-2026
+- /confluence/eng-platform/dashboards-and-alerts/platform-alert-routing-and-escalation-playbook-2026
+
+Appendix: Postmortem template (short)
+
+1) Summary: 1–3 sentences
+2) Timeline: precise timestamps of detection, mitigation actions, and recovery
+3) Impact: tenants affected, estimated client impact, SLA breaches
+4) Root cause and contributing factors
+5) Actions taken and owner assignments
+6) Preventative measures and schedule for implementation
+
+Contact and escalation
+
+- On-call: #platform-pager (PagerDuty: platform-scheduling)
+- Secondary escalation: gpu-fleet on-call (PD: gpu-fleet)
+- Architecture consult: Linh Nguyen (eng-serving-runtime)
+
+Document history
+
+- 2025-09-10: Created by Aisha Patel
+- 2025-12-11: Added KV warmup guidance (review: Diego Ramos)
+- 2026-02-28: Updated alert thresholds and rollout checklist (review: Priya Kaur)
+
+End of playbook

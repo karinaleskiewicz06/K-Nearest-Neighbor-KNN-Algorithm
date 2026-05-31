@@ -1,0 +1,190 @@
+Cold-start latency mitigation for private deployments
+
+Summary
+
+This playbook describes operational and configuration patterns to minimize cold-start latency for Redwood Private deployments (VPC and on-premise). It focuses on the common sources of initialization delays for model-serving processes (model load, CUDA/context warm-up, container start-up, and KV cache population) and provides reproducible mitigations operators can apply during install, day-2 tuning, and upgrades. The procedures are written for platform operators and SREs responsible for private deploys and are intended to be followed during steady-state hardening and incident response.
+
+Scope
+
+- Applies to: Private control plane + runtime in VPC and on-prem bundles (single-tenant and multi-tenant topologies).
+- Targets: reducing user-visible cold-starts for model inference containers/agents and improving tail latency during scale-up events.
+- Not in scope: model architecture changes (model teams should consult model-onboarding docs for model-level optimizations).
+
+Goals and SLOs
+
+- Target steady-state cold-start p95 for small models (<= 7B) <= 2s, p99 <= 5s.
+- Target steady-state cold-start p95 for large models (>= 70B) <= 8s, p99 <= 20s.
+- Reduce frequency of cold-starts by: keeping at least one warm instance per model (where practical) and using prefetching and preloading policies.
+
+Ownership and contacts
+
+- Primary owner: eng-private-deployments (day-2-ops).
+- Oncall escalation: infra-sre -> eng-serving-runtime -> applied-ml.
+- Runbook author: Aisha Patel (Platform Reliability).
+
+Root causes (symptoms to look for)
+
+1. Model load time: large checkpoint file transfer + deserialization; evidenced by high model_load_time_ms metric.
+2. GPU/CUDA context creation: long driver init or cuBLAS/cuDNN first-call penalties (metric: cuda_context_init_ms).
+3. Container/VM boot latency: OS-level boot or container image fetch time (metric: container_start_ms, image_pull_time_ms).
+4. KV cache and prefix warmup: first queries trigger cache misses (metric: kv_cache_miss_rate and kv_prefetch_time_ms).
+5. Eviction/scale-to-zero: aggressive autoscaler scales to zero and creates fresh processes on demand.
+6. I/O congestion: noisy-attached storage during model load (disk_io_wait_ms).
+
+Mitigation patterns (high level)
+
+- Maintain a warm pool: enforce min_replicas or warm-standby processes to avoid autoscaling-to-zero for critical models.
+- Model prefetch and fast startup images: pre-stage model weights into local NVMe or tmpfs on node boot and keep compact startup images that avoid lazy downloads.
+- Lazy-but-prefetch: start worker process with model mapping but delay expensive initializations until a warmup job triggers them.
+- CUDA context warmers: run a tiny kernel warmup step at process start to pay the driver penalty during a predictable window.
+- KV cache prepopulation: run representative traffic or synthetic warmers to populate prefix/KV caches after deploy.
+- Network and storage tuning: tune fio/IO scheduler, mount options and ensure parallel pull concurrency is controlled during fleet startups.
+
+Operator runbook: identifying and addressing a cold-start spike
+
+1) Verify telemetry and scope the issue:
+   - Check dashboards: p95/p99 cold_start_latency, model_load_time_ms, cuda_context_init_ms, image_pull_time_ms, kv_cache_miss_rate.
+   - Identify affected tenants, models and zones. Filter by node type (onprem vs cloud) and recent deploy events.
+
+2) Immediate mitigation (minutes):
+   - If autoscaler scaled to zero, temporarily set min_replicas=1 for the affected model route:
+
+     redwoodctl deploy set-config --model-id <MODEL> --min-replicas 1 --reason "emergency-warmup"
+
+   - If image pulls causing latency, increase parallelism limits and pre-pull images on nodes:
+
+     kubectl get nodes -o name | xargs -n1 -P10 kubectl ssh -- "docker pull registry.redwood/private:<TAG>"
+
+   - Trigger a synthetic warmup job (below) to pre-initialize CUDA contexts and load model weights.
+
+3) Short-term fixes (1-2 hours):
+   - Start warmup jobs that: open CUDA context, load model shards from local cache, run 2-4 `forward` passes with short prompts to populate KV cache. Use the builtin warmup harness:
+
+     redwoodctl warmup run --model <MODEL> --replicas 2 --prompts-file ./warmup-prompts.txt --target-node-selector "gpu=true"
+
+   - If disk or network saturation is observed during parallel model loads, throttle concurrent loads at origin (registry) and stagger restarts by zone.
+
+4) Medium-term tuning (days):
+   - Adopt a warm pool policy per-customer/route in the orchestration layer. Prefer a target of 1 warm replica per active route for latency-sensitive routes.
+   - Precache large checkpoints on local NVMe during maintenance windows with `rsync`+`verify` and use a hashed layout to avoid partial loads: see config table below.
+
+Configuration cookbook (recommended knobs)
+
+| Area | Parameter | Recommended value (default) | Reason / notes |
+|--|--:|--:|--|
+|Autoscaling|min_replicas|1 for latency-critical routes|Avoid scale-to-zero cold starts|
+|Warm pool|idle_keepalive_seconds|300-900|Time to keep idle workers warm before eviction|
+|Model caching|local_cache_path|/var/lib/redwood/models|Local NVMe to avoid repeated registry pulls|
+|Model load IO|max_parallel_loads_per_node|2-4|Limit concurrent heavy loads to reduce I/O contention|
+|CUDA|cuda_warmup_iterations|3|Small kernel runs to pay driver initialization cost|
+|Networking|registry_pull_rate_limit|10 MB/s per-node|Prevent storm on central storage|
+|KV cache|kv_prefetch_window|1000 tokens|How much prefix to prefetch during warmup|
+
+(Represent the table above in your deployment configuration system as key/value pairs.)
+
+Pre-warm job example (bash)
+
+- Save the following as warmup-script.sh and run via redwoodctl or Kubernetes Job.
+
+  #!/usr/bin/env bash
+  set -euo pipefail
+  MODEL=${1:-"${MODEL}"}
+  echo "Starting warmup for $MODEL"
+  # 1) establish CUDA context
+  python - <<'PY'
+import torch, time
+start=time.time()
+a=torch.empty(1024,1024).cuda(); torch.matmul(a,a);
+print('cuda warmup', time.time()-start)
+PY
+  # 2) stream two short inferences to populate caches\  redwood-infer --model $MODEL --prompt 'Warmup ping' --tokens 8 || true
+  redwood-infer --model $MODEL --prompt 'Warmup ping 2' --tokens 8 || true
+  echo "Warmup complete"
+
+Platform considerations (VPC vs on-prem differences)
+
+- VPC deployments: rely on cloud object storage; ensure pre-signed URL parallelism is limited and node-local caches use EBS/instance-store with io1/throughput provisioned. Use cloud-init to pre-warm on instance start.
+- On-prem deployments: prefer NVMe local cache and use a preseed process included in image build that validates model checksum and populates local cache during systemd firstboot.
+
+Upgrade and rollback guidance
+
+- During runtime upgrades (versioned runtime or model runtime), follow the canary warmup sequence:
+  1) Deploy new runtime to a subset (canary nodes) with min_replicas set to 1 and run warmup jobs.
+  2) Validate metrics (model_load_time_ms, cold_start_count, p99_latency) for at least two business cycles.
+  3) Gradually increase rollout, ensuring warm-pool size is preserved.
+  4) If regressions appear, pause rollout and run a rollback that preserves warm pool on old version before draining canaries.
+
+Rollback example commands:
+
+  redwoodctl deploy rollback --deployment <DEPLOYMENT_ID> --to-revision <REV> --preserve-warmpool true
+
+Observability and telemetry (what to collect)
+
+- Minimum recommended metrics (emit at 10s resolution):
+  - model_load_time_ms
+  - cuda_context_init_ms
+  - container_start_ms
+  - image_pull_time_ms
+  - cold_start_count (increment per cold start event)
+  - kv_cache_miss_rate
+  - disk_io_wait_ms
+  - gpu_memory_page_faults
+  - gpu_temperature_celsius
+  - warmup_success_count / warmup_failure_count
+
+- Alerts (examples):
+  - page if 5-min rolling cold_start_count > 10 for a single model on production lanes.
+  - warn if model_load_time_ms p95 increases by >50% compared to baseline for 30 minutes.
+
+Validation and acceptance tests
+
+- Run these post-install validation checks as part of the acceptance checklist:
+  1) Preload a representative 7B and 70B model using the preseed tool and record model_load_time_ms.
+  2) Execute 10 warmup runs per model and verify kv_cache_miss_rate drops by >80% after warmup.
+  3) Simulate a scale-up event for 100 concurrent requests and assert p99 < SLO for the appropriate model size.
+
+Cost vs latency tradeoffs (guidance)
+
+- Warm pools increase baseline cost; recommend allocating warm replicas only to high-value customer routes or SLA-bound models. Use an adoption matrix:
+  - Gold (SLA) routes: min_replicas=1-2
+  - Silver: min_replicas=0 with pre-warm on scheduled windows
+  - Bronze: best-effort, rely on auto-scaling
+
+Post-incident actions and retro checklist
+
+- Runbook owner to produce short incident summary with: root cause, steps taken, time-to-mitigate, and metrics before/after.
+- Add a recurring test that fires a warmup job weekly for each SLA model and records warmup success rate.
+
+Appendix A — Troubleshooting quick commands
+
+- Check cold-start events in metrics API:
+  curl -sS https://telemetry.internal/api/metrics?metric=cold_start_count&model=<MODEL> | jq .
+
+- Trigger a one-off warmup (K8s job example):
+  kubectl apply -f - <<EOF
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: warmup-<MODEL>-job
+spec:
+  template:
+    spec:
+      containers:
+      - name: warmup
+        image: registry.redwood/warmup:stable
+        args: ["/opt/warmup/warmup-script.sh", "<MODEL>"]
+      restartPolicy: Never
+EOF
+
+Appendix B — Observed patterns and notes
+
+- NVMe-backed local caches reduced model load tail latency by ~60% in internal benchmarking.
+- CUDA context warmers are cheap (small kernel run) and avoid a high fraction of first-request p99 spikes.
+- Overly aggressive parallel pulls at startup are a common root cause of fleet-wide cold starts; implement staggered restarts.
+
+Reference links
+
+- See: eng-private-deployments/day-2-ops/post-installation-telemetry-and-acceptance-checklist-2026 for acceptance tests.
+- See: eng-private-deployments/onprem-packaging/ephemeral-boot-and-attestation-playbook-2026 for firstboot preseed flow.
+
+End of document

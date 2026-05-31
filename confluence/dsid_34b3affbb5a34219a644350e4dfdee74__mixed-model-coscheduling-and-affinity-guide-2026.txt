@@ -1,0 +1,183 @@
+Mixed-size Model Co-scheduling and Traceable Kernel Affinity Guide
+
+Overview
+
+This document describes a pragmatic design and operational playbook for co-scheduling mixed-size LLM inference requests (small models, medium backbone models, and large-context LLMs) on heterogeneous GPU pools while preserving predictable latency SLOs and providing traceable kernel-to-request affinity for incident investigation. It complements the scheduler language profiles and heterogeneous-pool guidance; its aim is prescriptive: how to set affinity, observe it end-to-end, and run safe rollouts.
+
+Scope
+
+- Applies to hosted and Dedicated clusters that share the same scheduler control plane.
+- Covers inference-only workloads (token-generation and chat) and does not cover training jobs.
+- Targets co-location of models with different memory/compute footprints on the same compute nodes and multi-model pipelines where a single request touches more than one model.
+
+Motivation
+
+Co-scheduling increases GPU utilization but introduces contention that impacts tail latency and quality (eviction of KV cache, kernel serialization). Engineering teams need:
+
+1. A predictable model for assigning kernel affinity so traces map to requests.
+2. Runtime choices (slotting, preemption policy) that preserve latency budgets.
+3. A rollout/runbook for experiments and regressions.
+
+Key concepts and definitions
+
+- Model size class: SMALL (<=3B), MEDIUM (3B-13B), LARGE (>13B or long-context variants).
+- Kernel affinity: declarative hint that binds a request's kernel selection to a set of kernel implementations and GPU slot properties (tensor cores, persistent kernel lanes, quantized fast-paths).
+- Slot reservation: transient GPU resource reservation for latency-sensitive requests (duration measured in ms/tokens).
+- Traceable affinity token (AFT): a unique trace id propagated from API gateway through the scheduler to kernel telemetry so all runtime artifacts can be correlated to the originating request.
+
+Design overview
+
+1) Affinity-first routing
+
+- In the routing layer, requests declare the expected model-size-class and latency tier (critical / best-effort). The route's configuration converts these into scheduler affinity tags: model_class=SMALL/MEDIUM/LARGE, latency_tier=critical|standard|background.
+- The scheduler maps affinity tags to kernel profiles and slot classes. Example mapping:
+
+| model_class | latency_tier | kernel_profile | slot_class | preemption_allowed |
+|-------------|--------------|----------------|------------|--------------------|
+| LARGE       | critical     | large-opt-v2   | reserved_hq| false              |
+| MEDIUM      | standard     | medium-quant   | shared_mid | true               |
+| SMALL       | background   | small-fastpath | opportunistic | true            |
+
+2) Kernel profile hints
+
+- kernel_profile is a scheduler-side label that selects an ordered list of kernel implementations (e.g., tensorcore-fused, int8-quantized, fallback-generic). The runtime evaluates the list, preferring earlier entries but falling back safely.
+- Kernel profiles are versioned (kernel_profile: name@vN) to allow safe rollouts and telemetry rollbacks.
+
+3) Traceable affinity propagation
+
+- The API gateway assigns an AFT (traceable affinity token) to each request: AFT format: r_<route-id>_<timestamp>_<rand4>. This token is:
+
+  - logged at ingress (gateway)
+  - attached to RPC metadata to scheduler and runtime
+  - emitted in kernel telemetry as kernel.affinity_token
+
+- Example (pseudo-HTTP header):
+
+  X-AFFINITY-TOKEN: r-chat-v2_20260302T141200Z_7f9a
+
+Operational primitives and controls
+
+1) Slot classes
+
+- reserved_hq: pre-allocated slices with strict CPU+GPU memory limits for large-critical requests; no preemption.
+- shared_mid: dynamically multiplexed slots with fair scheduling and bounded preemption.
+- opportunistic: lower priority, bursty work; can be preempted or pushed to packer nodes.
+
+2) Preemption policy knobs
+
+- preemption_window_ms: how long the scheduler delays preemption to let short sequences finish (default 100ms).
+- evict_kvcache_only: Boolean; when true, preemption evicts KV caches first instead of killing kernels.
+
+3) Kernel profile rollout gates
+
+- Canary cohort (1% traffic), shadow validation (replay requests), and compare metrics: p50/p95/p99 latency, token-per-second throughput, top-5 kernel fallbacks.
+
+Telemetry and profiling guidance
+
+- Required telemetry keys to emit for every kernel invocation:
+
+  - kernel.affinity_token (AFT)
+  - kernel.profile.name@version
+  - kernel.impl (implementation id)
+  - kernel.exec_time_ms
+  - request.model_class
+  - request.route_id
+  - node.gpu_id
+
+- Traces must join gateway logs, scheduler decisions, and kernel events with the AFT as the join key. The recommended retention for affinity traces during rollouts is 30 days.
+
+- Profiling playbook snippet: how to measure co-scheduling impact on tail latency
+
+  1. Baseline: Measure p50/p95/p99 with only the target model class in the pool for 24 hours.
+  2. Add co-located class: introduce SMALL or MEDIUM classes to 10% of capacity.
+  3. Run synthetic and shadow traffic for 4 hours. Capture kernel.affinity_token and kernel.exec_time_ms.
+  4. Compare distributions and identify increased kernel fallback rates. If p99 increases by >15%, abort and rollback kernel_profile.
+
+Synthesis debugging workflow (incident triage)
+
+1) Assemble the AFT from the erroring request (gateway logs).
+2) Query scheduler decisions for that AFT to find the slot_class and kernel_profile chosen.
+3) Pull node/gpu telemetry for the kernel.affinity_token window to see co-located kernels and memory pressure events.
+4) Look for observable signals: increased kernel.fallback_count, kvcache.evictions, gpu.sustained_power_capping.
+
+Example diagnostics query (pseudo-SQL)
+
+SELECT trace_id, kernel_impl, exec_time_ms, fallback_count, node_gpu_id
+FROM kernel_telemetry
+WHERE kernel_affinity_token = 'r-chat-v2_20260302T141200Z_7f9a'
+ORDER BY ts ASC;
+
+Runbook: safe co-scheduling experiment (step-by-step)
+
+1. Define hypothesis and success criteria (latency delta thresholds, quality metrics).
+2. Reserve a canary pool (5% capacity) and mark with label: cosched_canary_<date>.
+3. Deploy kernel_profile name@v1 to canary; route 1% traffic.
+4. Enable AFT propagation and shadow-mode tracing; do not affect responses.
+5. Monitor metrics for 2 hours: p50/p95/p99, kvcache.eviction_rate, kernel.fallback_rate.
+6. If metrics exceed thresholds: revert kernel_profile, roll back scheduling weight, and file a triage ticket.
+7. If stable for 24 hours, increase canary capacity and repeat until full rollout.
+
+Configuration examples
+
+YAML: route affinity declaration example
+
+- route: /v1/chat
+  model_class: LARGE
+  latency_tier: critical
+  affinity: |
+    model_class=LARGE
+    latency_tier=critical
+    kernel_profile=large-opt-v2@v3
+    slot_class=reserved_hq\n
+
+Scheduler policy snippet (pseudo DSL)
+
+policy "cosched-affinity" {
+  when model_class == LARGE and latency_tier == "critical" {
+    bind slot_class = "reserved_hq"
+    bind preemption_allowed = false
+  }
+  when model_class == MEDIUM {
+    bind slot_class = "shared_mid"
+    bind kernel_profile = ["medium-quant@v2", "medium-generic@v1"]
+  }
+  metrics_to_emit = ["kernel.exec_time_ms", "kvcache.eviction_rate", "kernel.fallback_count"]
+}
+
+Safety and fallback modes
+
+- Soft-fallback: if a preferred kernel is not available, the runtime uses the next profile entry and emits kernel.fallback_count. Set alert if fallback_rate > 0.5% for critical routes.
+- Degradation policy: for sustained high contention, scheduler can switch reserved_hq to degraded_hq which reduces concurrency and pins single-request kernels to dedicated lanes. This mode requires an SRE approver and a recorded decision.
+
+Operational checklist (daily/weekly)
+
+- Daily: check canary cohorts for any kernel.fallback_count spikes; validate AFT join success rate (>99%).
+- Weekly: run co-scheduling shadow experiments with synthetic traffic and publish short report to the runtime QA channel.
+- Monthly: review kernel_profile adoption matrix and prune unused profiles older than 90 days.
+
+Ownership and contacts
+
+- Primary owner: Runtime Scheduling Team (runtime-scheduler@redwood.ai)
+- Oncall escalation: Runtime SRE rota (page: /confluence/eng-sre/oncall)
+- Related teams: Model Onboarding, Benchmarks, Kernel Engineering.
+
+References and links
+
+- Scheduler policy language (related page)
+- Kernel profile registry (internal service: kernel-registry)
+- Telemetry contract: runtime-observability (see team wiki)
+
+Appendix: common troubleshooting scenarios
+
+- Symptom: p99 latency spike for LARGE-critical routes after adding SMALL opportunistic workloads.
+  Action: check kvcache.eviction_rate and kernel.fallback_count for AFTs. If eviction_rate increased, enable evict_kvcache_only during preemption.
+
+- Symptom: unexplained GPU thermal throttling causing degraded throughput.
+  Action: correlate node.gpu_id events with kernel.exec_time_ms and offload opportunistic workloads using node-label packer-enabled=false.
+
+Change log
+
+- 2026-01-18: Initial draft (Aisha Patel).
+- 2026-02-10: Added trace token format and rollout gates (Daniel Kim).
+- 2026-03-02: Telemetry keys and operational checklist added (Mateo Alvarez).
+

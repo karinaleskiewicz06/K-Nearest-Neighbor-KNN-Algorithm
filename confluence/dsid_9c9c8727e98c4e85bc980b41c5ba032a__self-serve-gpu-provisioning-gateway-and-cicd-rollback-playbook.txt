@@ -1,0 +1,181 @@
+Self-Serve GPU Provisioning Gateway + CI/CD Rollback Playbook
+
+Summary
+-------
+This playbook documents the self-service GPU provisioning gateway and the associated CI/CD rollback procedures used by Redwood Inference engineering teams. It is intended for platform engineers, SREs, and infra owners who operate or maintain the self-service path for creating ephemeral and reserved GPU environments.
+
+Goals:
+- Enable safe, auditable, self-serve provisioning of GPU node pools and sandbox clusters.
+- Enforce CI/CD safety gates (plan reviews, quota checks, tenant tagging).
+- Provide deterministic rollback / evacuation steps for failed provision or degraded fleets.
+
+Scope
+-----
+Applies to:
+- Self-serve provisioning gateway (internal API + UI) that triggers Terraform modules to create GPU pools.
+- Associated CI/CD pipelines (Buildkite) and Terraform state backends.
+- Networks relying on shared VPC egress and cross-account routing.
+
+Exclusions:
+- Long-lived enterprise Dedicated contracts (handled by Reserved Capacity runbooks).
+- On-prem appliance packaging which uses a separate release flow.
+
+When to use this playbook
+-------------------------
+1. A developer or tenant requests a new ephemeral GPU pool via the self-serve gateway.
+2. A CI/CD run that provisions or updates GPU node images fails staging smoke tests.
+3. Observability detects a rapid rise in GPU preemptions or eviction rates tied to a recent iac change.
+
+Prerequisites / Ownership
+------------------------
+- Owners:
+  - Self-Serve Gateway: eng-infra/platform (Primary: Aisha Patel)
+  - Terraform modules: eng-infra/terraform (Primary: Miguel Santos)
+  - CI/CD pipelines: eng-infra/ci-cd (Primary: Lena Fischer)
+- Permissions: operator service account must have access to the appropriate Terraform remote state and the target cloud project.
+- Tooling: terraform >= 1.4.0, tflint, buildkite-agent, kubectl >= 1.27.
+- Monitoring dashboards: gpu-provisioning, gpu-evictions, warmpool-availability (linked in related pages).
+
+Quick reference SLOs and thresholds
+----------------------------------
+- Warm pool availability: 95% of requested warm nodes ready within 10 minutes.
+- Preemption spike: trigger if preemption rate > 5% of active nodes sustained for 2 minutes.
+- CI/CD plan approval: no unreviewed plan > 1 hour in prod-like environment.
+
+Runbook: Self-Serve Provision Flow (happy path)
+---------------------------------------------
+1. User submits request through gateway UI -> gateway enqueues request (request-id returned).
+2. Gateway runs preflight checks: tenant quota, IAM tagging policy, VPC egress path, and image signing status.
+3. Gateway creates a PR in the infra repo with terraform plan attached and pushes to the provisioning pipeline.
+4. Buildkite pipeline performs: tflint -> terraform init -> terraform plan -> automated policy checks -> optional human approval for quota > threshold.
+5. On successful apply, the node pool autoscaler is primed and warm-pool preallocation starts. Gateway marks request as provisioned and notifies tenant.
+
+Commands and examples (snippet)
+------------------------------
+Terraform apply (manual emergency apply):
+```bash
+export TF_WORKSPACE=tenant-abc-prod
+terraform init -backend-config="bucket=redwood-infra-state"
+terraform plan -var-file=tenant-abc.tfvars -out=plan.tfplan
+terraform apply plan.tfplan
+```
+
+Buildkite pipeline example (relevant steps):
+```yaml
+steps:
+  - label: "tflint"
+    command: "tflint ./modules/gpu_pool"
+  - label: "terraform-plan"
+    command: "terraform init && terraform plan -out=plan.tfplan"
+  - wait
+  - block: "Manual approval (quota > 2 T4s)"
+  - label: "terraform-apply"
+    command: "terraform apply plan.tfplan"
+```
+
+Terraform variables (reference table)
+------------------------------------
+| variable | description | example | required |
+|---|---:|---|---:|
+| tenant_id | Unique tenant identifier used for tagging | tenant-abc | true |
+| node_type | GPU SKU (e.g. nvidia-t4, a100-80gb) | nvidia-t4 | true |
+| desired_count | Autoscaled desired node baseline | 4 | true |
+| warm_pool_count | Number of preallocated nodes to keep ready | 2 | false |
+| preemptible | Use preemptible/spot instances to save cost | true | false |
+
+CI/CD Safety Gates and Policy Checks
+------------------------------------
+- Lint & Static Checks: tflint and tfsec must pass with zero high findings.
+- Quota Policy: automated check against the tenant quota store; fail pipeline if exceed.
+- Image Signing: image digest must match signed digest repository, otherwise block.
+- Network Egress: the candidate pool must validate egress paths to required endpoints (artifact registries, telemetry).
+- Canary Smoke: for any image or kernel upgrade, a canary pool of up to 2 nodes is provisioned and must pass smoke tests (startup, model load, inference latency) before full rollouts.
+
+Rollback and Failure Procedures
+-------------------------------
+Use-case A: Terraform apply failed during provisioning
+1. Abort buildkite job if still running (Buildkite UI or buildkite-agent cancel <build-id>).
+2. Inspect terraform plan and error logs: check terraform state locking issues (S3/Dynamo or remote backend).
+3. If partial resources were created (VPC subnets, instance profiles): run terraform destroy on the partial workspace with `-target` for the dangling resources.
+4. Re-run gateway preflight after fixing the root cause.
+
+Use-case B: Post-provisioning degraded fleet (high evictions / bad kernel image)
+1. Mark cluster as degraded in gateway admin UI to prevent new allocations.
+2. Scale down tenant traffic routing (feature-flag or API routing) and move active requests to fallback region/model variant.
+3. Drain affected nodes gracefully:
+```bash
+# For Kubernetes-managed nodes
+kubectl cordon <node-name>
+kubectl drain <node-name> --ignore-daemonsets --delete-local-data --timeout=10m
+```
+4. Roll back the node image by updating the Terraform variable `node_image_tag` to the previous known-good tag and trigger pipeline to apply canary first.
+5. If rollback fails or many nodes are unhealthy, initiate emergency capacity bleed to a warm spare pool (see emergency capacity section).
+
+Emergency capacity bleed (fast path)
+1. Trigger `provision-emergency` job in Buildkite with `warm_pool_count=10` and `node_type=nvidia-t4` in a pre-approved emergency account.
+2. Notify on-call SRE and tenant primary; post status to #gpu-ops channel.
+3. Monitor warm pool readiness and route traffic slowly (max 10% ramp per minute).
+
+Troubleshooting checklist & play-by-play notes
+---------------------------------------------
+- Terraform stuck on lock: check S3/Dynamo locks, run `terraform force-unlock <LOCK_ID>` if owner process dead.
+- Plan fails with quota: verify tenant quota service (internal API) is healthy and reconcile counts.
+- Image mismatch errors: check the signed-image index and the digest the pipeline references.
+- Slow warm-pool fill: look at cloud provider placement failures and preemption history. If placement failures exceed 20% within 5 minutes, abort and request a different zone.
+
+Monitoring and Alerts
+---------------------
+Essential alerts:
+- warmpool-not-ready: triggered when >10% of requests pending provisioning > 5 minutes. Severity: P2.
+- gpu-eviction-spike: preemption rate > 5% for 2 minutes. Severity: P1.
+- terraform-apply-failure: Apply step fails 3 times in 1 hour for the same workspace. Severity: P2.
+
+Dashboard widgets to include:
+- Warm pool fill time distribution (p50/p95/p99)
+- Eviction count and rate by node_type and zone
+- Pending-provision queue length and age
+- Terraform plan vs apply delta (lines changed / resources added)
+
+Post-incident run & RCA guidance
+-------------------------------
+1. Collect all pipeline logs, terraform state diffs, and gateway request audit for the incident window.
+2. Reproduce the plan in a private sandbox workspace and run `terraform plan` with `-out` to capture the exact diff.
+3. Create an incident timeline with: request-id, pipeline-id, critical error messages, human approvals, affected tenants, cost impact.
+4. If the incident was caused by a Terraform module change, open an ADR referencing the module and propose a mitigation (e.g., stronger preflight checks or canary pool requirement).
+
+Runbook maintenance
+-------------------
+- Owners must review this playbook every quarter or after any P1 GPU incident.
+- Significant changes to terraform modules or gateway APIs must update this playbook prior to rollout.
+
+Escalation contacts
+-------------------
+- Oncall SRE: #sre-oncall (page: eng-sre/oncall-rotations)
+- Terraform module owner: Miguel Santos (miguel@redwood.ai)
+- CI/CD owner: Lena Fischer (lena@redwood.ai)
+- Platform lead: Rajiv Menon (rajiv@redwood.ai)
+
+Appendices
+----------
+A. Example terraform variable file (tenant-abc.tfvars)
+```hcl
+tenant_id = "tenant-abc"
+node_type = "nvidia-t4"
+desired_count = 4
+warm_pool_count = 2
+preemptible = true
+```
+
+B. Common Buildkite debugging tips
+- Re-run a single step with `--step <label>`
+- Download artifacts for a failed plan: `buildkite-agent artifact download plan.tfplan --job <job-id>`
+
+C. Change log (high level)
+- 2025-09-12: Initial published playbook by Aisha Patel.
+- 2025-12-08: Added canary smoke step and image signing gate (reviewers: Miguel, Lena).
+- 2026-02-05: Clarified warm-pool SLOs and added emergency capacity fast path.
+
+Related pages and anchors:
+- eng-infra/terraform-and-iac/gpu-module-lifecycle-and-migration-guidelines
+- eng-infra/cloud-accounts-and-networking/gpu-shared-vpc-egress-and-ip-management
+- eng-infra/runbooks/gpu-warm-pool-replenishment-and-iac-sync

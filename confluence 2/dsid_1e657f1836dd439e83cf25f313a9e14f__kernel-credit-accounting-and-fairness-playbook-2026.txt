@@ -1,0 +1,213 @@
+Kernel Credit Accounting & Fairness Playbook
+
+Summary
+-------
+This playbook describes the design, configuration, operational runbooks, and rollout guidance for the kernel-level credit accounting and fairness layer used in Redwood’s multi-tenant inference runtime. The system ensures predictable throughput and latency SLOs while preventing noisy-tenant and priority-inversion problems when many concurrent requests contend for GPU kernels and KV-cache resources.
+
+Intended audience
+-----------------
+- Runtime engineers (owners of kernel scheduler and admission control)
+- SREs on-call for serving clusters
+- Capacity planners and product owners for Dedicated/Private products
+
+Goals and non-goals
+-------------------
+Goals:
+- Provide stable latency for high-priority routes while allowing best-effort capacity for trial/metered users
+- Bound tail latency by limiting long queue accumulation on kernel execution paths
+- Offer explainable and auditable per-customer accounting for GPU kernel usage
+
+Non-goals:
+- Replace higher-level rate-limiters or API quotas (this works below API surface in serving runtime)
+- Fully eliminate all client-visible variability in extreme overloads — we provide graceful degradation strategies instead
+
+Definitions and key concepts
+----------------------------
+- Credit: abstract unit representing entitlement to consume a kernel timeslice. Credits are consumed when a request enters a kernel-execution critical section.
+- Credit Bucket: per-tenant (and per-priority) balance tracked in-memory (and periodically checkpointed).
+- Refill policy: rate at which credits are added to a bucket (tokens/sec).
+- Debit event: decrement of credits on kernel entry; if insufficient credits, request is queued or subject to degradation depending on policy.
+- Fairness window: configurable sliding window (default 60s) for measuring usage and computing deficits.
+
+Architecture overview
+---------------------
+1) Placement: The credit accounting layer sits in the local serving process before kernel invocation and is enforced per-shard (NUMA / GPU device). It integrates with:
+   - admission-controller (global decisions for burst allowances),
+   - kernel-mapper (selects kernel variant after accounting), and
+   - request-pool (local queues and backpressure).
+2) Persistence: Buckets are ephemeral but periodically checkpointed to the control plane to enable cross-node rebalancing and debugging. Checkpoint sync is best-effort every 30s; immediate sync occurs on tenant migration.
+3) Telemetry: metrics exported as Prometheus/OTel metrics and traces. See "Telemetry and dashboards" section.
+
+Fairness algorithm (summary)
+---------------------------
+We use a hybrid Deficit-Weighted Round Robin (DWRR) with a decay term to prefer recent underutilization. Highlights:
+- Each tenant t has a configured weight w_t and min-guarantee g_t (credits/sec).
+- Deficit increases by w_t * quantum on each scheduling round and decays at half-life configured via fairness-window.
+- When kernel resources are scarce, tenants with exhausted deficits are deprioritized.
+- Priorities (system, paid-enterprise, paid-standard, trial) are mapped to weight ranges and short-term burst credits.
+
+Configuration reference (example)
+--------------------------------
+(Stored in runtime config: /etc/redwood/runtime/kernel-crediting.yaml per node)
+
+---
+# Top-level config version
+version: 1
+default_fairness_window_seconds: 60
+quantum_micros: 5000  # scheduling quantum used to bump deficit
+priority_classes:
+  system:
+    weight: 100
+    min_guarantee: 1000
+    burst_tokens: 5000
+    preemptible: false
+  enterprise:
+    weight: 50
+    min_guarantee: 300
+    burst_tokens: 1000
+    preemptible: false
+  standard:
+    weight: 10
+    min_guarantee: 50
+    burst_tokens: 200
+    preemptible: true
+  trial:
+    weight: 1
+    min_guarantee: 5
+    burst_tokens: 50
+    preemptible: true
+tenant_overrides:  # per-tenant config (optional)
+  tenant-abc123:
+    weight: 20
+    min_guarantee: 100
+
+Operational runbook: high-level flow
+-----------------------------------
+1) Admission: incoming request -> admission controller -> credit check.
+2) If credits >= kernel_cost(request) -> debit and enqueue for kernel mapper.
+3) If credits < kernel_cost -> check fallback policy:
+   a) If low-priority and degradation allowed -> route to a quantized model variant (lower kernel cost).
+   b) If burst_allowed (and bucket has burst_tokens) -> consume burst tokens and admit.
+   c) Else -> return 429 with Retry-After or queue with bounded wait (configurable max_wait_ms).
+4) On kernel completion, an accounting reconciliation event returns partial credits for short-circuited operations (e.g., cache hit avoids kernel).
+
+Runbook: incident scenarios and steps
+------------------------------------
+A. Symptom: sudden increase in p99 latency on standard and trial tenants while enterprise remains stable
+- Likely cause: burst tokens exhausted or noisy tenant consuming more than weight.
+- Steps:
+  1. Run quick telemetry queries (below) to identify tenant with spike in kernel_invocations.
+  2. Inspect credit_balance and deficit for top-10 tenants.
+  3. If noisy-tenant found, temporarily set tenant weight to a lower value:
+     redwoodctl runtime update-tenant-config --tenant tenant-id --weight 5
+  4. If more immediate relief needed, toggle preemption threshold to allow enterprise preemption:
+     redwoodctl runtime set-flag --name preemption_aggressiveness --value high
+  5. Document incident and add tenant to noisy-tenant watchlist.
+
+B. Symptom: large queue growth observed on particular GPU device
+- Likely cause: NUMA hotspot, slow kernel variant or memory thrashing.
+- Steps:
+  1. Correlate queue growth with kernel time/per-kernel-error.
+  2. Offload trial/standard queues by increasing min_guarantee for enterprise/system or disable burst for low tier.
+  3. If kernel is hung, trigger per-device kill and warmstart per runbook: /eng-serving-runtime/runbooks/numa-aware-shard-placement-eviction-playbook-2026.json
+
+Telemetry and dashboards (queries and metrics)
+--------------------------------------------
+Core metrics (Prometheus names):
+- redwood_kernel_credit_balance{tenant,priority} (gauge, credits)
+- redwood_kernel_deficit{tenant,priority} (gauge, credits)
+- redwood_kernel_debits_total (counter)
+- redwood_kernel_preemptions_total (counter)
+- redwood_kernel_burst_tokens_consumed_total (counter)
+- redwood_kernel_queue_length{device} (gauge)
+- redwood_kernel_wait_time_seconds_bucket (histogram)
+- redwood_kernel_success_rate{tenant} (gauge)
+
+Sample alert rules (SRE):
+- Alert: KernelQueueHigh
+  Expr: avg_over_time(redwood_kernel_queue_length[1m]) > 50 for 2m
+  Severity: P2
+- Alert: TenantCreditDepletedHigh
+  Expr: increase(redwood_kernel_debits_total{tenant=~".*"}[5m]) > (tenant_expected_rate * 3) and redwood_kernel_credit_balance < 10
+  Severity: P3
+
+Suggested dashboards:
+- Credit health (per-priority): median/95/99 balances, deficits, burst consumption
+- Fairness score: measured as max(usage_weight_ratio, enforced_deficit_ratio) over 5m window (explainable metric for SLAs)
+- Kernel queue and preemptions by device and shard
+
+Benchmarks and expected behavior
+--------------------------------
+Run benchmark harness (benchmarking-and-perf-suite/mixed-workload-slo-simulation-suite) with the following scenarios to validate fairness config changes:
+- Scenario A: 80% enterprise, 20% trial traffic — expected p99 for enterprise < 120ms, trial p99 degraded but < 500ms.
+- Scenario B: Noisy-tenant flood (10x normal) — system should cap noisy tenant to < 2x its guaranteed throughput within fairness window.
+- Scenario C: Cold-start heavy KV-cache misses — verify that debit refunds occur on cache hit avoidance and that observed token consumption aligns with kernel-time.
+
+Configuration change and rollout checklist
+----------------------------------------
+- Author change in a feature branch of runtime config repo.
+- Unit tests for deficit logic and decay.
+- Integration tests using local benchmark harness that covers: single-device stress, multi-device distributed run, and migration scenario.
+- Canary rollout (20% nodes) with aggressive telemetry watch for 24h.
+- Gradual ramp to 100% over 48h.
+- Post-rollout: run fairness regression tests from benchmark suite and record artifacts.
+
+APIs and CLI examples
+--------------------
+1) Query tenant credit balance:
+   curl -H "Authorization: Bearer $TOKEN" https://runtime.internal/api/v1/tenants/tenant-abc123/credits
+   Response: {"balance": 310, "deficit": 120, "last_refill_ts": "2026-02-14T09:34:12Z"}
+
+2) Update tenant weight:
+   redwoodctl runtime update-tenant-config --tenant tenant-abc123 --weight 20 --min-guarantee 100
+
+3) Toggle node-level flag:
+   redwoodctl runtime set-flag --name crediting_enabled --value true --nodes node-12,node-13
+
+Debugging snippets (common queries)
+----------------------------------
+- Top 10 tenants by kernel debits in last 5m
+  PromQL: topk(10, increase(redwood_kernel_debits_total[5m]))
+- Per-device queue growth with tenant breakdown
+  PromQL: sum by (device, tenant) (increase(redwood_kernel_queue_length[5m]))
+
+Known limitations and caveats
+---------------------------
+- Checkpointing is best-effort; a node crash can cause temporary mismatch between observed usage and control-plane records. Use reconciliation script (tools/runtime/reconcile_credits.py) after node replacement.
+- Small tenants with burst allowances may intermittently exceed long-term share; careful billing/visibility is required to prevent surprises.
+- Very large model kernel variance: when kernel cost estimators are inaccurate, tenant accounting may under- or over-charge. Ensure model_cost_estimator is profiled for new model variants.
+
+Safety and privacy considerations
+--------------------------------
+- Tenant ids in telemetry are hashed at rest in long-term stores. Short-term debugging dashboards will display tenant ids unmasked only to engineers with the "runtime-debug" permission.
+- Audit logs are generated for any manual tenant-config changes and stored for 365 days (see security-and-compliance/audit-logging).
+
+Appendix A: Example fairness math (simple view)
+------------------------------------------------
+Let quantum Q=100, weight w_t for tenant t. Deficit D_t increases by Q*w_t each round and decays at rate r per second. A tenant can run when D_t >= cost_k (cost in credits). On run, D_t -= cost_k.
+Decay: D_t = D_t * exp(-ln2 / half_life_seconds) every second (half-life parameterizable).
+
+Appendix B: Troubleshooting checklist (quick)
+--------------------------------------------
+- If p99 latency spikes: check credit_balance and kernel_queue_length -> reduce burst or reduce noisy tenant weight.
+- If sustained undershoot of enterprise guarantees: increase min_guarantee and observe for 10m.
+- If frequent preemptions observed: lower preemption_aggressiveness and add more quota to enterprise/system.
+
+Owners and contact
+------------------
+- Primary owner: runtime-kernel-scheduling team (on-call: runtime-sched-oncall@redwood.com)
+- Secondary owner: eng-sre (on-call: eng-sre@redwood.com)
+
+Change log
+----------
+- 2025-11-10 (Maya Chen): Initial draft and unit test matrix.
+- 2026-01-22 (Priya Raman): Added decay math and caution about checkpointing.
+- 2026-02-14 (Maya Chen): Added runbook incident scenarios and CLI examples.
+
+References
+----------
+- Runtime kernel mapper design: ../runtime-architecture/request-multiplexing-backpressure-architecture-2026.json
+- NUMA eviction playbook: ../runbooks/numa-aware-shard-placement-eviction-playbook-2026.json
+- Kernel telemetry annotation: ../team-wiki/kernel-telemetry-annotation-guidelines-2025.json
+
+End of document

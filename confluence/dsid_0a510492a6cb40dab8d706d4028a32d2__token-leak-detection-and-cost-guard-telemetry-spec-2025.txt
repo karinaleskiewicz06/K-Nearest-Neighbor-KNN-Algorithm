@@ -1,0 +1,147 @@
+Token leak detection and cost guard telemetry spec
+
+Overview
+
+This page defines the telemetry, dashboards, and alerting rules for detecting token leaks and automatically guarding platform cost exposure for hosted and dedicated inference routes. The aim is to provide an operationally actionable detection surface that:
+
+- detects abnormal token consumption patterns (leaks, runaway loops, malformed clients)
+- correlates leaks with cost exposure and tenant risk category
+- triggers tiered mitigation actions (soft rate-limit, notify, emergency throttle)
+- preserves signal quality for post-incident root cause analysis
+
+Intended audience
+
+- Platform SREs and oncall engineers
+- Runtime and routing teams (serving-runtime, eng-platform)
+- Account SAs and Customer Success for high-risk tenants
+
+Scope and non-goals
+
+In scope:
+- Token-level telemetry from the API gateway, routing layer, and dedicated host agents
+- Aggregation and attribution by tenant_id, route_id, model_version, region, and deploy_type (hosted/dedicated/private)
+- Dashboard panels for detection and backfill queries
+- Alerting rules and a prescriptive runbook for investigation and mitigation
+
+Out of scope:
+- Billing reconciliation workflows (handled by finance pipeline)
+- Per-customer legal escalation or refund policy (customer-success owned)
+
+Signal taxonomy (metrics and logs)
+
+We rely on a small, composable set of signals to detect anomalies. Each metric name below is the canonical name emitted by services and collected in Prometheus / Cortex and routed to the metrics warehouse:
+
+Table: metrics and description
+| metric_name | source | unit | short_description |
+|-------------|--------|------|-------------------|
+| platform.requests.tokens_total | api-gateway | tokens | Counter of tokens requested per API call (prompt + completion). Tag keys: tenant_id, route_id, model, region, deployment_type |
+| platform.requests.count | api-gateway | requests | Total API request count (labels as above) |
+| platform.runtime.kv_cache_hits | runtime | hits | KV cache hit count (labels: model, route_id, tenant_id, seq_len_bucket) |
+| platform.routing.retries | router | retries | Retry/redirect attempts per request (useful to detect retry loops) |
+| platform.errors.client_payload_size | api-gateway | counts | Number of requests rejected for oversized payloads (indicator of malformed or malicious clients) |
+| platform.billing.estimated_cost_rate | billing-proxy | usd_per_min | Rolling per-minute estimate of incremental cost per tenant (derived from tokens * model-cost-rate) |
+
+Derived signals (computed in metrics tier):
+- tokens_per_minute_per_tenant = increase(platform.requests.tokens_total[1m])
+- tokens_per_request_median = histogram_quantile(0.5, sum(rate(platform.requests.tokens_bucket[5m])) by (le, tenant_id))
+- token_burn_rate_change = (tokens_per_minute_current - tokens_per_minute_baseline) / tokens_per_minute_baseline
+
+Baselines and adaptive thresholds
+
+We use a hybrid baseline: a rolling 7-day hourly profile per tenant (to capture diurnal patterns) with a short-term 1-hour EWMA to capture recent trend. Two threshold bands are defined:
+
+- Alert threshold (yellow): 3x hourly baseline OR 50% increase vs 1h EWMA, sustained for 10 minutes
+- Critical threshold (red): 10x hourly baseline OR 200% increase vs 1h EWMA, sustained for 2 minutes or single-minute estimated_cost_rate > $10/min (tenant-level)
+
+Dashboard layout (panels and purpose)
+
+We recommend a single dashboard per team: 'Token Exposure & Leak Detection — Tenant view' with the following panels: 
+1) Tenant token burn timeline (stacked by model) — 1m resolution, 24h view
+2) Tokens per request median & 95th percentile — to spot unusually long completions
+3) Estimated cost rate (USD/min) with alert overlay
+4) Retry and error spikes correlated to token burn
+5) Recent top-N requests by token size (raw logs sample) — last 60m
+6) Baseline vs actual heatmap (hour-of-week vs tokens)
+
+Example Grafana panel PromQL snippets
+
+- tokens_per_minute_per_tenant: sum by (tenant_id)(increase(platform.requests.tokens_total[1m]))
+- token_burn_rate_change (1m): (sum by (tenant_id)(increase(platform.requests.tokens_total[1m])) - sum by (tenant_id)(increase(platform.requests.tokens_total[1h])) / 60) / (sum by (tenant_id)(increase(platform.requests.tokens_total[1h])) / 60)
+
+Alert rules and notification paths
+
+We define 3 alert levels with clear notification targets and automated actions: 
+
+1) TokenLeakWarning (severity: P3) — yellow
+- Condition: Alert threshold (see above)
+- Notify: eng-platform oncall (PagerDuty P3), Slack #platform-telemetry, create ticket in internal queue
+- Automated action: none (informational)
+
+2) TokenLeakCritical (severity: P2) — red
+- Condition: Critical threshold OR estimated_cost_rate > $10/min for a single tenant
+- Notify: eng-platform oncall (PagerDuty P2), runtime oncall, customer-success (for known high-value tenants)
+- Automated action: soft throttling via routing-policy: apply a per-tenant token rate-limit of 20% below current 95th percentile sustained for 5 minutes; trigger synthetic tracing to capture sample payloads
+
+3) TokenLeakEmergency (severity: P1) — black
+- Condition: sustained critical threshold for >10 minutes OR estimated_cost_rate > $50/min or platform-wide correlated spike >50% of total capacity
+- Notify: All-hands oncall (PagerDuty P1), exec-level pager, Slack #incident-ops, customer-success senior lead
+- Automated action: emergency tenant throttle to pre-configured emergency cap (default 1000 tokens/min) for offending tenants and toggle-model-fallback to a cheaper quantized model for that tenant routes if available
+
+Runbook: investigation and mitigation (step-by-step)
+
+1) Triage (first 5 minutes)
+   a) Acknowledge alert in PagerDuty and open incident channel.
+   b) Use dashboard tenant filter to identify top offending tenant_id(s) and top routes.
+   c) Check recent deploys / config changes: /confluence/eng-platform/systems-and-services/service-lifecycle-orchestration-guidelines-2026 
+
+2) Quick containment (5–15 minutes)
+   a) If TokenLeakWarning: add watch and enable higher-fidelity sampling (increase logs rate-limit for that tenant).
+   b) If TokenLeakCritical: apply soft per-tenant throttle via routing admin UI: set tokens_per_min = current_95th_pct * 0.8. Document change.
+   c) If TokenLeakEmergency: apply emergency cap and enable fallback model routing. Notify Customer Success for high-value tenants.
+
+3) Deep dive (15–90 minutes)
+   a) Pull request-level traces and request bodies from the last 30 minutes (sampled store).
+   b) Correlate with retry metrics and KV cache hit rate—look for retry loops or cache misses inflating completion length.
+   c) Search logs for anomalous prompt templates (e.g., runaway repetition tokens).
+
+4) Remediation and follow-up (90 minutes onward)
+   a) If client bug: contact customer, coordinate immediate fix and recommend client-side rate-limiting.
+   b) If model or runtime bug: escalate to serving-runtime and schedule a hotfix.
+   c) Issue a post-incident ticket with root cause, impact, cost exposure, and suggested preventative controls (e.g., default per-route caps, prompt sanitizer).
+
+Ownership and access controls
+
+- Metric ownership: telemetry infra team (eng-platform/observability)
+- Alert rule authoring: eng-platform and runtime teams jointly
+- Automated throttles: runtime routing service (route-admin API) with change approvals for dedicated tenants > $1k/day
+- Dashboard editing: eng-platform with view access to SRE and runtime; customer-success given read access for their assigned tenants
+
+Testing, rollout and tuning plan
+
+1) Canary: enable detection for 5 low-risk tenants for 2 weeks in monitoring-only mode. Verify false-positive rate < 2% and no unintended throttles.
+2) Gradual rollout: incrementally add tenant cohorts (by spend percentile), add automated soft throttles at cohort 50% mark.
+3) Post-rollout tuning: after 4 weeks, re-evaluate thresholds (yellow/red) using collected signal distributions and reduce sensitivity if FP > 5%.
+
+Privacy and storage constraints
+
+- Do not store full customer prompts unless legally required; store only hashed/sampled payloads for 1 week.
+- Trace samples must be redacted for PII and stored per data-retention policy.
+
+Open questions and future work
+
+- Should we expose an opt-in "tenant-cost-guard" control in the Console for customers to set their own caps? (customer-success product discussion)
+- Explore ML-based anomaly detection to reduce manual threshold tuning.
+
+References
+
+- platform cost and token model: /confluence/product-docs/pricing-and-packaging/hosted-token-economics-2025
+- Runtime fallback policies: /confluence/eng-serving-runtime/runbooks/kv-cache-and-fallback-strategies-2025
+
+Appendix: sample alert condition (PromQL)
+
+TokenLeakCritical: 
+sum by (tenant_id)(increase(platform.requests.tokens_total[2m])) > 10 * avg_over_time(sum by (tenant_id)(increase(platform.requests.tokens_total[1h]))[7d:1h]) and sum by (tenant_id)(increase(platform.billing.estimated_cost_rate[1m])) > 10
+
+Contact
+
+For questions or changes to this spec, contact the document owner: asha.patel@redwood.com.

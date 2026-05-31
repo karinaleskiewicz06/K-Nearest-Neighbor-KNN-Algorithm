@@ -1,0 +1,153 @@
+GPU Kernel Latency Investigation Playbook
+
+Summary:
+
+This playbook describes a repeatable, evidence-driven process for investigating request-level latency spikes attributable to GPU kernel behavior in the Redwood serving runtime. It is intended for on-call SREs, runtime engineers, and performance-focused ML engineers.
+
+Goals:
+- Rapidly determine whether a latency regression is caused by GPU kernel execution (vs. queueing, CPU scheduling, RPC, or networking).
+- Produce actionable remediation (config change, kernel selector tweak, batching rule, or model fallback).
+- Provide reproducible artifacts: kernel traces, flamegraphs, aggregated metrics, and a short root-cause summary.
+
+Scope and assumptions:
+- Applies to Redwood Dedicated and Private deployments where we control the GPU runtime.
+- Assumes access to Prometheus, Grafana dashboards, node ssh, and container runtime metrics.
+- Requires NVTX/NSYS instrumentation enabled on the runtime image (see section "Instrumentation checklist").
+
+Key contacts / owners:
+- Runtime Performance Lead: Maya Chen (author) — paged for escalations
+- Serving Runtime Lead: Carlos Rivera — owner for rollout and kernel selector changes
+- GPU Fleet Ops: Priya Kapoor — capacity and node-level remediation
+
+SLOs and thresholds to guide triage:
+- Per-request 95th percentile latency SLO: 1200 ms (text-generation default route).
+- Alert firing threshold: 95p latency > 1400 ms for 5m or error rate increase > 1% relative baseline.
+- Kernel suspicion rule: kernel_time_ratio > 0.5 for 95p requests (kernel_time_ratio = gpu_kernel_time / request_total_time).
+
+High-level investigation checklist (fast path):
+1) Confirm alert and scope in Grafana
+   - Open route latency dashboard (dash: /dashboards/route-latency)
+   - Identify affected routes, models, and regions.
+2) Check server-side queueing and CPU stalls
+   - Inspect metrics: request_queue_length, cpu_runqueue_length, worker_cpu_usage.
+   - If queueing explains >50% of increased latency, follow runbooks/runbook-queue-surge (not this doc).
+3) If CPU and queueing are normal, check GPU kernel dominance
+   - Pull precomputed metric: gpu_kernel_time_total, request_wall_time_total, and compute kernel_time_ratio.
+   - If kernel_time_ratio > 0.5 at 95p, proceed with kernel-level traces.
+
+Instrumentation checklist (must be enabled before deep profiling):
+- Runtime compiled with NVTX annotations around model forward passes and KV cache operations.
+- Healthcheck job that can run a deterministic micro-benchmark per node (see snippet below).
+- Container has nsys and ncu available (or a sidecar helper image).
+- Prometheus exporters exposing per-gpu metrics: gpu_utilization_pct, gpu_compute_ms, gpu_memory_copy_ms.
+
+Quick reproducible micro-benchmark (run from inside runtime container):
+
+# Run a short deterministic workload against the model shard
+python -c "from perf_utils import run_deterministic_batch; print(run_deterministic_batch('gpt-medium', batch_size=1, seq_len=128, steps=5))"
+
+Expected output: JSON with timing breakdown: total_ms, cpu_ms, kernel_ms, memcpy_ms. Save to /tmp/prof-run-$(date +%s).json
+
+Collecting traces (nsys) - safe, short captures:
+- When possible, use a 10-20s capture window to reduce noise and storage.
+- Prefer capturing a single node and single model shard to limit trace size.
+- Example commands (run as root or container with host GPU access):
+
+nsys profile --capture-range=nvtx --capture-range-end=stop --output=/tmp/trace-$(date +%s) --stats=true --trace=nvtx,cuda --duration=20s --processes=all --sample=none --sample-frequency=0
+
+# Steps:
+1. Start capture: nsys profile --output=/tmp/trace --trace=nvtx,cuda --capture-range=nvtx,...
+2. Trigger a deterministic test load (see micro-benchmark).
+3. Stop capture and pull .qdrep for analysis.
+
+Key artifacts to extract from NSYS/NVPROF:
+- Per-kernel latency distribution (mean, 50p, 95p, max)
+- Kernel call counts per forward pass
+- Memcpy times and patterns (H2D, D2H, P2P)
+- NVTX region timelines (map to logical phases: tokenize→model_forward→KV_cache→postprocess)
+
+What to look for (triage heuristics):
+- Single large kernel dominating forward (e.g., attention_flop_kernel) with high variance: indicates kernel scheduling/preemption or data-dependent work.
+- Many small kernels at high frequency causing scheduling overhead: candidate for kernel fusion or larger batch grouping.
+- Long memcpy operations concurrent with compute: suggests PCIe contention or suboptimal tensor placement (host staging).
+- High tail in kernel latency correlated with GPU context switches: check driver logs for TDR or preemption events.
+
+Prometheus queries and Grafana panels to produce (examples):
+- kernel_time_ratio by route:
+  sum(rate(gpu_kernel_time_seconds_sum[5m])) by (route) / sum(rate(request_latency_seconds_sum[5m])) by (route)
+- per-node kernel tail (95p):
+  histogram_quantile(0.95, sum(rate(gpu_kernel_duration_seconds_bucket[5m])) by (le, node))
+- memcpy vs compute scatter: use table panel with gpu_memory_copy_ms and gpu_compute_ms per node.
+
+Example short RCA (what should be produced within 2 hours):
+- Summary: High 95p latency on /api/generate caused by attention_kernel tail on shard-03 in us-west-2. Kernel_time_ratio=0.74.
+- Evidence: NSYS trace (trace-167...), kernel latency histogram attached, Prometheus query snapshots.
+- Root cause hypothesis: kernel performance regressed after CUDA driver upgrade -> changed scheduling granularity causing attention kernel to be preempted intermittently.
+- Action taken: pinned driver to previous working version on shard-03; rolled canary to 10% to validate.
+- Long-term fix: add kernel selector fallback to lower-compute granularities for affected models and add a preflight driver compatibility test.
+
+Remediation options (ordered by speed/risk):
+1) Node-level: Restart GPU driver / cordon and drain node (low-risk) — ops action.
+2) Runtime config: Reduce max_concurrent_inflight_kernels (runtime param) to reduce kernel overlap and tail (medium risk, instant).
+3) Kernel selector change: Prefer fused_kernel_variant_v2 for sequence lengths > 1024 (requires model-rebuild and canary, high risk).
+4) Capacity: Shift affected traffic to Dedicated overflow pool (policy-based routing) while investigating (low-risk and immediate).
+
+Rollback and rollout guidance for kernel selector changes:
+- Use A/B canary: 5% -> 20% -> 50% -> 100% with 30m observe window at each step.
+- Required telemetry: route-level 95p latency, gpu_kernel_time_ms 95p, error-rate.
+- If 95p latency increases > 10% vs baseline or error-rate increases > 0.5%, stop rollout and revert.
+
+On-call runbook (step-by-step):
+1) Acknowledge alert and note affected routes and hosts.
+2) Run quick checks (queueing, CPU busy, network) using dashboard checklist.
+3) If GPU kernel suspected, trigger micro-benchmark and collect NSYS trace for one representative node.
+4) Upload artifacts to /artifacts/perf/<incident-id>/ and create RCA draft in Jira ticket.
+5) Execute short-term mitigation (drain node / reduce concurrency / shift traffic) and monitor.
+6) If a kernel selector change is required, open PR in runtime repo and follow rollout guidance above.
+
+Common symptoms -> probable causes (diagnostic table):
+- Symptom: High tail only on long sequences. Probable cause: kernel variant with poor path for > seq_len threshold. Fix: switch selector, add regression test for long sequences.
+- Symptom: High variance across identical hardware. Probable cause: PCIe contention or thermal throttling. Fix: check node-level metrics, migrate shards.
+- Symptom: Small per-token slowdown but large aggregate. Probable cause: many tiny kernels. Fix: enable kernel fusion or increase batching.
+
+Developer tips and primitives:
+- Use NVTX ranges consistently in code; every logical phase should have a named NVTX annotation to ease capture filtering.
+- Keep deterministic microbenchmarks checked into /infra/profiling/benchmarks with pinned seeds.
+- When analyzing traces, always correlate nvtx timeline with top-level Prometheus traces to map request IDs to kernel timelines.
+
+Post-incident checklist (complete within 48h):
+- Produce an RCA doc with 1-2 figure summary, 3 evidence bullets, and 2 actionable follow-ups.
+- Add a regression test to perf-suite if root cause is software (driver/runtime/model change).
+- If hardware or driver was changed, add a canary job that runs perf smoke on the next upgrade.
+
+References and tools:
+- NVIDIA Nsight Systems (nsys): https://developer.nvidia.com/nsight-systems
+- NVTX annotation best-practices: internal link /confluence/eng-serving-runtime/profiling-playbook/nvtx-guidelines (draft)
+- Runtime config knobs: k_scheduling.max_concurrent_kernels, k_selector.prefer_fused, k_mem.copy_stride_threshold (see runtime-ops-config page)
+
+Appendix A: Example ncu command for kernel stacks (more invasive)
+
+ncu --target-processes all --launch-skip 0 --launch-count 10 --set full --output /tmp/ncu-report --sample 1000 --kernel-regex "attention|matmul|softmax" --trace-fork --target-pid <pid>
+
+Note: ncu captures are large and should be reserved for offline analysis.
+
+Appendix B: Minimal NVTX conventions (enforced by lint):
+- NVTX names must include: component:model:phase (e.g., runtime:gpt-medium:forward)
+- Push/pop nesting must be balanced; missing pop will break capture segmentation.
+
+Appendix C: Example artifact checklist for RCA ticket
+- Prometheus query snapshots (PNG) for route latency and gpu kernel metrics
+- NSYS .qdrep and derived kernel latency histogram (CSV)
+- Micro-benchmark logs and raw timing JSON
+- Driver and kernel versions for affected nodes (nvidia-smi -q and uname -r)
+- Short impact summary and mitigation steps taken
+
+Notes and future work:
+- We plan to add automated root-cause heuristics to the perf pipeline that flag kernel_time_ratio regressions and auto-attach the smallest representative NSYS trace.
+- Propose adding a canary that runs a targeted NVTX-instrumented workload after every driver or CUDA change in the Dedicated fleet.
+
+Document history:
+- 2024-06-12: Initial draft
+- 2024-09-05: Added NSYS examples and heuristics after attention-kernel regression
+- 2025-01-20: Revised rollout guidance and added kernel selector remediation options
+

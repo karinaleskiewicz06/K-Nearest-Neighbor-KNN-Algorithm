@@ -1,0 +1,193 @@
+Crossplane fallback & profiling playbook: diagnosing fused fallbacks across scheduler layers
+
+Summary
+-------
+This playbook documents how to diagnose, triage, and remediate cross-layer fallback events in the serving runtime when the router, kernel-dispatcher, and kv-cache layers interact to trigger graceful degradations. It focuses on a class of incidents we call 'fused fallbacks' — when multiple subsystems independently activate fallback policies and the system degrades more than intended (e.g., model swap + kernel downgrade + cache eviction).
+
+Audience
+--------
+- Oncall SREs and runtime engineers handling production incidents.
+- Performance engineers running microbenchmarks and regression hunts.
+- Release engineers validating canaries for new scheduler or kernel rollouts.
+
+Why this is different
+--------------------
+Existing runbooks cover single-layer fallback (router or kernel) or warmstart strategies. This document covers the combined behavioral surface: how fallback signals propagate, what telemetry to collect to see the causal chain, and an ordered mitigation sequence that minimizes user-visible SLO impact.
+
+Key goals and SLOs
+------------------
+- SLOs to use during triage: p50 < 60ms, p95 < 220ms, p99 < 700ms for short-text generation (seq<=128) on hosted tier.
+- Fallback budget: total degraded token-rate should be <5% of baseline over 5m rolling window.
+- Alert thresholds: sustained 2x increase in kernel-handled-slow-calls with concurrent model-variant-swaps > 10/min.
+
+Primary services and signals to inspect
+-------------------------------------
+- inference-router: routing decisions, chosen-tier, model-variant-id, timestamped route decisions (field: route_decision.trace_id).
+- kernel-dispatcher: kernel_version, queue_depth, dispatch_latency_ms, kernel_error_rate.
+- kv-cache-manager: hit_rate, warmup_ratio, eviction_rate, per-tenant cache_size_bytes.
+- fallthrough-agent: fused-fallback-events log (proto), reason codes (NETWORK_PRESSURE, KERNEL_TIMEOUT, CACHE_WARMUP_FAIL).
+- telemetry-ingester / traces: trace spans linking router -> dispatcher -> kernel.
+
+Immediate triage checklist (first 15 minutes)
+-------------------------------------------
+1) Verify customer impact and scope. Query the status dashboard for affected routes and tenants.
+2) Fetch correlated alerts: kernel_timeouts, model_swap_rate, cache_evictions.
+3) Run a targeted synthetic request against the same route with trace headers enabled. Example: 
+
+   curl -s -H "X-Trace-Enable: 1" 
+        -H "Authorization: Bearer $REDWOOD_DEBUG_TOKEN" 
+        -d '{"input":"hello"}' 
+        https://inference-router.internal/v1/generate?model=redwood-small
+
+   Capture trace_id and inspect trace spans in the trace UI.
+
+4) Check fallthrough-agent logs for fused-fallback-events in the 5m window.
+
+Causal diagnosis matrix
+-----------------------
+Use the following matrix to map observed symptoms to likely root causes. The matrix is intentionally conservative — multiple cells can be true.
+
+| Symptom | Likely root causes | Quick check |
+|---------|--------------------|-------------|
+| sudden model variant swap + p99 spike | router policy fallback due to capacity + kernel preemption | router logs: route_decision.reason == CAPACITY_CONSTRAINT; kernel-dispatcher.preemption_count > 0 |
+| progressive latency increase + kv hit-rate drop | cache warmup failing over eviction threshold | kv-cache-manager.eviction_rate > 100/s; warmup_ratio < 0.6 |
+| repeated kernel timeouts + model downgraded | kernel-side OOMs or kernel update causing regressions | kernel-dispatcher.kernel_error_rate > 1%; node-level GPU OOM events present |
+| multi-tenant p95 regressions with low per-tenant qps | admission controller misconfigured quota spillover | admission-controller.metrics.queue_weight_rebalance > 0.7 |
+
+Longer investigation (15–90 minutes)
+------------------------------------
+- Stitch traces: find the earliest fallback signal in router traces and follow downstream spans to kernel and cache. Identify which component first emitted a fallback decision (router fallthrough vs kernel probe failure).
+- Gather microbenchmarks: run the microbenchmark harness matching the production shape (concurrency, sequence length, input distribution). Compare against the last known-good baseline stored in the benchmarking suite.
+
+  Example microbenchmark command (internal harness):
+
+  ./bench/run --target https://inference-router.internal --model redwood-medium --shape concurrency=8,seq=256,inputs=1000 --trace --output /tmp/bench.out
+
+- Capture kernel telemetry snapshot: /api/v1/internal/kernel/metrics?snapshot=true. This returns a compact JSON array of kernel occupancy, active-calls, and per-kernel latency histograms. (The endpoint is internal-only and requires service-to-service auth).
+
+Observed pattern -> ordered mitigations
+--------------------------------------
+When fused fallbacks are observed, apply mitigations in this order. The goal is to limit cascading side-effects and keep the customer-visible latency within SLO while preserving safety.
+
+1) Rate-limit non-critical tenants: temporarily reduce burst allowance to free slots. CLI: 
+
+   redwoodctl quota apply --tenant experimental --burst=0 --policy=reduce-by-75
+
+2) Pin affected routes to a conservative model-variant (not a lower-quality model) using the router override to avoid triggering kernel variant swaps: 
+
+   redwoodctl router override --route /v1/generate --model redwood-medium:v1-pin --duration 15m --reason "fused-fallback triage"
+
+3) Increase kernel dispatch retry budget to avoid OOM-triggered swaps while kernel team investigates: 
+
+   curl -X POST -s -H "Authorization: Bearer $SVC_TOKEN" 
+     https://kernel-dispatcher.internal/admin/retry-config 
+     -d '{"max_retries":3,"backoff_ms":150}'
+
+4) If cache warmup is failing, temporarily enable conservative cache replication for the affected tenant: 
+
+   api: POST /api/internal/kvcache/replicate?tenant=TENANT_ID&mode=shadow
+
+5) If kernel-side regressions are suspected and rollback is available, rollback kernel to last-good version with canary disabled for that node pool. Follow the kernel rollback runbook after trusting the rollback assessment.
+
+Instrumentation and data to collect for postmortem
+--------------------------------------------------
+- Full traces for a sampling of 30 failed requests including the router route_decision span.
+- Kernel dispatch snapshots (as above) for the 30 requests and a 10m period surrounding the event.
+- kv-cache-manager metrics and per-tenant cache keys eviction traces for the 30 requests.
+- Fallthrough-agent fused-fallback-event protos.
+- Microbenchmark run output and diff against baseline.
+
+Quick reference tables
+----------------------
+Fallback reason codes and recommended triage owner:
+
+| Reason code | Primary owner | Triage action |
+|-------------|---------------|---------------|
+| KERNEL_TIMEOUT | runtime/kernel | collect kernel snapshot, raise kernel regression alert |
+| CACHE_WARMUP_FAIL | runtime/cache | inspect eviction/warmup metrics, replicate cache if necessary |
+| CAPACITY_CONSTRAINT | platform/router | check autoscaler activity, reduce non-critical burst allowances |
+| NETWORK_PARTITION | infra/networking | verify link health, throttle regional routing |
+
+Escalation matrix (when to page)
+--------------------------------
+- Page runtime-kernel oncall if p99 > 2x SLO and kernel_error_rate > 5% for 5m.
+- Page infra-networking if fallthrough-agent reason == NETWORK_PARTITION.
+- Page platform-availability if model_swap_rate > 50 swaps/min or global autoscaler failed.
+
+Runbook for reproducing fused fallback in staging (step-by-step)
+---------------------------------------------------------------
+1) Prepare a staging cluster configured to mimic the production admission-controller weights.
+2) Deploy a kernel test build with instrumentation flags: KERNEL_DEBUG=1, PROBING_ENABLED=1.
+3) Seed the kv-cache with a warm working set using the cache warmup harness: 
+
+   ./tools/cache-seed --tenant test-tenant --keys 100000 --payload-size 512
+
+4) Run synthetic load: 
+
+   ./bench/run --target https://staging-router.internal --model redwood-medium --shape concurrency=32,seq=128,inputs=20000 --faults kernel-slow=0.15,cache-evict-burst=0.2
+
+5) Observe the fused-fallback events via fallthrough-agent and iterate mitigation steps in a non-production safe mode. Ensure you capture the timeline of first fallback emission.
+
+Benchmark artifacts to collect
+----------------------------
+- baseline.json: last-known-good microbenchmark output for the same model/shape.
+- current-run.json: the run performed in step 4.
+- kernel-diff.txt: human-readable diff of kernel histogram deltas.
+- trace-archive.tar.gz: collected traces for all sampled requests.
+
+Postmortem template (required fields)
+------------------------------------
+- Summary of impact (routes, tenants, duration).
+- Timeline with the first fallback emission timestamp and causal chain.
+- Root cause analysis and evidence (traces, kernel snapshots, eviction logs).
+- Short-term mitigations applied and timeline.
+- Long-term action items (owners + target dates).
+- Monitoring changes and new alerts added.
+
+Ownership and contacts
+----------------------
+- Runtime: @runtime-oncall (rotation page) — primary triage.
+- Kernel: Carlos Mendes (carlos@redwood.ai) — kernel profiling and rollback.
+- Cache: Aisha Khan (aisha@redwood.ai) — eviction and warmup tuning.
+- Router & policies: Ethan Liu (ethan@redwood.ai) — routing policy tuning.
+
+Appendix A — common diagnostic queries
+--------------------------------------
+1) List fused-fallback events in the last 10m:
+
+   gcloud logging read 'resource.type="k8s_container" AND jsonPayload.component="fallthrough-agent"' --limit 50 --project redwood-prod | jq '.jsonPayload | select(.event=="fused-fallback")'
+
+2) Kernel snapshot fetch (internal curl):
+
+   curl -s -H "Authorization: Bearer $SVC_TOKEN" https://kernel-dispatcher.internal/api/v1/internal/kernel/metrics?snapshot=true | jq '.'
+
+3) Compare benchmark histograms using the internal comparator: 
+
+   ./tools/bench-compare --base baseline.json --current current-run.json --out /tmp/bench-diff.html
+
+Appendix B — safe defaults for emergency toggles
+-------------------------------------------------
+| Toggle | Safe default during triage | Notes |
+|--------|----------------------------|-------|
+| router.model_swap.enabled | false | prevents mass variant swaps while retaining current model mapping |
+| kernel.autotune.enabled | false | prevents aggressive kernel selection changes during live incidents |
+| kvcache.eviction_aggressiveness | 0.2 | reduces churn; may increase memory usage temporarily |
+
+Appendix C — glossary of new terms used here
+----------------------------------------------
+- fused fallback: coordinated or coincident fallback actions from multiple runtime layers that lead to larger-than-expected degradation.
+- fallthrough-agent: internal daemon responsible for aggregating fallback decisions and emitting fused-fallback-events.
+- kernel-probe: periodic kernel health probe used by the dispatcher to decide whether to switch kernel implementations.
+
+Notes and change history
+------------------------
+- 2025-08-15 (Priya Nambiar): initial playbook draft.
+- 2025-10-02 (Ethan Liu): added benchmark artifact checklist and safe toggles.
+- 2026-02-10 (Priya Nambiar): expanded escalation matrix and added CLI examples for router overrides.
+
+Related runbooks and reading
+---------------------------
+- runtime-deployment-circuit-breakers-and-sla-fallback-playbook-2026 (for circuit-breaker policy knobs).
+- telemetry-feedback-kernel-autotune-playbook-2026 (for kernel autotune interactions).
+
+End of document

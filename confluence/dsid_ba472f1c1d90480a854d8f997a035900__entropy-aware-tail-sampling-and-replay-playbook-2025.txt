@@ -1,0 +1,137 @@
+entropy-aware-tail-sampling-and-replay-playbook
+
+Summary
+-------
+This playbook describes an entropy-aware sampling and replay pipeline used to capture and investigate rare, high-cost tail latency events in the serving runtime. The goal is to produce a small, high-value corpus of end-to-end requests (input+context+response+runtime-trace) for offline replay, debugging, and kernel-level root-cause analysis without overwhelming storage or incurring excessive cost.
+
+Motivation
+----------
+Traditional frequency-based samplers either oversample common fast requests or miss low-frequency pathological requests that drive p99–p999 latency. Entropy-aware sampling combines statistical rarity in the request surface (input entropy), deviation from expected latency signatures (residual latency), and scheduler/kernel signals (unexpected kernel hops, cache misses) to prioritize traces for capture.
+
+When to use
+-----------
+- Investigating unexplained p99+ spikes.
+- Prioritizing data for quantization/regression testing when corpus budget is limited.
+- Building reproducer sets for kernel or NVLink anomalies.
+
+Definitions and signals considered
+--------------------------------
+- request_entropy: Shannon estimate on token distribution or prompt template fingerprint.
+- residual_latency: observed_latency - expected_latency(model, seq_len, tenant_profile).
+- kernel_hop_count: times request switched GPU kernels or was preempted.
+- kv_cache_miss_rate: fraction of KV lookups that missed warm caches.
+- cross_tenant_noise_index: normalized measure of concurrent slot contention.
+
+Sampling algorithm (high level)
+-------------------------------
+1. For each request, compute a sampling_score = w1 * normalized(request_entropy) + w2 * normalized(residual_latency) + w3 * normalized(kernel_hop_count) + w4 * normalized(kv_cache_miss_rate).
+2. Apply a minimum threshold T_min and a dynamic reservoir budget per epoch (1h window).
+3. Apply adaptive decay so that repeated requests from the same request_fingerprint are downweighted within the same epoch to protect diversity.
+4. Enrich sampled items with a short runtime-trace (per-request timeline), kernel telemetry (kernel id, duration, preemption flags), and a small snapshot of KV cache state (fingerprints only, not raw content).
+
+Weights and tuning recommendations
+--------------------------------
+- Default weights: w1=0.25, w2=0.45, w3=0.2, w4=0.1. These were empirically validated on mixed-production workloads (search-like + chat).
+- Increase w2 if investigating latency regressions; increase w1 when investigating model/prompt edge cases.
+- Reservoir sizing: aim for 2–10k captures per hour for large fleets; reduce by 10x in restricted-cost environments.
+
+Operational implementation (components)
+--------------------------------------
+- sampler-service: in-line low-latency component that receives lightweight telemetry and returns sample decisions. Must attach a sample_id header for later reassembly.
+- capture-proxy: short-circuit store for sampled request bodies and enriched traces; writes to compressed object store and indexes to telemetry DB.
+- replay-harness: isolated runner that can replay captured requests against staging kernels and collect deterministic kernel traces.
+- retention-controller: policy engine that ages captures by priority and storage pressure.
+
+Example sampling config (YAML)
+----------------------------
+sampling:
+  epoch_window: "1h"
+  reservoir_target_per_hour: 5000
+  threshold_min: 0.6
+  weights:
+    entropy: 0.25
+    residual_latency: 0.45
+    kernel_hops: 0.2
+    kv_miss: 0.1
+  dedupe_decay_seconds: 600
+  fingerprint_fields: ["prompt_template_id", "user_agent", "tenant_id"]
+
+Telemetry and metrics to emit (required)
+--------------------------------------
+- runtime.sampler.score (gauge, labeled by sample_id, tenant_id, model)
+- runtime.sampler.decision (counter: sampled|rejected)
+- runtime.capture.size_bytes (histogram)
+- runtime.capture.latency_ms (time for capture proxy roundtrip)
+- runtime.replay.success (counter)
+- kernel.hop.count (counter per request)
+- kvcache.fingerprint.count (gauge)
+
+Replay harness contract
+-----------------------
+1. Replay must accept a compressed tarball containing: metadata.json, request.json, small_trace.pb, kernel_hints.json.
+2. Replay must run in an isolated namespace with pinned kernel images matching the original kernel id or best-effort compatible variant.
+3. Replay should produce a canonical result bundle: stdout JSON, kernel-trace.pb, telemetry-snapshot.json, and a fidelity-report comparing runtime signatures against the captured baseline.
+
+Runbook: investigating a p99 spike with entropy samples
+-----------------------------------------------------
+1. Identify spike window and query telemetry: p50/p90/p99, sampler.decision ratio, reservoir usage.
+2. Pull top N samples by score (N=200 by default) and surface the distribution by fingerprint, model, and tenant.
+3. Triage by category: input-entropy dominant, kernel-hop dominant, kv-miss dominant, or mixed.
+4. For kernel-hop cases: run replay-harness on the top 5 captures, compare kernel-trace.pb to stored baseline, and check for kernel version skew or NVLink remapping.
+5. For kv-miss dominant: check kvcache hit rates across the cluster and warmup patterns; consult the kvcache-prefetch logs.
+6. Draft incident note with root cause hypotheses and remedial actions (kernel patch, scheduler-rule, cache policy change).
+
+SLOs and thresholds for sampling pipeline health
+------------------------------------------------
+- sampler.decision_latency: p95 < 2ms (impacting request tail should be negligible).
+- capture.success_rate: >= 99% for declared samples.
+- replay.harness.repeatability: >= 95% for deterministic kernels (document exceptions).
+
+Storage, retention, and backfill guidance
+----------------------------------------
+- Target compressed capture size: median 3KB, 95th percentile < 1MB.
+- Retention: high-priority captures (score > 0.95) keep 90 days; general captures keep 7–14 days depending on storage tier.
+- Backfill: if replays require additional context we do not capture inline (e.g., larger KV snapshots) we store hooks to request ephemeral backfill runs against a temporary snapshot of tenant state under approved compliance process.
+
+Privacy and compliance notes
+---------------------------
+- DO NOT capture full PII or customer content unless an explicit approved data-retention exception exists. Sampler must filter or redact fields defined in the global PII filter config.
+- All captures are tagged with confidentiality: internal and logged in the audit service.
+
+Operational checks and dashboards (recommended)
+---------------------------------------------
+- Dashboard: sampler overview (decisions/hour, avg score, reservoir fill).
+- Dashboard: capture quality (size distribution, replay success over time, median time-to-replay).
+- Alert: capture.success_rate < 98% for 10m, sampler.decision_latency.p95 > 5ms.
+
+Appendix: CLI examples
+----------------------
+- Create a replay bundle from capture store (example):
+  $ rcli capture fetch --id sample-2026-09-11-0001 --out ./bundle.tgz
+
+- Run replay against staging:
+  $ rcli replay run --bundle ./bundle.tgz --target staging --collect kernel-trace,telemetry --timeout 10m
+
+FAQ
+---
+Q: How do we avoid capturing test traffic or repeated PLG samples?
+A: Use fingerprint_fields to identify onboarding/test flows and set an explicit exclude policy.
+
+Q: Does sampling add latency to production calls?
+A: The in-line sampler must be asynchronous in critical-path if score calculation exceeds low-latency budget; prefer a fast-path estimate and deferred final capture.
+
+Owners and contacts
+-------------------
+Primary: eng-serving-runtime/profiling (team alias).
+Escalation: Aisha Patel (aisha.patel@redwood.ai), Marco Ruiz (marco.ruiz@redwood.ai).
+
+Related reading
+---------------
+- Performance-regression-huntbook (see onboarding steps for replay harness)
+- runtime-telemetry-sampling-cost-aware-profiling (design motivations and cost modeling)
+
+Change log
+----------
+- 2025-02-10: initial draft and internal review.
+- 2025-06-01: adjusted default weights after mixed-workload evaluation.
+- 2026-08-12: added replay contract and PII compliance section.

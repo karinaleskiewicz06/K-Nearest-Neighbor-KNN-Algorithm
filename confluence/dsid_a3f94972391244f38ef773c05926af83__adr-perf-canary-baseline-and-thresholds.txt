@@ -1,0 +1,247 @@
+ADR-0142: Perf Canary Baselines, Regression Thresholds, Min Sample Sizes, and Anti-Flap Logic
+
+## Status
+Published.
+
+## Summary
+This ADR defines how the production performance canary computes baselines and evaluates regressions for per-model serving performance (primarily p95 latency and tokens/sec). It documents:
+- Baseline computation approach (rolling vs fixed) and when each is used.
+- Regression thresholds (warning vs paging) and how they are applied.
+- Minimum sample sizes and confidence requirements to avoid noisy alerts.
+- Anti-flap / dedupe logic to prevent alert storms during drift, telemetry delays, or small-sample variance.
+
+## Context / Problem
+Redwood’s serving runtime changes frequently (kernel selection updates, scheduler heuristics, model config changes, GPU fleet changes, and staged rollouts). We need an always-on canary that:
+- Detects real p95 latency regressions and throughput drops early.
+- Produces actionable signals for attribution (kernel vs scheduler vs infra).
+- Avoids paging on expected variance and baseline drift (e.g., slow fleet mix changes or regional differences).
+
+The key design tension is baseline choice:
+- A **fixed baseline** is stable and easy to reason about during rollouts, but can become stale as hardware/driver stacks and workloads evolve.
+- A **rolling baseline** adapts over time, but can drift (masking regressions) or create false positives if drift is misinterpreted as regression.
+
+## Decision Drivers
+1. **Low noise / high trust**: warnings should be useful; pages should be rare and high-confidence.
+2. **Fast detection**: detect regressions within ~10–30 minutes for top models in covered regions.
+3. **Attribution**: baseline keys must align to dimensions needed for root cause (runtime build, kernel tags, SKU).
+4. **Operational simplicity**: SRE/on-call should have a predictable interpretation of “regression vs baseline,” including during ongoing rollouts.
+5. **Guardrails against drift and telemetry issues**: avoid alert storms caused by baseline drift, delayed metric ingestion, and label cardinality errors.
+
+## Decision
+We adopt a **hybrid baseline strategy**:
+
+1) **Primary baseline = Fixed, versioned baseline per (model, model_version, runtime_build, kernel_set_id, hardware_sku) with optional region override**
+- Baselines are generated from controlled canary runs (prod-like load) and stored as immutable artifacts.
+- Baselines are explicitly tied to the runtime build and kernel selection identifiers so comparisons remain meaningful.
+- This is the baseline used for rollout gating and for paging.
+
+2) **Secondary baseline = Rolling “health baseline” used for drift monitoring and threshold calibration (not for paging)**
+- We compute a rolling reference from recent stable periods (default: last 7 days) to detect slow environmental drift and to inform recalibration.
+- Rolling baseline is not used to auto-suppress a fixed-baseline regression; it is used as a triage and tuning signal.
+
+3) **Baseline freeze rules**
+- During a runtime rollout (canary/gradual), the baseline used for alerts is **frozen** to the most recent fixed baseline for the currently active runtime build on that ring.
+- If an incident is declared for a perf regression, baseline updates are **paused** for affected keys until incident closure.
+
+4) **Threshold evaluation requires minimum sample size + sustained breach + hysteresis**
+- Alerts require both a minimum number of canary requests and sustained breach across multiple evaluation windows.
+- Alert clear conditions are stricter than trigger conditions (hysteresis) to reduce flapping.
+
+## Baseline Keys (What defines “like-for-like”)
+Baseline artifacts and regression evaluation are keyed by the following dimensions:
+
+**Required baseline key fields (v1):**
+- model_id (canonical model identifier)
+- model_version (registry version / hash)
+- runtime_build_id (serving runtime build tag)
+- kernel_set_id (kernel selection/version identifier)
+- hardware_sku (e.g., H100-80GB, A100-80GB)
+
+**Optional fields (only when variance requires it):**
+- region (enabled for regions with materially different fleet/network characteristics)
+- capacity_tier (hosted vs dedicated pools) when pools differ materially
+
+Notes:
+- We do NOT key baselines by customer, endpoint, or prompt content (privacy + cardinality constraints).
+- Scheduler configuration flags that materially change behavior must be reflected either in runtime_build_id or an explicit scheduler_profile tag (introduced only if needed; kept off by default to control cardinality).
+
+## Metrics Covered
+Baselines and regressions are computed for:
+- End-to-end latency: p50, p95, p99 (ms)
+- Runtime-only latency: p50, p95, p99 (ms) (excludes network/client)
+- Prefill latency and decode latency (ms)
+- Queueing time (ms) (scheduler-level)
+- Tokens/sec (overall, and decode tokens/sec where available)
+- Batch size distribution (for attribution)
+- KV cache hit rate (where applicable; informational at v1)
+
+## Baseline Computation
+### Fixed baseline artifact
+- Source: controlled perf-canary runs using the approved synthetic prompt distribution.
+- For each baseline key, we store:
+  - distribution summaries (p50/p95/p99) for each latency metric
+  - mean and standard deviation where stable enough to be meaningful
+  - tokens/sec distribution summaries
+  - run metadata (time range, sample count, canary config version)
+- Baseline validity: baseline is considered valid only if it meets minimum sample size requirements (see below) and passes sanity checks (no telemetry gaps, no error-rate spikes).
+
+### Rolling health baseline (calibration only)
+- Window: trailing 7 days, excluding periods marked as “rollout” or “incident.”
+- Aggregation: daily aggregates with robust statistics (median-of-daily-p95) to reduce sensitivity to short spikes.
+- Purpose:
+  - detect slow drift (e.g., fleet changes) that may warrant generating a new fixed baseline
+  - suggest region/SKU overrides when variance is consistently higher
+
+## Regression Definition
+We define regression as a statistically and operationally meaningful deviation from the fixed baseline.
+
+### Core comparison method (v1)
+For each metric M and key K in each evaluation window W:
+- Compute observed metric value O(K, W).
+- Fetch baseline value B(K) and baseline variability estimates when available.
+- Compute percent change: Δ = (O - B) / B.
+
+We use percent change thresholds with guardrails (min samples + sustained breach). Percent thresholds are chosen because:
+- Different models have different absolute latencies.
+- p95 is the primary SLO-relevant tail metric.
+
+### Threshold levels
+Two alert levels exist:
+- **Warning**: actionable signal for runtime team triage; routed to #eng-runtime.
+- **Paging**: sustained, high-confidence regression on top models; routed to on-call rotation.
+
+## Default Thresholds (v1)
+Thresholds are configurable per model, with these platform defaults used unless overridden.
+
+### Latency (p95 end-to-end)
+- Warning: p95 E2E latency **+10%** vs baseline for **2 out of 3** consecutive evaluation windows.
+- Paging: p95 E2E latency **+20%** vs baseline for **3 out of 4** consecutive evaluation windows.
+
+### Throughput (tokens/sec)
+- Warning: tokens/sec **-8%** vs baseline for **2 out of 3** windows.
+- Paging: tokens/sec **-15%** vs baseline for **3 out of 4** windows.
+
+### Runtime-only attribution signals (non-paging by default)
+These are emitted to dashboards and included in alert payloads, but do not page unless explicitly enabled for a model:
+- Queueing time p95 +25% (suggests scheduler/fleet saturation)
+- Prefill p95 +15% (suggests kernel/model config regressions)
+- Decode p95 +15% (suggests kernel/model config regressions)
+
+Rationale:
+- Paging should be driven by end-to-end customer-impact proxy (E2E p95 and tokens/sec).
+- Breakdown metrics improve triage but are often noisier and more sensitive to load mix.
+
+## Minimum Sample Sizes and Windowing
+### Evaluation window
+- Default evaluation window: **10 minutes**.
+- Windows are evaluated continuously and require sustained breach rules (see anti-flap).
+
+### Minimum samples (per key K, per window)
+- **Latency metrics**: minimum **200 successful canary requests** per window.
+- **Tokens/sec**: minimum **200 successful canary requests** per window AND minimum **50,000 total generated tokens** per window.
+
+If sample requirements are not met:
+- No alert state change is allowed (prevents flapping in low-coverage periods).
+- Dashboard panels display “insufficient sample” annotation.
+
+Rationale:
+- Tail latency (p95/p99) is unreliable with very small N.
+- Tokens/sec needs sufficient token volume to smooth per-request variance.
+
+## Anti-Flap, Dedupe, and Hysteresis
+### Sustained breach logic
+We use “M out of N windows” to reduce sensitivity to transient spikes:
+- Warning: 2/3 consecutive windows breach
+- Paging: 3/4 consecutive windows breach
+
+### Alert clear (hysteresis)
+Alerts clear only when performance returns closer to baseline:
+- Warning clears when Δ < +6% (latency) and Δ > -5% (tokens/sec) for 3/3 windows.
+- Paging clears when Δ < +12% (latency) and Δ > -10% (tokens/sec) for 4/4 windows.
+
+### Cooldown
+After an alert transitions to firing, we enforce a cooldown before re-triggering a new incident thread for the same key:
+- Warning cooldown: 60 minutes
+- Paging cooldown: 120 minutes
+
+### Dedupe key
+Incident-bot dedupes based on:
+- model_id + model_version + runtime_build_id + kernel_set_id + hardware_sku (+ region if present) + metric_type + severity
+
+### Telemetry delay protection
+If telemetry ingestion delay exceeds 2x the evaluation window (e.g., >20 minutes), alert evaluation is suspended and a separate “telemetry delay” warning is emitted to #eng-platform.
+
+## Alternatives Considered
+### A) Pure rolling baseline (always updated)
+Pros:
+- Adapts to drift without explicit re-baselining.
+Cons:
+- Risk of masking slow regressions (baseline chases the regression).
+- Hard to use for rollout gating (“moving goalposts”).
+- Susceptible to alert storms if rolling logic is impacted by label bugs or ingestion gaps.
+
+Decision: Rejected for paging/gating. Allowed only as a secondary calibration signal.
+
+### B) Pure fixed baseline (never updated unless manual)
+Pros:
+- Extremely stable; easy to reason about.
+Cons:
+- Becomes stale as fleet/hardware/driver changes accumulate; increases false positives over time.
+- Forces frequent manual work to remain relevant.
+
+Decision: Rejected as the only strategy. Adopted as primary baseline with explicit regeneration workflows.
+
+### C) Per-region baselines always on
+Pros:
+- Reduces false positives due to cross-region fleet differences.
+Cons:
+- Baseline explosion (more artifacts and config), operational overhead.
+
+Decision: Region is optional and only enabled for models/regions where observed variance requires it.
+
+## Consequences
+### Positive
+- Stable, versioned baselines support rollout gates and high-confidence paging.
+- Rolling health baseline provides drift visibility without undermining safety.
+- Anti-flap controls reduce alert noise and prevent incident-bot storms.
+
+### Negative / Tradeoffs
+- Requires baseline artifact generation whenever major runtime/kernel changes land for covered models/SKUs.
+- Some true regressions may be detected slightly later due to sustained-breach requirements.
+- Optional region/tier overrides add complexity when enabled.
+
+## Implementation Notes / Requirements
+1. Baseline artifacts must be stored in an access-controlled, versioned store with auditability (who/when created).
+2. Canary config must support per-model overrides:
+   - thresholds by severity
+   - whether region-specific keys are enabled
+   - “top model” flag affecting paging eligibility
+3. Alert payloads must include:
+   - observed value, baseline value, percent change
+   - sample counts and token counts
+   - runtime_build_id, kernel_set_id, hardware_sku, region
+   - links to dashboards, traces, and runbook
+4. Changes to default thresholds must go through an ADR update or SRE-approved change request.
+
+## Rollout Guidance
+- Phase 1 (single region): warnings only, tune per-model overrides until noise is acceptable.
+- Phase 2: enable paging only for top models with proven low variance and stable baselines.
+- Phase 3: integrate gating with release engineering once paging signal is trusted (warning can gate early as “soft fail,” paging as “hard fail”).
+
+## Open Questions (tracked outside ADR)
+- Whether to introduce a scheduler_profile tag in baseline keys (cardinality vs attribution benefit).
+- Whether to page on runtime-only p95 for certain enterprise-dedicated pools (when E2E has additional network variance).
+- Whether to incorporate a lightweight statistical test (e.g., bootstrap CI on p95) for models with unusually high variance.
+
+## Appendix A: Example Per-Model Overrides (illustrative)
+- Top model (customer-critical): paging at +15% p95 E2E, -12% tokens/sec, stricter min token count.
+- High-variance model: warning only, wider thresholds (+15% / -10%), region-specific baseline enabled.
+- New kernel rollout candidate: temporary tighter warning (+8%) during rollout ring, but paging remains at default until validated.
+
+## Appendix B: Ownership
+- Baseline pipeline and artifact integrity: Telemetry Platform (Logan Wright) + Metrics/Baselines (Nadia Rahman)
+- Threshold standards and paging hygiene: SRE (Sean Gallagher, Allison Grant)
+- Model list and rollout gating integration: Serving Runtime (Noah Patel) + Release Engineering (Connor O'Brien)
+
+## Changelog
+- 2026-02-12: Clarified cooldown timers, added telemetry delay protection rule, and tightened tokens/sec minimum token count requirement.

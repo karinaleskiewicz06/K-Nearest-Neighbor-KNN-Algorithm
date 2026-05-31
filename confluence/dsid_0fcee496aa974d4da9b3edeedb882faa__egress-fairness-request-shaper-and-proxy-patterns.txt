@@ -1,0 +1,190 @@
+Egress fairness: request shaper and tenant-proxy patterns
+
+Summary
+
+This document describes a practical, production-ready pattern for achieving egress fairness across multi-tenant GPU inference pools using a request-shaper + tenant-proxy architecture. It covers motivation, design trade-offs, Terraform module surface, CI/CD integration patterns, operational runbook for common incidents, monitoring thresholds, and a phased rollout checklist.
+
+Motivation
+
+- Problem: noisy tenants or eval jobs can saturate egress and upstream APIs (external model registries, logging sinks, or billing-sensitive services), causing latency and cost regressions for other tenants.
+- Goals: enforce predictable per-tenant egress behavior, preserve tail latency SLOs for real-time inference routes, and provide simple operational controls for capacity owners.
+- Constraints: minimal per-request overhead, compatibility with existing Envoy-based sidecar proxies, and ability to enforce quotas across cloud accounts/regions.
+
+Design overview
+
+High level components:
+
+1. Tenant Proxy (sidecar or small edge fleet)
+   - Runs Envoy or our lightweight tenant-proxy service per GPU node group.
+   - Responsible for token bucket shaping, request classification (route -> tenant -> priority), and per-tenant accounting.
+
+2. Global Shaper Controller (control-plane service)
+   - Stores configurable policy (per-tenant and per-route rates, burst sizes, egress classes).
+   - Streams policy to tenant proxies via gRPC.
+   - Emits metrics for enforcement and headroom.
+
+3. Fallback / Backpressure Router
+   - When tenant budgets are exhausted, low-priority requests are queued or redirected to a cheaper model variant or cached response.
+
+Key behaviors and policies
+
+- Rate classes: realtime (latency-sensitive), batch (best-effort), evaluation (sandboxed).
+- Default per-tenant baseline: 50 requests/min per realtime SKU (configurable).
+- Burst allowance: 3x baseline for 30s then decays to baseline over 2 minutes.
+- Shared headroom: a cluster-level token pool that can be loaned based on tenant priority and recent error budgets.
+
+Operational metrics and SLOs
+
+- Enforcement success rate (target): > 99.9% of requests passing through proxies are classified and shaped.
+- Tail latency SLO for realtime routes: p99 < 120 ms (proxy+runtime).
+- Egress saturation alarm: cluster egress utilization > 80% sustained for 3 minutes.
+- Cost guardrail alert: external egress spend spike > 20% day-over-day for a tenant.
+
+Table: example shaping parameters (default namespace)
+
+| Class | Per-tenant rate (rps) | Burst tokens | Decay window | Queueing policy |
+|-------|------------------------|--------------|--------------|-----------------|
+| realtime | 2.0 | 6 | 120s | reject -> fallback |
+| batch | 0.5 | 8 | 300s | queue 50 reqs, FIFO |
+| eval | 0.1 | 20 | 600s | sandbox redirect |
+
+Design details and implementation notes
+
+- Classification: tenant proxy extracts tenant-id from JWT or API key header. For legacy tenants, fall back to IP-based mapping.
+- Token bucket semantics: implemented in-memory with periodic persistence to ensure graceful restart recovery; state is reconciled with controller on reconnect.
+- Cross-account enforcement: for Dedicated pools using AWS account-per-tenant, the controller maps account IDs to tenant IDs and enforces policies in the tenant-proxy deployed in that specific account.
+- Metrics: counters for tokens_consumed, tokens_replenished, shaped_requests, dropped_requests, headroom_pool_used. Tag metrics by tenant, class, region, node_pool.
+
+Terraform module example (surface)
+
+- Module: modules/tenant-proxy
+- Provided variables: tenant_id, env, node_pool_id, egress_class_defaults (map), controller_endpoint, iam_role_for_proxy
+
+Example usage (YAML snippet for clarity):
+
+```hcl
+module \"tenant_proxy\" {
+  source = \"git::ssh://git@repo/infra/modules//tenant-proxy\"
+  tenant_id = var.tenant_id
+  env = var.env
+  node_pool_id = aws_eks_node_group.gpu.id
+  controller_endpoint = module.shaper_controller.endpoint
+  iam_role_for_proxy = aws_iam_role.proxy_role.arn
+}
+```
+
+Terraform notes:
+- The module deploys a DaemonSet (k8s) for each node_pool that requires shaping. For Dedicated (non-k8s) node pools, the module can produce an AMI user-data snippet to run the tenant-proxy as a systemd unit.
+- Ensure automatic rotation of proxy IAM credentials via SecretsManager and attach read-only IAM policy for policy pulls.
+
+CI/CD and promotion flow
+
+- Pipeline: build -> unit tests -> integration (local Envoy harness) -> canary deploy to sandbox tenant pool -> staged rollout to non-prod node_pools -> gradual promotion to prod with traffic mirroring.
+- Canary gates:
+  1) Shaping correctness: shaped_requests / total_requests > 99.0% in canary for 10 min
+  2) Latency impact: p99 increase < 10 ms over baseline
+  3) Error rate: dropped_requests increase < 0.1% absolute
+
+- Example Buildkite step (pseudo):
+
+```yaml
+steps:
+  - label: \":package: build proxy\"
+    command: ./ci/build-proxy.sh
+  - label: \":test_tube: run shaping unit tests\"
+    command: ./ci/run-unit.sh
+  - label: \":mag: canary deploy sandbox\"
+    command: ./ci/deploy-canary.sh --target=sandbox
+    depends_on: [\":test_tube: run shaping unit tests\"]
+```
+
+Operational runbook: egress surge (high-level)
+
+1. Detect
+   - Alert: egress_utilization > 80% sustained 3m OR billing spike alert.
+2. Triage
+   - Identify top 5 tenants by tokens_consumed in last 5m.
+   - Query proxy metrics: shaped_requests, dropped_requests per tenant.
+3. Immediate remediation (fast)
+   - Apply emergency throttle on offenders via controller: set per-tenant rate to 10% of baseline.
+   - If external API causing cost, enable per-tenant external-api-blocklist for known endpoints.
+4. Mid-term
+   - Migrate heavy eval jobs to sandbox cluster with isolated egress.
+   - Reconfigure tenant billing alerts and enforce quota changes.
+5. Post-incident
+   - Create incident summary, include tenant-id, timeline, actions, and follow-up: quota adjustment, tenant outreach, or infra change.
+
+Runbook commands and debug snippets
+
+- List proxies and controllers (kubectl):
+
+```bash
+kubectl -n infra get pods -l app=tenant-proxy -o wide
+kubectl -n infra logs deploy/shaper-controller --since=10m
+```
+
+- Query metrics (Prometheus example):
+
+```promql
+sum by (tenant_id) (increase(proxy_tokens_consumed_total[5m]))
+```
+
+- Emergency throttle via controller CLI (example):
+
+```bash
+shaperctl set-rate --tenant=tenant-123 --class=realtime --rps=0.2 --duration=30m
+```
+
+Testing and validation
+
+- Unit tests: deterministic token-bucket edge cases (burst recovery, clock skew).
+- Integration tests: local envoy with fake controller exercising policy changes.
+- Chaos: simulate controller partition and ensure proxies keep local conservative defaults for 5m and then fail open/closed per policy (configurable).
+
+Security and IAM considerations
+
+- Principle of least privilege for proxy machine roles: allow only policy GET and metrics PUT.
+- Secrets: use short-lived credentials for controller communication and rotate via SecretsManager/SSM.
+- Auditing: write policy changes and emergency throttles to audit-log topic with tenant, operator, and justification.
+
+Rollout checklist (recommended phases)
+
+1. Sandbox - small eval cluster (2 weeks): validate classification and token-bucket semantics against synthetic workloads.
+2. Non-prod - partial node_pools (4 weeks): canary policies per tenant segment.
+3. Prod - staged node_pools (2–4 weeks): gradually increase coverage; monitor enforcement metrics and latency.
+4. Enforce - enable billing guardrails and automatic sandbox redirection for repeat offenders.
+
+Ownership and contacts
+
+- Shaper controller owner: infra-platform (oncall: infra-ctrl@redwood.example.com)
+- Tenant proxy owner: gpu-infra team (oncall: gpu-infra@redwood.example.com)
+- Escalation path: infra-oncall -> platform-eng -> security if billing abuse suspected.
+
+Appendix: example Envoy filter (conceptual)
+
+```yaml
+filters:
+- name: request_shaper
+  typed_config:
+    \"@type\": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+    inline_code: |
+      -- extract tenant
+      -- token bucket check and header set
+```
+
+Notes and open questions
+
+- How aggressive should shared headroom be when multiple SLA-critical tenants are active? (defer to customer tiering policy)
+- Consider integrating with Redwood Optimize to propose per-tenant rate recommendations based on historical patterns.
+
+References
+
+- Related runbooks and modules: see related_pages above.
+- Implementation repo: git@repo/infra/tenant-proxy (internal)
+
+Document changes
+
+- 2025-09-12: initial draft by Aisha Patel
+- 2025-12-08: added Terraform module surface and CI/CD gates (reviewer: Carlos Rivera)
+- 2026-02-14: tuned default shaping table and added emergency throttle CLI examples (reviewer: Maya Singh)
+

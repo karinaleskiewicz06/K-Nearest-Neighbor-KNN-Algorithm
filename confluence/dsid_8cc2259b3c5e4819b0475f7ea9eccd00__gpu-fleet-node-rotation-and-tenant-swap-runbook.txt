@@ -1,0 +1,130 @@
+GPU fleet node rotation and tenant swap runbook
+
+Summary:
+This runbook describes the safe procedure for rotating GPU worker nodes across the fleet while performing live tenant swaps (reassigning tenant workloads to replacement nodes). It combines infrastructure (Terraform/IaC), CI/CD image promotion, capacity planning, and operational playbook steps so rotations are predictable, low-risk, and auditable. Use this when: planned maintenance, kernel or driver roll, decommissioning older GPU models, or rebalancing tenant placement across racks/regions.
+
+Owner and stakeholders:
+- Runbook owner: eng-infra oncall (primary)
+- Business owner: Platform Reliability
+- Reviewers: Capacity, Billing, Security as listed in metadata
+
+Goals and success criteria:
+- No tenant-facing 5xx errors attributable to node rotation.
+- Median p99 tail latency increase <= 10% for affected routes during operation windows.
+- No data-plane KV-cache loss for pinned sessions (see KV cache preservation checklist).
+- Successful rotation of a target node without manual rollback > 95% of attempts in dry-run environment.
+
+SLOs and thresholds to monitor during operation:
+- Request success rate >= 99.7% per-minute for production routes routed through rotated pool.
+- Queue depth (inference request queue) < 75% of configured soft-capacity for 90% of the operation window.
+- Token-generation latency p95 increase <= 20% (alert if > 20%).
+
+Preflight checklist (must be green before starting):
+1) Capacity and traffic
+   - Confirm warm-pool size for target tenant classes >= requested replacement capacity + 20% buffer.
+   - Confirm cross-region fallback enabled for tenants with strict latency SLAs.
+2) Image and kernel validation
+   - Promoted GPU node image tag verified in CI (pipeline: cicd/gpu-image-promotion) and signed: IMAGE_TAG_PROMOTED.
+   - Kernel-driver compatibility matrix checked: kernel vX.Y -> driver vA.B verified in \"gpu-driver-rollback-orchestrator\" doc.
+3) Terraform drift & plan
+   - Run `terraform plan -var-file=workspace-vars.hcl` against the target account and ensure only intended node objects change.
+   - Confirm remote state lock acquired and plan reviewed by second engineer.
+4) Telemetry & logging
+   - Synthetic probes and canary traffic configured for the rotation window.
+   - Telemetry exporters for KV-cache hits, GPU utilization, queue depth enabled and baseline snapshot saved (see command below).
+5) Communication
+   - Post to #infra-notifications with expected window and rollback times.
+   - Notify customer-success for any tenants on the rotation list if latency-sensitive.
+
+Operational steps (high-level):
+1) Mark node(s) for rotation in the fleet registry (OIDC-backed): add label `rotation:scheduled-<YYYYMMDD>`.
+2) Trigger CI job to build and promote the replacement node image if not already present: `ci promote-image --pipeline gpu-image-promotion --tag <IMAGE_TAG>`.
+3) Run a Terraform create for replacement node(s) in the same VPC/placement group: `terraform apply -target=module.gpu_node_set[\"rotation-<id>\"]`.
+4) Warm and seed KV cache on the replacement node pool by replaying recent traffic fingerprint (use `tools/kv-seed` with tenant prompt bundles).
+5) Execute tenant-swap orchestration (see detailed procedure below).
+6) Decommission old nodes after 15–30 minutes of green telemetry and no errors traced to replacement nodes.
+
+Tenant-swap detailed procedure (ordered numbered steps):
+1) Identify affected tenants and their current assignment via `fleetctl tenant-assignments --node <old-node-id>`.
+2) For each tenant:
+   a) Put tenant routing into soft-drain mode: `routingctl set-policy --tenant <id> --policy soft-drain` (in-flight requests allowed; new sessions prefer replacement nodes).
+   b) Monitor session transfer metric `session_migration_in_progress{tenant=\"<id>\"}` until it reaches 0 for at least 2 consecutive minutes.
+   c) After session stabilization, mark tenant assignment: `fleetctl reassign --tenant <id> --to-node <new-node-id> --force-rehash=false`.
+   d) If tenant uses pinned KV state across nodes, trigger KV state copy: `kvctl copy --src <old-node> --dst <new-node> --tenant <id>` and verify checksum.
+   e) Wait for traffic to flow and validate request success rate and tail latency for tenant-specific route.
+3) Repeat for tenant batches (batch size defaults to 5 tenants but tune based on pool size and queue depth).
+
+Rollback criteria and procedures:
+- Abort rotation and rollback if any of the following occur during the operation window:
+  1) Aggregate request success rate drops below 99.0% for > 2 minutes.
+  2) Queue depth exceeds 90% of maximum for > 5 minutes.
+  3) More than 2 tenants report degraded outputs beyond quality regression thresholds (see Quality guardrails doc).
+- Rollback steps:
+  a) Revert routing policy: `routingctl set-policy --tenant <id> --policy normal` to restore traffic to old node.
+  b) If the replacement node was created in this run, `terraform destroy -target=module.gpu_node_set[\"rotation-<id>\"]` after confirming zero assignments.
+  c) Re-run `terraform apply` to confirm old node resources remain healthy; if old node was deleted, follow emergency re-create procedure in appendix.
+
+Terraform and IaC considerations (required):
+- Use the `gpu_node_set` module with flags: `hot_swap = true`, `tenant_exclusion_list` per rotation run.
+- Plan invocation pattern (example):
+```
+terraform init
+terraform workspace select prod-gpu-us-west-2
+terraform plan -var 'rotation_id=rotation-20260112' -out rotation.plan
+terraform apply rotation.plan
+```
+- Remote-state locking policy: require `plan` approved by at least one reviewer via Atlantis or PR pipeline before `apply`.
+- Tagging policy for rotated nodes: `tags = {managed_by = \"rotation-runbook\", rotation_id = \"rotation-20260112\", lifecycle = \"ephemeral\" }`
+
+CI/CD pattern for image promotion and node bootstrap:
+- Use `cicd/gpu-image-promotion` pipeline that notarizes images and updates the `node-image-catalog` SSM parameter.
+- Bootstrap hooks must include the `node-attestation` check with the internal CA and the `gpu-kernel-check` script.
+- Promote image only after passing: unit tests, integration smoke (including synthetic inference run), and signed SBOM check.
+
+Telemetry and verification checklist (post-swap):
+- Verify the following metrics have returned to baseline or within acceptable deviation for 30 minutes:
+  - request_success_rate (>= 99.7%)
+  - gpu_utilization (no sustained < 15% underutilization after warmup)
+  - kv_cache_hit_ratio (>= previous baseline - 3%)
+  - queue_depth <= 60% of soft capacity
+- Perform end-to-end canary tests using `canaryctl run --suite rotation-smoke` which executes 200 small generation flows and asserts quality tolerances.
+- Confirm billing tags and cost-center attribution for new nodes: cost center tag present and exported to billing pipeline.
+
+Post-rotation housekeeping:
+- Update fleet inventory: `fleetctl annotate --node <new-node-id> --rotation completed-<YYYYMMDD>`.
+- Archive Terraform plan and CI run IDs in rotation run folder in S3: `s3://redwood-rotation-archives/rotation-20260112/`.
+- Create an incident-trace entry if any metric breached thresholds even if recovered, for learning and RCA scheduling.
+
+Safety knobs and automation limits:
+- Auto-abort: automation will abort the tenant-swap orchestration if any global metric exceeds the abort thresholds listed in Rollback criteria.
+- Rate limiting: `fleetctl reassign` will default to 5 tenants / 10 minutes. This can be tuned using `--concurrency` with an explicit justification recorded in the rotation run metadata.
+- Dry-run mode: to simulate tenant-swap without changing routing, run `runbookctl rotation --dry-run <rotation-id>` (recommended for first-of-kind rotations).
+
+Appendix A — Emergency recreate sequence (if an old node was accidentally destroyed):
+1) Run `terraform apply -target=module.gpu_node[\"<old-node-id>_recreate\"]` to provision a minimal replacement with identical IPs/hostnames if required by tenant licensing.
+2) Restore KV checkpoint from backup bucket using: `kvctl restore --s3 s3://kv-checkpoints/<old-node>/<timestamp>`.
+3) Mark replacement as `recreated:emergency` and run full KV reconciliation: `kvctl reconcile --full --src-backup true`.
+
+Appendix B — Commands and helper scripts (quick reference):
+- Acquire baseline snapshot: `telemetryctl snapshot --selectors gpu_utilization,queue_depth,kvc_hits --since 10m --out baseline-<id>.json`.
+- Trigger seed job: `jobctl start kv-seed --image <IMAGE_TAG> --tenants-file tenants-batch.json`.
+- Reassign tenant: `fleetctl reassign --tenant t-1234 --to-node node-abc --reason "rotation-20260112"`.
+
+Frequently asked questions (short):
+Q: How do we choose batch size?
+A: Default 5 tenants. If warm-pool >= 3x batch size and average request size < 50 tokens, batch can be increased to 10. Consult capacity lead for exceptions.
+
+Q: What about migrations for long-running pinned sessions?
+A: Use `kvctl copy` to preserve KV state and set `reassign --force-rehash=false` to avoid invalidating session tokens. If not possible, schedule tenant for maintenance with customer-success.
+
+Revision history:
+- 2025-02-10: Initial draft by Priya Nandakumar
+- 2025-06-04: Added Terraform module patterns and tagging guidance (Marco Rinaldi)
+- 2026-01-12: Added emergency recreate appendix and tightened rollback thresholds (Lin Zhao)
+
+Related documents and references:
+- See `eng-infra/terraform-and-iac/gpu-node-image-supply-chain-and-multi-account-iac-pipeline` for image promotion details.
+- See `eng-infra/runbooks/preemptive-fallback-and-burst-hedging-for-gpu-pools` for burst handling and warm-pool sizing guidance.
+- See `eng-infra/cloud-accounts-and-networking/gpu-ephemeral-ssh-cert-operator-and-terraform-integration` for node attestation steps.
+
+If you are executing this runbook for the first time, contact the oncall eng-infra lead for a guided run.

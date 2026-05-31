@@ -1,0 +1,142 @@
+Model swap and cold-start containment runbook
+
+Overview
+========
+
+Short intro
+- Purpose: Provide the SRE oncall and owners a concise, step-by-step operational playbook to contain and remediate incidents driven by model cold-starts, model swap events, and eviction/preemption cascades in the inference fleet.
+- Scope: Applies to inference GPU pools (hosted and dedicated), warm pools, routing layers, and autoscale controllers. Not intended for build-time model conversion; focus is runtime mitigation and safe traffic migration.
+
+When to use this runbook
+- Tail latency (p99/p999) for inference increases > 2x baseline and correlates with model-load or cache-miss spikes.
+- Error budget burn spikes attributable to model-loading OOMs, KV cache misses, or repeated preemption-driven reload cycles.
+- Canary failure during a model swap (failed health checks / regression in quality telemetry).
+
+Owners and roles
+- Primary oncall: Eng-SRE oncall (first responder for runtime)
+- Model steward: Owner for the model(s) involved (product or research owner)
+- Serving runtime lead: Responsible for kernel/quantization fallbacks and warm-pool configuration
+- Fleet ops: Responsible for GPU capacity adjustments and hotpool control
+
+Key SLOs impacted (examples)
+- latency.p99 serving API <= 450ms (baseline)
+- availability.success_rate >= 99.95%
+- error_budget.daily_burn <= 2% (alert at 5%)
+
+Signal mapping and quick checks
+- Immediate indicators:
+  - p99 latency surge on model route (example PromQL):
+    sum(rate(request_duration_seconds_bucket{route=~"/v1/generate.*model=foo"}[5m])) by (le)
+  - model_load_time histogram spike: model_load_seconds_bucket{model=~"foo.*"}
+  - OOMs / pod restarts: kubectl get pods -n inference -o wide --field-selector=status.phase!=Running
+  - KV cache miss rate: sum(rate(kv_cache_misses_total{model="foo"}[5m])) / sum(rate(kv_cache_requests_total{model="foo"}[5m]))
+
+Quick triage checklist (first 10 minutes)
+1) Confirm scope: is the signal confined to a single model/version/region? Use traces and route tags.
+2) Check warm-pool health: number of warm workers available vs target (query: warm_pool_workers{pool="region-a:gpu-pool"})
+3) Inspect recent scheduling events and preemption logs (cloud provider events / cluster-scheduler events).
+4) Review model swap/canary deployment activity in the last 15 minutes.
+5) If errors or latency are global, escalate to cross-region oncall and mark incident critical.
+
+Containment options (choose in this order; aim for minimal customer impact)
+A. Route around the affected model variant
+  - If a known compatible variant exists (e.g., quantized or smaller seq-length tuned variant), switch traffic via routing policy:
+    POST /internal/route/update {"route_id":"/v1/generate/foo","target_model":"foo-v2-quantized","weight":100}  // use console/cli wrapper
+  - Verify traffic has moved (trace sampling and /metrics check).
+
+B. Route to warmed pool / keep-alive workers
+  - If warm pool has idle warm workers, move the route to nodes in that pool to avoid loading latency.
+  - CLI example: rwdctl warmpool promote --pool region-a:gpu-pool --route /v1/generate/foo --count 10
+
+C. Apply temporary admission controls
+  - Reduce per-route concurrency and increase queue limits to avoid thundering herd model loads.
+  - Example flags: --route-concurrency=4 --route-max-queued=200
+
+D. Scale capacity (fast path)
+  - If preemption caused reduced capacity, request immediate capacity changes: scale out warm pool + add reserved instances.
+  - Example (k8s): kubectl scale deployment inference-foo --replicas=+10 -n inference
+  - If autoscale is not reacting, manually trigger an emergency burst using capacity provisioner: rwdctl capacity burst --pool region-a --gpus 4 --expiry 30m
+
+Model swap procedure (safe migration with verification)
+Pre-flight (prepare before swapping live traffic):
+1) Verify the candidate model artifact is in the artifact registry and signed: rwdctl model verify --model foo-v3
+2) Check resource profile in model catalog (memory, init_time, quantization level).
+3) Warm the model in a canary worker pool (no traffic): rwdctl model warm --model foo-v3 --count 5 --pool canary-pool
+4) Run synthetic canaries (quality and perf): rwdctl canary run --model foo-v3 --cases /eval/prompt-set/foo --target-slo latency.p95<=300ms,quality>=0.95
+5) Validate telemetry: no unacceptable regressions in latencies, memory, or token cost.
+
+Gradual traffic shift (if canary checks pass):
+1) Shift 5% traffic to foo-v3 for 10 minutes. Observe key metrics: p50/p95/p99, error_rate, KV miss rate.
+2) If stable, step to 25% for 15 minutes.
+3) Step to 50% then 100% with observation windows.
+4) If at any step errors exceed thresholds (p99 > +30% baseline or error_rate > 2x baseline), abort and rollback to previous version.
+
+Rollback steps (fast rollback):
+1) Pause new traffic to candidate variant: POST /internal/route/update {"route_id":"/v1/generate/foo","target_model":"foo-v2","weight":100}
+2) If necessary, mark candidate as quarantined in model catalog: rwdctl model quarantine --model foo-v3 --reason "canary_failure"
+3) Start postmortem evidence capture (see Post-incident section).
+
+Cold-start containment strategies (runtime knobs)
+- Warm pool sizing: maintain target headroom of >= 10% more warm workers than rolling 99th percentile concurrency per pool.
+- Soft keep-alives: configure workers to keep KV cache for N requests or M minutes (e.g., KV_TTL=20m, MIN_RETAIN=3).
+- Preload hotspots: use request prefix analysis to pre-populate KV cache for common prefixes.
+- Eviction backoff: on preemption events, backoff reloads for model pods for 15s before retry to avoid repeated thrash.
+
+Eviction and preemption handling (if worker nodes are being evicted)
+1) Detect eviction storm: node_eviction_rate > 0.5/min over 5m window.
+2) Reduce concurrency for affected pools and drain new requests to other pools.
+3) Request fleet ops to pause non-critical batch workloads.
+4) If eviction is caused by noisy neighbor, coordinate with cloud provider logs and file ticket.
+
+Commands and telemetry snippets (copy-paste)
+- PromQL: p99 latency per model\  histogram_quantile(0.99, sum(rate(request_duration_seconds_bucket{job="inference",route=~"/v1/generate.*"}[5m])) by (le, model))
+- Warm pool status: curl -sS http://console.internal/api/warmpool/status?pool=region-a
+- Promote warm workers: rwdctl warmpool promote --pool region-a --route /v1/generate/foo --count 10
+- Emergency capacity: rwdctl capacity burst --pool region-a --gpus 4 --expiry 30m
+
+Post-incident: evidence capture and review checklist
+- Capture traces for 30 minutes before/after the incident start time.
+- Export model-serving logs, scheduler events, and node events to the incident bucket: rwdctl incident export --id INCIDENT-#### --artifacts logs,events,traces
+- Snapshot warm pool state and model catalog entries for involved models.
+- Collect canary results and synthetic-run outputs.
+- Create a focused postmortem template fields to populate: timeline, detection, containment, root cause hypothesis, corrective actions, owner, due dates.
+
+Metrics to include in postmortem
+- headroom_utilization_pct (warm pool)
+- model_load_ms P50/P95/P99
+- pod_restart_count and OOM_kills
+- route_error_rate, route_latency_p99
+
+Lessons and long-term actions (examples)
+- Implement adaptive warm-pool autotuner that increases warm workers when model-load-ms trend grows by >30% for 10m.
+- Add an additional health check metric that monitors KV cache readiness independently of process liveness.
+- Add a tenant-priority lane to avoid evicting critical customer routes in spot scaling events.
+
+Testing and game days
+- Quarterly run: simulate cold-start storm using synthetic traffic -> validate that warm pool promotion + routing to quantized variant keeps p99 within SLO.
+- Playbook test steps:
+  1) Create load profile that causes mass model loads (200 concurrent cold clients).
+  2) Observe warm pool response and timed autoscale triggers.
+  3) Validate rollback path and evidence capture timing.
+
+Appendix: configuration table (current defaults)
+| Config name | Default | Purpose | Action threshold | Owner |
+| KV_TTL | 20m | Keep KV cache for model workers | Change if cache churn high | serving-runtime |
+| WARM_POOL_TARGET_HEADROOM | 10% | Minimum warm headroom relative to 99th concurrency | Alert if < 5% | fleet-ops |
+| MODEL_LOAD_BACKOFF | 15s | Backoff after failed model load to avoid thrashing | Increase if repeated reloads | serving-runtime |
+| EMERGENCY_BURST_EXPIRY | 30m | How long emergency capacity remains by default | N/A | fleet-ops |
+
+Related runbooks and docs
+- Model warm pool sentinel & demotion runbook (see related pages)
+- Capacity eviction & soft preemption guidelines
+
+Contact and escalation matrix
+- Eng-SRE oncall: #oncall-eng-sre (slack)
+- Fleet ops pager: pagerduty->fleet-ops
+- Serving runtime lead: chen.wang@redwood.com
+
+Document history and change log
+- 2024-09-15: Initial draft by Aisha Patel
+- 2025-06-02: Added warm-pool promotion CLI and playbook testing steps (reviewers: L. O'Connor)
+- 2026-01-21: Clarified backoff defaults and added EV eviction detection rule (reviewers: Chen Wang)
+

@@ -1,0 +1,169 @@
+GPU cost and egress ownership playbook
+
+Summary
+-------
+This playbook describes Redwood's recommended patterns for assigning egress ownership, mapping egress tiers to NAT/egress gateways, enforcing per-tenant cost accountability for GPU workloads, and the associated Terraform/CI-CD guardrails and operational runbooks. The goal is to reduce unexpected egress bills, make cost carriers explicit, and ensure fast mitigation during surges without manual, ad-hoc changes to network infrastructure.
+
+Scope
+-----
+- Applies to all GPU-enabled tenant pools and evaluation fleets across cloud accounts.
+- Covers egress route selection, NAT gateway tiers, billing tags, Terraform module contracts, CI/CD checks, and an on-call runbook for egress surge events.
+- Does not replace billing reconciliation processes in finance; instead it ensures engineering ownership is traceable and auditable.
+
+Design Principles
+-----------------
+- Ownership by default: every GPU pool must declare a cost center (tenant_id or internal project) and an egress tier in IaC.
+- Safety by contract: Terraform modules gate required metadata and enforce immutable egress assignments during normal promotion flows.
+- Runtime tolerance: runtime affinity and throttling should be used to avoid sudden cross-region egress (see Runtime Affinity section).
+- Observability first: egress must emit meters and traces with tenant and route tags for per-tenant chargeback and alerting.
+
+Egress Tiers (recommended)
+-------------------------
+1) internal-only: no internet egress; traffic to internal services only (allowed via VPC endpoints). Reserved for regulated customers. SLO: 0 external bytes/month.
+2) limited-outbound: controlled egress through dedicated NAT with egress firewall rules. Use for production tenants that call small set of third-party APIs. SLO: <100 GB/month per GPU instance baseline.
+3) public-burst: uses high-throughput shared egress gateways with burst capacity; suitable for evaluation or low-sensitivity workloads. SLO: best-effort, cost-aware.
+
+Table: Tier -> Gateway mapping (example)
+-------------------------------------
+| Tier | Gateway type | Terraform module | Prefered tags |
+|------|--------------|------------------|---------------|
+| internal-only | VPC endpoint + private route | redwood_vpc_private_egress | owner,env,tenant,egress_tier |
+| limited-outbound | dedicated NAT Gateway per-account | redwood_nat_dedicated | owner,env,tenant,egress_tier,cc |
+| public-burst | shared egress pool (egress-as-a-service) | redwood_egress_pool | owner,env,tenant,egress_tier |
+
+Terraform/IaC Patterns and Guards
+--------------------------------
+- Each gpu_pool module must accept these inputs (contract-enforced):
+  - tenant_id (string)
+  - cost_center (string)
+  - egress_tier (string; permitted values: internal-only, limited-outbound, public-burst)
+  - preferred_region (string)
+- The gpu_pool module must set tags on all created cloud resources: owner=tenant_id, cost_center, egress_tier.
+- Preventing accidental tier changes: a policy variable commit_protection = true will cause the module to fail plan/apply if egress_tier changes for an existing pool unless a special approval tag is present.
+
+Example module interface (HCL snippet)
+```hcl
+module "gpu_pool" {
+  source        = "git::ssh://git@github.com/redwood/platform-modules.git//gpu-pool"
+  tenant_id     = var.tenant_id
+  cost_center   = var.cost_center
+  egress_tier   = var.egress_tier
+  preferred_region = var.region
+  commit_protection = true
+}
+```
+
+Enforced pre-merge checks (CI)
+-----------------------------
+1) terraform-validate-and-guard: ensure required variables (tenant_id, cost_center, egress_tier) are present and non-empty.
+2) egress-tier-linter: static analysis that rejects deployments mixing internal-only pools with public-burst networking resources.
+3) plan-diff-approval: any change to egress_tier or NAT gateway resources requires an explicit approval label on the PR and a run of the cost-estimator job.
+
+CI job example (pipeline YAML excerpt)
+```yaml
+jobs:
+  - name: tf-validate
+    image: hashicorp/terraform:1.5.0
+    steps:
+      - run: terraform init -input=false
+      - run: terraform validate
+  - name: egress-lint
+    image: redwood/infra-linter:latest
+    steps:
+      - run: infra-linter check --rule egress-tier
+  - name: cost-estimate
+    image: redwood/cost-estimator:latest
+    steps:
+      - run: cost-estimator --plan-file plan.json --expect-limit 5000
+```
+
+Runtime Affinity and Network Hints
+---------------------------------
+- GPU serving runtime must expose a "preferred_egress" hint in provision requests. The scheduler uses this hint to avoid placing compute in regions where egress would cross expensive paths.
+- Kubernetes example: GPU node pools should be labeled with eg. "egress_tier=limited-outbound" and pods should have nodeAffinity settings that prefer matching egress tiers.
+
+Kubernetes pod affinity example
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: inference-worker
+spec:
+  affinity:
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        preference:
+          matchExpressions:
+          - key: egress_tier
+            operator: In
+            values:
+            - limited-outbound
+```
+
+Monitoring, Metrics and Alerts
+------------------------------
+- Required metrics emitted per-GPU-pool: egress_bytes_total{tenant,egress_tier}, egress_5m_rate, nat_gateway_cost_estimate.
+- Alert rules:
+  - P1: egress_5m_rate > 2x baseline AND egress_bytes_total > 50GB in 24h -> page oncall infra-sre and owner.
+  - P2: nat_gateway_cost_estimate > monthly_budget * 1.2 -> notify pool owner and finance-ops.
+  - P3: unexpected-destination-count > 10 in 1h for an internal-only pool -> auto-isolate route and create incident.
+
+Runbook: Egress surge -> hibernate GPU pools (step-by-step)
+-------------------------------------------------------
+1) Detection: Pager triggers P1 or P2 alert.
+2) Triage: Confirm tenant_id and egress_tier from alert tags.
+3) Immediate mitigation (within 5 minutes):
+   a) If egress_tier == public-burst: scale down evaluator pools by 50% using the autoscale controller: `kubectl scale deploy/eval-pool-${tenant_id} --replicas=$(max(1,current/2))`.
+   b) If egress_tier == limited-outbound and egress_bytes_total recent rate is high: attach temporary egress-throttle policy via network-policy sidecar: `redwood-netctl throttle --tenant ${tenant_id} --limit 100mbps`.
+   c) If internal-only shows external destinations: run isolation job: `terraform apply -target=module.${tenant_id}_route_blackhole` (requires oncall approval).
+4) Cost control: apply cost-estimate label and set `commit_protection = true` on the pool module to prevent further IaC changes while we investigate.
+5) Root cause and follow-up: create post-incident thread with logs, egress destinations, and Terraform plan diff. If third-party misuse found, ban tokens and rotate keys.
+
+Rollback and restore checklist
+----------------------------
+- Confirm egress rate returned to < baseline for 2 consecutive 15-minute windows.
+- Revert temporary throttles via `redwood-netctl unthrottle --tenant ${tenant_id}` and scale deployments back to previous replica counts using recorded autoscale targets in the incident ticket.
+- Lift commit_protection flag only after cost-owner signs off and a follow-up PR updates the IaC with a mitigation plan.
+
+Ownership and Escalation
+------------------------
+- Primary owner: infra-gpu-platform team (oncall: infra-gpu-platform-oncall).
+- Secondary: cloud-networking.
+- Finance notification: billing-alerts@redwood.com.
+- Escalation path: oncall -> team lead -> eng-sre -> CTO for cross-account billing > $50k/month abnormal.
+
+Operational Notes and Best Practices
+-----------------------------------
+- Use per-tenant pre-warming for NAT gateways when expecting bursty eval runs to avoid unexpected egress routing across regions.
+- Prefer dedicated NATs for production tenants with strict budget requirements.
+- Keep small tenants in public-burst but attach accurate budget alert thresholds.
+- When possible, favor VPC endpoints or provider-managed private connectors to third-party APIs to avoid internet egress.
+
+Appendix: Helpful commands and snippets
+-------------------------------------
+- List GPU pools and egress tier (CLI):
+  `redwood infra list-gpu-pools --format json | jq '.[] | {tenant_id,name,egress_tier,cost_center}'`
+- Locking a pool in Terraform during incident (example):
+  `terraform state rm module.gpu_pool && terraform apply -var 'commit_protection=true'`
+- Quick NAT cost-estimate (internal tool):
+  `cost-estimator --service nat --region us-west-2 --bytes 50000000000 --output csv`
+
+Appendix: Example tags required in IaC (table)
+---------------------------------------------
+owner: tenant_id
+cost_center: cost center code (CC123)
+egress_tier: internal-only | limited-outbound | public-burst
+project: short project slug
+env: staging | prod | eval
+
+Related reading
+---------------
+- See platform-modules/gpu-pool README for exact variable names and examples.
+- See eng-infra/cloud-accounts-and-networking/egress-multi-path-mitigation for cross-region strategies.
+
+Revision history
+----------------
+- 2024-03-12: Initial draft by Anika Rao.
+- 2024-06-01: Added CI gate examples and cost-estimator integration (reviewers: Marcus Li).
+- 2025-07-01: Formalized runbook steps and added commit_protection contract (reviewers: Priya Menon, Evan Gallagher).

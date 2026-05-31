@@ -1,0 +1,163 @@
+Postmortem: 2026-01-18 Hosted Latency Regression Causing Rapid Error Budget Burn
+
+## Summary
+On 2026-01-18, Redwood Hosted (shared) experienced a latency regression on the chat/completions request path after a runtime configuration change and a routing preference change were deployed within the same hour. The combined effect increased queueing and tail latency, triggering downstream timeouts and elevated 5xx rates for a subset of traffic.
+
+The incident led to rapid **error budget burn** for Hosted and exposed gaps in our ability to (a) detect budget burn early, (b) prevent risky rollouts when reliability is degraded, and (c) clearly separate Hosted vs Dedicated accounting during mitigation actions (fallbacks/traffic shifting).
+
+**Primary impact:** tail latency and intermittent 5xx for Hosted chat/completions (including streaming disconnects). **Dedicated** was not the target, but mitigation actions (traffic shifting) created brief contention signals in the shared control plane that were difficult to quantify due to missing tier propagation in metrics at the time.
+
+## Customer impact
+**User-visible symptoms (Hosted):**
+- Elevated end-to-end latency (especially p95/p99) for `/v1/chat/completions` and `/v1/completions`.
+- Increased gateway timeouts (HTTP 504) and upstream 5xx.
+- Higher rate of streaming disconnect events during long generations (client saw partial output and stream termination).
+
+**Blast radius:**
+- Regions: primarily `us-east-1`, secondarily `eu-west-1`.
+- Models: concentrated on the default Hosted chat model variant and a high-traffic long-context model in the curated catalog.
+- Workloads: multi-turn chat with streaming and prompts > 4k tokens were disproportionately affected.
+
+**What customers experienced:**
+- Several PLG customers reported “random” slow responses and broken streams during bursts.
+- Support received multiple tickets referencing the same time window and similar request IDs.
+
+## Business impact
+- Hosted reliability perception degradation during a high-traffic Monday morning window.
+- Support and Solutions Engineering escalations increased; engineering time diverted to triage and comms.
+- Demonstrated that our current approach (static latency thresholds + ad-hoc rollback decisions) does not provide consistent operational guardrails.
+
+## SLO/SLI impact and error budget burn
+> Note: At the time of the incident, Hosted SLOs were tracked in dashboards but **error budget burn-rate alerting and enforcement gates were not yet enabled**.
+
+**SLIs affected (Hosted):**
+- **Success rate SLI:** proportion of requests with non-5xx terminal status.
+- **Latency SLI:** end-to-end latency from gateway ingress to first byte (streaming) / response complete (non-streaming).
+- **Streaming reliability SLI (proto):** stream disconnect/error events excluding validated client aborts.
+
+**Observed SLI degradation (peak window):**
+- p99 latency: increased from ~2.8–3.4s baseline to **>12s** for affected routes in `us-east-1`.
+- 5xx rate: increased from ~0.05% baseline to **0.6–1.1%** depending on route/model.
+- Streaming disconnect events: increased ~3–5x over baseline for long generations.
+
+**Error budget impact (Hosted):**
+- For the rolling 30-day window used by SRE dashboards, Hosted consumed approximately **38% of remaining error budget** during a ~70 minute period.
+- Budget burn was amplified by retries: retries did not fully mask user impact and increased backend pressure.
+
+**Key lesson:** Without tier-aware accounting and formal exclusion rules, we could not confidently quantify whether mitigation steps (routing/fallback, overload shedding) were helping or simply shifting failure modes.
+
+## Timeline (all times UTC)
+**2026-01-18**
+- **16:12** – Deploy `runtime-config` change begins (Hosted shared pool). Change includes increasing continuous batching aggressiveness and enabling a new kernel selection path for long-context prompts.
+- **16:19** – Routing policy change rolls out to 25%: increased preference weight for the lowest-cost GPU pool under normal load.
+- **16:26** – First internal signal: latency dashboard shows p95 rising for Hosted chat in `us-east-1`. No page triggered (static threshold alert set to p99 > 20s sustained for 10m).
+- **16:33** – Support reports first customer complaints: “stream ends mid-response” and “requests stuck.”
+- **16:37** – 5xx begins increasing; gateway timeouts appear.
+- **16:41** – On-call SRE (IC) declared; incident channel created. Initial hypothesis: regional capacity dip.
+- **16:46** – Mitigation attempt #1: increase autoscaling max for Hosted pool; partial improvement but tail latency continues to climb.
+- **16:52** – Mitigation attempt #2: routing adjusted to shift a portion of traffic to alternative compatible model variant; disconnect events decrease slightly but p99 remains high.
+- **17:01** – Identification: correlation found between regression start and the combined routing/runtime changes (deploy annotations + metrics).
+- **17:07** – Decision: rollback routing preference change first (fastest revert). Begins propagation.
+- **17:16** – 5xx plateaus then starts decreasing; latency remains elevated.
+- **17:22** – Disable runtime feature flag for new kernel selection path on long-context (targeted). Begin rollout.
+- **17:30** – Latency drops materially; streaming disconnect events return toward baseline.
+- **17:46** – Incident downgraded; monitoring continues.
+- **18:10** – Incident resolved; post-incident watch begins for 24h; no recurrence.
+
+## Root cause
+Two changes combined to create a queueing + timeout feedback loop in Hosted shared capacity:
+
+1) **Runtime configuration change increased per-request GPU residency for long-context prompts**
+- A new kernel selection path (optimized for certain sequence length distributions) was enabled globally for Hosted. Under real traffic, it increased compute time for long-context prompts and interacted poorly with the current batching configuration.
+- The batching change increased batch formation latency under bursty load, raising time-to-first-token for streaming.
+
+2) **Routing preference change shifted more traffic onto a cost-optimized pool with lower headroom**
+- Routing policy increased preference for the lowest-cost pool when the system believed it was within safe utilization.
+- Utilization signals were slightly delayed (telemetry aggregation lag), so routing continued to send additional requests into a pool that was already entering saturation.
+
+**Failure mode:**
+- Saturation increased queue times → gateway upstream timeouts increased → clients retried → more load → further saturation.
+- For streaming, long time-to-first-token raised disconnect probability; some disconnects were server-side (upstream abort) and some were client aborts after long waits. We could not cleanly separate these in SLI accounting at the time.
+
+## Contributing factors
+### Technical
+- **Insufficient canary scope for tail-latency-sensitive paths:** runtime changes were canaried by aggregate success rate, not by p99 latency and streaming health for long-context segments.
+- **Telemetry lag for routing decisions:** routing policy relied on utilization metrics with 1–3 minute effective lag during high churn, causing overshoot.
+- **Retry amplification:** retry behavior increased backend pressure during the degradation window; retry budgets were not explicitly tied to error budget state.
+- **Missing tier propagation in metrics/tracing:** we could not reliably segment Hosted vs Dedicated in end-to-end request traces during mitigation actions.
+- **No burn-rate alerting:** static threshold alerts triggered late relative to budget burn.
+
+### Process
+- **Change coupling:** two changes (runtime config + routing preference) landed close together without an explicit “risk coupling” check.
+- **No deploy gates tied to budget state:** even after early degradation signals, there was no automated pause/guardrail to block further rollouts.
+- **On-call decision overhead:** triage required manual correlation across dashboards; deploy annotations were not consistently present for all components.
+
+## Detection and response
+### What went well
+- Rollbacks were executed quickly once correlation was established.
+- Cross-team coordination (SRE + Routing + Serving) was effective after IC declaration.
+- Support provided actionable examples (timestamps, regions, and request IDs) that helped confirm scope.
+
+### What didn’t go well
+- We did not page early because alerts were tuned to avoid noise; they were not aligned to error budget burn.
+- Initial mitigation (autoscaling) was too slow to address a queueing-driven tail latency regression.
+- Streaming failure classification was ambiguous, leading to uncertainty in “is it improving?” assessments.
+
+### Where we got lucky
+- The worst effects concentrated in `us-east-1`; other regions had enough headroom to absorb partial shifts.
+- The rollback path for routing policy was straightforward and low-risk.
+
+## Corrective actions (completed)
+- Rolled back routing preference change and disabled the runtime feature flag for the new kernel selection path on long-context prompts.
+- Added temporary routing guardrails: cap on traffic share to cost-optimized pool during high queue depth.
+- Increased visibility in incident channels: pinned dashboards and a standardized “first 10 minutes” checklist for Hosted latency incidents.
+
+## Follow-up actions (prioritized)
+The following work directly motivated the tiered SLO + error budget enforcement program.
+
+| Action | Owner | Priority | Due | Status |
+|---|---|---:|---:|---|
+| Define canonical Hosted vs Dedicated SLIs (success rate, latency, streaming reliability), including exclusions (client aborts, invalid requests, rate limits) | Allison Grant / Aisha Bello | P0 | 2026-02-14 | In progress |
+| Implement tier-aware labeling at ingress and propagate through routing/fallback, tracing, and metrics | Amara Diallo / Mina Haddad | P0 | 2026-02-21 | In progress |
+| Add multi-window burn-rate alerts for Hosted and page SRE on fast burn (e.g., 2% budget/hour equivalent) | Sergio Costa / Rafael Mendes | P0 | 2026-02-28 | Planned |
+| Stand up error budget computation job with data quality checks and backfill strategy | Logan Wright | P0 | 2026-03-07 | Planned |
+| Introduce deploy gate (warn-only) when Hosted is in active budget burn; log and notify on overrides | Jordan Lee / Connor O'Brien | P1 | 2026-03-14 | Planned |
+| Move to enforced release freeze rules when budget is exhausted; define emergency fix pathway | Sahana Iyer / Sean Gallagher | P1 | 2026-03-28 | Planned |
+| Update routing policy evaluation to use more responsive utilization/queue-depth signals (reduce overshoot) | Ravi Menon / Elena Popov | P1 | 2026-03-31 | Planned |
+| Improve streaming disconnect taxonomy to distinguish server-side aborts vs client aborts; update SLI formulas accordingly | Caleb Johnson | P1 | 2026-04-05 | Planned |
+
+## Prevent recurrence: policy and engineering changes
+### 1) Tiered SLOs and enforced error budgets
+This incident demonstrated that “latency regressions” can burn reliability faster than traditional availability-only thinking. We are adopting:
+- **Tiered SLOs** (Hosted vs Dedicated) with explicit SLIs and measurement boundaries.
+- **Error budget policy** with burn-rate alerting and clear consequences (mitigation priority, release throttles/freezes).
+- **Gradual enforcement**: warn-only gates → soft gates → hard gates, with auditable overrides.
+
+### 2) Change management improvements
+- Require “risk coupling” review when multiple high-impact changes (routing, runtime, gateway) are scheduled within the same 2-hour window for the same traffic class.
+- Expand canary success criteria to include p95/p99 latency and streaming first-token latency for long-context segments.
+- Ensure deploy annotations exist for all relevant components and are visible on SLO dashboards.
+
+### 3) Overload and graceful degradation expectations
+During this incident we relied on ad-hoc traffic shifting. We will codify:
+- Overload shedding policies for Hosted (what we shed first, how it’s communicated, and how it counts against SLIs).
+- Fallback behavior accounting: when routing to a model variant counts as success and how we attribute latency.
+
+## Communications
+- No public status page update was issued during the first 20 minutes due to uncertainty in scope; internal comms lagged behind customer reports.
+- Going forward, for tier-specific incidents we will use the tiered comms guidelines to:
+  - Declare suspected tier and regions early (even if partial).
+  - Provide predictable update cadence during fast burn.
+  - Share “what to expect” for streaming (partial outputs vs hard failures).
+
+## Appendix
+### Impacted services/components
+- API Gateway: request timeouts and 5xx observed.
+- Routing/control plane: policy preference change and fallback decisions.
+- Model serving runtime: batching configuration and kernel selection path.
+- Observability pipelines: delayed utilization signals and insufficient tier tagging.
+
+### Key takeaways
+1) Latency regressions can be as damaging as outright errors via timeout/retry loops.
+2) Burn-rate alerts are required; static thresholds are too slow for tail-driven incidents.
+3) Tier-aware SLO measurement is a prerequisite for making safe mitigation decisions (and for customer trust).

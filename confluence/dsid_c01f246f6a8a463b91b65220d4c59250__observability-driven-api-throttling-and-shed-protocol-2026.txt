@@ -1,0 +1,171 @@
+Observability-driven API throttling and shed protocol
+
+Summary
+
+This document defines a cross-service protocol for adaptive API throttling and graceful shedding that is driven by high-fidelity observability signals. The goal is to protect SLOs at the service and cluster level while preserving useful client requests and providing clear client-facing status and guidance. This spec applies to edge proxies, ingress controllers, and service-side request routers for all public and internal Redwood APIs.
+
+Motivation
+
+High-throughput inference workloads create transient and sustained resource pressure (GPU queues, KV cache hot partitions, telemetry backpressure). Standard static rate limits either under-protect SLOs during bursts or unduly throttle healthy clients. By tying throttling decisions to observability signals (latency, queue depth, error taxonomy, and model-specific indicators), we can implement graduated shedding that: 
+
+- Preserves high-priority traffic (customer-paid tiers, signed enterprise tenants).
+- Minimizes user-visible errors and tail-latency breaches.
+- Surfaces actionable telemetry for operations and product teams.
+
+Scope
+
+Applies to: 
+- Public REST/streaming endpoints (generation, chat, embeddings).
+- Internal control-plane RPCs that affect capacity (model load/unload, orchestration flows).
+- Edge and regional proxies that perform rate shaping.
+
+Excludes: 
+- Long-term contract change to pricing/billing tiers (handled by product).
+- Offline batch jobs (handled by batch scheduler).
+
+Key concepts and definitions
+
+- Shedding: intentionally rejecting or delaying lower-value requests to preserve capacity for higher-value requests.
+- Observability signal: any monitored metric, trace-derived percentile, or alert that is used as input to the shedding decision.
+- Priority token: opaque token provided in request metadata that indicates the client’s priority tier.
+- Admission window: short-duration (1s-30s) time slice used for continuous admission decisions.
+
+Metrics and Signals (canonical names)
+
+Define and use these canonical metrics across services. All metrics MUST be tagged with service, region, model_variant, and tenant_id when applicable.
+
+- api.request.latency.p50 (ms)
+- api.request.latency.p95 (ms)
+- api.request.latency.p99 (ms)
+- api.request.error_rate (0-1)
+- runtime.queue.length (count) — queue of ready requests per GPU shard
+- runtime.kv_cache.hit_rate (0-1)
+- serve_gpu.utilization (0-1)
+- model.variant.fallback_count (count)
+- infra.preemption.rate (count/min)
+
+Decision signals (examples and thresholds)
+
+The following are recommended starting thresholds. Teams must calibrate per-service.
+
+- Early warning: api.request.latency.p95 > 2x baseline OR runtime.queue.length > 75% of configured queue_capacity.
+- Degraded: api.request.latency.p95 > 3x baseline OR runtime.queue.length > 90% of queue_capacity OR serve_gpu.utilization > 0.95.
+- Critical: api.request.latency.p99 > 5x baseline OR infra.preemption.rate spikes above 0.5/min per node.
+
+Priority and admission policy
+
+Admission decisions SHOULD be based on a 3-layer policy:
+1) Hard tier filter: block requests explicitly denied by tenant-level billing/contract state.
+2) Priority preservation: admit requests with priority tokens indicating enterprise/dedicated/reserved capacity.
+3) Degraded admission: during Degraded/Critical states, accept a fraction of non-priority requests according to a configured weight vector (e.g., 10% free-tier, 30% paid-tier, 60% enterprise).
+
+Algorithm sketch (per-admission window)
+
+1. Ingest observability snapshot for the past admission window (latency percentiles, queue length, GPU util).
+2. Classify window state: Normal | EarlyWarning | Degraded | Critical.
+3. If Normal: pass-through (respect static client quotas).
+4. If EarlyWarning: start soft-shaping — prefer batching-friendly requests (shorter sequences), increase path-level timeouts by 10%, emit advisory header X-Redwood-Shed:soft.
+5. If Degraded: enforce admission fractions, lower non-priority concurrency, and return HTTP 429 with structured body and Retry-After when requests are rejected. Include X-Redwood-Shed:degraded and telemetry id.
+6. If Critical: fail-fast non-priority traffic, escalate alerts, and open circuit for low-priority clients until metrics recover.
+
+Config schema (table)
+
+Service config fields (YAML/JSON keys) — each service must expose a typed config and validate on startup.
+
+| key | type | description | example | default |
+|------|------|-------------|---------|---------|
+| enabled | boolean | whether OS-driven throttling is active | true | true |
+| window_seconds | int | admission window in seconds | 5 | 5 |
+| queue_capacity | int | soft-per-shard queue capacity | 512 | 512 |
+| early_warning_p95_multiplier | float | multiplier vs baseline p95 to trigger early warning | 2.0 | 2.0 |
+| degraded_p95_multiplier | float | multiplier to trigger degraded | 3.0 | 3.0 |
+| critical_p99_multiplier | float | multiplier to trigger critical | 5.0 | 5.0 |
+| admission_fractions | map[string,float] | fraction per priority label (sum<=1) | {free:0.1,paid:0.3,enterprise:0.6} | {free:0.2,paid:0.5,enterprise:0.3} |
+| advisory_headers | list[string] | headers added during soft-shaping | ["X-Redwood-Shed"] | [] |
+| telemetry_id_header | string | header used to surface shed decision into traces | X-Redwood-Telemetry-Id | X-Redwood-Telemetry-Id |
+
+Operator runbook (fast path)
+
+1) Alert fires: Metric api.request.latency.p95 for service X > degraded threshold (see alert doc).
+2) Confirm with dashboard: check runtime.queue.length and serve_gpu.utilization.
+3) If degraded: temporarily reduce non-critical admission_fractions to 0.05/0.15/0.8 (free/paid/enterprise) via feature flag.
+4) If critical: enable emergency-failfast toggle for free tier, notify CS for affected customers.
+5) Watch for recovery window: require 3 consecutive admission windows in Normal before rolling back hard throttles.
+6) Post-incident: create a regression evaluation run (prompt suite) to detect if requests rejected correlate with model-quality regressions.
+
+Client contracts and error semantics
+
+When requests are shaped or rejected, the API MUST: 
+- Return HTTP 429 for rate-based rejects with JSON body containing fields: code, message, telemetry_id, suggested_backoff_seconds.
+- Use Retry-After header with integer seconds when appropriate.
+- Return a structured advisory header for soft shaping: X-Redwood-Shed: state=soft|degraded|critical;telemetry_id=<id>.
+
+Backwards compatibility and rollout guidance
+
+- Changes to admission_fractions and multipliers are safe and should be rolled via staged feature flags (canary -> region -> global).
+- Addition of new advisory headers is backward compatible; clients SHOULD ignore unknown headers.
+- Changing telemetry_id_header requires coordination with tracing/alerting teams.
+
+Testing and validation
+
+- Unit tests for admission logic covering all state transitions.
+- Integration test harness that simulates varying queue lengths and GPU utilization. Use the runtime perf harness (eng-serving-runtime/runtime-architecture) with synthetic traffic patterns: bursty short-seq, sustained long-seq, and cold-model-load.
+- Load-stage validation: run staged canary at 10% traffic, measure p95, p99, and error_rate for 30m before promoting.
+
+SLOs and alerting (owner: eng-sre)
+
+- Service-level SLOs: 99.5% success rate (2xx/3xx) for paid-tier, p95 latency < 400ms for short sequences under Normal conditions.
+- Alert: trimmed-latency-breach if p95 rises > degraded multiplier for 2 consecutive windows.
+- Incident severity mapping: degraded -> Sev3; critical -> Sev2 and paging.
+
+Ownership and responsibilities
+
+- Runtime teams: implement admission APIs and validate config validation schema.
+- Edge/ingress teams: implement header insertion and initial shaping.
+- Eng-SRE: own alerts, on-call runbook, and capacity tuning.
+- Product/CS: own customer communications for enterprise shedding and billing state.
+
+Rollout checklist
+
+1. Implement config schema and local simulator.
+2. Add advisory headers and telemetry_id propagation.
+3. Canary: enable on non-critical region at 5% traffic.
+4. Validate metrics and SLI adherence for 24 hours.
+5. Gradually increase canary to 25%, 50%, then global.
+
+Example config snippet (JSON)
+
+{
+  "enabled": true,
+  "window_seconds": 5,
+  "queue_capacity": 512,
+  "early_warning_p95_multiplier": 2.0,
+  "degraded_p95_multiplier": 3.0,
+  "critical_p99_multiplier": 5.0,
+  "admission_fractions": {"free": 0.1, "paid": 0.3, "enterprise": 0.6},
+  "advisory_headers": ["X-Redwood-Shed"],
+  "telemetry_id_header": "X-Redwood-Telemetry-Id"
+}
+
+Related links and references
+
+- Telemetry ingestion and retention guidelines: /confluence/architecture-and-standards/observability-standards/telemetry-ingestion-and-retention-guidelines-2025
+- Request priority and hinting protocol: /confluence/architecture-and-standards/api-standards/request-priority-and-hinting-protocol-playbook-2026
+- Runtime perf harness: /confluence/eng-serving-runtime/benchmarking-and-perf-suite
+
+Appendix: example HTTP 429 body (JSON)
+
+{
+  "code": "RATE_LIMITED",
+  "message": "Request rejected due to capacity constraints; try again later.",
+  "telemetry_id": "b6f3a2c4-1a4f-4b9b-8c2a-14f2a6d9e9f0",
+  "suggested_backoff_seconds": 10
+}
+
+Revision history
+
+- 2025-10-12: created by Aisha Patel (draft).
+- 2025-11-03: added canonical metric names and initial thresholds after SRE review.
+- 2026-02-14: published following integration tests and canary run on us-west-2.
+
+If there are questions about integrating this protocol into a specific service, contact the runtime guild (runtime-guild@redwood-inference.internal) or the document owners listed in the header.

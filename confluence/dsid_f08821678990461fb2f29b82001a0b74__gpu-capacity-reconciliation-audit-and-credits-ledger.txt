@@ -1,0 +1,155 @@
+GPU Capacity Reconciliation Audit and Credits Ledger
+
+Overview
+--------
+This page defines the GPU Capacity Reconciliation Audit process and the canonical Credits Ledger used by Redwood Inference to reconcile physical/virtual GPU allocations, tenant consumption, and accounting credits across cloud accounts and on-prem pools. The goal is a repeatable, auditable monthly reconciliation that ties IaC state, telemetry, allocation decisions, and billing signals together for accuracy and dispute resolution.
+
+Intended audience
+- Infra oncall and SREs responsible for GPU fleet accounting
+- FinOps and billing analysts performing chargeback reconciliations
+- Platform engineers who own Terraform/IaC modules for GPU pools
+- Engineering managers reviewing quota disputes
+
+Scope
+- Applies to all public cloud GPU pools (aws/gcp/azure) and managed on-prem clusters that are reconciled into Redwood’s capacity ledger.
+- Includes reserved capacity, burst credits, spot fallback usage, and warm-pool reservations.
+- Excludes ephemeral developer laptops and third-party managed services (unless explicitly integrated).
+
+Key principles
+- Single source of truth: Terraform state plus cloud metadata + runtime telemetry -> reconciliation pipeline -> Credits Ledger.
+- Immutable audit trail: every reconciliation run produces an immutable snapshot and an exportable CSV/Parquet file stored for 12 months by default.
+- Explainability: every ledger entry references the upstream evidence (Terraform resource id, VM instance id, Pod/node id, telemetry export path).
+- Triage first, chargeback second: reconcile for correctness before making billing adjustments.
+
+Terminology
+- Allocation: A logical reservation of GPU capacity to a tenant or system (examples: reserved pool, dedicated reservation, ephemeral lease).
+- Consumption: Observed usage derived from tokenized runtime telemetry (tokens/minute, GPU-hours, vram-second counters).
+- Credit: Accounting unit used for chargeback. For Redwood we use GPU-credit where 1 GPU-credit == 1 GPU-hour at baseline SKU.
+- Adjustment: Manual or automated change to the ledger to reflect contract terms, refunds, or errors.
+
+Architecture and data flow
+1. IaC source: Terraform state (S3/remote) + module metadata (module tags: team, environment, tier).
+2. Cloud inventory: periodic cloud provider API snapshots (instance IDs, SKUs, zone, preemptible flag).
+3. Runtime telemetry: serving-runtime exports per-node GPU-hours and system tags via metrics pipeline (Prometheus -> metrics-bridge -> bigquery).
+4. Reconciliation service: batch job (airflow/kubernetes CronJob) that ingests the three sources and emits a Credits Ledger snapshot.
+5. Ledger storage: canonical ledger stored in BigQuery (or internal RDS replica) and exported to S3/GS for archived snapshots.
+6. Downstream: FinOps dashboards, billing exports, and dispute management UI.
+
+Ledger schema (canonical columns)
+| column | type (conceptual) | description |
+|--------|-------------------|-------------|
+| snapshot_id | string | reconciliation run UUID |
+| run_date | date | reconciliation run date |
+| resource_id | string | cloud instance / node / terraform id |
+| resource_type | string | "instance" | "node" | "reservation" |
+| sku | string | cloud GPU SKU (e.g., nvidia-a100-80gb) |
+| allocated_to | string | tenant id or system tag |
+| allocation_type | string | reserved | burst | spot | warm_pool |
+| observed_gpu_hours | string | float stored as string for export compatibility |
+| ledger_credits | string | computed credits assigned |
+| evidence_refs | string | comma-separated list of evidence ids (terraform_state_key, metrics_blob) |
+| adjustment_note | string | free text for manual adjustments |
+
+Reconciliation cadence and windows
+- Daily lightweight run: verifies inventory and emits alerts for drift > 5% between IaC and cloud snapshot. Produces diffs stored in /reconciliations/daily/.
+- Weekly audit run: full ingest of metrics and IaC, writes ledger snapshot, runs automated validation checks.
+- Monthly financial snapshot: authoritative export of the Credits Ledger used by billing exports. Locked for edits after 14 days unless a formal correction request is approved.
+
+Automated validation checks (examples)
+- IaC vs cloud count check: |expected_instances - cloud_instances| / expected_instances < 0.05 passes.
+- Telemetry continuity: nodes must have >= 90% telemetry coverage in the window or be flagged as telemetry-missing.
+- SKU mismatch: SKU in Terraform must match SKU reported by cloud API.
+- Double allocation: Ensure resource_id assigned to at most one tenant allocation.
+- Credits bounds: ledger_credits must be within +/-20% of observed_gpu_hours * SKU-factor unless an adjustment rule exists.
+
+Alerting and SLOs
+- SLO: Daily reconciliation job success 99.5% monthly.
+- Alert: reconciliation-failure high priority -> page oncall SRE immediately.
+- Alert: drift-detected (>=5% on daily run) -> slack channel #gpu-infra and create ticket in JIRA with priority P2.
+- Alert: telemetry-missing for a reserved resource in monthly snapshot -> notify owner_team and create follow-up task.
+
+Terraform / IaC integration patterns
+- Canonical tags required on every GPU resource: terraform module should set tags {"gpu:allocation_owner": "<team>", "gpu:pool": "<pool-name>", "gpu:billing_tier": "<tier>"}. The reconciliation service relies on these tags to map instances to ledger allocations.
+- IaC sentinel policy: run a pre-apply check that validates required tags and denies apply if missing. Example sentinel rule snippet: `deny unless has_tag("gpu:allocation_owner")`.
+- Module outputs: every gpu pool module must export `pool_id`, `pool_tier`, and `default_billing_profile` to the Terraform state so the reconciliation job can link module-level reservations to instances.
+
+CI/CD validations (merge-time checks)
+1. Terraform plan Linting: PRs touching gpu modules trigger `tfsec` and `terraform plan` validations.
+2. Reconciliation schema contract test: changes to module outputs must increment the reconciliation contract version (a small JSON file tracked in repo). This prevents silent schema drift.
+3. Integration test: for major changes, create a canary pool in staging using the module and run a reconciliation dry-run that validates the mapping end-to-end (IaC -> cloud -> metrics).
+
+Operational runbook: Monthly reconciliation failure -> triage and resolution (step-by-step)
+1. On alert, open the reconciliation run details page (link in alert).
+2. Check job logs: `kubectl logs -n infra reconciliation-job-<snapshot_id>`. Look for the first error block.
+3. If IaC remote-state fetch failed: verify remote state S3 role access by running `aws s3api get-object --bucket terraform-state-prod --key <key>` from reconciliation pod credentials.
+4. If cloud API rate limit: escalate to platform API quota owner, and retry with exponential backoff. Record rate-limit headers.
+5. If telemetry ingestion missing: run manual metrics export from the metrics-bridge `python scripts/export_metrics.py --window 2026-02-01 --out /tmp/metrics.json` and validate with `jq`.
+6. If ledger computation error: run the ledger verifier locally using `make ledger-verify SNAPSHOT=<snapshot_id>` which executes the same checks as the pipeline.
+7. If manual adjustment required: add an adjustment row in the corrections UI and create a JIRA ticket with category `finops:ledger-correction`. Attach evidence refs.
+8. After fix, re-run the reconciliation job with the same snapshot_id + `--force-apply` and verify the export matches expected.
+
+Dispute and correction policy
+- Corrections window: 14 days after MONTHLY snapshot lock for automated edits. After 14 days, corrections require approval from FinOps and Infra Director.
+- Evidence required: Terraform state key, instance lifecycle event, and metrics blob covering the disputed period. Partial evidence may be accepted for developer errors but requires approver sign-off.
+- Adjustment auditing: all manual adjustments create an immutable log entry that includes approver, reason, and evidence refs.
+
+Retention and export
+- Daily diffs: retained 30 days in S3.
+- Monthly authoritative snapshots: retained 12 months in both BigQuery and an archived S3 path with access controls.
+- Full export format: compressed Parquet with columns matching the ledger schema and a companion manifest.json listing evidence files.
+
+Ownership and contacts
+- Primary owner: Infra Capacity Team (team slack: #infra-capacity).
+- Document owner: Aisha Khan (aisha@redwood.ai).
+- FinOps contact: Priya Natarajan (priya@redwood.ai).
+- Oncall: rotation visible in /confluence/eng-infra/oncall-and-incident-response/oncall-rotations.
+
+Appendix: SQL & CLI snippets
+-- Example SQL to compute monthly credits per tenant (BigQuery-like syntax)
+SELECT allocated_to AS tenant, SUM(CAST(ledger_credits AS FLOAT64)) AS gpu_credits
+FROM `redwood-prod.ledger.credits_monthly`
+WHERE run_date = DATE('2026-01-31')
+GROUP BY tenant
+ORDER BY gpu_credits DESC;
+
+-- Query to find drifted instances
+SELECT r.resource_id, r.allocated_to, r.sku, r.observed_gpu_hours, i.cloud_state
+FROM `redwood-prod.ledger.credits_latest` r
+LEFT JOIN `redwood-prod.inventory.cloud_instances` i USING(resource_id)
+WHERE ABS(CAST(r.observed_gpu_hours AS FLOAT64) - i.reported_gpu_hours) / NULLIF(i.reported_gpu_hours,0) > 0.05;
+
+-- Example kubectl command for logs
+kubectl -n infra exec -it reconciliation-job-<snapshot_id> -- /bin/bash -c "cat /var/log/reconcile.log | sed -n '1,400p'"
+
+Appendix: Terraform example (module contract)
+```
+module "gpu_pool" {
+  source = "git::ssh://git@repo.git//modules/gpu-pool"
+  pool_name = "staging-a100-pool"
+  billing_tier = "tier-b"
+  tags = {
+    "gpu:allocation_owner" = "staging-team"
+    "gpu:pool" = "staging-a100"
+    "gpu:billing_tier" = "tier-b"
+  }
+}
+
+output "pool_id" {
+  value = module.gpu_pool.id
+}
+output "default_billing_profile" {
+  value = module.gpu_pool.billing_profile
+}
+```
+
+Change log
+- 2025-06-03: Document created (Aisha Khan).
+- 2025-09-10: Added telemetry continuity checks and daily run definition (Miguel Rivera).
+- 2026-02-12: Introduced corrections window policy and retention updates (Priya Natarajan).
+
+Related artifacts and links
+- Reconciliation job on k8s repo: git@repo.git:infra/reconciliation
+- Corrections UI: https://internal.redwood.ai/finops/corrections (access-controlled)
+- Archived snapshots path: s3://redwood-archive/reconciliations/
+
+Done.

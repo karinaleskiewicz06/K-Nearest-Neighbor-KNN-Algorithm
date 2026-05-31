@@ -1,0 +1,319 @@
+Deploy Metadata Export Spec (for Incident Bot v2 and Diagnostics)
+
+## Summary
+This document specifies how Redwood exports **deploy metadata** in a machine-readable form so automated diagnostics (primarily **incident-bot v2**) can attach reliable “recent deploy context” during incident triage.
+
+The spec defines:
+- A canonical **Deploy Event** schema (push) for deployment pipelines to emit.
+- A **Deploy Metadata API** (pull) for consumers (incident-bot, Console deep links, SRE tooling).
+- Field semantics for **service/version**, **rollout phase**, and **canary results**.
+- Reliability and guardrails (rate limits, pagination, caching, partial availability behavior).
+
+## Goals
+1) Provide incident responders with accurate “what changed recently” context: service, image/commit, rollout phase, and canary health.
+2) Standardize deploy metadata across environments (hosted, dedicated pools, private/VPC where applicable).
+3) Make the export robust during incidents (bounded query cost, cached responses, predictable latency).
+
+## Non-goals
+- Replacing the source CI/CD system of record (e.g., Argo CD / Buildkite / GitHub).
+- Full change management or approval workflow.
+- Tenant/customer-specific rollout details (deploy metadata is service/infrastructure scoped, not tenant scoped).
+
+## Consumers
+Primary:
+- **incident-bot** “Recent deploys” context card in #incidents / #eng-oncall.
+Secondary:
+- **Redwood Console** deep links (deploy timeline view).
+- SRE scripts for postmortem timeline export.
+
+## Definitions
+- **Service**: A deployable unit with a stable identifier registered in the Service Registry (e.g., `hosted-api`, `router`, `scheduler`, `config-service`).
+- **Artifact**: The immutable runtime unit (container image digest and/or binary build ID).
+- **Rollout**: A multi-step process that changes the running artifact in one or more regions/cells.
+- **Canary**: A staged rollout step routed to a limited slice of traffic/capacity.
+
+## Overview: data flow
+1) CI/CD pipeline (or deploy controller) emits a `deploy.event.v1` event at key state transitions (started, canary complete, ramp, complete, rollback).
+2) Events are ingested by the Deploy Metadata service (`deploy-registry`) and written to a durable store.
+3) Consumers query recent deploys via HTTP API; responses are cacheable and paginated.
+
+Sources (typical):
+- GitHub: PR + merge commit SHA
+- Build system: build ID, image digest
+- Deploy orchestrator: environment, region/cell, rollout state machine
+- Canary analyzer: canary metrics and pass/fail
+
+## Contract 1: Deploy Event (push)
+### Transport
+- Topic: `deploy.event.v1` (internal event bus)
+- Encoding: JSON
+- Ordering: best-effort ordering per `(service_id, environment, rollout_id, region)`; consumers must handle reordering.
+- Delivery: at-least-once; consumers must dedupe by `event_id`.
+
+### Event envelope
+Required:
+- `schema_version`: string, must be `"1"`
+- `event_id`: string (UUID)
+- `emitted_at`: RFC3339 timestamp
+- `source`: string (e.g., `argo-cd`, `release-orchestrator`, `private-deploy-agent`)
+
+### Deploy event payload (v1)
+Required identifiers:
+- `service_id`: string (canonical Service Registry ID)
+- `environment`: string enum: `prod` | `staging` | `dev` (incident-bot uses `prod` and select `staging` for pre-prod incidents)
+- `rollout_id`: string (stable across all steps of a rollout; required for joins)
+- `deployment_id`: string (unique per region/cell execution; may differ from rollout_id)
+
+Artifact fields:
+- `artifact_type`: string enum: `container` | `binary`
+- `image_repo`: string (if container)
+- `image_digest`: string (e.g., `sha256:...`) (if container)
+- `image_tag`: string (optional; NOT relied on for uniqueness)
+- `build_id`: string (optional)
+- `commit_sha`: string (40-hex)
+
+Rollout targeting:
+- `regions`: array of strings (e.g., `us-east-1`, `eu-west-1`) (may be empty if this event is region-scoped)
+- `region`: string (preferred when known; set for region-scoped events)
+- `cell`: string (optional, e.g., `cell-a`, `cell-b`)
+- `cluster`: string (optional)
+
+Rollout state:
+- `rollout_phase`: string enum:
+  - `queued`
+  - `started`
+  - `canary_running`
+  - `canary_passed`
+  - `canary_failed`
+  - `ramp_running`
+  - `completed`
+  - `rollback_started`
+  - `rollback_completed`
+  - `aborted`
+- `rollout_percent`: number (0–100) (optional; required when `ramp_running`)
+- `initiator`: string (e.g., `"connor.obrien"` or `"automation"`)
+- `change_reason`: string (optional; brief human-readable)
+
+GitHub linkage:
+- `repo`: string (e.g., `github.com/redwoodinference/redwood`)
+- `pr_number`: number (optional)
+- `pr_title`: string (optional)
+- `release_notes_url`: string (optional)
+
+Canary results (optional; required when phase is `canary_passed` or `canary_failed`):
+- `canary`: object serialized as JSON in the event payload under key `canary_json` (see “Canary JSON” below)
+
+Notes on `canary_json`:
+- To keep the event schema stable while we iterate on canary metrics, `canary_json` is a JSON-encoded string containing a small structured object. Consumers must treat unknown keys as optional.
+
+### Canary JSON (embedded as a JSON string)
+Required keys when present:
+- `status`: `pass` | `fail` | `inconclusive`
+- `analysis_window_minutes`: integer
+- `baseline_ref`: string (e.g., `previous_release`, `control_pool`)
+- `signal_summary`: string (short text; safe for Slack)
+
+Recommended keys:
+- `metrics`: array of objects, each including:
+  - `name`: string (e.g., `http_5xx_rate`, `p95_latency_ms`, `stream_disconnect_rate`)
+  - `delta`: number (current - baseline, in same units)
+  - `current`: number
+  - `baseline`: number
+  - `threshold`: number (optional)
+  - `verdict`: `pass` | `fail` | `warn`
+- `dashboard_url`: string (deep link)
+- `runbook_url`: string
+
+### Example deploy.event.v1
+{
+  "schema_version": "1",
+  "event_id": "7b98f3d0-2f7c-4c3c-8b0e-2c4b4f7cf54e",
+  "emitted_at": "2025-04-08T19:22:41Z",
+  "source": "release-orchestrator",
+  "service_id": "hosted-api",
+  "environment": "prod",
+  "rollout_id": "rollout_2025-04-08_1921Z_hosted-api_29104",
+  "deployment_id": "deploy_us-east-1_cell-a_2025-04-08_1921Z",
+  "artifact_type": "container",
+  "image_repo": "registry.redwood.internal/hosted-api",
+  "image_digest": "sha256:4f9f9b0e0c0a5c7b8b2f7d9c1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0",
+  "commit_sha": "3a1b7f1b8a1d64c6dca3b8b3e2f9b2d4a1c0e9ff",
+  "repo": "github.com/redwoodinference/redwood",
+  "pr_number": 29104,
+  "pr_title": "Export deploy metadata to incident-bot",
+  "rollout_phase": "canary_passed",
+  "rollout_percent": 5,
+  "region": "us-east-1",
+  "cell": "cell-a",
+  "initiator": "automation",
+  "canary_json": "{\"status\":\"pass\",\"analysis_window_minutes\":15,\"baseline_ref\":\"previous_release\",\"signal_summary\":\"No regression detected (5xx, p95, streaming)\",\"dashboard_url\":\"https://console.redwood.internal/obs/deploys?service=hosted-api&region=us-east-1&rollout_id=rollout_2025-04-08_1921Z_hosted-api_29104\"}"
+}
+
+## Contract 2: Deploy Metadata API (pull)
+### Service
+- Name: `deploy-registry`
+- Audience: internal services only (incident-bot, Console backend, SRE tooling)
+- Auth: service-to-service mTLS + OAuth2 service identity (see ADR-013 for permission model)
+
+### Endpoint: Recent deploys
+`GET /v1/deploys/recent`
+
+Query params:
+- `service_id` (required)
+- `environment` (optional; default `prod`)
+- `region` (optional; when absent returns global + region-scoped entries)
+- `cell` (optional)
+- `since` (optional RFC3339; default `now-24h`)
+- `limit` (optional; default 10; max 25)
+
+Response headers:
+- `Cache-Control: private, max-age=30` (bot-friendly; short cache)
+- `ETag` (supported)
+
+Response body:
+- JSON array of deploy records, newest first.
+- Each record is a flattened view derived from events; see “Deploy Record Schema (API)” below.
+
+### Endpoint: Rollout detail
+`GET /v1/rollouts/{rollout_id}`
+
+Returns a full timeline (events) for a rollout. Intended for Console and deep debugging; incident-bot should avoid calling this in the hot path unless a user clicks “More details”.
+
+### Deploy Record Schema (API)
+The API returns a stable deploy record representation that is safe to display in Slack and to persist in incident context payloads.
+
+Required:
+- `schema_version`: `"1"`
+- `service_id`
+- `environment`
+- `rollout_id`
+- `region` (may be `"global"` if not region-scoped)
+- `started_at` (RFC3339; earliest known start)
+- `last_updated_at` (RFC3339)
+- `rollout_phase` (current phase)
+- `artifact_fingerprint` (string; preferred value is `image_digest` when present, else `build_id`)
+- `commit_sha`
+
+Recommended:
+- `image_repo`
+- `image_digest`
+- `build_id`
+- `pr_url`
+- `commit_url`
+- `release_notes_url`
+- `initiator`
+- `rollout_percent`
+- `canary_status`: `pass` | `fail` | `inconclusive` | `unknown`
+- `canary_summary`: short string
+- `canary_dashboard_url`
+
+Example response item:
+{
+  "schema_version": "1",
+  "service_id": "router",
+  "environment": "prod",
+  "rollout_id": "rollout_2025-04-08_1644Z_router_1857",
+  "region": "eu-west-1",
+  "started_at": "2025-04-08T16:44:12Z",
+  "last_updated_at": "2025-04-08T17:05:03Z",
+  "rollout_phase": "ramp_running",
+  "rollout_percent": 40,
+  "artifact_fingerprint": "sha256:8ad0...",
+  "image_repo": "registry.redwood.internal/router",
+  "image_digest": "sha256:8ad0...",
+  "commit_sha": "9b7f3b6c0dfb9cc2f0b4f3f14b2ab8e1b2e0d111",
+  "pr_url": "https://github.com/redwoodinference/redwood/pull/29161",
+  "commit_url": "https://github.com/redwoodinference/redwood/commit/9b7f3b6c0dfb9cc2f0b4f3f14b2ab8e1b2e0d111",
+  "canary_status": "pass",
+  "canary_summary": "p95 stable; 5xx -0.01% vs baseline (15m)"
+}
+
+## Field semantics and requirements
+### `service_id`
+- Must match the canonical ID in the Service Registry.
+- Do not use human aliases (e.g., “Hosted API”) in machine fields; aliases belong in UI.
+
+### Artifact identity: `image_digest` over tags
+- `image_digest` is required for container artifacts.
+- `image_tag` is optional and must not be used as the unique identifier.
+
+### `rollout_phase`
+- The phase represents the current state of the rollout in a single region/cell scope.
+- If the orchestrator only produces a global state, set `region` to `"global"`.
+
+### Canary results
+- Canary evaluation must be attached when the canary completes.
+- If canary analysis fails (tooling outage), emit `canary_json` with `status=inconclusive` and a human-readable `signal_summary`.
+
+### Time fields
+- `emitted_at` must be in UTC.
+- `started_at` is derived by `deploy-registry` from earliest observed event for `(rollout_id, region, cell)`.
+
+## Reliability, performance, and guardrails
+### SLO target (deploy-registry API)
+- P95 latency for `GET /v1/deploys/recent`: < 250ms (in-region)
+- Availability: 99.9% monthly
+
+### Rate limits
+Default (per calling service identity):
+- `GET /v1/deploys/recent`: 60 RPM sustained, burst 20
+- `GET /v1/rollouts/{id}`: 30 RPM sustained, burst 10
+
+Incident-bot guidance:
+- Use cached responses for thread interactions.
+- Prefer `/recent` in the “first 5 minutes” path.
+
+### Caching behavior
+- `/recent` responses are cacheable for 30s.
+- `deploy-registry` should return partial results rather than fail when one backing store is degraded.
+
+### Failure modes and degraded behavior
+- If the deploy store is unavailable, return HTTP 200 with an empty array and `X-Deploy-Registry-Degraded: true`.
+- If fields cannot be resolved (e.g., missing PR linkage), return the record with the known identifiers and omit unknown optional fields.
+
+## Security and access control
+- Deploy metadata is classified **internal** and must not include tenant identifiers, customer payloads, or secrets.
+- AuthN/AuthZ is service-to-service; no end-user tokens.
+- All API access is logged (service identity, endpoint, params excluding any free-form text).
+
+Explicitly prohibited fields:
+- Tenant/customer IDs
+- Feature flag values
+- Request payload samples
+- Any secret material (tokens, keys)
+
+## Data retention
+- Raw events: 30 days (event bus retention)
+- Materialized deploy records: 180 days (supports postmortems and trend analysis)
+
+## Versioning and compatibility
+- Event schema is versioned via `schema_version`. v1 is the baseline for incident-bot v2 GA.
+- Additive changes are allowed (new optional fields).
+- Breaking changes require a new major schema version (v2) and a migration plan with at least 4 weeks dual-write.
+
+## Implementation checklist (for deploy emitters)
+1) Emit `deploy.event.v1` on rollout start and completion, plus canary completion.
+2) Include `service_id`, `environment`, `rollout_id`, `region` (or `global`), `commit_sha`, and `image_digest`.
+3) Provide PR linkage when available (`repo`, `pr_number`, `pr_title`).
+4) Include `canary_json` for `canary_passed` / `canary_failed`.
+5) Validate JSON against the v1 rules in CI (see internal linter: `deploy-event-lint`).
+
+## FAQ
+**Q: Why both events and an API?**
+A: Events are the canonical ingest mechanism (cheap, reliable, decoupled). The API provides a bounded, cacheable query surface for incident-bot and UI surfaces.
+
+**Q: What if a service has no canary?**
+A: Emit phases without canary states; `canary_status` will be `unknown`. Incident-bot will still show “recent deploy started/completed” context.
+
+**Q: How do private deployments participate?**
+A: Private deploy agents emit the same event schema. If connectivity to the central bus is restricted, the private control plane can proxy events and/or expose a local deploy-registry API for the bot running in that environment.
+
+## Owners
+- Spec owner: Release Engineering (Connor O’Brien)
+- API implementation owner: Eng Infra / CI-CD (Sahana Iyer)
+- Primary consumer owner: Incident Automation (Miles Thornton)
+
+## Change log
+- 2025-02-18: Initial draft (v1 schema + /recent endpoint)
+- 2025-03-11: Added canary_json rules and degraded behavior header
+- 2025-04-09: Finalized rate limits, retention, and rollout phase enum for GA

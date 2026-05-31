@@ -1,0 +1,165 @@
+Profiling → Benchmark Bridge Handbook
+
+Summary
+
+This handbook describes the standard process and templates we use at Redwood to convert live runtime profiling traces and telemetry signals into repeatable benchmarking scenarios. The goal is to ensure that performance investigations produce benchmarks that faithfully reproduce observed production behaviours (latency shapes, tail events, kernel hotpaths, KV cache dynamics) so we can validate fixes, run regressions, and reason about cost/latency tradeoffs.
+
+Audience
+
+- Runtime engineers and SREs performing root-cause analysis.
+- Performance/benchmarking owners who run controlled experiments.
+- Release engineers validating performance gates.
+
+When to use this playbook
+
+1) You have an ongoing latency or cost regression and profiling traces show anomalous kernel/dispatch behaviour.
+2) You must validate a kernel or scheduler change against a production-shaped workload.
+3) You need a reproducible benchmark to demonstrate an SLA improvement or cost regression before rollout.
+
+Key principles
+
+- Fidelity over simplicity: preserve request concurrency shape, sequence length distribution, and KV cache warm/cold ratios when possible.
+- Observability-driven knobs: derive benchmark knobs from telemetry signals (not arbitrary values).
+- Small fast iterations: build a minimal reproducer first, then scale to full fidelity.
+- Ownership and signalling: every benchmark run must list the owner, intent, and success criteria in the run metadata.
+
+Mapping telemetry to benchmark knobs (quick reference)
+
+- request_rate_rps -> target_concurrency / arrival_poisson_lambda
+- sequence_length_p50/p90/p99 -> sample_length_distribution (file: lengths.csv)
+- kv_cache_hit_ratio -> kv_cache_initial_warm_fraction and prefix_reuse_pattern
+- kernel_exec_time_p50/p95 -> kernel_hint_profile (used to select mock kernel timeouts)
+- batch_size_distribution -> concurrency_shaper.max_batch and batch_release_delay_ms
+- tail_latency_spike_count -> interleaved_poisson_bursts / microburst_amplitude
+
+Extraction procedure: from profile -> bench config (numbered steps)
+
+1) Capture a canonical trace
+
+- Command: rdwctl traces dump --trace-id <TRACE_ID> --format jsonl > production-trace.jsonl
+- Capture matching logs: rdwctl logs fetch --trace-id <TRACE_ID> --since "-30m" > trace-logs.ndjson
+
+2) Summarise the trace
+
+- Run summariser: python tools/trace_summary.py production-trace.jsonl --output trace-summary.yaml
+- Required output fields: request_rate_rps, concurrency_histogram, seq_len_p50_p90_p99, kv_cache_stats (hit_pct, hot_prefix_count), kernel_latency_p50_p95_p99, batch_dist_summary
+
+3) Derive bench knobs
+
+- Use tools/map_trace_to_bench.py --summary trace-summary.yaml --template templates/bench-template.json --out bench-config.json
+- The script fills: arrival model (poisson or replay), concurrency target, sequence_length_sampler (with weights), kv_cache_warm_fraction, batch_release_delay_ms, runtime_model (real vs. synthetic kernel timings)
+
+4) Create minimal reproducer
+
+- Start with a single-node bench: bench/runner --config bench-config.json --scale 0.05 --replay-mode sample
+- Validate that kernel hotpaths observed (kernel names/ids) match production summary within ±10% for p50/p95 kernel latencies.
+
+5) Iterate to increase fidelity
+
+- Gradually increase scale to full target. Add network noise, simulated NFS latency, and multi-tenant noise injection using bench/noise-injector.yaml.
+- For KV cache dynamics, run a pre-warm phase: bench/warm_cache --pattern bench-config.kv_pattern --duration 300s then start primary run.
+
+Bench config template (essential fields)
+
+Content below is a representative JSON that our mapping script generates. Replace placeholders before running.
+
+{
+  "metadata": {
+    "owner": "<owner-email>",
+    "intent": "reproduce p99 latency spike for ModelX after kernel change",
+    "created_at": "2028-01-11"
+  },
+  "workload": {
+    "arrival_model": "poisson",
+    "rps": "1200",
+    "concurrency_target": "240",
+    "sequence_length_sampler": "lengths.csv",
+    "sequence_length_weights": "[0.6,0.25,0.1,0.05]"
+  },
+  "kernel_model": {
+    "mode": "real",
+    "kernel_select_hint": "attention-shard-3"
+  },
+  "kv_cache": {
+    "warm_fraction": "0.36",
+    "hot_prefix_count": "42"
+  },
+  "slo": {
+    "target_p95_latency_ms": "85",
+    "target_p99_latency_ms": "220"
+  }
+}
+
+(When checked in, this config must be saved under bench/runs/<run-id>/bench-config.json)
+
+Success criteria and validation checklist
+
+- Visual parity: concurrency and RPS histogram match within 10% at p50/p90/p99.
+- Kernel parity: top-3 kernel IDs have p50 and p95 within ±15% of production summary.
+- KV cache behaviour: measured hit_ratio is within ±0.05 absolute.
+- SLO gating: the change only passes the gate if p99 is improved or cost reduced without degrading p95 by >5 ms.
+
+SLO thresholds (team defaults)
+
+- p95 <= 120 ms (service-level)
+- p99 <= 350 ms
+- sustained cpu/gpu_util <= 85% (per instance)
+- KV cache hit ratio >= 0.30 for warm-start dominated workloads
+
+Mapping Bench outputs back to profiling for RCA
+
+- Attach bench run traces to experiment ticket. Use tools/bench_to_trace.py to convert bench logs to the same trace schema as production so profiling tools can directly compare flame graphs and kernel timelines.
+
+Common pitfalls and mitigations
+
+- Error: bench shows lower latency than production despite similar summary metrics.
+  - Cause: missing multi-tenant noise (other customers). Mitigation: enable noise_injector and rerun.
+- Error: KV cache warm_fraction mismatch.
+  - Cause: pre-warm pattern differs (prefix churn high). Mitigation: capture prefix histogram and port exact pattern into bench-config.kv_pattern.
+- Error: kernel id mismatch (bench shows fallback kernel).
+  - Cause: runtime feature flags differ. Mitigation: check runtime_feature_flags in bench metadata and align with prod.
+
+Operator commands and utilities
+
+- Capture traces: rdwctl traces dump --trace-id <id> --tail 0 --format jsonl
+- Quick summary: python tools/trace_summary.py traces.jsonl --top-kernels 10 --out summary.yaml
+- Map to bench: python tools/map_trace_to_bench.py --summary summary.yaml --out bench-config.json
+- Run bench locally (docker): docker run --rm -v $PWD:/workspace redwood/bench:latest /workspace/bench/runner --config /workspace/bench-config.json
+
+Rollout decision matrix (high level)
+
+1) Local reproducer passes success criteria -> promote to staging with traffic shadowing (10% shadow). Run 3 x 30m replicates.
+2) Staging parity holds -> schedule a canary: 5% traffic for 2h, monitor p99, kernel time series, and error rate.
+3) If canary stable for 4h and post-canary audit shows no cost regression >3% -> proceed to 50% then 100% with standard cooldowns.
+4) If at any step p99 worsens by >10% or errors rise by >0.2% absolute, rollback immediately and open incident runbook.
+
+Runbook stub for failures during bench-driven rollouts
+
+- Pager: runtime-oncall -> escalation to runtime-team and benchmarking-owner.
+- Immediate steps: abort canary, revert runtime feature flags, pin model to previous version, and re-run bench to validate rollback.
+- Postmortem: attach bench configs, production trace, and timeline.
+
+Ownership and lifecycle
+
+- Bench and mapping scripts owner: eng-serving-runtime/bench-team (primary contact: eng-bench@redwood.com).
+- Long term artifacts (bench configs used for release gates) must be checked into git under bench/corpus/<named-workload>.
+
+Appendix A — Example investigation timeline
+
+1) 09:10 — Customer incident report p99 spike.
+2) 09:20 — Capture trace id=trc-20281109-9911.
+3) 09:30 — Summary produced: rps=1.2k, p99 kernel attention-shard-3=280ms, kv_hit=0.28.
+4) 10:00 — Bench config generated and minimal reproducer confirms kernel p99 reproduces at scale factor=0.2.
+5) 11:45 — Scheduler change tested: improved p99 from 280ms -> 210ms in bench. Canary runs initiated.
+
+Appendix B — Useful links and references
+
+- Runtime profiling playbook: /confluence/eng-serving-runtime/profiling-playbook/runtime-profiling-playbook-guidelines-2025
+- Bench templates: git@redwood:infra/bench-templates.git
+- Production trace schema: /confluence/eng-serving-runtime/team-wiki/runtime-telemetry-data-model-and-tracebook-2026
+
+Notes and revision history
+
+- 2026-11-15: initial draft (Anika Sharma).
+- 2027-03-02: added bench_to_trace conversion utility and success criteria updates (Marcus Li).
+- 2028-01-12: formalized rollout decision matrix and SLO defaults (Priya Nambiar).

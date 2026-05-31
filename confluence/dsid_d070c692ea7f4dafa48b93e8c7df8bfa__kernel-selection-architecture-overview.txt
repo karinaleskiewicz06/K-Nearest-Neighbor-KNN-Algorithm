@@ -1,0 +1,351 @@
+Kernel Selection Architecture Overview (Serving Runtime)
+
+## Overview
+Kernel selection is the Serving Runtime subsystem responsible for choosing the concrete GPU implementation (“kernel plan”) for a request, given:
+- Model identity and architecture/family
+- Workload regime (prefill vs decode characteristics; sequence length buckets)
+- Hardware target (GPU SKU, driver/CUDA capability, MIG partitioning)
+- Runtime feature flags (quantization profile, attention variant, KV-cache layout)
+
+This page describes:
+1) Where selection happens in the execution pipeline
+2) Interfaces to Scheduler and Compilation Cache
+3) How decisions are cached, serialized, and made replayable/deterministic
+
+This is an architectural overview. For the v2 decision logic and fallback policy, see ADR-017 and the v2 design doc.
+
+---
+
+## Goals
+- Ensure **correctness-first** selection: only choose kernels that are compatible with the request + target hardware.
+- Maintain **determinism and replayability**: identical inputs must yield identical selection (modulo explicitly versioned policy changes).
+- Reduce tail latency by selecting optimized kernels per SKU and per seq-length regime.
+- Keep selection overhead low (bounded CPU time, bounded telemetry overhead).
+- Provide operational controls: allow/deny lists, feature gates, and forced overrides.
+
+## Non-goals
+- Training or learning a model-based selector (out of scope for v2; we use explicit policy rules).
+- Deciding cluster placement (region/pool routing is handled by control plane and scheduling layers).
+
+---
+
+## High-level execution pipeline (where selection occurs)
+Kernel selection runs inside the per-request runtime execution path after model resolution and before compilation/execution.
+
+### Request flow (text diagram)
+1. **Front Door / API Adapter**
+   - Validates request, resolves model alias → `model_id` + `model_version`.
+   - Normalizes request options (max_tokens, streaming, tool/function calling toggles) into `RequestOptions`.
+
+2. **Scheduler / Batcher**
+   - Assigns request to a worker process on a GPU.
+   - Produces lightweight workload hints (e.g., observed prefill/decode distribution for the batch queue).
+
+3. **Kernel Selector** (this subsystem)
+   - Extracts features (`SelectorFeatures`) from request + model metadata + GPU metadata + scheduler hints.
+   - Applies feature gate + allow/deny rules.
+   - Generates candidate kernels and selects a `KernelPlan`.
+   - Emits selection telemetry (sampled).
+
+4. **Compilation Cache + Launcher**
+   - Checks compilation cache for compiled artifacts matching `KernelPlan`.
+   - Compiles if missing (within guardrails), then launches the selected kernel.
+
+5. **Execution + Metrics**
+   - Executes prefill/decode.
+   - Reports latency breakdown, kernel identifiers, and errors.
+
+Selection occurs at step 3, and is designed to be:
+- **Pure** with respect to its inputs (no hidden dependence on time or ambient process state)
+- **Versioned** via policy version IDs and runtime build version
+
+---
+
+## Component boundaries
+### Kernel Selector module
+**Owner:** Runtime Kernels + Runtime Architecture
+
+**Responsibilities:**
+- Feature extraction and normalization
+- Candidate generation
+- Rule evaluation and scoring (v2)
+- Fallback selection
+- Decision caching and serialization
+- Telemetry emission hooks
+
+**Does not own:**
+- GPU placement / pool selection (control plane + scheduler)
+- Compilation artifact generation logic (compiler backend owns compilation; selector only keys it)
+
+### Kernel Registry
+A registry of kernel implementations and their compatibility constraints.
+
+Registry entries are keyed by:
+- `kernel_id` (stable string)
+- Model family/architecture compatibility (e.g., llama-like, mistral-like)
+- Capability requirements (SM version, CUDA capability flags)
+- Supported quantization profiles
+- Known-bad deny rules (SKU/driver specific)
+
+Registry is loaded from:
+- Built-in runtime defaults
+- Hot-reloadable config overlays (for emergency deny/pin)
+
+### Compilation Cache interface
+Selector produces a `CompilationKey` / `PlanKey` used by compilation caching.
+
+Compilation cache uses `CompilationKey` to:
+- Lookup a compiled artifact (in-process memory + on-node disk cache)
+- Avoid recompiles across requests
+
+Selector guarantees:
+- If `CompilationKey` is identical, compiled artifacts should be reusable.
+- If a choice changes any codegen-relevant parameter, it must reflect in `CompilationKey`.
+
+### Scheduler hints interface
+Scheduler provides *optional* hints that improve stability for mixed workloads.
+
+Examples of hints:
+- Estimated `prefill_tokens` and `decode_tokens` for the in-flight batch
+- Observed queue regime classification (short prompts vs long-context dominated)
+- Batching parameters currently in effect (max batch size, continuous batching mode)
+
+Selector treats hints as inputs to selection, but the hint schema is:
+- Explicitly versioned (`hints_schema_version`)
+- Safe to omit (selector must fall back to request-derived features)
+
+---
+
+## Data contracts
+### SelectorFeatures (normalized inputs)
+SelectorFeatures is the normalized set of signals used for decision-making.
+
+At a minimum, v2 uses:
+- `model_family` (e.g., llama-like, mistral-like, qwen-like, gemma-like)
+- `model_id`, `model_version`
+- `seq_bucket` (see below)
+- `gpu_sku_normalized` (see below)
+- `sm_version` / `compute_capability`
+- `driver_version` and `cuda_runtime_version` (guardrails)
+- `quant_profile` (fp16/bf16/int8/int4 where applicable)
+
+#### Sequence bucket definition
+Selection uses coarse buckets to reduce decision noise while capturing the main performance regimes.
+
+Current buckets (subject to policy updates):
+- `S`: prefill ≤ 512 and expected decode ≤ 128
+- `M`: prefill 513–2048 or decode 129–512
+- `L`: prefill 2049–8192 or decode 513–2048
+- `XL`: prefill > 8192 or decode > 2048 (long-context / long generation)
+
+Notes:
+- Buckets are computed from request limits + scheduler hints (when present).
+- For streaming requests, decode bucket should be based on expected decode tokens (max_tokens) but may be clamped to historical workload hints.
+
+#### GPU SKU normalization
+We normalize cloud instance naming, PCI IDs, and MIG partitioning into a stable SKU string.
+
+Examples:
+- `nvidia-a100-80gb` (covers common PCI IDs; memory size retained)
+- `nvidia-h100-80gb-sxm`
+- `nvidia-l40s-48gb`
+- `nvidia-a100-40gb-mig-1g.5gb` (MIG partitions include slice info)
+
+Normalization is performed once per process at GPU init and passed as immutable metadata to the selector.
+
+---
+
+## Output contract
+### KernelPlan
+KernelPlan is the selector’s output. It is a structured record that must fully describe the execution choice.
+
+KernelPlan includes:
+- `selected_kernel_id`
+- `policy_version` (e.g., `kasv2-2026-02-18`)
+- `fallback_reason` (empty if primary rule matched; otherwise explicit)
+- `compilation_key` (string; stable serialization)
+- `execution_toggles` (e.g., attention variant, KV-cache layout)
+
+The plan must be serializable into:
+- Log/trace fields
+- A stable “plan key” string for caching
+- A replay record for deterministic tests
+
+---
+
+## Decision caching (what is cached and where)
+To keep overhead low and avoid repeated policy evaluation, we use a two-level cache.
+
+### Level 1: In-process Decision Cache (L1)
+- **Scope:** per worker process
+- **Key:** `DecisionCacheKey`
+- **Value:** `KernelPlan` (including compilation_key)
+- **Eviction:** bounded LRU (default 5k entries) + TTL (default 30 minutes)
+
+Recommended key fields:
+- `model_version`
+- `model_family`
+- `gpu_sku_normalized`
+- `seq_bucket`
+- `quant_profile`
+- `driver_version_major_minor` (coarsened)
+- `policy_version`
+
+Rationale:
+- This captures stable performance regimes and avoids per-request recomputation.
+- Including `policy_version` prevents stale cache reuse across policy updates.
+
+### Level 2: Compilation Cache (L2)
+Compilation caching is separate from decision caching.
+
+- Decision cache returns a `KernelPlan` quickly.
+- Compilation cache ensures the chosen plan maps to a compiled artifact.
+
+Important: do **not** conflate “same decision” with “compiled exists”. A KernelPlan can be cached even if compilation misses occur; compilation cache handles that separately.
+
+---
+
+## Serialization & determinism
+Determinism is a hard requirement for kernel selection.
+
+### Determinism rules
+- Selection must be a pure function of explicitly provided inputs.
+- Any policy changes must be represented by a versioned `policy_version`.
+- Any non-deterministic ordering (e.g., iterating hash maps) is forbidden in candidate ordering and rule evaluation.
+
+### SelectionRecord (replay + debugging)
+For sampled requests (and for forced-debug runs), we serialize a compact SelectionRecord.
+
+SelectionRecord fields (minimum):
+- `selector_version` (runtime build + module version)
+- `policy_version`
+- `decision_cache_key`
+- `selected_kernel_id`
+- `candidate_kernel_ids` (ordered)
+- `model_id`, `model_version`, `model_family`
+- `seq_bucket`
+- `gpu_sku_normalized`, `sm_version`, `driver_version`, `cuda_runtime_version`
+- `allow_deny_outcome` (e.g., allowed by model allowlist; denied by SKU rule)
+- `fallback_reason` (if any)
+
+Storage locations:
+- Trace span attributes on the request root span (sampled)
+- Structured logs in `runtime-kernel-selection` log stream (sampled)
+- Optional per-request dump when `--kernel_selection_dump=1` is enabled (debug-only)
+
+### Stable plan keys
+We require stable string encoding for:
+- `decision_cache_key`
+- `compilation_key`
+
+Encoding guidance:
+- Use `key=value` segments joined by `|` in a fixed order.
+- No whitespace.
+- No high-cardinality freeform fields.
+
+Example (illustrative):
+`policy=kasv2-2026-02-18|model=llama-3.1-70b@2026-02-01|gpu=nvidia-h100-80gb-sxm|seq=XL|quant=bf16|drv=550.54`
+
+---
+
+## Interfaces to rollout gates and overrides
+Kernel selection behavior can be modified at runtime via control-plane-provided gates and local debug flags.
+
+### Feature gates
+- Gate name: `kernel_selection_v2`
+- Scope: environment/region/pool + model allowlist
+- Evaluation point: **before** selector applies v2 rules
+
+If gate is disabled:
+- Selector falls back to v1 selection or a conservative default plan (per policy).
+
+### Allow/deny rules
+Support for emergency and proactive safety:
+- Deny specific `kernel_id` on a `gpu_sku_normalized` (and optionally driver/CUDA)
+- Deny v2 entirely for a `model_version`
+- Pin a kernel for a model+SKU+seq_bucket for fast mitigation
+
+Override precedence (highest to lowest):
+1. Local debug flags (on-call / reproduction only)
+2. Control plane hotfix rules (deny/pin)
+3. Built-in denylist guardrails (known unstable combos)
+4. v2 normal policy
+5. v1 fallback policy
+6. Conservative baseline kernel (last resort)
+
+---
+
+## Observability hooks (what we emit)
+The selector emits the following telemetry (subject to sampling and cardinality controls):
+
+### Metrics
+- `kernel_selection_decisions_total{policy_version, model_family, gpu_sku, seq_bucket, selected_kernel_id}` (sampled or aggregated)
+- `kernel_selection_fallbacks_total{reason, gpu_sku, model_family}`
+- `kernel_selection_eval_ms` (CPU overhead)
+- `kernel_selection_cache_hit_ratio` (L1 decision cache)
+
+### Traces
+- Span event: `kernel_selection` on request root span
+- Attributes include `selected_kernel_id`, `policy_version`, `seq_bucket`, `gpu_sku_normalized`, and `fallback_reason`
+
+### Logs
+- Structured log line in `runtime-kernel-selection` stream for sampled requests
+
+PII/Sensitive data note:
+- No prompt text, no customer identifiers.
+- Model identifiers are internal version IDs; customer-provided model aliases must be resolved before logging.
+
+---
+
+## Failure modes and fallback behavior
+Kernel selection has explicit fallback behavior to avoid correctness issues and to bound tail latency.
+
+Common failure modes:
+- Kernel missing for a SKU (registry mismatch)
+- Known unstable kernel+driver combination (guardrail deny)
+- Seq bucket misclassification leading to long-context regressions
+- Compilation failure for a selected plan
+
+Fallback principles:
+- Prefer a known-safe kernel with acceptable perf over an unverified optimized kernel.
+- Treat compilation failure as a signal to fall back to the next candidate (bounded retries) before failing the request.
+- Emit explicit telemetry on fallback reason.
+
+For the authoritative fallback hierarchy, see ADR-017.
+
+---
+
+## Operational notes (Dedicated / Private)
+Dedicated and Private deployments often have constrained SKU sets and driver policies.
+
+Recommended practices:
+- Pre-register and validate kernel registry entries per allowed SKU set.
+- Keep a minimal emergency override file that can:
+  - Disable v2 per model
+  - Pin a known-good kernel
+  - Deny known-bad kernel+SKU combos
+- Ensure selection telemetry sampling is tuned to avoid excessive cardinality in smaller clusters.
+
+---
+
+## Appendix: configuration and debug controls (runtime)
+The following names are representative; refer to the runbook for exact flags per runtime version.
+
+- `--enable_kernel_selection_v2=true|false`
+- `--kernel_selection_policy_version=<id>` (debug only; production uses release-default)
+- `--kernel_selection_force_kernel_id=<kernel_id>` (debug only)
+- `--kernel_selection_dump=1` (writes SelectionRecord to local logs)
+- `--kernel_selection_decision_cache_size=<n>`
+- `--kernel_selection_telemetry_sample_rate=<0..1>`
+
+---
+
+## Owners
+- Architecture/perf correctness: Noah Patel
+- Selector logic: Yuki Sato
+- Kernel registry + implementations: Hiro Tanaka, Grace Kim
+- Scheduler hints integration: Sofia Ivanova
+- Tail latency and observability: Omar El-Sayed
+- Control-plane rollout gates: Ethan Park
+
+For on-call actions, see: Kernel Selection v2 Override and Rollback Runbook.

@@ -1,0 +1,133 @@
+Self-serve GPU environments: IaC patterns and CI/CD pipeline
+
+Overview
+
+This page documents the recommended infrastructure pattern and CI/CD pipeline for self-serve GPU environments (dev sandboxes, feature-branch testbeds, and ephemeral eval clusters). The goal is to provide engineers a predictable, low-friction way to provision short-lived GPU environments while enforcing cost, security, and network constraints via Terraform modules and automated pipelines.
+
+Goals
+- Provide a self-serve flow for creating ephemeral GPU namespaces with minimal manual approvals.
+- Enforce cost/egress/networking constraints by default.
+- Keep IaC modules composable, testable in CI, and safe to roll back.
+- Ensure reclamation and chargeback automation for unused resources.
+
+Scope
+- Covers single-tenant ephemeral environments (one Kubernetes namespace + dedicated fractional GPU or whole GPU allocation on the Redwood cluster).
+- Integrates with: fleet-provisioner service, gpu-tenant-operator, terraform-iac modules, and the infra-ci GitHub Actions pipelines.
+- Does NOT cover Dedicated (reserved) or Private on-prem installs; those follow the Dedicated onboarding flow.
+
+Architecture (text diagram)
+- Developer Git branch -> PR triggers infra-ci pipeline -> terraform plan/app against ephemeral workspace -> fleet-provisioner creates pod/VM with GPU -> gpu-tenant-operator enforces RBAC, egress fencing, and PVCs.
+
+Provisioning flow (high level)
+1. Developer opens a PR to a repository that contains an infra/preview/terraform/ directory.
+2. infra-ci (GitHub Actions) runs lint, module unit tests, and a terraform plan using an ephemeral workspace (named pr-<number>).
+3. On approval, infra-ci runs terraform apply to a pre-authorized ephemeral workspace; this creates an entry in the provisioning service (fleet-provisioner) and triggers a tenancy allocation request.
+4. gpu-tenant-operator validates the request, allocates fractional GPU via k8s-device-plugin or attaches a whole GPU node from the ephemeral-pool autoscaler.
+5. Post-provision: tagging, cost-center label injection, and a 48-hour automatic reclamation timer are applied.
+
+Terraform module contract (summary table)
+| Input | Type | Description | Default |
+|-------|------|-------------|---------|
+| name | string | short environment id (alphanumeric) | required |
+| owner_email | string | requestor contact for reclamation notices | required |
+| gpu_fraction | number | fraction of GPU to allocate (0.25, 0.5, 1) | 0.25 |
+| max_hours | number | lifetime in hours before auto-delete | 48 |
+| egress_profile | string | network policy profile (restricted|dev|open) | restricted |
+| cost_center | string | billing tag injected into resources | infra-sandbox |
+
+Implementation notes
+- Module must validate inputs and fail-fast on invalid names or unsupported GPU fractions.
+- Use remote state per-workspace (S3/GCS) using a workspace name prism: con-redwood-ephemeral-pr-<number>. Remote state keys must be namespaced to the repo and PR.
+- State locking must use DynamoDB/GCS locking table to avoid concurrent applies.
+
+CI/CD pipeline details
+- Pipeline name: infra-ci/ephemeral-provision. Implemented as GitHub Actions with the following stages:
+  1) terraform-format & tfsec lint
+  2) module-unit-tests (go test / terratest)
+  3) terraform-plan (ephemeral workspace) -> uploads plan JSON as artifact
+  4) human approval (protected by CODEOWNERS) OR automatic merge if PR label 'auto-provision' present and requester is in the list of trusted devs
+  5) terraform-apply -> post-apply validation (k8s smoke tests)
+
+Sample GitHub Actions snippet (plain text)
+```
+name: Ephemeral Provision
+on: [pull_request]
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v1
+      - name: Terraform Init
+        run: terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" -backend-config="key=${{ github.repository }}-pr-${{ github.event.pull_request.number }}.tfstate"
+      - name: Terraform Plan
+        run: terraform plan -out=plan.tfplan
+      - name: Upload Plan
+        uses: actions/upload-artifact@v3
+        with:
+          name: plan
+          path: plan.tfplan
+```
+
+Reclamation and quota enforcement
+- Autosweep policy: environments are created with a 48-hour TTL. Two email notifications are sent: at 24 hours (reminder) and at 12 hours prior to deletion.
+- Metrics: number_of_ephemeral_envs, avg_cost_per_env_hour, reclaimation_failed_count. Alert if reclaimation_failed_count > 3 in 1 hour.
+- Quota check: infra-ci checks per-user and per-team active env count prior to apply. Defaults: 3 active envs per user, 10 per team. Requests over quota are denied and require ticket to infra.
+
+Cost controls and tagging
+- Every provisioned resource must have labels: owner_email, cost_center, terraform_workspace, provisioning_request_id.
+- Fractional GPU chargeback measured by gpu_fraction * time_active. Billing export job runs hourly to attribute spend to cost_center tag.
+
+Networking & security
+- Egress fencing is applied by default using the egress_profile input. Policy mapping: restricted -> deny all egress except internal APIs; dev -> allow common dev endpoints (apt, dockerhub, internal staging); open -> unrestricted but only for specific trusted groups.
+- All environments use a dedicated NetworkPolicy resource and shared NAT gateways per region to consolidate egress IPs.
+- Secrets: no long-lived secrets are injected by default. KMS-wrapped secrets are requested via a short-lived token from secret-broker.
+
+Observability and post-provision validation
+- Smoke checks (run as post-apply job): sample inference call against a small local model, node GPU utilization > 5% within first 10 minutes, pod readiness > 95%.
+- Dashboards: Ephemeral Provisioning (panels: active envs by owner, avg creation latency, reclaimation lag, per-environment cost).
+
+Runbook (oncall steps for reclaimation failures)
+1. Alert: reclaimation_failed_count > 3 -> page oncall (infra-onsite) with ticket id.
+2. Check the provisioning service (fleet-provisioner) logs: `kubectl -n infra logs deploy/fleet-provisioner` and look for provisioning_request_id.
+3. If terraform destroy failed due to lock, run: `terraform force-unlock <LOCK_ID>` in the corresponding workspace after verifying no active apply.
+4. If deletion blocked by finalizers (PVCs), escalate to storage team; run `kubectl delete pvc --grace-period=0 --force` only after confirming data is not required.
+5. Post-incident: add failing env id to the reclaimation_failed_count dashboard and kick off a cleanup job `infra-scripts/cleanup-ephemeral --request-id <id> --dry-run` then without --dry-run once validated.
+
+Ownership and lifecycle
+- Owner services: fleet-provisioner (svc-owner: infra-provisioning-team@redwood.com), gpu-tenant-operator (svc-owner: infra-gpu-team@redwood.com).
+- Module maintainers: eng-infra/terraform-team. Changes to core module must include a migration section and a canary rollout plan.
+
+Testing & migration guidelines
+- Module changes must include terratest unit coverage and a staged rollout: canary apply to `ci-ephemeral` workspace, smoke validation, then roll to prod ephemeral workspace.
+- For breaking input changes, provide a compatibility shim (deprecated inputs still supported for one quarterly release cycle).
+
+Appendix: Example Terraform input snippet (plain text)
+```
+module "ephemeral_env" {
+  source        = "git::ssh://git@github.com/redwood/terraform-modules.git//ephemeral-gpu?ref=v1.3.0"
+  name          = "pr-432-feature-x"
+  owner_email   = "dev@example.com"
+  gpu_fraction  = 0.5
+  max_hours     = 72
+  egress_profile = "dev"
+  cost_center   = "feature-x"
+}
+```
+
+Related decisions
+- Default TTL of 48 hours set (see migration notes) after an incident where lingering dev environments caused a 22% bump in spot usage costs.
+
+Questions & future work
+- Add per-environment GPU auto-scaling for multi-stage tests.
+- Integrate sandbox cost estimation into the PR UI before apply.
+
+Contact
+- For infra module questions: infra-terraform@redwood.com
+- Oncall for provisioning: infra-onsite@redwood.com
+
+Revision history
+- 2024-05-18: initial draft by Maya Chen
+- 2024-07-09: added CI snippet and quota rules (Ravi Patel)
+- 2025-02-20: updated reclamation runbook and increased max default TTL to 72 for long-running evals (Elena Garcia)

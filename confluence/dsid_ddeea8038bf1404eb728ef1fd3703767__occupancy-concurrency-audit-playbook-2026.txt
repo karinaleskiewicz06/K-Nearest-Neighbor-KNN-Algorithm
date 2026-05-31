@@ -1,0 +1,200 @@
+Occupancy and Concurrency Audit Playbook for Serving Runtime
+
+Overview:
+
+This playbook describes a repeatable audit process to assess and remediate GPU occupancy and request concurrency issues in the Redwood serving runtime. It is intended for on-call engineers, performance engineers, and SREs responsible for multi-tenant inference pools and kernel scheduler tuning. The goal is to detect pathological occupancy/concurrency patterns early, quantify their impact on latency/cost, and prescribe targeted mitigations.
+
+Why this matters:
+
+- Low GPU occupancy (SM utilization) or poor warp efficiency increases per-token cost and can drastically raise tail latency for short requests.
+- Excessive concurrency without appropriate kernel crediting can cause kernel contention, eviction churn, and KV-cache thrash.
+- Multi-tenant pools and dynamic batching increase the surface area for occupancy anomalies; automated audits help prevent regressions when we change kernel mappers, quantization profiles, or shard placement rules.
+
+Scope and audience:
+
+- Scope: GPUs used by Redwood-hosted runtime (heterogeneous pools), Dedicated clusters on RDW, and Private deployment models where we operate the inference stack.
+- Audience: runtime performance team, serving runtime owners, SRE, release engineers.
+
+Key concepts and metrics (short primer):
+
+- SM Occupancy: fraction of Streaming Multiprocessor compute capacity active. Monitored with nvidia-smi dmon/ DCGM metric: gpu_sm_active and nvprof metrics like sm_efficiency.
+- Warp Efficiency: fraction of executed threads performing useful work (warp_execution_efficiency).
+- GPU Active Time / Kernel Time: total kernel execution time versus idle/wait time.
+- CUDA Stream Utilization: concurrency of CUDA streams per process (useful for kernel overlap).
+- Kernel Queue Length: number of enqueued kernels waiting execution per GPU.
+- Token-per-second per-GPU and per-request token latency: application-visible metrics correlated with kernel metrics.
+
+Acceptance thresholds (operational guidance):
+
+- Avg SM Occupancy: target 30%–80% depending on model size. Small models (<=4B) should aim for >45% with batching; large models (>=70B) may be 20%–40% due to register pressure.
+- Warp Efficiency: target >70%; investigate below 60%.
+- Kernel Queue Length (p95): <= 8 for latency SLOs; if >16, treat as congestion.
+- Kernel Preemption Events: zero preferred; any spike should be investigated.
+
+Audit cadence and triggers:
+
+- Scheduled audit: weekly automated run across production pools.
+- Release-triggered audit: run after kernel mapper, quantization, or scheduler changes.
+- Incident-triggered audit: triggered by sustained SLO degradation (p95 latency increase >20% or error spike).
+
+Automated data collection (what to gather):
+
+1) DCGM / Prometheus exporter snapshots for each GPU: sm_efficiency, sm_active, gpu_util, mem_used, sm_clock, power.
+2) Kernel-level traces (perfetto / CUPTI) sampled for 60s across representative nodes.
+3) Per-request runtime traces (trace-id keyed) including batch size, sequence length, model variant, and scheduling priority.
+4) Kernel queue metrics and kernel metadata (kernel name, duration, per-kernel average latency).
+5) KV-cache hit/miss rates and warmup time per request shard.
+6) System-level metrics: NUMA statistics, PCIe throughput, nvlink/ nvlink errors.
+
+How to run an audit (step-by-step):
+
+1. Kick off collection:
+   - Run the automated collector job (prod-audit-collector) for the target pool. CLI: 
+
+   ```bash
+   ./tools/profiler/run-audit --pool gpu-pool-2 --duration 60s --out /tmp/audit-gpu-pool-2.json
+   ```
+
+   - Ensure collector captures DCGM metrics at 250ms granularity and samples 1 CUPTI trace per physical GPU.
+
+2. Baseline correlation (automated):
+   - Run the baseline comparator tool to correlate p95 latency and per-GPU sm_efficiency. Example: 
+
+   ```bash
+   ./tools/perf/compare-baseline --current /tmp/audit-gpu-pool-2.json --baseline s3://perf-baselines/gpu-pool-2/2026-01-01.json
+   ```
+
+   - Output: CSV with columns (metric, current_p50, current_p95, baseline_p95, relative_change).
+
+3. High-level triage (manual):
+   - Open the generated dashboard link from the collector output. Inspect: SM occupancy heatmap, kernel queue length timeseries, per-model aggregated warp efficiency.
+   - If p95 latency correlates with occupancy drop (sm_efficiency falls while kernel queue increases), flag as kernel contention.
+
+4. Deep dive: kernel-level analysis:
+   - Identify top 5 kernels by total time in the trace. Use the kernel map to attribute kernels to model layers (attention, MLP, softmax).
+   - For each kernel, inspect duration distribution, occupancy-dependent latency (plot duration vs active warps).
+   - Look for kernels with large variance or heavy tail (p99 > 4x median). Those are primary candidates for micro-optimization or fallback tuning.
+
+5. Concurrency accounting check:
+   - Verify kernel-credit accounting logs to ensure per-request credit consumption matches runtime expectations. Query: 
+
+   ```promql
+   sum by (pool) (increase(kernel_credit_consumed_total[5m]))
+   ```
+
+   - If observed concurrency > configured_max_concurrency by >20%, investigate admission control or credit leak bugs.
+
+6. KV-cache correlation:
+   - Join per-request latency with KV-cache hit rate. A simultaneous drop in hit-rate and SM occupancy often indicates aggressive eviction policies during high concurrency.
+
+7. NUMA/PCIe check:
+   - If occupancy low but GPU util high and kernel times are fragmented, inspect NUMA binding and transfer stalls. Use `numactl --hardware` and `perf record` to validate.
+
+Automated remediation recommendations (ordered):
+
+1) Apply immediate throttling: reduce admission concurrency for the affected model/pool by 20% (fast rollback).
+2) Switch to a compatible lower-parallel kernel variant (runtime supports alternative kernel variants labeled fast-path, conservative).
+3) Increase batching window for short-sequence workloads for 30s to evaluate impact.
+4) Adjust kernel mapper hints to prefer fewer concurrent small kernels on the same GPU (see kernel mapper tuning snippet below).
+
+Kernel mapper tuning example (config snippet):
+
+- purpose: prefer sequential execution for kernels with low occupancy and high variance
+- config keys (YAML):
+
+  kernel_mapper:
+    prioritize_small_kernel_serialization: true
+    small_kernel_threshold_ms: 1.5
+    concurrency_grouping_window_ms: 12
+    backpressure_on_queue_length: 10
+
+Metrics and dashboard recipes (Grafana/PromQL examples):
+
+- SM occupancy heatmap: avg(sm_efficiency) by (gpu_id) over 5m
+- Kernel queue alarm: (max_over_time(kernel_queue_length[5m]) > 12)
+- Warp inefficiency alert (event): increase(warp_stall_cycles_total[5m]) / increase(instruction_issued_total[5m]) > 0.35
+- Correlation panel: overlay p95(request_latency) with 1 - avg(sm_efficiency) (both normalized) to surface inverse relationships.
+
+Incident play examples (short):
+
+- Symptom: sudden p95 spike for short-text generation where throughput hasn't changed.
+  Triage: run audit collector for 60s; find that kernel queue length jumped and sm_efficiency dropped to 18% on two GPUs.
+  Remediation: throttle concurrency for model route, apply kernel mapper change to serialize small kernels. Result: p95 restored within 3 minutes.
+
+- Symptom: slow cold-start for mini-batches after rollout of a quantized kernel.
+  Triage: KV-cache miss surge and multiple small kernels with long tail.
+  Remediation: revert to previous kernel variant for the model, schedule controlled rollout with traffic shadowing.
+
+Decision criteria matrix (when to change runtime configs vs when to open a kernel engineering ticket):
+
+- Quick config change (runtime): if issue is resolved by admission control, mapper hint flips, or batch-window adjustments and change reduces p95 by >15% in canary.
+- Kernel engineering ticket: if top kernel p99 > 3x median and variance does not change with concurrency reduction or mapper hints, escalate to kernel team with trace bundle.
+
+Ownership and escalation paths:
+
+- Primary: serving-runtime-performance@redwood.internal (team lead: Priya Natarajan).
+- Kernel engineering: kernel-core@redwood.internal (owner: Diego Morales).
+- Oncall escalation: page SRE oncall if SLO breached after the second remediation step.
+
+Artifacts to attach to the audit ticket:
+
+- audit collector JSON and generated dashboard link
+- top-5 kernel trace bundle (CUPTI/Perfetto) with timestamped ranges
+- per-request trace subset (10–100 representative trace ids) with correlated KV-cache and scheduler decisions
+
+Rollback playbook (if remediation regresses production):
+
+1) Immediately revert the admission control change via runtime CLI: `runtimectl set-concurrency --pool <pool> --value <previous>`
+2) Revert kernel mapper config using config rollback tag in S3 and trigger a config reload: `runtimectl reload-config --tag <previous-tag>`
+3) If kernel variant was replaced, rotate traffic back to previous variant and monitor p95 for 10 minutes.
+
+Checklist for a good audit report (what we expect in the ticket):
+
+- Executive summary (one paragraph): impact, affected pools/models, summary of root cause.
+- Data appendix: top graphs and a CSV of key metrics.
+- Remediation applied and measurable effect (before/after numbers).
+- Recommendations (short-term / long-term).
+- Owner and ETA for follow-up (if kernel ticket created).
+
+Related pages:
+
+- /confluence/eng-serving-runtime/kernel-and-scheduling/adaptive-kernel-mapper-and-scaling-playbook-2026
+- /confluence/eng-serving-runtime/runbooks/numa-aware-shard-placement-eviction-playbook-2026
+- /confluence/eng-serving-runtime/profiling-playbook/runtime-profiling-playbook-guidelines-2025
+
+Appendix: Useful commands and example outputs
+
+- DCGM sample query (JSON):
+
+```bash
+dcgmi dmon -e 250 -s 60 -o /tmp/dcgmi-gpu-pool-2.json
+```
+
+- Example PromQL for kernel queue p95: 
+
+```promql
+histogram_quantile(0.95, sum(rate(kernel_queue_length_bucket[5m])) by (le, gpu))
+```
+
+- CUPTI/Perfetto capture invocation (example):
+
+```bash
+perfetto --txt -c /etc/perfetto/prod-gpu-capture.cfg --out /tmp/perfetto-gpu-$(date +%s).trace
+```
+
+Change log:
+
+- 2025-11-10: Document created (initial draft).
+- 2026-01-15: Added kernel mapper tuning snippet and PromQL recipes.
+- 2026-02-02: Hardened remediation ordering and clarified ownership/escalation.
+
+Notes and future work:
+
+- Integrate audit collector with auto-remediation playbooks (low-risk throttles) once we have robust canary testing.
+- Add ML-driven anomaly detection for warp efficiency drop that triggers a lightweight sampler trace.
+
+Contacts:
+
+- Priya Natarajan (serving-runtime-performance lead) — priya@redwood.internal
+- Diego Morales (kernel engineering) — diego@redwood.internal
+

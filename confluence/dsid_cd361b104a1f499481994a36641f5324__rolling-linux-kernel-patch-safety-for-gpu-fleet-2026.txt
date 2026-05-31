@@ -1,0 +1,162 @@
+Rolling Linux Kernel Patch Safety for GPU Fleet Ops
+
+Overview:
+
+Purpose: This runbook describes safe operational procedures, observability checks, and automated safeguards for performing rolling Linux kernel patches on Redwood GPU node pools. It focuses on minimizing P99/P99.9 latency blasts for inference traffic, preserving KV cache health, and maintaining SLOs during a multi-region rolling kernel update.
+
+Scope: Applies to all GPU fleets that serve production inference (hosted + dedicated nodes) and any Kubernetes or VM groups running the Redwood serving runtime. Excluded: isolated on-prem clusters with dedicated change processes (see eng-private-deployments).
+
+When to use this playbook:
+- Security or stability kernel patches that must be applied within a maintenance window.
+- Kernel backports that address scheduler, memory reclamation, or driver compatibility impacting inference performance.
+- When automated node replacement is used (termination + re-enroll) instead of in-place kernel upgrade.
+
+Owner and escalation:
+- Primary owner: Fleet Reliability (eng-sre)
+- Secondary: Serving Runtime Ops (eng-serving-runtime)
+- Pager: on-call fleet-sre rotation
+- Escalation matrix: Tier 1 operator -> Fleet Reliability lead -> Platform Eng manager -> CTO on severe customer impact
+
+SLOs and guardrails (pre-update):
+- Target P50 token latency delta during maintenance: < +15% of baseline
+- Target P99 token latency delta: < +30% of baseline
+- Allowed error budget consumption window: no more than 2% of monthly budget per region for scheduled maintenance
+- KV cache hit-rate degradation allowed: <= 8% drop sustained for >10 minutes
+
+Preflight checklist (automated + manual steps):
+1) Canary validation (automated):
+   - Spin up a 3-node canary pool in a non-customer region that mirrors production traffic profile using synthetic load generator (read from /ops/canary/job-playbooks).
+   - Run the following validation suite for 45 minutes: kernel boot, driver module load, runtime healthcheck, prefix cache warmup, 1k streaming generation sessions.
+   - Pass criteria: no OOMs, no KV-cache corruption, <10% P99 delta vs baseline.
+
+2) Metrics and dashboard baseline snapshot:
+   - Capture a 2-hour baseline for the targeted node group: token-latency.{p50,p95,p99}, request-rate, gpunode.memory.available, gpubandwidth.util, kvcache.hit_rate, serving-runtime.errors.
+   - Save metrics snapshot ID to the maintenance ticket.
+
+3) Alert and rollback hooks:
+   - Ensure the following alert rules are active and have on-call notifications:
+     * gpu-node-reboot-rate > 0.5/min (5m window) -> paging
+     * serving-runtime.request-error-rate > 0.2% (2m) -> alert (pager if sustained 10m)
+     * token-latency.p99-increase > 40% (5m) -> auto-throttle traffic + page on-call
+   - Ensure the automated rollback playbook is registered in orchestration (see Automation section).
+
+4) Communication:
+   - Open maintenance ticket with target node groups, planned rollout cadence, and observable dashboard links.
+   - Notify downstream teams: Customer Success for impacted tenants, Platform Observability for dashboard watch, and Support.
+
+Rolling upgrade procedure (operator steps):
+1) Drain strategy and prewarm:
+   - Mark node as unschedulable for new inference sessions: kubectl label node <node> redwood-maintenance=true && kubectl cordon <node>
+   - Wait for in-flight sessions to drain using grace period 90s (adjust per tenant SLA). Monitor streaming.session_count.{node}.
+   - If using live-migrate for KV cache, trigger KV-shard handoff to target node per operator workflows.
+
+2) Apply kernel patch (two supported flows):
+   A) Immutable replacement (recommended):
+      - Trigger autoscaler to provision replacement nodes with patched image.
+      - Ensure new nodes pass health checks and are added to pool.
+      - Evict old node once KV cache synced or prefix cache checkpointed.
+   B) In-place upgrade (only for non-critical pools):
+      - Run remote upgrade: apt/yum package install -> update-grub -> reboot.
+      - Monitor dmesg and journalctl for driver errors during boot.
+
+3) Post-boot validations (automated checks, operator watches):
+   - Verify kernel version: uname -r -> matches patched version.
+   - GPU driver present and in the right mode: nvidia-smi -> check GPU memory, GPU persistence mode.
+   - Serving runtime health: curl -f http://localhost:9090/healthz -> status=ok
+   - KV cache consistency: run cache-checker tool (ops/bin/cache-checker --node <node>) -> exit code 0
+   - Token latency smoke test: run a short synthetic workload (100 requests) and compare to baseline snapshot.
+
+4) Admission back to pool:
+   - If all checks pass, uncordon node: kubectl uncordon <node> and remove redwood-maintenance label.
+   - Wait 10 minutes of steady-state observation before proceeding to next node.
+
+Automated safety gates and orchestration:
+- Orchestration system (fleet-orch) must support the following gates before advancing to the next node:
+  1) No P99 spike > 40% across the region for 10m.
+  2) Global KV cache hit-rate decline < 8% sustained.
+  3) Failed node fraction < 1 in 100 nodes.
+- Implementation pattern (pseudocode):
+
+  # Pseudocode for orchestration gate (shell-style)
+  for node in nodes_to_patch:
+    apply_patch(node)
+    start_time=$(date +%s)
+    sleep 120
+    if metrics.p99_increase(region) > 40:
+      rollback_node(node)
+      notify_oncall("p99 spike: rollback triggered for node ${node}")
+      abort_rolling_update()
+    fi
+    if metrics.kvcache_drop(region) > 8 and elapsed > 600:
+      rollback_node(node)
+      notify_oncall("kv cache degradation: rollback triggered for node ${node}")
+      abort_rolling_update()
+    fi
+    wait_until_steady(600)
+  done
+
+Dashboards and essential views to monitor:
+- Fleet health overview (fleet/ui/fleet-health): node readiness, reboot rate, replace rate
+- Latency burn-down: token-latency.{p50,p95,p99} by region and node-pool
+- KV cache topology: kvcache.hit_rate by shard and region; prefix-cache.write_lag
+- Driver & kernel errors: syslog kernel.err and dmesg.gpu.error counts
+- Canary test panel: synthetic success rate, P99 latency, resource pressure graphs
+
+Alert tuning guidance (examples):
+- Set token-latency.p99-increase alert threshold at +40% for operator paging, +60% for critical SLA escalation.
+- Use composite alerts to reduce noise: only page if latency spike AND error-rate > 0.05%.
+
+Rollback strategies (fast vs safe):
+- Fast rollback: revert traffic routing to previous model variants and mark node group draining. Used for severe customer-impact incidents.
+- Safe rollback: re-provision nodes with previous image, wait for KV cache rehydration, then re-introduce. Preferred for cache-sensitive regressions.
+
+Post-incident retrospective checklist:
+1) Capture traces and flamegraphs for any latency spike windows.
+2) Correlate kernel boot timestamps with latency/error telemetry.
+3) Re-run canary with narrower workload slices to reproduce.
+4) Update playbook with observed deviations (e.g., driver regression, scheduler preemption).
+
+Automation snippets and CLI examples:
+- Health check curl:
+  curl -fsS http://localhost:9090/healthz || exit 1
+
+- Minimal orchestration command to check kernel on a node (bash):
+  ssh ops@${NODE} "uname -r && nvidia-smi --query-gpu=driver_version --format=csv"
+
+- Grafana snapshot export (example):
+  grafana-cli snapshot export --dashboard-id=1234 --org-id=1 --api-key=${GRAFANA_KEY} > /tmp/patch-dashboard.json
+
+Operational limits and timing recommendations:
+- Recommended patch cadence: monthly security windows for non-critical pools; quarterly for latency-critical pools unless security urgency requires otherwise.
+- Max concurrent patching per region: floor(total_nodes/50) or 10 nodes, whichever is smaller, unless canary shows lower risk.
+- Maintenance window: prefer 02:00–07:00 local region time for lowest traffic (metric-backed).
+
+Known gotchas and mitigation notes:
+- Kernel/driver combos: some older kernels regress GPU page-fault handling; test both mainline and vendor drivers.
+- KV cache cold-start penalty: when replacing multiple nodes, coordinate staggered prefix checkpoint restores to avoid N*cache-rebuild storms.
+- Live-migration edge-case: in-place driver reloads may leave stale device nodes; prefer immutable replacement flow.
+
+Appendix: quick reference table
+
+| Item | Command / Metric | Threshold / Expected |
+|------|------------------|----------------------|
+| Health endpoint | curl http://localhost:9090/healthz | status=ok |
+| Kernel check | uname -r | <patched-version-string> |
+| GPU driver | nvidia-smi | driver_version matches image |
+| Latency panel | token-latency.p99 | < +40% allowed for gate |
+| KV cache | kvcache.hit_rate | decline < 8% |
+| Max concurrent nodes | config | floor(total_nodes/50) or 10 |
+
+References and related docs:
+- eng-platform/runbooks/gpu-pool-live-shrink-and-maintenance-runbook-2026
+- eng-serving-runtime/runbooks/prefix-cache-shard-operator-playbook
+- security-and-compliance/change-management/kernel-patch-approval-flow
+
+Contact and feedback:
+- To propose improvements, open a PR against this page or ping #fleet-ops on Slack.
+- Post-mortem owner for kernel patch incidents: Fleet Reliability lead (fleet-reliability@redwood.com).
+
+Document history:
+- 2025-08-14: initial draft by Aisha Patel
+- 2025-10-02: added automated gate pseudocode and threshold tuning by Marco Chen
+- 2026-02-02: expanded rollback strategies and added KV cache mitigation guidance by Lina Rodriguez

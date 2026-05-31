@@ -1,0 +1,180 @@
+GPU bastion hardening and remote debugging runbook
+
+Overview
+
+This runbook documents the recommended architecture, hardening controls, and operational procedures for using bastion (jump) hosts to access GPU nodes for troubleshooting and interactive debugging. It balances the need for fast engineering diagnostics against risk controls required by our data residency and tenant isolation policies. This doc applies to all cloud-hosted GPU pools (shared, dedicated, and edge) and describes Terraform modules, CI/CD hooks, and on-call playbooks.
+
+Goals
+
+- Provide a reproducible, auditable process to grant temporary SSH access to GPU nodes.
+- Minimize blast radius by using ephemeral bastion instances, strict IAM, session recording, and ephemeral keys.
+- Ensure GPU-specific telemetry and log capture is automated during debugging sessions.
+- Integrate bastion lifecycle with Terraform and CI/CD pipelines for predictable promotion, rotation, and rollback.
+
+Ownership and SLAs
+
+- Primary owner: infra/gpu-pool (oncall, escalation to eng-sre).
+- Secondary owner: infra/cloud-networks.
+- Expected time-to-access SLA for an approved session: 15 minutes (business hours), 60 minutes (off-hours).
+
+When to use a bastion
+
+Use the bastion only when remote debugging cannot be performed via:
+
+- Runtime remote debugging tools (kubectl exec into debug container)
+- Remote metrics and traces (Console, Datadog, Perfpipe)
+- Repro runs in an isolated evaluation sandbox
+
+Examples that justify bastion access: kernel panics impacting NVidia driver, hardware sensor failures (thermal throttling), inter-node PCIe errors, collection of crash dumps that cannot be captured programmatically.
+
+High-level Architecture
+
+- Ephemeral bastion fleet in a dedicated management VPC subnet.
+- Bastions are reachable only through corporate SSO + short-lived SSH certs issued by our CA (cert-ssh flow).
+- Bastion uses session recording (ttyrec + auditd) and streams to S3 (encrypted) + DataDog for retention indexing.
+- Bastion has host-level hardening (fail2ban, restricted shell for service accounts, no persistent credentials).
+
+Table: Key components and responsibilities
+
+| Component | Purpose | Owner | Retention/Notes |
+| --- | --- | --- | --- |
+| Ephemeral bastion autoscaling group | Provide jump hosts scaled to demand | infra/cloud-networks | Logs -> S3 (90d), sessions -> Datadog (30d) |
+| SSH CA & short-lived cert issuance | Short-lived certs via SSO flow | infra/sso | Cert TTL = 1h |
+| Session recording pipeline | Capture terminal sessions & upload | eng-sre | Encrypted storage, access via audit ticket |
+| Terraform module | Deploy bastion ASG, LB, IAM roles | infra/terraform | Versioned in modules repo |
+
+Hardening checklist (pre-deployment)
+
+1. Minimum AMI surface - baked image with only required debug tools (nvidia-drivers, nvtop, nvidia-smi, cuda-toolkit-lite). Remove package managers where possible.
+2. Disable password auth and root SSH. Enforce authorized_keys via CA-signed certs only.
+3. Enforce MFA via SSO for cert issuance.
+4. Install and configure auditd to capture execve and network connections from sessions.
+5. Configure immutable sysctl and kernel hardening (nosuid, nodev, etc.).
+6. Harden SSHD: AllowUsers jump-ops@redwood-inference, ForceCommand /usr/local/bin/jump-shell-wrapper.sh.
+7. Centralize logs to S3 with KMS encryption; ensure lifecycle policies.
+8. Set host-level resource limits to prevent accidental GPU or memory starvation affecting tenant workloads.
+
+Terraform/IaC snippet (reference)
+
+Example (abbreviated) for the bastion module usage in tenant management account (HCL pseudo):
+
+module "gpu_bastion" {
+  source = "git::ssh://git@repo.redwood-infra/modules.git//bastion?ref=v1.3.0"
+  name_prefix = "gpu-bastion"
+  vpc_id = var.management_vpc_id
+  subnets = var.bastion_subnets
+  ami_id = data.aws_ami.bastion_ami.id
+  instance_type = "t3.medium"
+  min_capacity = 1
+  max_capacity = 4
+  ssh_ca_key = var.ssh_ca_public_key
+  session_bucket = "s3://redwood-bastion-sessions"
+  tags = {team = "infra" environment = var.environment}
+}
+
+CI/CD integration
+
+- Bastion AMI builds are produced by the gpu-bastion-image pipeline in CI. Only signed AMIs marked 'stable' are allowed into the Terraform promotion pipeline.
+- Promotion pipeline automatically updates module inputs and creates a PR against infra/live to rotate the ASG.
+- Emergency fast path: a controlled manual pipeline exists to spin a one-off bastion instance with strict TTL for urgent troubleshooting (requires two approvers).
+
+Access request and approval flow
+
+1. Engineer opens an access request in the Access Portal including: justification, target node IDs, requested duration (max 4h), and logs already collected.
+2. Pager duty oncall reviews request and confirms if the session is necessary.
+3. If approved, SSO issues a one-hour cert and the session is scheduled. Approval triggers an audit ticket and an automated ephemeral port-forward rule in Security Group to allow only the cert-holder.
+4. Session starts; session recording begins automatically.
+
+Runbook: Operator steps for granting emergency access (short path)
+
+1. Verify the request in the Access Portal. Confirm target node and risk (is it a customer-owned dedicated node?).
+2. From the SSO admin console, issue cert with scope 'bastion:debug' TTL=1h.
+3. Ensure Security Group rule only allows the cert-holder IP (or corp-proxy) to the bastion LB.
+4. Start session and run the automated collection script (see collection section).
+5. When session ends, validate logs uploaded. Close audit ticket and mark evidence in the incident record.
+
+Automated GPU debugging collection (run on bastion session start)
+
+Command snippet saved as /usr/local/bin/gpu-collect.sh (invoked automatically):
+
+#!/bin/bash
+set -euo pipefail
+OUT_DIR=/tmp/gpu-dump-$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p "$OUT_DIR"
+# capture driver, dmesg, nvidia-smi output, pci-errors
+nvidia-smi -q > "$OUT_DIR"/nvidia-smi-q.txt 2>&1 || true
+dmesg -T | tail -n 500 > "$OUT_DIR"/dmesg-tail.txt || true
+cat /var/log/nvidia-installer.log 2>/dev/null > "$OUT_DIR"/nvidia-installer.log || true
+# collect container runtime info
+crictl ps -a --output json > "$OUT_DIR"/crictl-ps.json 2>/dev/null || true
+# compress and upload
+tar -czf "$OUT_DIR".tgz -C /tmp "$(basename $OUT_DIR)"
+aws s3 cp "$OUT_DIR".tgz "${SESSION_BUCKET:-s3://redwood-bastion-sessions}/$(hostname)-$OUT_DIR.tgz" --storage-class STANDARD_IA || true
+
+Note: the collection script runs with limited privileges and must not copy tenant data directories. It is reviewed weekly as part of security audits.
+
+Troubleshooting checklist (common cases)
+
+- No SSH access: validate cert validity (ssh -v -i ~/.ssh/id_redwood_cert user@bastion). Check SSO logs for issuance.
+- Sessions not recorded: check fluentd/journald forwarder on bastion; confirm KMS decrypt key access.
+- GPU drivers missing: use AMI artifact metadata to validate AMI version and use the AMI promotion pipeline to remediate.
+- Elevated CPU on bastion: scale ASG or schedule session to a different bastion; do not run long profiling on primary bastions.
+
+Post-session obligations
+
+- Engineer must attach collection artifact links to the Access Portal request and to any incident ticket.
+- If any host-level changes were made that could affect tenant workloads, open a change request and coordinate with SRE.
+
+Audit and monitoring
+
+- All session starts emit an event to the audit log (Kafka topic: audit.bastion.sessions) including cert_id, approver, target_node, session_start.
+- Session termination generates a signed manifest containing the session hash uploaded to the incident record.
+
+Retention and data handling
+
+- Raw session recordings: 30 days in S3, encrypted with KMS key redwood-bastion-sessions.
+- Parsed transcripts & indexes: 90 days in Datadog/Elasticsearch for fast search.
+- Collection artifacts: 180 days for dedicated customer incidents, 90 days otherwise.
+
+Security exceptions and escalation
+
+- For customer-owned dedicated pools with higher confidentiality requirements, bastion access is disabled by default. An exception process exists and requires Security and customer success approval (documented in the Access Portal).
+
+Change and testing procedures
+
+- Monthly chaos test: randomly terminate 1 ephemeral bastion and ensure CI pipeline rebuilds capacity within 10 minutes. Results posted to eng-infra/retrospectives.
+- Quarterly audit: review session retention, KMS key rotation, and IAM roles.
+
+Appendix: useful commands and examples
+
+- Start an SSH session (example):
+ssh -o CertificateFile=~/.ssh/id_redwood-cert -i ~/.ssh/id_redwood user@bastion.redwood-infra.internal
+
+- Gather NVidia telemetry:
+watch -n 1 nvidia-smi --query-gpu=index,name,utilization.gpu,temperature.gpu,driver_version --format=csv
+
+- Example systemd unit for session forwarder (bastion):
+[Unit]
+Description=Bastion session forwarder
+After=network.target
+
+[Service]
+Type=simple
+User=forwarder
+ExecStart=/usr/local/bin/session-forwarder --bucket ${SESSION_BUCKET}
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+
+Related references
+
+- infra/terraform/modules/bastion (module repo)
+- security-and-compliance/risk-and-exceptions/bastion-exceptions-process
+- eng-infra/runbooks/kernel-panic-capture-and-analysis-runbook (for additional kernel dump collection steps)
+
+Change log
+
+- 2025-11-12: Initial draft and ownership assignment (Asha Patel).
+- 2025-12-20: Added Terraform module example and CI/CD integration notes (Ravi Menon).
+- 2026-02-10: Added automated collection script and updated retention policy after security review (Emily Zhang).

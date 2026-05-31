@@ -1,0 +1,462 @@
+Design Spec: Staged rollouts for Dedicated pools (reserved capacity)
+
+## Summary
+This document describes the end-to-end design for **Dedicated staged rollouts for reserved pools**. The feature introduces explicit rollout plans with operator/customer-visible stages and **objective gates** (latency, errors, saturation/headroom, GPU health, OOM/evictions, request drops/429s, and optional quality checks where applicable).
+
+The design spans:
+- **Control plane** (data model + API + audit)
+- **Routing/data plane** (partitioning and request assignment by stage)
+- **Policy engine** (gate evaluation and deterministic decisions)
+- **Telemetry/observability** (stage-tagged signals, dashboards, alerting)
+- **Console** (timeline UI, promotion/abort/hold, gate evidence drilldowns)
+
+This is *not* a general-purpose experimentation platform. It supports A/B only insofar as it is used for safe, gated rollouts.
+
+---
+
+## Goals and non-goals
+### Goals
+1) Provide a first-class **DedicatedPoolRolloutPlan** with a stage list (default 1%/10%/50%/100% or replica partitions) and explicit promotion/rollback transitions.
+2) Define and enforce **gates** using standardized signals and thresholds aligned to Dedicated SLOs.
+3) Make changes **deterministic, auditable, reversible**, and safe under partial failures:
+   - Stage-by-stage promotion
+   - Auto-abort/rollback on gate failures
+   - Explicit **hold/freeze**
+   - Administrative escape hatches with audit logging
+4) Integrate consistently across regions/failure modes; avoid capacity starvation and pool fragmentation.
+
+### Non-goals (v1)
+- Arbitrary customer-defined gating metrics (beyond limited configuration on Redwood-defined gates).
+- General multi-variant experiments with statistical analysis and long-running ramp scheduling.
+
+---
+
+## Definitions
+- **Dedicated pool**: reserved capacity (potentially multi-region) for a single customer/account with isolation guarantees.
+- **Baseline**: the currently active serving configuration for the pool (e.g., model version, runtime build, router policy).
+- **Candidate**: the new configuration being rolled out.
+- **Stage**: a discrete partition of the pool (traffic share or replica partition) running Candidate while the rest remains on Baseline.
+- **Gate**: an evaluation rule producing pass/fail/unknown, computed from telemetry signals over a time window with minimum sample requirements.
+
+---
+
+## High-level architecture
+### Components
+1) **Dedicated Pool Rollouts Service (control plane)**
+   - Stores rollout plans and state.
+   - Validates stage definitions vs pool size/regions/headroom.
+   - Exposes CRUD and actions: promote, hold, abort, (admin) force-promote/force-rollback.
+   - Emits audit events.
+
+2) **Policy Engine (gate evaluation + decisioning)**
+   - Evaluates gate queries per stage on a fixed cadence and/or on-demand.
+   - Produces deterministic results with clear missing-data semantics.
+   - Provides “gate evidence” to Console.
+
+3) **Routing layer (smart routing / dedicated router)**
+   - Splits traffic by stage partition and ensures stable assignment.
+   - Enforces safety: no starvation, backpressure, and fallback behavior.
+
+4) **Data plane (serving runtime + pool manager)**
+   - Supports running Baseline and Candidate side-by-side in the same pool.
+   - Ensures capacity partitions map to actual replicas/allocations.
+
+5) **Telemetry pipeline**
+   - Emits stage-aware metrics/traces/logs with cardinality controls.
+
+6) **Console**
+   - Rollout timeline and stage panels.
+   - Promotion/abort/hold flows.
+   - Gate evidence drilldown + audit trail.
+
+### Data/control flow (text diagram)
+- Operator creates rollout plan in Console → Control plane validates/saves plan → Router receives updated policy/config → Stage 1 activated → Telemetry emits stage-tagged signals → Policy engine evaluates gates → Console displays pass/fail evidence → Operator promotes → repeat until 100% → completion.
+
+---
+
+## Rollout plan model
+### Resource: DedicatedPoolRolloutPlan
+A plan is scoped to a single Dedicated pool and represents a single rollout of a specific target change set.
+
+**Core attributes**
+- `rollout_plan_id` (UUID)
+- `pool_id` (Dedicated pool identifier)
+- `account_id` (customer account)
+- `change_summary` (human readable)
+- `baseline_spec` (opaque reference to current pool serving spec)
+- `candidate_spec` (opaque reference to new serving spec)
+- `stage_set` (ordered list)
+- `state` (draft | running | held | aborted | completed)
+- `current_stage_index` (int)
+- `created_by`, `created_at`, `last_updated_at`
+- `feature_flag_context` (beta enablement context; used for safe rollout of the feature itself)
+
+**Stage representation (v1 design)**
+Stages can be defined in one of two allocation modes; the mode is chosen per plan with validation rules:
+
+1) **Traffic percent** (default for larger pools)
+- Each stage defines `traffic_percent_to_candidate`.
+- Router assigns requests according to deterministic sampling.
+
+2) **Replica partitions** (required/encouraged for small pools)
+- Each stage defines `candidate_replica_count` (or per-region replica count), with the remainder running Baseline.
+- Router assigns requests based on replica partition selection.
+
+Rationale: percentage-based stages are simpler for UX and compatible with multi-region policies, but small pools can’t safely sustain very small percentages without starving capacity or losing redundancy. Replica partitions give explicit control over minimum serving capacity.
+
+**Stage fields (conceptual)**
+- `stage_id` (stable within plan)
+- `name` (e.g., “Canary”, “Ramp 10%”, “Half”, “Full”)
+- `allocation_type` (traffic_percent | replica_partition)
+- `allocation_value` (e.g., 1, 10, 50, 100 OR replica counts)
+- `min_duration_seconds` (recommended defaults; used for UX guidance and automation constraints)
+- `gates` (ordered list of gate checks; see below)
+- `auto_abort_on_failure` (default true)
+- `promotion_mode` (manual | automatic) (v1: manual promotion; automatic promotion is optional behind flag)
+
+### Validation rules (control plane)
+Plan creation/update is rejected if:
+- Stage allocations are not monotonic increasing toward Candidate.
+- Requested partitioning would violate **min headroom** or **min replicas per region** (see Infra guidelines).
+- Candidate requires hardware not present in the pool (GPU type mismatch).
+- Multi-region pools define allocations that would result in a region falling below redundancy requirements.
+
+Key guardrails (defaults; final numbers in ADR/Infra doc):
+- Minimum viable canary partition for replica mode: >= 1 replica per enabled region.
+- Minimum headroom target: do not allow partitions if predicted p95 queue depth > threshold at typical load.
+
+---
+
+## Rollout state machine and transitions
+### Plan state
+- **draft**: created but not affecting routing.
+- **running**: current stage active; routing splits baseline/candidate per stage.
+- **held**: routing remains at current stage, but promotion actions are disabled until resumed (except admin).
+- **aborted**: routing is reverted to baseline (0% candidate) and candidate partitions are drained.
+- **completed**: candidate becomes baseline; plan is immutable (except annotations).
+
+### Stage status (derived)
+Per stage: pending | active | passed | failed | skipped.
+
+### Transitions and semantics
+- `Start`: draft → running, stage 0 becomes active.
+- `Promote`: running(active stage i) → running(active stage i+1) if gates for stage i are passing (or override).
+- `Hold`: running → held (no automatic abort; stop promotion).
+- `Resume`: held → running (same stage).
+- `Abort`: running/held → aborted (revert to baseline and drain candidate).
+- `Complete`: when stage allocation reaches full candidate (100% or all replicas), then candidate is finalized as baseline and plan → completed.
+
+### Determinism and idempotency
+Promotion/abort/hold endpoints require:
+- `idempotency_key` (client-generated)
+- `if_match` / `expected_version` (optimistic concurrency)
+
+This prevents double-promote on retries and guarantees audit ordering.
+
+---
+
+## Gate model
+### Gate list (v1)
+Each stage can include a standard set of gates. Default set for Dedicated rollouts:
+1) **Error rate gate**
+2) **p95/p99 latency gate**
+3) **Saturation/headroom gate** (GPU util, queue depth, concurrency)
+4) **OOM / eviction gate** (OOM kill rate, KV cache eviction spike)
+5) **Request drop/429 gate**
+6) **GPU health gate** (ECC errors, throttling, node taints)
+7) **Telemetry freshness gate** (ensures we are not evaluating stale/missing data)
+8) **Optional quality regression gate** (when eval harness + prompt sets are available; v1 supports Redwood-managed checks only)
+
+### Gate evaluation states
+Each gate produces:
+- **PASS**: metric within thresholds and minimum sample met.
+- **FAIL**: threshold violated and sample met.
+- **UNKNOWN**: insufficient data or missing signals.
+
+**Missing-data policy (v1 default): fail-closed for promotion**
+- If any required gate is UNKNOWN, the stage is not eligible for promotion.
+- Auto-abort behavior on UNKNOWN is configurable per plan; default is **do not auto-abort** on UNKNOWN, but **block promotion** and surface “telemetry missing” with instructions.
+- Admin override can force promotion/rollback with required reason.
+
+### Windows, freshness, and sample size
+Defaults (subject to the Gate ADR and SRE alignment doc):
+- Evaluation window: 15 minutes for latency/errors; 5 minutes for saturation spikes; GPU health uses last 10 minutes.
+- Minimum samples: per stage minimum request count (e.g., 500 requests) OR minimum token count for token-based workloads.
+- Freshness: data points must be <= 2 minutes old; otherwise gate becomes UNKNOWN (telemetry staleness).
+
+### Threshold configuration
+- Thresholds are standardized by Redwood by tier (Dedicated SLA tier) and potentially by hardware family.
+- A limited set of thresholds may be adjustable per account/pool with explicit approval (v1: allowlist).
+
+---
+
+## Gate evaluation pipeline
+### Responsibilities
+- Control plane defines *what* gates are required for each stage.
+- Policy engine computes *whether* gates pass/fail and returns evidence.
+- Console consumes evidence and renders it.
+
+### Pipeline design
+1) **Stage activation** triggers a routing annotation and begins emitting stage-tagged telemetry.
+2) **Policy engine** periodically evaluates gates for the active stage(s):
+   - Pulls metrics/traces from the telemetry store (Prometheus-like + tracing backend).
+   - Computes aggregates over defined windows.
+   - Applies thresholds and hysteresis (to avoid flapping).
+3) Results are written to a cache/store with:
+   - `evaluated_at`
+   - `window_start`, `window_end`
+   - per-gate observed values and threshold used
+4) Control plane uses policy engine’s result for:
+   - determining “promotion eligible”
+   - optionally triggering auto-abort
+
+### Anti-flap/hysteresis
+- Gate must be continuously passing for a minimum “stable duration” (e.g., 5 minutes) before becoming eligible.
+- If a gate fails, it is marked failed and remains failed until a new evaluation window clears and stability requirements are met.
+
+### Evidence payload (Console contract)
+Console requests evidence for a plan and receives:
+- Stage summary: active stage, time in stage, promotion eligibility.
+- Gate list with:
+  - status (PASS/FAIL/UNKNOWN)
+  - observed value(s) and units
+  - threshold and comparator
+  - evaluation window and sample sizes
+  - link to underlying query template and drill-down charts
+  - explanation string (human-readable reasoning)
+
+---
+
+## Routing + data plane integration
+### Core requirement
+At any point, the router must decide which partition (baseline vs candidate) serves a request for a Dedicated pool, given:
+- current stage allocation
+- region availability
+- load/capacity constraints
+- safety and fallback rules
+
+### Stage-based routing behavior
+#### Request assignment
+- For **traffic_percent** stages:
+  - Deterministic sampling based on a stable hash of `(request_id || conversation_id || account_id)`.
+  - If `conversation_id` is present, use it to reduce cross-partition churn for multi-turn chats.
+
+- For **replica partitions**:
+  - Router selects from candidate replica set for the candidate share and baseline replica set otherwise.
+  - Replica selection respects locality (region), health, and concurrency.
+
+#### Streaming and long-lived requests
+- Streaming requests are **pinned at admission** to a partition and do not migrate mid-stream.
+- Abort/rollback does not terminate in-flight streams by default; it affects new admissions.
+- A “drain candidate” mode stops new candidate admissions and allows existing streams to complete (with a configurable max drain timeout).
+
+#### Multi-region Dedicated pools
+- Allocation is applied **per region** when replica partitions are used.
+- When traffic percent is used, the router applies the split *after* region selection to avoid sending candidate traffic to an impaired region.
+
+If one region becomes impaired mid-stage:
+- Router may temporarily route candidate traffic away from the impaired region (bounded by capacity and policy).
+- Gate evaluation should surface region-specific failures; promotion remains blocked unless policy allows “region degraded” overrides.
+
+### Capacity starvation protection
+The router enforces safeguards to prevent the canary partition from creating elevated 429s/queue depth:
+- Minimum candidate capacity check prior to enabling stage.
+- Admission control per partition with backpressure.
+- If candidate partition is overloaded while baseline is healthy, router can apply **safe fallback**:
+  - Route excess would-have-been-candidate requests to baseline (and emit a metric indicating fallback occurred).
+  - This is a safety valve; it impacts the purity of the experiment but preserves SLOs.
+
+This behavior is explicitly visible in stage dashboards and gate evidence to avoid “silent” masking of candidate regressions.
+
+---
+
+## Telemetry and observability
+### Stage tagging
+All key signals used by gates must include stage context:
+- `dedicated_pool_id`
+- `rollout_plan_id`
+- `stage_id`
+- `partition` (baseline|candidate)
+- `region`
+- `model_id` / `model_version`
+- `runtime_build_id`
+
+### Cardinality control
+To prevent label explosion:
+- `stage_id` is a short stable identifier (e.g., `s0`, `s1`, `s2`), not a UUID.
+- Allowlist stage tags only on a curated set of high-value metrics.
+- Sampling on traces; stage tags added at ingress with consistent propagation.
+
+### Dashboards
+The “Dedicated staged rollout” dashboard is organized by stage and region:
+- Traffic share and request volume
+- p95/p99 latency (overall + token latency where applicable)
+- Error rate (5xx, timeouts)
+- 429 / drops
+- GPU utilization, queue depth, saturation indicators
+- OOM/evictions
+- GPU health (ECC, throttling)
+- Annotations for promote/hold/abort actions with actor and reason
+
+### Alerting
+- Gate failure alerts route to oncall based on owning service and pool tier.
+- Alerts are suppressed for draft plans and for held plans unless explicitly configured.
+- Auto-abort events produce a high-signal notification (page for high-tier pools; ticket for lower tiers).
+
+---
+
+## Console UX flows
+### Primary views
+1) **Rollout overview** (per pool)
+- List of rollout plans (active + history)
+- Status badges (running/held/aborted/completed)
+- Quick actions (view, abort)
+
+2) **Rollout detail**
+- Stage timeline component
+- Current stage panel with:
+  - traffic/replica allocation
+  - time in stage
+  - gate summary (N passing / N failing / unknown)
+  - promotion eligibility
+- Gate evidence drilldown
+- Audit trail panel
+
+### Promotion flow
+- User clicks “Promote to next stage”
+- Confirmation modal shows:
+  - current stage → next stage
+  - gates passing and time window
+  - warnings if any near-threshold values
+  - required reason field (for change management)
+- On submit: Console calls promote endpoint with idempotency key
+
+If promotion is blocked:
+- UI shows which gate(s) block promotion and links to evidence.
+
+### Hold/freeze flow
+- User can hold a running rollout (e.g., during an incident)
+- While held:
+  - No auto-promotion (if enabled) and no accidental promote
+  - Gate evaluation continues to update visibility
+
+### Abort/rollback flow
+- User clicks “Abort rollout”
+- Modal explains:
+  - routing revert to baseline for new requests
+  - drain behavior for in-flight streams
+  - expected timeline and what to monitor
+
+### Admin overrides
+- Force-promote and force-rollback are visible only to admin roles.
+- UI requires:
+  - explicit reason
+  - acknowledgement of risk
+  - optional incident link
+- All overrides are prominently annotated in the timeline and audit trail.
+
+---
+
+## APIs (control plane)
+Base path (proposed): `/v1/dedicated/pools/{pool_id}/rollout-plans`
+
+### Endpoints
+- `POST /rollout-plans` Create plan
+- `GET /rollout-plans/{rollout_plan_id}` Get plan
+- `GET /rollout-plans` List plans (filter by state)
+- `PATCH /rollout-plans/{rollout_plan_id}` Update plan (draft only)
+- `POST /rollout-plans/{rollout_plan_id}:start` Start plan (draft → running)
+- `POST /rollout-plans/{rollout_plan_id}:promote` Promote stage
+- `POST /rollout-plans/{rollout_plan_id}:hold` Hold
+- `POST /rollout-plans/{rollout_plan_id}:resume` Resume
+- `POST /rollout-plans/{rollout_plan_id}:abort` Abort
+- `POST /rollout-plans/{rollout_plan_id}:forcePromote` Admin-only
+- `POST /rollout-plans/{rollout_plan_id}:forceRollback` Admin-only
+
+### Common request requirements
+- `idempotency_key` header
+- `expected_version` in body or `If-Match` header
+- `reason` field for actions that change state
+
+### RBAC
+Roles (conceptual):
+- Customer admin: create/start/hold/promote/abort within their account, subject to policy.
+- Redwood operator/SRE: all actions for supported accounts.
+- Redwood admin: can use force actions.
+
+The authorization model is enforced in the control plane and mirrored in Console action availability.
+
+---
+
+## Audit logging
+Every lifecycle action emits an audit event with:
+- actor identity (user/service) + auth context
+- account_id, pool_id, rollout_plan_id, stage_id
+- action type (create/update/start/promote/hold/resume/abort/force-promote/force-rollback)
+- before/after state snapshots (redacted as needed)
+- reason
+- correlation ids (request id, idempotency key)
+
+Audit events must be exportable for enterprise change management. See the audit logging spec for payload details and retention.
+
+---
+
+## Failure modes and mitigations
+1) **Telemetry lag/outage → gates UNKNOWN**
+- Promotion blocked; show “telemetry stale” guidance.
+- No auto-abort on UNKNOWN by default.
+- Admin override available with audit.
+
+2) **Canary partition causes 429s due to over-partitioning**
+- Enforce minimum partition size and headroom validation.
+- Router fallback to baseline on partition overload (emits fallback metric).
+- Gate includes 429/drop + queue depth, which should fail fast.
+
+3) **Region impairment mid-stage**
+- Router shifts traffic within policy constraints.
+- Gate evidence is region-aware; promotion blocked if any required region violates thresholds (unless explicitly configured).
+
+4) **Double promote from retries**
+- Idempotency keys + optimistic concurrency.
+
+5) **Rollback during streaming requests**
+- Pin streams; drain candidate admissions.
+- Document operational expectations and timeouts in runbook.
+
+---
+
+## Rollout of this feature (feature flags and migration)
+- Feature flag scoped by account and pool: `dedicated_staged_rollouts_enabled`.
+- Backend supports read-only mode first (list/get) before enabling create/start.
+- DB migrations ship ahead of UI exposure; safe disable plan retains plans but prevents action endpoints.
+
+---
+
+## Open questions (tracked in PRD / Linear)
+- Default evaluation window per gate (5m vs 15m) for bursty workloads; final decision needed from SRE and telemetry owners.
+- Exact set of thresholds configurable per customer (if any) for v1.
+- Whether auto-abort triggers on repeated FAIL evaluations or immediate FAIL (recommended: require two consecutive FAILs unless severity is extreme).
+- Policy for promotions during active incidents / high error budget burn.
+
+---
+
+## Appendix: Example stage defaults
+### Recommended default stage set (traffic percent)
+- Stage 0: 1% (Canary)
+- Stage 1: 10%
+- Stage 2: 50%
+- Stage 3: 100% (Complete)
+
+### Recommended default stage set (replica partitions)
+- Stage 0: +1 candidate replica per region (or +1 total for single-region pools)
+- Stage 1: ~10% replicas candidate
+- Stage 2: ~50% replicas candidate
+- Stage 3: all replicas candidate
+
+---
+
+## Changelog
+- 2025-03-19: Updated missing-metrics semantics (block promotion on UNKNOWN; do not auto-abort by default) and clarified router fallback behavior + observability requirements.
+- 2025-03-07: Added idempotency + optimistic concurrency requirements for promote/abort.
+- 2025-02-24: Added replica partition mode and validation guardrails for small pools.
+- 2025-02-12: Initial draft.

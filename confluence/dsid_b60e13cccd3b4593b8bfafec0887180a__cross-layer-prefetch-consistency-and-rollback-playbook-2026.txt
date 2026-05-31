@@ -1,0 +1,164 @@
+Cross-layer prefetch consistency and rollback playbook
+
+Summary:
+This playbook describes cross-layer detection, mitigation, and rollback procedures when prefetch subsystems produce inconsistent or stale state that affects inference correctness, latency, or cost. It covers the edge prefetch proxy, regional prefetch orchestrator (prefetch-service), KV prefix cache, and runtime-router fallbacks. The intent is operator-run actionable steps tied to dashboards and alerts, plus a short retrospective template and roadmap items to reduce recurrence.
+
+Scope and impact:
+- Services in scope: prefetch-service, edge-prefetch-proxy, kv-prefix-cache, runtime-router, allocator, telemetry-ingest
+- Typical user impact: elevated token latency, decreased match rate for cached prefixes, increased token cost from redundant model calls, and correctness regressions for stateful prompts
+- SLOs and thresholds (component-targeted):
+  - End-to-end prefetch latency (p50/p95/p99): aim p99 < 120ms for prefetch paths
+  - KV prefix cache hit rate: target >= 75% over 10-minute windows
+  - Prefetch consistency error rate (mismatched prefix versions): < 0.05%
+  - Inference-cost-per-request uplift: < +5% vs baseline over 1h
+
+Owners and contacts:
+- Primary owner: eng-platform - Prefetch Squad (oncall rota: @prefetch-ops)
+- Runbook editor: Ava Patel (eng-platform)
+- Pager escalation: #platform-operators -> oncall rotation (pager) -> Eng SRE lead (Diego Morales)
+- Slack channels: #prefetch-ops, #platform-operators, #prefetch-postmortem
+
+Signals to watch (dashboards & alerts):
+- Dashboards:
+  - Prefetch: Cross-layer Consistency (Grafana)
+    - Panels: KV-prefix-hit-rate, recent-prefix-versions, edge-prefetch-latency, prefetch-duplicate-writes, runtime-prefetch-fallbacks
+  - Tenant-impact: Token-cost Uplift by Tenant (BigQuery derived, daily and 1h views)
+
+- Key alerts (example names and trigger rules):
+  1) alert:prefetch.kv.hitrate.drop
+     - Trigger: kv-prefix-cache hit rate < 60% for 5m
+     - Severity: P2
+     - Pager target: oncall-prefetch
+  2) alert:prefetch.consistency.errors.spike
+     - Trigger: consistency mismatch count > 10 in 5m AND rate increase > 5x baseline
+     - Severity: P1 if runtime fallbacks observed, P2 otherwise
+  3) alert:prefetch.edge.latency.tail
+     - Trigger: edge-prefetch-proxy p99 > 400ms for 10m
+     - Severity: P2
+  4) alert:prefetch.duplicate-writes
+     - Trigger: duplicate prefetch write errors > 3/min for 10m
+     - Severity: P3
+
+Pre-incident checks (operator checklist):
+1) Open the Prefetch Cross-layer Consistency dashboard and note current values for p99 latency, KV hit rate, and consistency mismatch rate.
+2) Check recent deploys: `git log --oneline --decorate --since=\"24 hours\" -- services/prefetch-service` and `CI/CD > last deploys` for prefetch-related components.
+3) Confirm whether a canary rolling update is happening (look for active rollout in the operator console).
+4) Note any correlated regional incidents (region tags on dashboards and #regional-ops).
+
+Investigation steps (quick path):
+1) Correlate alerts across layers:
+   - If alert:prefetch.consistency.errors.spike is firing, open `telemetry-ingest` traces for a sample request that shows a mismatch. Use trace id from the dashboard.
+2) Query recent prefix versions for affected tenant(s):
+   - CLI snippet (internal API):
+     ```bash
+     curl -sS -H \"Authorization: Bearer $OPERATOR_TOKEN\" \n       \"https://operator-console.internal/v1/prefetch/prefixes?tenant_id=${TENANT}&minutes=30\" | jq '.'
+     ```
+   - Verify whether the edge, prefetch-service, and KV have the same version hash for recent prefixes.
+3) Check KV write acknowledgment latency and error rates:
+   - metrics: kv_prefix_write_latency_ms, kv_prefix_write_errors_total
+   - If writes are failing or timing out, root cause is likely storage (etcd/redis) or network flakiness.
+4) Validate runtime-router fallback counts:
+   - `runtime_prefetch_fallbacks_total` by region and model. If fallbacks > 0, users experienced a miss that induced a direct model call.
+
+Mitigation decision matrix:
+- If KV writes are failing or lagging (write errors > 0.5% and latency > 500ms): consider short rollback of prefetch-service (> last non-breaking deploy) OR disable writes to KV and enable safe fallback mode (see 'safe-mode' below).
+- If prefix versions diverge but KV appears healthy: suspect prefetch-service race or orchestrator bug -> throttle prefetch-service replication and enable verification gating.
+- If edge latency is the primary symptom with healthy KV and prefetch-service: isolate edge-prefetch-proxy (drain connections, restart, or scale up).
+
+Mitigation actions (step-by-step):
+A. Soft mitigation (minimal customer disruption):
+  1) Enable Safe Read-Only Mode on prefetch-service:
+     - Purpose: stop new writes; let runtime read existing prefixes.
+     - Command (operator CLI):
+       ```bash
+       rpctl prefetch-service set-mode --mode=read-only --reason=\"consistency-spike-YYYYMMDD\" --expires=1h
+       ```
+     - Monitor KV hit rate and runtime fallbacks for 10 minutes.
+  2) Route new traffic through runtime-router fallback guard: temporarily bias routing to model-variants with stronger prefix-compatibility using runtime-router policy: `prefetch_bias: 0.7`
+
+B. Targeted rollback (when soft mitigation insufficient):
+  Preconditions:
+    - Verified recent deploy touched prefetch write or replication logic
+    - CI/CD rollback candidate identified and smoke tests passing in staging
+  Steps:
+    1) Notify stakeholders: #prefetch-ops, #platform-operators, product-owner
+    2) Start rollback of prefetch-service to revision X (last known-good):
+       - `ci deploy rollback prefetch-service --revision <REV>`
+    3) Verify health: check prefetch-service readiness, `kv_prefix_write_errors_total` drops, and consistency mismatch rate decreases.
+    4) Run targeted synthetic test: `scripts/test_prefetch_consistency.sh --tenant ${TENANT}` (automated integration test that verifies prefix hashes across layers).
+    5) If rollback restores service, follow the post-rollback checklist and schedule postmortem. If not, escalate to Eng SRE lead.
+
+C. Emergency isolation (high severity P1):
+  - If runtime correctness is compromised at scale (consistency errors causing visible product regressions), perform a traffic diversion to a compatibility-only routing tier:
+    1) `runtime-router` command to set region-level policy: `runtime-router set-policy --policy=compat-only --regions=us-west-2,us-east-1`
+    2) Coordinate with Customer Success for impacted enterprise tenants.
+
+Safe-mode specifics and caveats:
+- Read-only mode preserves existing KV prefixes; it prevents further writes that could advance inconsistent versions.
+- During read-only mode, cache eviction windows are shortened to avoid serving very stale prefixes: `kv_prefix_ttl_override=30m`.
+- Risk: long read-only windows may cause model output drift as prefixes stale. Always set an expiry and monitor correctness metrics.
+
+Runbook for operators: checklist to resolve and close incident:
+1) Confirm alerts resolved for 30 consecutive minutes across regions.
+2) Re-enable writes only after smoke tests pass and KV write errors remain below 0.1% for 15 minutes.
+3) Re-run `test_prefetch_consistency.sh` and validate synthetic traffic across 3 example tenants.
+4) Capture timeline and commands executed in the incident channel and create an incident issue in Jira with tags: prefetch, rollback, P1/P2.
+5) Tag the deploy that caused the regression in the deploy history and link the PR(s).
+
+Post-incident retrospective template (to be completed within 48 hours):
+- Title: Prefetch Cross-layer Inconsistency — <date>
+- Summary of impact, affected tenants, and duration
+- Root cause hypothesis and evidence
+- Mitigations performed and why they were chosen
+- Action items (owner and due date) — examples: tighter pre-commit tests for prefix hashing (owner: Prefetch Squad), add canary prefetch validation in CI (owner: Eng Platform), add an alert for missing replication acknowledgements (owner: Eng SRE)
+
+Testing and canary guidance (roadmap items):
+- Add cross-layer consistency check to pre-merge CI for prefetch-service: sample prefix generation -> simulate write -> verify KV and edge observe same version within 3s.
+- Build a 'prefetch-canary' job that runs in prod: small fraction of tenants (1%) with synthetic traffic to exercise write+replication paths every 5 minutes.
+- Roadmap tickets (short):
+  - PLAT-1428: Prefetch write acknowledgements telemetry (Q2 2026)
+  - PLAT-1599: Canary prefetch pipeline and automatic rollback framework (Q3 2026)
+
+Operational run-rate instrumentation (table):
+| Metric | Dashboard panel | Runbook threshold | Action |
+| --- | ---: | ---: | --- |
+| kv_prefix_hit_rate | KV-prefix-hit-rate | < 60% for 5m | escalate P2, enable read-only mode |
+| kv_prefix_write_errors_total | KV-write-errors | > 0.5% over 10m | check storage, consider rollback |
+| prefetch_consistency_mismatch | Consistency mismatches | > 10 in 5m | investigate, possibly rollback |
+| edge_prefetch_p99_ms | Edge latency panel | > 400ms for 10m | scale edge, restart proxies |
+
+Escalation and communication template:
+- Initial page: #platform-operators -> oncall-prefetch
+- 20 minutes in: include Eng SRE lead + product owner + PM in the incident channel
+- Customer notification templates (if enterprise tenants impacted):
+  - Subject: Incident: Temporary inference inconsistency for Tenant <NAME>
+  - Body: Brief summary, start time, affected functionality, mitigation in progress, expected next update in 30m
+
+Postmortem acceptance criteria:
+- Timeline and root cause documented
+- Actions with owners and deadlines added to backlog
+- CI canary added or ticket created within 7 days
+- Two independent verifications of fixes (integration test + prod canary)
+
+Appendix: Useful CLI snippets and diagnostic queries
+- List recent prefix versions (JSON):
+  ```bash
+  curl -sS -H \"Authorization: Bearer $OPERATOR_TOKEN\" \n    \"https://telemetry.internal/api/v1/prefetch/prefix_versions?limit=100&tenant=${TENANT}\" | jq '.'
+  ```
+- Example PromQL for KV hit rate (10m avg):
+  ```promql
+  avg_over_time(kv_prefix_hit_rate[10m])
+  ```
+- Synthetic consistency test (local):
+  ```bash
+  ./scripts/test_prefetch_consistency.sh --tenant test-tenant-1 --iterations 50
+  ```
+
+Related pages and artifacts:
+- Playbook owner: eng-platform Prefetch Squad runbook index
+- Link to upstream design doc: /confluence/eng-platform/systems-and-services/prefetch-architecture-overview
+- Automation scripts: repo: infra/tools/prefetch-ops
+
+Changelog:
+- 2025-11-12: Created by Ava Patel. Initial incident-response runbook and metrics mapping.
+- 2026-02-20: Added safe-mode TTL guidance, escalation template, and roadmap tickets.

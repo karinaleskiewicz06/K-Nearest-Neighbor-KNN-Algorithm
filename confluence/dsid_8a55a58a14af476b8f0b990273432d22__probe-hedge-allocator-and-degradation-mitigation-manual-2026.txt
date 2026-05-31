@@ -1,0 +1,208 @@
+Probe Hedge Allocator and Degradation Mitigation Manual
+
+Summary
+-------
+This manual describes the Probe Hedge Allocator (PHA): a runtime-aware subsystem in the eval harness that proactively allocates and schedules evaluation probes to detect, contain, and mitigate fidelity degradation across private, dedicated, and hosted inference tiers. The PHA is designed to hedge coverage for slices that are most likely to show regression when model variants, quantization profiles, or serving kernels change.
+
+Intro / Motivation
+------------------
+Given that regressions frequently emerge from interactions between model quantization, KV-cache behavior, and workload priming, we need an automated allocator that:
+- Prioritizes probes by predicted information gain rather than raw frequency.
+- Distributes probe replicas across runtime variants (float32, int8/4x, mixed-precision) and regions for early divergence detection.
+- Triggers lightweight mitigations (dynamic fallback, probe re-synthesis) when drift is detected.
+
+Scope
+-----
+This document covers:
+- The allocation policy and scoring heuristics for probes.
+- Operational runbook for handling hedged-probe alerts.
+- Integration points with the eval harness, telemetry bridge, and model promotion pipelines.
+- YAML config examples and a validation checklist.
+Not covered: deep statistical investigation techniques (see regression-triage docs) and offline annotator calibration workflows.
+
+Terminology
+-----------
+- Probe: a single input (with metadata) used to evaluate model behavior.
+- Hedge: creating multiple, staggered replicas of a probe across variants/regions.
+- Fidelity delta: metric representing semantic divergence (see Metrics section).
+- Probe-band: logical grouping of probes that share a slice/signature (e.g., “payment-instructions_en_US_long”).
+
+Ownership
+---------
+- Product owner: Maya Patel (Applied ML)
+- Implementing team: Eval Platform (eng-applied-ml)
+- Oncall: Eval-Oncall rotation (see team wiki for calendar)
+- Escalation: first to Eval Platform SRE, then to Runtime Model Ops if quantization or kernel root cause suspected.
+
+Design goals and constraints
+---------------------------
+- Fast detection: median divergence detection within 15 minutes for high-priority slices.
+- Low cost: hedge allocations should increase probe traffic by no more than 8% for top 500 slices during normal hedging.
+- Isolation: hedged probes must not affect production customer traffic; use separate shadow tokens and rate-limits.
+
+Metrics and SLOs
+---------------
+Primary metrics (collected per probe-band and model-version):
+- Fidelity Delta (FD): symmetric token-level and embedding cosine divergence composite. (lower is better)
+- Divergence Rate (DR): fraction of probes exceeding FD > threshold.
+- Time-to-detect (TTD): time from a change (deployment/quantization) to when DR crosses alert threshold.
+- Hedge Cost Uplift (HCU): additional token/compute cost from hedging.
+
+SLOs (targets):
+- TTD: 95th percentile <= 20 minutes for priority bands.
+- DR alert threshold: FD >= 0.22 for textual slices or embedding cosine <= 0.88.
+- HCU: <= 8% for top-500 bands, <= 15% for all bands in a confined rollout window.
+
+Allocation policy (high-level)
+-----------------------------
+1. Score probe-bands by a combination of:
+   - Historical volatility (weight 0.35)
+   - Business priority (weight 0.30)
+   - Cross-variant sensitivity (weight 0.25)
+   - Recent production error signals (weight 0.10)
+2. Select top-K bands per evaluation window (K configurable).
+3. For each selected band, allocate hedged replicas across a taxonomy of runtime variants:
+   - canonical-fp32 (baseline)
+   - quant-int8 (default quant profile)
+   - quant-int4-mixed (aggressive)
+   - low-latency-kernel (kernel variant B)
+   - region-mirror (if multi-region enabled)
+4. Orchestrate staggered execution and compare outputs using fidelity rules described below.
+
+Pseudocode (policy)
+-------------------
+```
+for window in rolling_windows:
+  bands = fetch_band_scores(window)
+  selected = top_k(bands, k=WINDOW_CONFIG.k)
+  for band in selected:
+    variants = select_variant_set(band)
+    for v in variants:
+      schedule_probe_replica(band, variant=v, stagger=rand(0,STAGGER_MAX))
+```
+
+Fidelity comparison rules
+-------------------------
+- Primary comparator: composite FD = 0.6 * normalized_token_edit_distance + 0.4 * (1 - cosine_embed).
+- For function-call or structured outputs: apply field-level equivalence with stricter thresholds (FD_field <= 0.12).
+- Acceptable variance window: if replica outputs diverge but pass semantic equivalence (QA passes), do not alert.
+
+Shutdown and mitigation strategies
+--------------------------------
+Automated actions when divergence conditions met:
+- Soft-mitigation (automated): increase sampling to 3x for the affected band and capture extended debug trace (KV-cache snapshot, seed, full telemetry).
+- Autoswap: route subsequently scheduled probes to fallback variant (canonical-fp32) while human review occurs.
+- Canary-quarantine: mark latest model/quant artifact as quarantined in the artifact registry and block promotion pipelines.
+- Alert owner and create incident with prefilled triage template.
+
+Operational runbook (step-by-step)
+---------------------------------
+1. Alert fires: DR > threshold for a band.
+2. Oncall: acknowledge within 10 minutes in PagerDuty and open a triage ticket.
+3. Run lightweight triage commands:
+   - CLI: evalctl probe inspect --band <band> --last 60m
+   - CLI: evalctl probe compare --band <band> --variants all --format json
+4. If FD confirms regression in quant variants but not canonical-fp32:
+   - Trigger autoswap: evalctl hedger autoswap --band <band> --target canonical-fp32
+   - Notify Model-Ops and set artifact quarantine flag: model-registry tag set --id <artifact> --tag quarantine
+5. If all variants diverge from expected golden outputs: escalate to Applied ML for root cause hypothesis (prompt sensitivity, seed changes, tokenization drift).
+6. Postmortem: attach probe traces, hedger logs, and telemetry to the incident and link to regression-triage docket.
+
+Validation & test harness integration
+-----------------------------------
+- Shadow run mode: PHA must be exercised in shadow for every rollout. Test checklist:
+  1. End-to-end scheduling works under synthetic load (5000 probes/s for 10m).
+  2. Comparators produce stable FD values under controlled perturbations.
+  3. Autoswap triggers in the sandbox and respects rate-limits.
+- Unit tests: score normalization, variant selection heuristics, and stagger calculation.
+- Integration tests: gated in CI with a smoke job that runs PHA across a minimal model set.
+
+YAML config example
+-------------------
+Below is a representative hedger config used by the eval orchestrator (values annotated):
+
+```yaml
+hedger:
+  window_seconds: 600            # evaluation window
+  k_top_bands: 250              # number of bands to hedge each window
+  max_stagger_seconds: 45       # jitter to reduce simultaneous stress
+  variant_sets:
+    default: ["canonical-fp32", "quant-int8", "low-latency-kernel"]
+  cost_budget_pct: 0.08         # HCU budget
+  alerting:
+    fidelity_threshold: 0.22
+    min_alert_volume: 3
+```
+
+CLI examples
+------------
+- Inspecting allocations in last window:
+  evalctl hedger status --window 10m --json
+- Forcing a temporary hedge for a band:
+  evalctl hedger force-hedge --band payment-instructions_en_US_long --variants quant-int8,low-latency-kernel --ttl 1h
+
+Alerting and observability
+-------------------------
+Dashboard panels to include in the default hedger view:
+- Probe-band heatmap (DR over time)
+- FD distribution histogram by variant
+- Hedge Cost Uplift time series and budget burn rate
+- Replica failure rate and scheduling latency
+
+Baked alert rules (examples):
+1. hedger.fd.high: when DR for any priority band > 0.05 sustained for 15m.
+2. hedger.hcu.burn: when HCU > configured budget for 30m.
+3. hedger.autoswap.rate: when autoswap events exceed 5 in 1 hour (indicates instability).
+
+Telemetry & audit
+----------------
+Captured artifacts for every hedged replication:
+- full request/response (sanitized PII)
+- model artifact id and runtime kernel id
+- KV-cache diagnostics snapshot (if available)
+- execution trace id and machine metadata
+All artifacts stored in probe-archive with 90-day retention for internal investigations.
+
+Release checklist & promotion gates
+----------------------------------
+Before enabling PHA for a new model-family or quant-profile:
+- Run a 48-hour shadow trial with full telemetry enabled.
+- Confirm HCU remains below specified budget in a representative workload sample.
+- Ensure automated autoswap reversions are tested end-to-end in staging.
+- Obtain sign-off from Applied ML, Runtime, and SRE owners (names recorded in sign-off log).
+
+Appendix A: Sample triage template (prefilled)
+---------------------------------------------
+Title: [Auto] Hedger alert - <band> - <artifact-id>
+Severity: P2
+Summary: DR crossed threshold in quant variants; canonical-fp32 shows [pass|fail].
+Hypotheses:
+- quant-precision drift (quantization mapping mismatch)
+- priming/seed variation affecting KV-cache
+- tokenization or normalization bug in preprocessor
+Immediate actions taken: autoswap -> canonical-fp32; captured extended traces; quarantined artifact.
+Next steps: run focused replay job, re-evaluate quant-profile sensitivity, roll forward with revert if necessary.
+
+Appendix B: Quick debugging commands
+-----------------------------------
+- Compare sample outputs: evalctl probe compare --band <band> --variants quant-int8,canonical-fp32 --sample 20 --output table
+- Dump KV cache snapshot for a replica: evalctl probe debug --trace <trace-id> --dump-kv
+
+Contact and escalation
+----------------------
+- Primary: Eval Platform Slack channel #eval-hedger (pings to PagerDuty)
+- Model-Ops lead: Diego Ramos (diego@redwood.com)
+- Applied ML lead: Maya Patel (maya@redwood.com)
+
+Change log
+----------
+- 2026-09-15: Initial draft (Asha Menon)
+- 2026-10-10: Added autoswap flow and YAML config defaults (Diego Ramos)
+- 2026-11-02: Finalized FD comparator and SLO targets; publish (Maya Patel)
+
+Related reading
+---------------
+- regression-triage/playbook for automated-regression-bisect (see internal docket)
+- quantization-profiles/quant-shadow-cohort-strategy-and-rollback-playbook-2026.json
+
+End of manual

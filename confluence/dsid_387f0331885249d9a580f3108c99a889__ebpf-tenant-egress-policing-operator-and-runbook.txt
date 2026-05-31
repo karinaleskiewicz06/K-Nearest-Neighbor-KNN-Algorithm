@@ -1,0 +1,153 @@
+eBPF-based Tenant Egress Policing Operator and Runbook
+
+Overview:
+
+This document defines the eBPF-based Tenant Egress Policing Operator (TEPO) design, Terraform integration, CI/CD validation strategy, and operational runbook. TEPO is an in-cluster network policing operator intended to enforce per-tenant bandwidth and connection-rate policies at the node egress level with minimal packet-path overhead. It complements existing egress proxies and rate-limiters by providing deterministic enforcement and fast failover for noisy-tenant scenarios.
+
+Goals:
+- Provide low-latency, kernel-level enforcement of tenant egress quotas and soft-fallback throttles.
+- Integrate with Terraform/IaC so tenant policies are declarative and auditable.
+- Offer safe rollouts with canary traffic shaping and CI validation for policy correctness.
+- Provide clear runbook actions for oncall to mitigate large egress spikes without global service impact.
+
+Non-goals:
+- Not a replacement for application-level flow-control or quota billing.
+- Not a global egress billing reconciler (billing/export tasks remain in the billing pipeline).
+
+High-level Architecture:
+
+- Operator (K8s controller): watches TenantPolicy CRs (implemented as CRD for canary testing) and reconciles Node-level attachments via BPF maps and BPF programs shipped as signed kernels.
+- eBPF Programs: TC clsact (ingress/egress) and XDP helper shims for early drop on extreme surges; maps expose per-tenant counters: bytes_sent, packets_sent, active_conns, last_update_ts.
+- Control plane: reconciler exposes Prometheus metrics and an event log stream sent to the observability pipeline (loki/otel).
+- IaC surface: Terraform module (tenant-egress-police) publishes TenantPolicy objects, RBAC, and RBAC approvals for policy owners. Module integrates with the existing tenant onboarding pipeline.
+
+Key Concepts and Terms:
+- Tenant ID: opaque string representing Redwood tenant (mapped to network tag/annotation).
+- Soft policy: sets target rate and a grace period for automated throttles; used during gradual rollouts and for customers with burst allowances.
+- Hard policy: enforced immediately; used for SLA breaches or security quarantines.
+- Shadow mode: operator simulates enforcement, emits metrics and events but does not drop traffic.
+
+SLOs and Alerts:
+- Enforcement latency: operator must reconcile new policy within 60s in 99th percentile during normal control-plane load.
+- Drop error budget: accidental false-positive drops must be <0.01% of tenant traffic per month.
+- Alerting rules (Prometheus):
+  - TEPO:ReconcileErrorRate > 0.5% for 10m -> P3 (controller problem).
+  - TEPO:EgressDropSpike (global drop rate delta > 5x baseline) -> P1 if correlated with customer tickets.
+  - TEPO:PolicyMismatchDetected (shadow metrics diverge >10% after 1h) -> P2.
+
+Terraform / IaC Integration (example patterns):
+
+- Module: redwood/tenant-egress-police (registry)
+  - Inputs: tenant_id, max_mbps, max_conns, enforcement_mode (shadow|soft|hard), owners (list of emails), audit_notes
+  - Outputs: tenant_policy_id, cr_manifest_location
+
+- Recommended workflow:
+  1) developer/SE opens PR against tenant-infra repo adding module invocation in their tenant workspace.
+  2) CI validates policy via unit tests (lint + policy schema) and integration harness (shadow-mode canary).
+  3) Auto-approval gating: policies that increase hard enforcement require 2 reviewers from Networking and Security teams.
+
+Policy Example (YAML for CRD manifest):
+---
+apiVersion: networking.redwood.ai/v1
+kind: TenantPolicy
+metadata:
+  name: tenant-123-egress
+  labels:
+    tenant-id: "tenant-123"
+spec:
+  enforcementMode: "soft"
+  maxMbps: 200
+  maxConns: 1000
+  gracePeriodSeconds: 300
+  owners:
+    - aisha.patel@redwood.ai
+    - se-team@redwood.ai
+
+Canary and CI/CD Strategy:
+
+- CI jobs (recommended):
+  - unit: validate CRD schema, terraform plan outputs expected manifest
+  - sim: run e2e harness that simulates tenant traffic (locally in KinD or small cloud cluster) in shadow mode and assert metrics map to expected counters
+  - canary: staged rollout pipeline that applies enforcement to 1% of nodes for 30 minutes (automatically roll back on behavioral anomalies).
+
+- Canary gating conditions:
+  - No policy reconcile errors
+  - Shadow-mode metric delta < 5% for three consecutive 10m windows
+  - No P1/P2 alerts in the rollout window
+
+Observability and Telemetry:
+
+- Prometheus metrics (examples):
+  - tepo_policy_reconciles_total{status}
+  - tepo_map_bytes_sent_total{tenant}
+  - tepo_active_enforced_tenants_total
+  - tepo_shadow_vs_enforced_ratio{tenant}
+
+- Traces: controller reconcile spans (duration, retry count), map update spans (attach/detach).
+- Logs: structured JSON with fields: tenant_id, policy_id, reconcile_op, result, error_code.
+
+Runbook: common operational scenarios
+
+1) Large egress spike detected (oncall: Network SWAT):
+   - Alert: TEPO:EgressDropSpike OR sudden billing/monitoring ticket from billing pipeline.
+   - Steps:
+     1. Triage: confirm signal in Prometheus and event stream. Gather affected tenant IDs from metrics query: tepo_map_bytes_sent_total by tenant (top 10).
+     2. If spike is a single tenant: switch that tenant's policy to soft with doubled gracePeriodSeconds (via Terraform quick patch) or scale down enforcement to shadow.
+     3. If multiple tenants or global: enable cluster-level companion throttle (proxy-level) and activate global rate-shed circuit until root cause identified.
+     4. Communicate: post summary to #oncall-networking channel with affected tenants and mitigation steps.
+     5. Run post-incident analysis: attach event log + kernel map snapshot to incident ticket.
+
+2) Accidental false-positive drops reported:
+   - Steps:
+     1. Confirm drop patterns and correlate with policy changes (audit logs).
+     2. Immediately set offending TenantPolicy to shadow mode.
+     3. If crash or reconcile errors observed, roll controller to last known-good image using the controller's rolling rollout playbook (kubectl rollout undo + verify maps cleared).
+     4. File a policy/regression ticket and block auto-approve on similar policy changes until root cause fixed.
+
+3) Node-level eBPF program crash or OOM:
+   - Symptoms: kernel OOPS logs, controller reconcile errors for attachments, tepo_node_program_restart_total spikes.
+   - Steps:
+     1. Evict workloads from node (cordon + drain) and tag node for quarantine (node:tepo-quarantine=true).
+     2. Reboot node if crash persists and re-provision node image via golden-image pipeline.
+     3. If many nodes affected, initiate emergency rollback to previous controller image and global shadow mode.
+
+Safety and Security Controls:
+- Signed BPF artifacts: all eBPF object files are signed by the build pipeline; operator verifies signature before loading.
+- RBAC: only the operator service account binds to CAP_BPF capability. Terraform module enforces least privilege for policy authoring.
+- Audit logs: every policy change recorded with requestor identity and terraform commit SHA in the event log.
+
+Testing Matrix and CI Jobs (table as plaintext):
+- job: unit-policy-lint -> runs: golang unit tests and JSON schema validation
+- job: shadow-sim -> runs: KinD cluster e2e with shadow mode, validates metric counters
+- job: canary-apply -> runs: apply to canary nodes, monitors Prometheus and reverts on anomalies
+- job: signature-verify -> runs as part of release: verify eBPF artifact signatures and provenance
+
+Release and Rollout Steps:
+1. Build pipeline produces signed eBPF objects and controller image (CI).
+2. Push to release staging; run signature-verify and shadow-sim.
+3. Canary: apply controller to a 5-node subset for 24h with selected tolerant tenants.
+4. Gradually increase to 25% nodes, then full cluster.
+5. Post-rollout: run reconciliation audit to ensure per-tenant map counts are within expected ranges for 72h.
+
+Ownership and Contacts:
+- Primary owner: Network Infrastructure team (oncall rotation: net-infra-oncall@redwood.ai)
+- Secondary: Runtime Infrastructure
+- Security reviewer: security-infra@redwood.ai
+
+Open Implementation Notes / TODOs:
+- CRD vs. GitOps CR model: decision to migrate TenantPolicy management to tenant-workspace repos after Q3 2025.
+- Guardrail: implement a pre-flight terraform plan analyzer that flags policies that reduce enforcement thresholds by >50% across many tenants.
+
+Appendix: Quick CLI snippets
+- Inspect top egress tenants (PromQL): topk(10, sum by (tenant) (increase(tepo_map_bytes_sent_total[5m])))
+- Patch policy to shadow (kubectl): kubectl patch tenantpolicy tenant-123 -p '{"spec":{"enforcementMode":"shadow"}}' --type=merge
+- Fetch BPF map dump (node): sudo bpftool map dump id <map-id>
+
+Change Log:
+- 2024-08-12: Draft created by Aisha Patel
+- 2024-10-05: Added Terraform module inputs and CI gating rules (review: Jonah Reyes)
+- 2025-03-02: Revised runbook steps for node-level crashes and added signed-BPF security control (review: Marta Li)
+
+Related reading and artifacts:
+- link: /confluence/eng-infra/cloud-accounts-and-networking/egress-fabric-operator-design.json
+- module registry: registry.redwood.ai/terraform/tenant-egress-police

@@ -1,0 +1,188 @@
+Operator cost-aware prefetch tuning and validation guide
+
+Summary
+=======
+This guide documents a repeatable operator workflow for tuning prefetch and warmset policies with explicit cost-awareness. It consolidates heuristics, validation tests, dashboards, alert rules, rollout steps, and rollback criteria used by Platform Operators to reduce token and GPU spend while preserving application-level latency and quality SLOs.
+
+Motivation
+----------
+Redwood’s automatic prefetch machinery can materially reduce per-token cost and tail latency, but aggressive prefetching increases GPU utilization and spot/preemptible spend. Operators must balance:
+- Cost (GPU-hours and token unit economics)
+- Latency SLOs (p95/p99 for foreground requests)
+- Service availability / fairness across tenants
+
+Scope
+-----
+Applies to: multi-tenant runtime prefetch/warmset policies and operator validation in non-prod and canary regions. Not covered: kernel-level scheduling or model quantization tuning (see runtime-architecture docs). This is intended for Platform Operators and SREs owning the prefetch operator surface.
+
+Key concepts and terminology
+---------------------------
+- Prefetch cohort: a grouping of tenants/tenants’ request patterns used to seed warm KV/prefix caches.
+- Warmset: pre-initialized model state (KV cache, attention state) held in memory to avoid cold-start token costs.
+- Prefetch budget: a token/GPU-hour budget assigned to a cohort over a sliding window (default 1h).
+- Safety floor: p99 latency threshold below which prefetch reduction should not be attempted.
+
+Required SLIs / targets
+----------------------
+Use these as the baseline for decisions. Targets are tenant-facing SLOs and operator-facing cost guardrails.
+- Foreground p95 latency <= 320ms (regional production)
+- Foreground p99 latency <= 800ms
+- Token cost per 1k tokens: track baseline and aim for < 10% increase from baseline during experiments
+- Prefetch GPU-hour utilization spike <= +15% over baseline for a region-wide policy change
+- Operator budget breach alert: >20% of daily prefetch budget consumed within first 2 hours
+
+Dashboards and essential queries
+-------------------------------
+Create a consolidated dashboard (copyable panel names) with:
+- Prefetch spend by cohort (GPU-hrs/hour)
+- Foreground p95/p99 per tenant and cohort
+- Cold-start rate (requests that hit a cold KV set)
+- Token cost per 1k tokens over time
+- Prefetch hit ratio (requests served from warmset)
+
+Example PromQL panels (used in dashboard widgets):
+- Prefetch GPU hours (sum):
+  sum(rate(prefetch_gpu_seconds_total[5m])) by (region, cohort)
+- Cold-start rate per minute:
+  sum(rate(runtime_cold_start_total[1m])) by (service,region)
+- Token cost per 1k (derived gauge):
+  (sum(rate(token_charge_units[5m])) / sum(rate(tokens_generated[5m]))) * 1000
+
+Tuning heuristics (operator checklist)
+------------------------------------
+1) Baseline collection (72h recommended)
+   - Collect the dashboards above and tag baseline windows (low, median, high load).
+   - Export current prefetch policy JSON for the region: run 
+     curl -sS -H "Authorization: Bearer $OPERATOR_TOKEN" \n       "https://platform-api.internal/v1/prefetch/policies?region=us-west-2" > baseline-prefetch.json
+2) Identify candidate cohorts
+   - Pick 2–3 cohorts representing 60–80% of warmset churn and diverse request patterns.
+3) Define conservative goal: cost delta target (e.g., -12% token unit spend with p99 impact < +5% relative)
+4) Apply incremental changes: 3-step schedule
+   - Step A (conservative): reduce prefetch window by 10% for cohort X
+   - Step B (moderate): reduce prefetch window by 25% and reduce prefetch frequency by 20%
+   - Step C (aggressive): move to on-demand prefetch for tail requests (keep warmset for top-20% tokens)
+5) Observe for 2 maintenance windows (minimum 4–6 hours) at each step before moving forward
+6) If any p99 or operator-budget alert triggers, roll back to previous step immediately
+
+Validation suite (synthetic tests and metrics)
+---------------------------------------------
+Purpose: confirm that tuning changes achieve cost improvements without unacceptable latency regressions.
+Synthetic workloads to run:
+- Steady-state small-batch load (represents chat UI light typing): 1000 RPS for 30m, short prompt length (avg 50 tokens)
+- Bursty long generation load (represents generative job): 200 RPS for 15m, long prompt lengths (avg 800 tokens)
+- Realistic mixed tenant mix (replay trace using 24h production trace sampled 10%)
+
+Validation pass criteria (all must pass):
+- Token cost delta <= goal (e.g., -12%)
+- Foreground p99 regression <= +5% absolute or <= 1.1x relative (whichever is smaller)
+- Cold-start rate <= baseline * 1.3
+- No more than 5% increase in user-perceived tail errors (5xx, timeouts)
+
+Automated validation harness steps (CI job example)
+1) Deploy policy to canary region using feature flag: prefetch.policy.cohortX = staged-stepA
+2) Run synthetic suite (30–60 minutes per workload) via the platform synthetic runner (see README in /infra/synthetic)
+3) Collect metrics and run validator script (examples below)
+4) Validator returns exit code 0 for pass, non-zero for fail
+
+Validator pseudocode (shell)
+---------------------------
+#!/usr/bin/env bash
+set -euo pipefail
+# fetch metrics, compute aggregates and evaluate against thresholds
+python tools/validate_prefetch_results.py --metrics-endpoint $METRICS --baseline baseline-metrics.json --policy stepA-result.json
+
+Example validation output (JSON snippet)
+{
+  "token_cost_delta_pct": "-12.8",
+  "foreground_p99_delta_ms": "+22",
+  "cold_start_rate_change_pct": "+10",
+  "status": "PASS"
+}
+
+Alerting and SLO guardrails
+--------------------------
+Suggested alert rules (integrate with paging on severity):
+- Prefetch-budget-burn-fast: fires when (sum(rate(prefetch_gpu_seconds_total[5m])) by (cohort) > cohort_budget * 2) for 10m -> Severity P1 (pager)
+- Foreground-p99-regression: fires when (foreground_p99_ms / baseline_foreground_p99_ms) > 1.15 for 5m -> Severity P1
+- Cold-start-surge: async alert when cold_start_rate > baseline * 2 for 10m -> Severity P2 (ops channel)
+- Synthetic-validation-failure: CI job failure triggers automated rollback unless explicitly approved
+
+Rollout checklist (operator runbook)
+----------------------------------
+Pre-change
+1) Notify platform-operators and affected tenant owners: announce window and expected rollback time (standard: 60m detection + 30m rollback)
+2) Take configuration snapshot and tag in git: platform-configs/prefetch/YYYYMMDD-HHMM
+3) Ensure canary region and synthetic runner are green
+
+Change window
+1) Apply Step A policy to cohort in canary region via the operator CLI: 
+   operator-cli prefetch set --region us-west-2 --cohort cohort-X --policy ./policies/stepA.json
+2) Wait 10–15 minutes for warmset changes to propagate, start synthetic suite
+3) Monitor dashboard and alerts continuously (shared channel: #platform-prefetch)
+
+Post-change (if PASS)
+1) Promote to additional canaries or 10% of region traffic (split traffic steering)
+2) Re-run synthetic suite with 2x duration
+3) If no adverse signals after 24h, stage to 50% then 100% with pauses and each pause duration >= 4 hours
+
+Rollback criteria and steps
+-------------------------
+Immediate rollback triggers:
+- Foreground p99 regression > +10% absolute or >1.25x relative
+- Prefetch-budget-burn-fast alert fires (P1)
+- Synthetic-validation-failure
+
+Rollback steps:
+1) operator-cli prefetch set --region <region> --cohort <cohort> --policy baseline-prefetch.json
+2) Restart operator sync job: kubectl rollout restart deployment/prefetch-operator -n platform-ops
+3) Post-rollback: collect forensic snapshot (metrics + operator logs) and file incident in JIRA with label prefetchtuning/rollback
+
+Incident runbook: stubborn p99 degradation after rollback
+----------------------------------------------------
+1) Triage: confirm degradation correlates with policy change window using trace_id/trace logs
+2) If traces show increased queuing, escalate to runtime-kernel team (pager: runtime-kernel@oncall)
+3) If traces show GPU saturation, open a capacity emergency (see runbook: gpu-pool-live-shrink-and-maintenance-runbook-2026)
+4) If degradation persists beyond 4h, rehydrate baseline warmsets using warmset-restore tool: 
+   warmset-cli restore --cohort <cohort> --snapshot <snapshot-id> --region <region>
+
+Ownership and communication
+--------------------------
+- Primary owner: platform-operators (oncall rotation)
+- Secondary owner: runtime-performance team (escalation for kernel/driver issues)
+- Notification channels: #platform-prefetch (ops), #platform-incident (pager bridge)
+- Reporting cadence: weekly cost-savings updates to infra-finance and monthly retrospective to eng-platform
+
+Retrospective & experiment notes (example)
+----------------------------------------
+Summary of August 2025 canary: cohort-X Step A
+- Observed token spend delta: -11.5%
+- Foreground p95: +8ms (negligible); p99: +30ms (+3.6% relative)
+- Cold-start increase: +9%
+- Action: promoted Step A to 30% traffic, scheduled Step B trial with a longer validation window
+
+Lessons learned
+- Synthetic validation caught a rare long-tail regression not apparent in aggregate metrics; extend replay traces to include top 0.1% latencies.
+- Operator budget alarms should include a rolling-window normalization to reduce false positives during short regional spikes.
+
+Appendix: example prefetch policy JSON (simplified)
+--------------------------------------------------
+{"cohort":"cohort-X","region":"us-west-2","prefetch_window_seconds":"3600","prefetch_frequency_seconds":"300","budget_gpu_seconds_per_hour":"1800","safety_floor_p99_ms":"800"}
+
+Appendix: helpful CLI snippets
+-----------------------------
+- Export current policies:
+  operator-cli prefetch list --region us-west-2 --output json > current-policies.json
+- Stage a policy to canary:
+  operator-cli prefetch set --region us-west-2 --cohort cohort-X --policy ./policies/stepA.json --dry-run=false
+- Run synthetic suite (local):
+  ./scripts/run_synthetic_suite.sh --suite prefetch-smoke --duration 30m --region us-west-2
+
+Related reading
+--------------
+- platform-operator-handbook-degraded-kv-prefix-cache-2026 (runbook)
+- prefetch-experiment-validation-cookbook-2025 (how-to)
+- operator-prefetch-validation-lab-playbook-2025 (runbook)
+
+Contact
+-------
+For questions or suggested additions, ping Ariana Chen (@ach) or open a PR against /confluence/eng-platform/how-tos.

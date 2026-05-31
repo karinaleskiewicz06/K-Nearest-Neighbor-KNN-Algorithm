@@ -1,0 +1,304 @@
+Cost Model Service (cost-model-api) — Service Overview
+
+## Summary
+Cost Model Service (service name: **cost-model-api**) provides a single, versioned implementation for inference cost estimation and cost breakdowns across Redwood products.
+
+It is the canonical source for:
+- **Per-request cost estimates** and standardized breakdown taxonomy (prefill/decode, cache, batch efficiency, overhead allocation, quantization deltas)
+- **Aggregated cost breakdowns** for Console dashboards (bounded-cardinality responses)
+- **What-if projections** used by Optimize to quantify ROI from configuration changes (batching/caching/quantization)
+
+This document describes architecture, dependencies, SLOs, ownership/on-call, and rollout strategy.
+
+---
+
+## Service owners
+**Primary owner team:** Platform Control Plane
+- Service/API lead: Ethan Park
+- Control plane integration: Benji Okafor, Cole Summers
+- Auth/tenancy: Kaitlyn Nguyen
+
+**Reliability partner:** SRE
+- Reliability lead: Rafael Mendes
+
+**Key dependencies owners:**
+- Telemetry & Analytics: Logan Wright, Nadia Rahman
+- Runtime metrics/instrumentation: Sofia Ivanova, Omar El-Sayed, Grace Kim
+- Finance alignment: Laura Bennett, Rishi Malhotra
+
+---
+
+## Where this service sits
+The Cost Model Service is an internal service + shared library that standardizes cost calculations. It is intentionally *not* the billing system of record.
+
+### Primary callers
+- **Redwood Console backend** (hot path for cost breakdown pages; calls are cacheable)
+- **Redwood Optimize backend** (what-if projections; heavier compute but guarded and bounded)
+- **Finance/analytics pipelines** (offline reconciliations and reporting windows; typically via batch exports or aggregated endpoints)
+
+---
+
+## High-level architecture (text diagram)
+
+```
+            +-----------------------+
+            |  Redwood Console BE   |
+            |  (dashboards, APIs)   |
+            +-----------+-----------+
+                        |
+                        | (internal, mTLS)
+                        v
++-----------------------+-----------------------+
+|                cost-model-api                 |
+|----------------------------------------------|
+|  1) Request validation + tenancy/authz        |
+|  2) Version negotiation (schema + semantics)  |
+|  3) Cost computation engine                   |
+|     - cost breakdown taxonomy                 |
+|     - overhead allocation policy              |
+|     - quantization profile deltas             |
+|  4) Response bounding + aggregation guards    |
+|  5) Cache (read-through) for hot keys         |
++-----------+-------------------+---------------+
+            |                   |
+            |                   |
+            v                   v
+  +------------------+   +---------------------+
+  | Telemetry Store  |   | Model Catalog       |
+  | (token + runtime |   | (model + quant      |
+  |  metrics, lag)   |   |  profile metadata)  |
+  +------------------+   +---------------------+
+            |
+            v
+  +------------------+
+  | Drift Monitor Job|
+  | (scheduled; SLI) |
+  +------------------+
+            |
+            v
+  +------------------+
+  | Observed Spend / |
+  | Billing Primitives|
+  +------------------+
+
+            +-----------------------+
+            |   Redwood Optimize    |
+            | (recommendations/ROI) |
+            +-----------+-----------+
+                        |
+                        v
+                 (what-if endpoints)
+```
+
+Notes:
+- **Console** calls are latency-sensitive; the service is designed to be cache-friendly and returns bounded responses.
+- **Optimize** calls can be more compute-heavy, but are constrained by request guardrails (limits on parameter ranges, cardinality, and time horizon).
+- A **drift monitoring job** compares predicted vs observed spend to produce a correctness/drift SLI.
+
+---
+
+## Dependencies
+
+### Required upstream data
+1) **Telemetry Store** (authoritative inputs for per-request and aggregated cost)
+- Token accounting: prompt/prefill tokens, decode tokens, output tokens
+- Cache metrics: KV cache hit/miss rates and bytes (when available), cache eligibility flags
+- Scheduling metrics: effective batch size, queue time, batching window outcomes
+- Runtime stage breakdown: prefill vs decode wall time and/or token accounting split
+
+Owners: Telemetry & Analytics (Logan Wright, Nadia Rahman)
+
+2) **Model Catalog**
+- Model identifiers, versions, architecture class
+- Hardware compatibility metadata
+- **Quantization profile IDs** and relevant metadata used by the cost model
+
+Owner: Platform / Model Catalog maintainers (in coordination with Applied ML)
+
+3) **Overhead allocation policy**
+- Finance-approved policy to allocate shared costs to request-attributable vs overhead buckets
+- Reporting windows and reconciliation rules
+
+Owners: Finance/FP&A (Laura Bennett, Rishi Malhotra) + Platform
+
+### Downstream integrations
+- Console cost breakdown views (feature flag gated)
+- Optimize ROI estimates and recommendation guardrails
+- Billing hooks alignment (shared primitives; may intentionally differ for invoicing semantics; see ADRs)
+
+---
+
+## Data flow & request types
+
+### Request types supported (v1)
+- **Estimate**: Per-request estimated cost + breakdown (for request detail / tracing contexts)
+- **Breakdown**: Aggregated cost breakdown over a bounded query window (for dashboards)
+- **What-if**: Projected deltas based on configuration changes (for Optimize)
+
+### Query bounding (hard requirements)
+To prevent cardinality and latency blowups, the service enforces:
+- Maximum time window per request (e.g., dashboard query windows must be bounded; long-range queries require pre-aggregation)
+- Maximum number of group-by dimensions
+- Maximum response size (rows and bytes)
+- Allowed parameter ranges for what-if (e.g., batch size multipliers, cache warm-rate assumptions, quantization profile sets)
+
+The exact limits are maintained in the API standards addendum and service config.
+
+---
+
+## Cost computation model (implementation overview)
+The cost-model-api combines three layers:
+
+1) **Standard Cost Spec (schema + semantics)**
+- Versioned schemas for inputs/outputs (e.g., cost_model_spec v1)
+- Explicit semantics for:
+  - Prefill vs decode attribution
+  - Cache hits vs misses vs ineligible requests
+  - Batch efficiency and queue-time effects
+  - Quantization profile deltas (throughput/memory impacts; quality guardrails)
+  - Overhead allocation buckets
+
+2) **Deterministic computation engine**
+- Pure functions over canonical inputs where possible
+- Stable rounding rules and currency/unit conventions
+- Explicit “unknown/unavailable” handling for missing telemetry fields (no silent backfill that changes semantics)
+
+3) **Confidence/uncertainty for projections (What-if only)**
+- What-if returns a point estimate plus a confidence indicator when driven by empirically learned parameters
+- Guardrails prevent projections when input uncertainty is too high or when inputs are out of policy bounds
+
+---
+
+## SLAs / SLOs (service-level)
+Detailed SLO definitions live in the SLO page (see related pages). This section summarizes the operational targets used by Platform + SRE.
+
+### Availability SLO
+- **99.9%** monthly availability for core endpoints used by Console
+- Degraded-mode behavior is allowed (see “Fallbacks”)
+
+### Latency SLO (p95)
+- Estimate/Breakdown endpoints (Console path): **p95 < 250ms** for cache-hit and **p95 < 600ms** for cache-miss under typical dashboard query bounds
+- What-if endpoint (Optimize path): **p95 < 2.0s** for bounded scenarios
+
+### Correctness / Drift SLI
+- A scheduled drift job compares predicted costs (from cost-model primitives) to observed spend attribution over an agreed reporting window.
+- Alerting is based on drift thresholds that account for telemetry lag and overhead allocation windows.
+
+### Error budget policy
+- If latency or errors threaten Console UX, the Console integration must automatically fall back to the legacy breakdown path (flag-controlled), and SRE may request a rollout pause.
+
+---
+
+## Reliability: fallbacks and failure modes
+
+### Client fallbacks (required)
+- Console must implement:
+  - Timeouts (short)
+  - Retries (bounded)
+  - Fallback behavior (legacy cost breakdown implementation) behind a feature flag
+
+- Optimize must implement:
+  - Timeouts (longer)
+  - No unbounded retries
+  - Safe default behavior (suppress recommendation / show “insufficient confidence”) when the what-if endpoint is unavailable
+
+### Common failure modes
+- **Telemetry lag / partial ingestion** → drift alerts, missing fields, inconsistent breakdowns
+- **Schema mismatch / version negotiation errors** → 4xx from service; clients should downgrade gracefully
+- **Cardinality explosion** from overly broad group-bys → request rejected with explicit error code
+- **Cache stampede** on common dashboard keys → mitigated via request coalescing + short TTL caching
+
+---
+
+## Deployment & environments
+- Environments: dev, staging, prod
+- Deployed as a standard internal control-plane service with:
+  - mTLS service-to-service auth
+  - Tenant-aware authorization checks
+  - Per-route rate limits (stricter for what-if)
+
+Config highlights:
+- Cache TTLs are endpoint-specific
+- Feature flags control:
+  - Console adoption percentage
+  - Optimize what-if enablement
+  - Strictness of schema enforcement (e.g., rejecting vs warning on unknown fields)
+
+---
+
+## On-call & escalation
+
+### On-call rotation
+- **Primary:** Platform Control Plane on-call (cost-model-api)
+- **Secondary:** SRE on-call (platform services)
+
+### Escalation
+- Telemetry ingestion incidents: page Telemetry & Analytics on-call
+- Runtime instrumentation regressions: page Runtime Scheduling/Kernels on-call
+- Finance reconciliation concerns (non-urgent): route to FP&A partner (Rishi Malhotra) via ticket
+
+### Operational readiness requirements
+Before enabling Console in production beyond initial canary:
+- Dashboards exist for latency, error rates, request volume, version distribution, and drift
+- Runbook is current and linked in service alerts
+- Client fallback is verified in staging with forced fault injection
+
+---
+
+## Observability
+Metrics emitted by cost-model-api:
+- Request volume by endpoint + tenant tier (bounded cardinality)
+- Latency (p50/p95/p99) by endpoint
+- Error rates by error class (validation, auth, upstream dependency, compute timeout)
+- Cache hit ratio (endpoint-level)
+- Schema version distribution (requested vs served)
+- Drift metrics (from scheduled job) and telemetry lag indicators
+
+Logging/tracing:
+- Trace IDs propagated from Console/Optimize
+- Logs must not include raw prompts or customer content; only derived counts and stable identifiers
+
+---
+
+## Rollout strategy
+
+### Phase 0 — Service bootstrap (completed)
+- Ship service skeleton, auth/tenancy, and schema package
+- Implement bounded endpoints with deterministic behavior
+
+### Phase 1 — Staging integrations
+- Console integration behind flag with fallback enabled
+- Optimize integration behind flag for internal tenants only
+- Validate schema version negotiation behavior
+
+### Phase 2 — Production canary
+- Enable for a small set of internal tenants and low-risk customers
+- Monitor: latency, errors, schema version distribution, and drift SLI
+- Compare Console breakdowns vs legacy for a sample of dashboard queries
+
+### Phase 3 — Expand adoption
+- Increase Console coverage gradually (e.g., 5% → 25% → 50% → 100%)
+- Expand Optimize what-if access with strict guardrails
+- Align billing hooks to consume the same primitives (document intentional differences)
+
+### Rollback plan
+- Immediate rollback via feature flag to legacy breakdowns (Console)
+- Disable what-if endpoint exposure (Optimize) and freeze new recommendation rollouts
+- If drift alerts are driven by telemetry lag: widen lag tolerance window temporarily and open follow-up work with Telemetry
+
+---
+
+## Open items / follow-ups
+- Finalize drift thresholds by deployment mode (hosted vs dedicated vs private)
+- Reduce dependency on high-cardinality telemetry dimensions for dashboard queries (prefer pre-aggregations)
+- Document a clear customer-support explanation template for “Console vs invoice differences” rooted in the standard taxonomy and reporting windows
+
+---
+
+## Appendix: operational checklist (quick)
+- [ ] Pager routes to Platform Control Plane on-call
+- [ ] Dashboards present in Grafana (latency/errors/version/drift)
+- [ ] Alerts link to runbook
+- [ ] Client timeouts + fallback verified
+- [ ] Request bounds tested (reject oversized queries)
+- [ ] Schema version negotiation tested across Console/Optimize client library versions

@@ -1,0 +1,112 @@
+Runtime integration safety and benchmark gate
+
+Summary:
+This document defines the integrated runtime safety gate and benchmark gate used by Runtime, Kernel Scheduling, and Release teams to evaluate changes to the serving stack (kernels, scheduler policies, routing/fallback logic, and runtime control plane). It describes the architecture of the gate, the required benchmark suite, profiling and sampling playbooks, release checklist integration points, runbooks for common degradation scenarios, and known issues that should block an automated gate.
+
+Scope and intent:
+- Scope: PRs that touch runtime execution kernels, scheduler policy code, model variant routing, admission control, or any production-facing performance flag.
+- Intent: Prevent regressions to latency SLOs, throughput guarantees, and observable fidelity; provide deterministic gates so engineers can push changes with high confidence.
+
+High-level architecture:
+1) Pre-merge pipeline: unit + integration tests + microbench harness. Changes that alter kernel behavior must ship with a microbenchmark profile (see `bench/profile.yaml` artifact).
+2) Shadow validation: candidate commits are mirrored to a shadow pool for a configurable period (default: 2 hours) using a sampled production trace. Shadow runs produce a per-request delta bundle (latency, tokens, kernel-selection, cache-hit, memory residency).
+3) Gate evaluator: centralized job that runs the benchmark suite (see Benchmark Suite section) and computes pass/fail per threshold matrix.
+4) Release gate: if the gate passes, an automated canary rollout is permitted; failing gates require triage and a blocking label.
+
+Safety gates and thresholds:
+- Latency: p50/p90/p95 (in ms) vs baseline. Gate fails if p95 increases by > 10% AND absolute p95 > 200ms for interactive tiers.
+- Throughput: end-to-end throughput drop > 8% under the same synthetic shape fails gate.
+- Kernel regressions: any kernel that increases median per-token GPU time by >12% fails gate unless mitigations are documented.
+- Fidelity: for eval prompt-sets (representative prompt set), generation quality drop > 3% (measured by configured metric e.g., semantic-similarity or-task-specific metric) fails gate.
+- Resource usage: GPU memory usage increase > 6% or sustained NVLink saturation delta > 10% fails gate.
+
+Scheduler interaction and failure taxonomy:
+- Decision points: admission controller, preemptive-shepherd, kernel-mapper, fallback-orchestrator.
+- Failure modes handled by the gate: priority inversion (detected via queueing-delay skew), handoff oscillation (rapid model-swap churn), kernel-starvation (dispatcher blocked by a slow kernel).
+- Allowed degradations: short-lived p99 spikes during warmstart with clear warmup profile and documented mitigation.
+
+Profiling playbook (step-by-step):
+1) Reproduce locally with microbench: run `tools/microbench --model <variant> --shape <seq, batch>` and collect `profile.json`.
+2) Capture kernel traces: enable kernel-tracer (env: KERNEL_TRACE=1) and run the synthetic shape for 1K requests.
+3) Generate the delta bundle: `tools/delta-assembler --baseline /artifacts/baseline.json --candidate profile.json --out delta.json`
+4) Stratify by request class: split delta.json into short/medium/long prompt buckets (<=64, 65-512, >512 tokens).
+5) Run targeted sampling: for each bucket, select 500 representative requests using the stratified sampler to produce stable medians.
+6) Validate fallback behavior: for a subset, force an artificial kernel disconnect and assert fallback semantics (should succeed within configured t_fallback = 150ms).
+7) Annotate and upload to gate: produce a gate artifact that includes `delta.json`, kernel traces, an experiment note, and the `bench/profile.yaml` file.
+
+Benchmark suite (tests and minimal pass criteria):
+| Test name | Purpose | Key metrics | Pass criteria |
+|-----------|---------|-------------|---------------|
+| Shadow-Trace-Replay | Validate end-to-end delta on sampled production traffic | p95 latency delta, throughput delta, error-rate | p95 <= +10% and throughput drop <= 8% |
+| Microkernel-Throughput | Measure per-kernel per-token GPU time | median token GPU-time, variance | median delta <= +12% |
+| Multi-tenant-noise | Simulate co-located tenants to detect interference | tail latency, queue depth | p99 tail increase <= 15% |
+| Cold-start-warmup | Measure warmstart cost and cache warmup time | time to reach steady-state p95 | warmup < 300s or documented backoff |
+| Fidelity-eval | Run representative prompt-sets to check quality | metric delta (BLEURT / cosine) | metric drop <= 3% |
+| Resource-regression | Detect NVLink/GPU memory/PCIe regressions | memory, NVLink utilization | memory delta <= +6% |
+
+Operational thresholds (examples):
+- Interactive tier: p95 target 120ms, gate absolute ceiling for p95 = 200ms.
+- Batch tier: throughput target 20 tokens/s per slot, gate allows up to 12% throughput drop if compensated by cost reductions.
+- Canary weight ramp: 1% -> 5% -> 20% -> 50% over a minimum of 30m per stage.
+
+Release checklist integration:
+1) PR author attaches bench artifact and `bench/profile.yaml` with test shapes.
+2) CI runs microbench and attaches artifacts to the PR.
+3) Gate evaluator runs shadow replay and benchmark suite; results recorded in the PR `gate/result.json`.
+4) On pass: auto-merge allowed when other approvals are satisfied.
+5) On fail: label `gate-failed` applied and owners paged according to ownership table below.
+
+Runbooks (short actionable steps):
+- Runbook: Shadow gate fails with p95 regression:
+  1. Stop the shadow feed (tools/shadowctl pause).
+  2. Collect delta bundle and kernel traces.
+  3. Run binary search: revert recent micro-optimizations or toggle quantization flags (e.g., `KERNEL_QUANTIZE=off`) to isolate.
+  4. If isolatable to a kernel, open urgent bug with `severity:high`, attach traces, set assignee to kernel owner.
+
+- Runbook: Canary rollout p99 spike detected:
+  1. Immediately scale canary back to prior weight.
+  2. Enable extended tracing for affected cohort.
+  3. If spike correlates with kernel-change, rollback kernel rollout via the kernel-release roll-back job.
+
+Known issues (current triage list):
+1) Interleaved-batch memory safety: under certain interleaving patterns, temporary soft-GC occurs and can show higher memory high-water marks. Workaround: reduce interleaving window (scheduler flag `max-interleave=4`).
+2) NVLink saturation aliasing: when a multi-socket job runs two large attention kernels concurrently, NVLink counters show aliasing spikes; mitigation: stagger activation with `kernel-waveform-spread=2`.
+3) Shadow replay determinism: occasional seed drift in tokenizer causes small fidelity deltas. Note: canonical mitigation is to pin tokenizer version in `profile.yaml`.
+
+Ownership and escalation:
+- Gate owner: Runtime Release (runtime-release@redwood.com).
+- Kernel owners: list available in `OWNERS` file in the kernel repo.
+- Pager for gate failures: on-call runtime-devops (see rota).
+
+Appendix: sample bench/profile.yaml
+```yaml
+profile_name: integration-shadow-v1
+shapes:
+  - name: interactive-small
+    seq: 64
+    batch: 1
+    requests: 2000
+  - name: interactive-medium
+    seq: 256
+    batch: 1
+    requests: 1000
+  - name: long-form
+    seq: 1024
+    batch: 1
+    requests: 500
+baseline_artifact: /artifacts/baseline-2026-01-01.json
+trace_sample_method: stratified
+strata: [short, medium, long]
+```
+CLI quick commands:
+- Run microbench: `./tools/microbench --profile bench/profile.yaml --out artifacts/candidate.json`
+- Trigger gate evaluation locally: `./tools/gate-eval --candidate artifacts/candidate.json --baseline /artifacts/baseline.json`
+
+Related reading and links:
+- Release gate contract and checklist (/confluence/eng-serving-runtime/release-notes/release-readiness-integrated-checklist-technical-gate-2026)
+- Profiling playbook: continuous profiling strategy (link above)
+
+Change log:
+- 2025-11-02 (Asha Patel): initial draft and architecture decisions.
+- 2025-12-18 (Gordon Li): added profiling playbook and runbooks.
+- 2026-01-15 (Marina Silva): tightened thresholds for p95 and resource regressions, added NVLink note.

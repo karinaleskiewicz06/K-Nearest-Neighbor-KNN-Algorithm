@@ -1,0 +1,196 @@
+Ephemeral GPU Load-Testing Sandbox Operator and CI Integration
+
+Summary
+
+This document describes the Ephemeral GPU Sandbox Operator (EGSO) pattern and the recommended CI/CD integration for safe, reproducible load-testing of inference workloads. EGSO provides short-lived GPU environments that mirror production networking and routing but enforce strict cost, egress, and tenant-quota controls. This page covers operator architecture, Terraform snippets, GitHub Actions examples, safety controls, SLOs and alerts, ownership, incident runbook, and deprovisioning policies.
+
+Why this exists
+
+- Teams need realistic token-latency and memory-pressure experiments against the serving runtime without consuming long-lived fleet capacity.
+- Self-serve sandboxes reduce noisy neighbor incidents by isolating ephemeral tests and providing explicit economic limits.
+- Integrating sandboxes into CI enables repeatable canary runs for kernel/quantization/ batching changes.
+
+Goals and non-goals
+
+- Goals: reproducible load-testing, low-latency realistic networking, cost-capped GPU usage, auditable billing tags, automated cleanup, CI gating for runtime/kernel changes.
+- Non-goals: simulating full production traffic volume (use dedicated stress-farm for very large scale), hosting customer workloads.
+
+Overview and architecture
+
+- Components:
+  - EGSO controller (K8s operator) that provisions ephemeral node pools via Terraform Cloud/Account API and registers instances into the internal allocator.
+  - Sandbox manager service (internal API) that: accepts requests, assigns quota, mints short-lived credentials, and applies egress/egress-rate limits.
+  - CI integration (GitHub Actions/GitLab CI) that launches sandboxes, runs load profiles, collects telemetry, and tears down resources.
+  - Billing sidecar that annotates usage with tags: sandbox_id, ci_run_id, change_id, owner_team.
+
+Diagram (text):
+
+  Developer/CI -> Sandbox Manager -> EGSO Controller -> Terraform -> Cloud GPU Pool -> Inference Node(s)
+                                                 
+  Telemetry -> Prometheus -> Grafana (sandbox dashboards)
+  Billing -> Cost Exporter -> Billing Ledger (tagged)
+
+Provisioning flow (high level)
+
+1. CI job requests a sandbox via the Sandbox Manager API (/v1/sandboxes). Request includes desired profile (small/medium/large), expected duration, and test token.
+2. Sandbox Manager validates against org quotas and owner-team limits. It returns a sandbox_id and ephemeral credentials.
+3. EGSO controller reconciles a Terraform module (sandbox module) that creates the node pool and a K8s namespace with network policies.
+4. Once nodes are healthy and the runtime provided, CI runs the test profile. Telemetry and logs stream to a tagged sandbox dashboard.
+5. On completion or timeout, sandbox is destroyed automatically by EGSO and billing is exported with sandbox tags.
+
+Safety controls and constraints
+
+- Maximum wall-clock duration: 6 hours (configurable by org).
+- Maximum GPU-hours per sandbox: 12 GPU-hours default.
+- Per-team daily GPU-hour cap: enforced by Sandbox Manager (quota backplane).
+- Egress must pass through sandbox egress-proxy with per-sandbox rate-limiter (default 50 MB/s).
+- No inbound public IPs; access via ephemeral bastion with time-limited SSH certs.
+- All sandboxes are created with a default CPU and memory resource quota to avoid cluster-level resource starvation.
+
+Terraform module example (recommended pattern)
+
+- Purpose: spawn a small heterogeneous GPU node pool, attach to the internal allocator, and label nodes for sandbox_id.
+
+Example snippet (HCL)
+
+provider "aws" { region = var.region }
+module "egso_sandbox_pool" {
+  source = "git::git@github.com:redwood-inference/terraform-modules.git//egso-sandbox-pool?ref=v1.2.0"
+  sandbox_id = var.sandbox_id
+  profile    = var.profile  # small | medium | large
+  node_count = var.node_count
+  labels = {
+    sandbox = var.sandbox_id
+    ci_run  = var.ci_run_id
+  }
+  tags = {
+    Project = "egso"
+    Team    = var.owner_team
+    Owner   = var.owner_email
+  }
+}
+
+Required Terraform variables table (as text)
+
+| variable | type | example | purpose |
+|---|---|---:|---|
+| sandbox_id | string | sbox-2025-0421 | unique id for sandbox lifecycle |
+| profile | string | medium | mapping to GPU types and sizes |
+| node_count | number | 2 | initial node count to create |
+| owner_team | string | inference-team | used for billing/tags |
+| owner_email | string | dev@example.com | contact for auto-notify |
+
+GitHub Actions example (abridged)
+
+- Workflow steps:
+  - request-sandbox (POST /v1/sandboxes) -> returns SANDBOX_ID, KUBECONFIG (base64), TEST_CREDENTIALS
+  - run-load-profile -> uses load-generator (internal tool: rload) with test manifest
+  - collect-artifacts -> push telemetry and traces to artifact store and notify sandbox dashboard
+  - teardown -> DELETE /v1/sandboxes/{SANDBOX_ID} (falls back to auto-teardown after TTL)
+
+Sample job snippet:
+
+jobs:
+  sandbox-load-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request sandbox
+        run: |
+          curl -X POST "${{ secrets.SANDBOX_API }}/v1/sandboxes" \
+            -H "Authorization: Bearer ${{ secrets.SANDBOX_TOKEN }}" \
+            -d '{"profile":"medium","duration_hours":3,"ci_run_id":"${{ github.run_id }}","owner_email":"dev@example.com"}' \
+            | jq -r '.sandbox_id, .kubeconfig' > /tmp/sandbox_info
+      - name: Run load generator
+        env:
+          KUBECONFIG: ${{ steps.request.outputs.kubeconfig }}
+        run: |
+          rload --manifest tests/perf/token-latency.yml --target postgresql://inference-router/sandbox --out artifacts/perf.json
+
+Telemetry and SLOs
+
+- Mandatory metrics (exported by sandbox runtime):
+  - sandbox.request.latency.p95 < 80ms for small sequences (SLO for sandbox fidelity)
+  - gpu.utilization.average < 95% (alert if > 98% sustained 5m)
+  - sandbox.liveness.up (gauge) -> must be true while the sandbox is allocated
+  - sandbox.billed.gpu_hours (cumulative)
+
+- Alerts (prometheus alert rules examples, thresholds):
+  - ALERT SandboxGPUHotspot: gpu_utilization > 98 for 5m -> severity=critical -> notify infra-oncall, owner_team
+  - ALERT SandboxEgressExceeded: sandbox_egress_bytes_rate > 60MB/s -> severity=high -> pause network, notify owner
+  - ALERT SandboxStale: sandbox.liveness.up == 0 AND sandbox_age > 10m -> severity=high -> auto-reap fallback
+
+Operational runbook: incidents and recovery
+
+1. Symptom: CI job times out waiting for sandbox provision
+   - Check Sandbox Manager logs (service: sandbox-manager.prod)
+   - Verify Terraform run status in the Terraform Cloud workspace for sandbox_{sandbox_id}
+   - If TF run failed due to quota, escalate to infra-capacity and create transient allocation ticket with required size and region
+   - If controller stuck reconciling, restart EGSO controller pod (kubectl -n infra-rollouts rollout restart deploy/egso-controller)
+
+2. Symptom: High GPU temperature / node flakiness during test
+   - Check node metrics gpu_temp and thermal_throttle
+   - Cordon the node: kubectl cordon <node>
+   - Drain safely (preserve KV cache if required): kubectl drain <node> --ignore-daemonsets --delete-local-data --grace-period=120
+   - If thermal stress continues across nodes, pause sandbox creation (flip feature flag: egso.allow_new_sandboxes=false) and notify hw-ops
+
+3. Symptom: Unexpected billing spike for a sandbox
+   - Confirm sandbox tags in cost-exporter; query billing ledger for sandbox_id
+   - If charges exceed policy, open billing dispute and rollback any sustained allocations
+   - Verify sandbox max GPU-hours enforcement: sandbox.billed.gpu_hours <= sandbox.quota.gpu_hours
+
+Ownership and contacts
+
+- EGSO controller owner: infra-platform@redwood.example.com (pager: #infra-oncall)
+- Sandbox Manager owner: platform-tools@redwood.example.com
+- Billing/exporter owner: infra-finops@redwood.example.com
+- CI integration and tests: eng-dx@redwood.example.com
+
+Onboarding checklist for teams
+
+1. Request onboarding with infra-platform via the internal portal.
+2. Allocate team quota (daily and monthly GPU-hour caps).
+3. Add owner_email and team labels to CI workflows.
+4. Validate test manifest against the standard load profiles (token-latency, memory-flood, kv-eviction).
+5. Run baseline canary and confirm telemetry dashboards show expected baselines.
+
+CI best-practices and cost controls
+
+- Always run small profile on PRs; reserve medium/large for nightly regression runs.
+- Use sample rate limiter in rload to avoid synthetic egress spikes (example --egress-rate 40MB/s).
+- Keep artifact retention to minimum: metrics (90 days), traces (14 days), raw logs (7 days).
+- Apply cost tags early; billing pipeline aggregates by sandbox_id, owner_team and ci_run_id.
+
+Deprovisioning and TTL policy
+
+- Default TTL: 3 hours. Auto-extend only if: test signals extend_allowed and team has remaining quota.
+- Soft teardown (at TTL-10m): send 10-minute warning via Slack mention to owner_email and create explicit incident if job still active.
+- Hard teardown (TTL + 5m): Terraform destroy triggered, resources removed, billing finalized and exported.
+
+Audit and observability
+
+- All sandbox lifecycle events are logged to an append-only audit stream (audit-sbox) with fields: timestamp, sandbox_id, action, actor, reason, tf_run_id, ci_run_id.
+- Use Grafana playbooks to switch to sandbox-specific dashboards: query by sandbox_id or ci_run_id.
+
+Appendix: Common CLI shortcuts and checks
+
+- Check sandbox status:
+  curl -s $SANDBOX_API/v1/sandboxes/{sandbox_id} | jq
+- Reap stalled Terraform run (use terraform-cloud token with limited scope):
+  tfe run cancel <run_id> --token=$TFE_TOKEN
+- Force teardown from controller namespace:
+  kubectl exec -n infra-rollouts deploy/egso-controller -- /usr/local/bin/egsoctl teardown --id {sandbox_id}
+
+Change log
+
+- 2024-07-12: Initial draft by Jordan Meyer
+- 2024-09-08: Added Terraform module recommendations and tags (Aditi Shah review)
+- 2025-03-19: Tightened default egress limits and added GPU-hours quota enforcement (Luca Romano)
+- 2025-11-02: Published with CI job examples and alert rules (Priya Anand)
+
+Related references
+
+- terraform-modules/egso-sandbox-pool (internal git repo)
+- rload (internal load generator)
+- sandbox-manager API spec (internal)
+
+If you are the owner of a failing CI sandbox run, follow the Operational runbook above and ping #infra-oncall if escalation is needed.

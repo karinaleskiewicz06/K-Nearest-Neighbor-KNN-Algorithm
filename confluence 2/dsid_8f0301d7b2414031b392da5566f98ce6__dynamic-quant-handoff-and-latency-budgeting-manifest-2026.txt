@@ -1,0 +1,137 @@
+Dynamic quant handoff and latency budgeting manifest
+
+Summary:
+This document defines the operational contract, evaluation harness, and rollout playbook for dynamic quantization handoff — the runtime capability to switch between full-precision and quantized model variants (including mixed-precision hybrids) based on latency budget, KV-cache state, and quality guardrails. It codifies telemetry, safety checks, example configs, and regression-triage hooks required to safely operate quant handoffs across Hosted, Dedicated, and Private deployments.
+
+Goals and scope:
+- Goal: reduce per-token cost while preserving application-level quality and meeting latency SLOs by opportunistically routing requests to quantized model variants.
+- Scope: applies to text and function-call serving pipelines. Multimodal and embedding-only services follow the same principles but require separate calibration (see Related configs).
+- Out-of-scope: autonomous cross-model reranking, model architecture changes, and offline-only quant experiments (those belong to research notebooks).
+
+Key concepts and definitions:
+- Quant variant: a binary or mixed-precision build of a base model (e.g., fp16 baseline, int8 static, int8+kv-cache hybrid).
+- Handoff: the runtime decision to route a request to a quant variant for inference.
+- Latency budget: the target SLO for a route (p95/p99). Example: p95 <= 150ms for short chat turn endpoints.
+- Anchored probe: a synthetic input used to validate that a quant variant preserves a critical response anchor (semantic or token-level) to within an allowed delta.
+
+Operational contract (must-have requirements):
+1) Safety gates (pre-handoff checks) — REQUIRED
+   - Quality sentinel passed: If the quant variant has any active regressions on the latest anchor suite, the handoff is disabled for that model-version/route.
+   - KV-cache compatibility: only enable quant variant for a request if kv-cache-hit-rate >= 60% for that tenant/route (configurable per workload).
+   - Token limit check: quant variants that use sequence-length optimized kernels must only accept requests <= max_seq_len_quanted (enforced in routing).
+
+2) Latency budget enforcement — REQUIRED
+   - Runtime must compute an expected latency delta for a quant handoff using the model profile and current batching window. If expected_latency_quant > latency_budget then skip handoff.
+   - Example budgets: interactive-chat (p95 150ms), batch-rerank (p95 400ms). See Routing policy table below.
+
+3) Quality tolerances — REQUIRED
+   - Per-route coherence delta <= 2.5% (measured by anchored probes and instruction-following probes), or explicit business-owner signoff.
+   - For function-call endpoints, function-argument fidelity must be preserved: argument omission rate delta <= 0.5%.
+
+Routing policy matrix (example):
+| Route type       | Default latency budget (p95) | KV-cache min hit | Max sequence for quant | Allowed quant tiers |
+|------------------|------------------------------|------------------|------------------------|---------------------|
+| interactive-chat | 150ms                        | 60%              | 2048                   | int8-hybrid, int8   |
+| assistant-long   | 350ms                        | 30%              | 8192                   | mixed16,int8-hybrid |
+| rerank-api       | 450ms                        | 0%               | 1024                   | int8                |
+
+Telemetry and metrics (minimum set):
+- quant_handoff_attempts (count) by route, model_variant, tenant
+- quant_handoff_success (count) by route, model_variant, tenant
+- quant_expected_latency_delta_ms (gauge)
+- anchor_failure_rate (ratio) by probe_family, variant, route
+- coherence_delta_pct (gauge) sliding window 1h/24h
+- kv_cache_hit_rate (gauge) by tenant, route
+- cost_per_token_estimate (gauge) by variant
+- rollback_triggers (count) reasons: anchor_regression, latency_violation, downstream_error
+
+Evaluation harness and anchored probes:
+- Anchor suite composition:
+  - 200 short-turn instruction probes representative of highest-frequency intents; labeled golden tokens for token-diff checks.
+  - 50 function-call probes with strict argument assertions.
+  - 100 long-context coherence probes emphasizing continuity across 4-8 turns.
+  - 40 adversarial/noise probes to detect hallucination amplification under quant noise.
+
+- Offline eval flow (pre-promotion):
+  1. Run suite against candidate quant variant and baseline. Collect deltas (lexical token-diff, semantic embedding similarity, function-arg fidelity).
+  2. Apply statistical test: require p-value < 0.05 on equivalence test for primary metrics OR fail.
+  3. Run synthetic latency simulation using runtime profiler to estimate expected_latency_delta_ms across typical batching windows.
+  4. If both quality and latency gates pass, create a promotion ticket with recommended config.
+
+- Shadow validation (canary before handoff):
+  - 24–72 hour shadow run with 5–20% traffic mirroring for targeted tenants.
+  - Compute rolling anchor_failure_rate and coherence_delta_pct. If delta exceeds thresholds for >30 minutes, automatically revoke canary.
+
+Rollout and handoff playbook (step-by-step):
+1) Create quant candidate artifact and tag (artifact: model-vX-quant-int8-hybrid).
+2) Run offline anchor suite and latency simulation. Record results in promotion ticket.
+3) If passed, submit for SHIP review and set up a shadow-mirror experiment (configs: shadow_percentage, probe_injection_rate=5%).
+4) Start a 72-hour shadow run for low-risk routes; for high-risk routes start 24-hour then escalate.
+5) If shadow metrics stable and owner approves, enable dynamic handoff for a narrow tenant subset with strict telemetry alerts.
+6) Incrementally expand tenant set by doubling exposed traffic every 12 hours while monitoring rollback_triggers.
+7) Full enablement: convert to a rolling policy where runtime makes per-request decisions.
+
+Failure modes and automated rollback behavior:
+- Anchor regression: if anchor_failure_rate > threshold (default 0.75%) for 10 consecutive minutes, revoke handoffs for that model-variant/route and create an incident with regression-triage label.
+- Latency drift: if observed p95 exceeds configured latency_budget by > 20% for 15 minutes, downgrade handoff probability to 0% and re-evaluate.
+- Downstream errors (503/timeout): if downstream_error_rate increases by >2x baseline within 5 minutes, pause handoffs and escalate to oncall.
+
+Regression triage integration:
+- Triage ticket fields (required): model_variant, route, tenant_sample, last_good_artifact, anchor_failure_examples (up to 10), diffs (token-level and embedding diffs).
+- Runbook: see the Regression Huntbook (link) for hypothesis matrix. Prioritize regressions with production impact (anchored probes failing or user-visible function-call faults).
+- Bisect pattern: support A/B bisect between quant artifact and last_good_artifact using live replay mode; use probabilistic blame model to rank likely root causes (quant kernel mismatch, KV-cache misalignment, tokenizer drift).
+
+Runtime configuration examples (text YAML presented as code):
+---
+route: interactive-chat
+policy: dynamic_quant_handoff
+allowed_variants: ["int8-hybrid","mixed16"]
+min_kv_cache_hit_rate: 0.6
+latency_budget_ms_p95: 150
+probe_injection_rate: 0.05
+handoff_decision: >
+  - if kv_cache_hit_rate >= min_kv_cache_hit_rate and expected_latency_delta_ms <= (latency_budget_ms_p95 * 0.2) then enable variant
+  - else use baseline
+---
+
+Developer checklist for model-onboarding owners:
+- [ ] Provide quant artifact and profiler file for expected latency estimations.
+- [ ] Supply an anchor suite linked to the promotion ticket.
+- [ ] Define route-level SLOs and acceptable deltas (coherence, function-call fidelity).
+- [ ] Run offline suite and attach results.
+- [ ] Schedule shadow run and inform oncall calendar.
+
+Ownership and escalation:
+- Model owner: Applied ML team owning model-vX (responsible for artifacts and anchor suites).
+- Runtime owner: Serving-runtime team (implements decision logic and telemetry).
+- Oncall: Platform SRE (first responder for rollback triggers).
+- Escalation path: Platform SRE -> Applied ML -> Engineering manager -> Head of Inference.
+
+Related pages and artifacts:
+- runtime-fingerprint-onboarding-and-shadow-compatibility-checklist (link)
+- quant-shadow-cohort-strategy-and-rollback-playbook (link)
+- regression-huntbook (link)
+- artifact-repository: /models/registry/quantized/ (internal)
+
+Appendix: quick troubleshooting snippets
+- How to force-disable handoff for a tenant (CLI):
+  redwoodctl routes update --route interactive-chat --set dynamic_quant_handoff.enabled=false --tenant tenant-123
+
+- Example query to find latest anchor failures (SQL-like):
+  SELECT timestamp, route, tenant, probe_id, diff_type, diff_score FROM telemetry.anchor_failures WHERE model_variant='model-vX-quant-int8-hybrid' ORDER BY timestamp DESC LIMIT 50;
+
+- Minimal local eval command (dockerized):
+  docker run --rm -v $PWD/anchors:/anchors redwood/eval-runner:stable \
+    --model /artifacts/model-vX-quant-int8-hybrid --anchors /anchors/interactive-chat.json --report /tmp/quant-eval.json
+
+Notes and rationale:
+- We bias handoffs to high KV-cache-hit contexts because quantized kernels often compress KV storage or alter cache indexing patterns — stability tends to be higher on cached prefixes.
+- Latency-first workloads must keep a conservative overhead budget (we use 20% of budget for expected_latency_delta in many interactive routes).
+- Anchored probes are intentionally small but targeted: they allow quick detection of semantic shifts that token-diff metrics miss.
+
+Document maintenance:
+- Owner: Diego Morales (Applied ML).
+- Review cadence: quarterly or after any major quant kernel change.
+- Required artifacts: promotion tickets must include anchor suite, profiler, and shadow-run results.
+
+End of document.

@@ -1,0 +1,156 @@
+Adaptive ingress batching and error backoff guide
+
+Overview
+
+Purpose
+This guide describes recommended patterns, configuration defaults, and operational playbooks for adaptive batching and error backoff on inbound inference requests. It is intended for customer integration engineers, solutions architects, and SREs who implement or validate connectors that send traffic to Redwood Inference (hosted, dedicated, or private).
+
+Scope and assumptions
+- Applies to both streaming (chunked / websocket) and synchronous HTTP/REST ingest paths.
+- Assumes a proxy or sidecar exists in the customer environment which can buffer, batch, and retry (e.g., Envoy, custom sidecar, or managed connector).
+- Focus on reducing tail latency, preventing overload, and preserving SLOs during transient errors and capacity surges.
+
+When to apply adaptive batching
+- High request parallelism with many short requests (avg tokens < 80) where per-request overhead dominates cost.
+- Periods of bursty traffic where dynamic batch sizing reduces GPU utilization variance.
+- Environments where upstream rate-limits or quota errors are returned (HTTP 429 / 503) and a coordinated retry/backoff strategy is required.
+
+Design goals
+- Preserve p95/p99 latency SLOs for interactive flows while reducing per-token cost for bulk flows.
+- Prevent cascade failures by bounding queueing and applying circuit-breaker logic.
+- Maintain request ordering and idempotency guarantees where required by the customer workload.
+
+Architecture (textual diagram)
+Client -> Ingress proxy/sidecar (batcher) -> Rate limiter / circuit breaker -> Redwood edge -> Serving runtime
+
+Key components and responsibilities
+- Batcher: groups small requests into a single request payload when beneficial. Responsible for configurable max batch size, max waiting time, and priority queues.
+- Retry controller: applies retry policy with exponential backoff + jitter, respects server-provided Retry-After headers and throttle signals.
+- Circuit breaker: trips under elevated error rates or increased p99 serve latency to fail fast and avoid queue buildup.
+- Metrics & tracer: emits per-batch and per-request metrics (see metrics section) and attaches trace ids for correlation.
+
+Configuration recommended defaults (table)
+Parameter | Default | Rationale
+--------|---------|-------
+max_batch_size | 16 | Fits typical GPU parallelism for small requests; tune upward for long-context models
+max_batch_latency_ms | 30 | Limits additional wait introduced by batching to keep interactive latency under 200ms p95
+min_batch_size | 1 | Allows passthrough for single request when latency-critical or when queue is empty
+batch_priority_threshold_tokens | 120 | Requests longer than this are sent in dedicated batches to avoid head-of-line blocking
+queue_capacity | 200 | Prevents unbounded memory growth; choose based on sidecar memory profile
+circuit_breaker_error_pct | 20 | Trip if >20% of calls in sliding window fail (adjust per tenant SLA)
+cb_window_seconds | 60 | Sliding evaluation window
+retry_policy | exponential_jitter | Backoff base 200ms, multiplier 2, max 5 attempts
+retry_on | 429, 503, 502, network_errors | Only retry transient errors; 4xx otherwise returned to caller
+respect_retry_after | true | Honor Retry-After header from Redwood endpoints or upstream proxies
+health_check_interval_s | 10 | Periodic probe to recovery endpoints when circuit open
+
+JSON example: sidecar batcher config snippet
+{
+  "batch": {
+    "max_batch_size": 16,
+    "max_batch_latency_ms": 30,
+    "min_batch_size": 1,
+    "priority_token_threshold": 120
+  },
+  "retry": {
+    "policy": "exponential_jitter",
+    "initial_backoff_ms": 200,
+    "multiplier": 2.0,
+    "max_attempts": 5,
+    "retry_on": [429, 503, 502]
+  },
+  "circuit_breaker": {
+    "error_percentage": 20,
+    "window_seconds": 60
+  }
+}
+
+Integration steps (recommended)
+1) Validate call pattern: capture token distribution and request latencies for 48–72 hours in staging. Calculate median tokens and 95th percentile tokens.
+2) Start conservative: enable batching with max_batch_size=8 and max_batch_latency_ms=50. Run traffic through sidecar to verify latency impact.
+3) Ramp: increase max_batch_size incrementally (8 -> 16 -> 32) while monitoring p95 latency and GPU utilization.
+4) Enable retry policy with max_attempts=3 and exponential backoff for staging tests against induced 429/503 responses.
+5) Configure circuit breaker thresholds and test circuit open/close behavior via synthetic failures.
+6) Go-live: adopt final config and schedule a monitored window (72 hours) with on-call coverage.
+
+Operational runbook: alerts and triage
+Primary metrics to monitor (metric names are Redwood conventions; map if using custom telemetry):
+- ingress.batcher.active_batches (gauge)
+- ingress.batcher.avg_batch_size (gauge)
+- ingress.request.latency.p95 (histogram)
+- ingress.request.errors.count (counter) broken down by status code
+- ingress.sidecar.queue_length (gauge)
+- ingress.sidecar.circuit_open (boolean)
+- upstream.retry_after_rate (counter)
+
+Primary alerts (suggested thresholds)
+- High queue growth: ingress.sidecar.queue_length > 150 for 2m -> Severity: high -> Action: investigate traffic spike; scale sidecar replicas or reduce max_batch_size
+- Increased client latency: ingress.request.latency.p95 > 500ms for 5m -> Severity: high -> Action: check batch latency, inspect avg_batch_size, and triage for hotspot model or throttling
+- Elevated error rate: ingress.request.errors.count (4xx/5xx) > 5% for 3m -> Severity: critical -> Action: check circuit breaker status, inspect upstream 429/503 patterns, escalate to CS/Platform if widespread
+- Circuit breaker open: ingress.sidecar.circuit_open == true -> Severity: medium -> Action: follow circuit-breaker remediation steps below
+
+Circuit-breaker remediation steps
+1. Confirm scope: determine whether circuit breaker is tenant-specific or global. Check sidecar logs and metric tags.
+2. Inspect error distribution: are errors 429/503 from Redwood or network errors?
+3. If transient upstream 429s: temporarily decrease request concurrency and enable longer backoff; notify Redwood CS if persistent.
+4. If the circuit is open and healthy probes fail, scale sidecar and/or reduce ingress ingress rate at the client.
+5. If issue persists >30 minutes, create an incident and escalate to Redwood Support per the escalation matrix below.
+
+Escalation matrix (recommended)
+- First-line: customer integration engineer / on-call platform engineer (0–15 minutes) — perform immediate triage and apply local mitigations (reduce concurrency, increase backoff).
+- Second-line: Customer Success Engineering (15–60 minutes) — validate tenant config, run deeper traces, correlate with Redwood telemetry dashboards.
+- Third-line: Redwood Platform SRE (60–240 minutes) — investigate serving capacity, GPU pressure, model fallback events.
+- Executive/Account escalation: Customer Success Manager + Sales Engineering (>240 minutes) — coordinate client communications and SLA remedies.
+
+Testing and validation checklist
+- Synthetic load test at 1.5x normal peak while tracking p95/p99 latency and batch size behavior.
+- Fault-injection: send a stream of 503s from a proxy to verify retry and circuit-breaker actions.
+- Chaos test: restart sidecar replicas and confirm traffic re-routes without data loss.
+- End-to-end trace verification: every request must carry a trace id that maps to Redwood edge trace id for easy triage.
+
+Common failure modes and workarounds
+1) Head-of-line blocking: large requests hold a batch and delay small interactive ones.
+   Workaround: implement priority queues or token-threshold routing (send large requests in their own batch).
+2) Unbounded queue growth during upstream outage.
+   Workaround: enforce queue_capacity and fail fast (return 503 with guidance) when capacity exceeded; consider token-bucket rate-limiter upstream.
+3) Retry storms causing more upstream load.
+   Workaround: use exponential backoff with full jitter and respect Retry-After headers; limit max_attempts to 3–5.
+4) Jitter in batching causing p95 regressions.
+   Workaround: reduce max_batch_latency_ms or lower max_batch_size; prefer client-driven batching for ultra-low-latency paths.
+
+Customer-facing error messaging guidance
+When returning errors to downstream clients, include:
+- stable error code (e.g., INGRESS_OVERLOADED)
+- human-friendly summary of cause and expected retry window
+- correlation id / trace id that maps to Redwood request id
+Example HTTP 503 payload:
+{
+  "error_code": "INGRESS_OVERLOADED",
+  "message": "Request dropped due to temporary ingress overload. Retry after 30s or contact support if persistent.",
+  "trace_id": "rwd-9a2b-..."
+}
+
+Rollouts and change control
+- Any change to batcher or retry defaults must go through a staged rollout: feature-flagged in staging -> 10% of traffic -> 50% -> 100%.
+- Include automated canary checks measuring p95 latency, error rate, and avg_batch_size.
+- Document configuration changes in the tenant change log and tag SRE owner.
+
+Ownership and contacts
+- Primary owner: Customer Success Engineering (Priya Nair)
+- SRE escalation: Platform SRE on-call (rota: eng-sre)
+- Redwood support contact: support@redwood.ai (include trace id and tenant id in subject)
+
+Related resources
+- Streaming webhook retry and deduplication guide (integration-guides)
+- Tenant onboarding observability kit (enterprise-onboarding)
+- Redwood edge API reference and Retry semantics (product-docs)
+
+Appendix: quick tuning heuristics
+- For high-throughput batch workloads (non-interactive): increase max_batch_size to 64–128 and increase max_batch_latency to 100–200ms for better throughput efficiency.
+- For strict interactive SLAs: set max_batch_size <=8 and max_batch_latency_ms <= 20ms.
+- If 429s are common at steady-state: coordinate with Redwood CS to increase quota or provision Dedicated capacity.
+
+Document history
+- 2026-11-10: Created by Priya Nair
+- 2027-02-15: Updated with expanded circuit-breaker guidance and new metrics
+

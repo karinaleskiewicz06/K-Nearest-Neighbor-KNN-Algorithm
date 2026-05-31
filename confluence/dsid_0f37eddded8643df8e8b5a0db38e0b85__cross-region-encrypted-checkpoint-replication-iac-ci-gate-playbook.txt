@@ -1,0 +1,154 @@
+Cross-Region Encrypted Checkpoint Replication — IaC & CI/CD Gate Playbook
+
+Summary
+
+This playbook describes the recommended architecture, Terraform modules, CI/CD gating rules, operational runbook, and testing strategy for cross-region, encrypted replication of GPU model checkpoints (snapshots) for Redwood production workloads. The goal is to provide fast, auditable replication with key management and IAM controls suitable for Dedicated and Private deployments while minimizing egress costs and ensuring data privacy.
+
+Goals and scope
+
+- Ensure asynchronous, eventually-consistent replication of checkpoints to a secondary region within SLOs.
+- Use customer KMS (or Redwood-managed HSM where required) for server-side encryption with enforced key policies.
+- Provide Terraform modules and CI gating to prevent unsafe replication changes from being promoted to prod.
+- Cover runbook steps for common failure modes: replication lag, KMS access errors, bucket/object-level corruption, cross-account permissions break.
+- Not in scope: application-level checkpoint format validation (handled by model owning teams).
+
+Architecture overview
+
+Textual diagram:
+- Primary region: gpu-checkpoint-bucket-prod (S3) -> Replication Controller (replication-controller-prod) -> SNS/SQS replication queue -> Cross-region replication job (lambda or container) -> Secondary region: gpu-checkpoint-bucket-replica-prod (S3)
+- KMS: aws-kms-key-checkpoints-prod (primary) and aws-kms-key-checkpoints-replica-prod (replica) with explicit key policy allowing cross-account replication role.
+- IAM roles: replication-service-role-prod (assume role in replica account/region), terraform-deploy-role, ci-gate-scanner-role.
+
+Key non-functional SLOs
+
+- RTO (read after failover): target 10 minutes for the latest checkpoint to be available in secondary after cutover orchestration.
+- Replication lag: 95th percentile < 60s for incremental checkpoint uploads under nominal load (single-file < 500 MB).
+- Durability: 11 9s (S3 default) plus periodic integrity checks.
+
+Required components and responsibilities
+
+- Terraform modules (this repo): tf-module/checkpoint-replication (owned by infra/terraform).
+- CI/CD pipelines: buildkite/replication-module (owned by infra-ci).
+- Oncall rotations: infra-oncall (first responder), storage-ops (escalate for S3/KMS), networking (for cross-region connectivity).
+
+Terraform module contract (table)
+
+| Variable | Type | Description | Default / Notes |
+|---|---|---:|---|
+| source_bucket | string | Primary checkpoint bucket name | required |
+| replica_bucket | string | Replica checkpoint bucket name | required |
+| kms_key_arn_primary | string | ARN of KMS key in primary region | required |
+| kms_key_arn_replica | string | ARN of KMS key in replica region | required |
+| replication_role_arn | string | Role ARN used by replication service | required | cross-account role when applicable |
+| replication_prefixes | list(string) | Prefixes to include in replication | ["checkpoints/"] |
+| lifecycle_rules | list(string) | Bucket lifecycle rules to apply | [] recommended: expire temporary artifacts |
+
+Note: the module will create the replication configuration only when enable_replication = true. The module will not auto-create cross-account roles; it will expect replication_role_arn to be provided by the cross-account IAM playbook.
+
+CI/CD gating and safety checks
+
+1. Pull request checks (fast failure):
+   - Static analysis: terraform fmt, tfsec, and tflint must pass.
+   - Policy-as-code: opa/gatekeeper policies enforce that KMS keys have key_rotation_enabled and that replication_role_arn references a sanctioned role tag (tag:replication-role=true).
+   - Cost sanity check: diff analyzer must estimate egress and replication storage delta; changes > $2000/mo require manual approval.
+
+2. Integration stage (isolated sandbox):
+   - Plan applied to a sandbox account/region using ephemeral buckets with randomized names.
+   - End-to-end replication smoke test: upload a 100MB synthetic checkpoint, verify object presence, SSE-KMS metadata and KMS-encryption context propagation in replica region.
+   - Integrity verification: checksum (SHA256) match and object size match.
+
+3. Canary promotion:
+   - Apply to a low-traffic tenant bucket in prod account first.
+   - Monitor replication lag, S3 replication metrics (NumberOfRecordsReplicated, ReplicationBytes) for 24 hours.
+
+4. Production promotion: only after all checks and approvals. Promotion is gated by a single Approval step in Buildkite with reviewers from storage-ops and infra-security.
+
+Operational runbook (procedures and commands)
+
+A. Detecting replication lag exceeding threshold (alert triggers when > 60s for 95th percentile):
+   1. Check SQS queue depth for replication-controller: aws sqs get-queue-attributes --queue-url <url> --attribute-names ApproximateNumberOfMessages
+   2. Inspect replication controller logs (CloudWatch or cluster): kubectl -n replication logs deploy/replication-controller --since=1h
+   3. Verify S3 replication metrics: CloudWatch metrics for SourceBucket -> ReplicationLatency and ReplicationStatus.
+
+B. KMS access denied or key errors:
+   1. Identify the failing ARN from replication logs.
+   2. aws kms get-key-rotation-status --key-id <key-arn> and aws kms get-key-policy --key-id <key-arn> to validate policy.
+   3. If policy drift is detected, revert Terraform IAM change using: terraform apply -target=module.kms_key_policy --auto-approve (only after approval).
+
+C. Stalled or partially replicated object(s):
+   1. Run checksum compare: aws s3api head-object --bucket <bucket> --key <key> --query '{Size:ContentLength, ETag:ETag, SSE:ServerSideEncryption}'
+   2. If object missing in replica, re-enqueue replication via the replication controller trigger: kubectl -n replication exec deploy/replication-controller -- /app/replicate --key <object-key>
+   3. If automated re-enqueue fails, run a one-off container in replica region to copy the object using the replication role credentials and validate SSE headers.
+
+D. Emergency failover checklist (manual):
+   1. Confirm latest replicated checkpoint timestamp and manifest in replica.
+   2. Update application config (feature-flagged) to point to replica bucket and test model load on staging instances.
+   3. Coordinate DNS/Cutover with SRE and Product if full regional failover required.
+
+Testing and verification matrix
+
+- Unit tests: terraform validate + terratest for module unit tests (run in CI).
+- Integration tests: sandbox replication test (create bucket, attach replication config, upload sample objects).
+- Chaos tests: simulate KMS throttle and region network partition in a Canary environment.
+- Periodic audits: monthly integrity audit that samples 1% of new checkpoint objects and compares checksums across regions.
+
+Observability and alerts
+
+- Metrics to export to observability platform:
+  - replica_lag_seconds (histogram), replication_failure_count, replication_retry_count, kms_denied_errors, replication_queue_depth
+- Alert rules (examples):
+  - P1: replication_failure_rate > 5% for 5m -> page infra-oncall + storage-ops
+  - P2: kms_denied_errors > 1 for 3m -> page infra-oncall; auto-create incident with runbook link
+  - P3: cross-account-role-expiry-warning: IAM role certificate or external-id changed -> notify infra-security and open a PR to remediate
+
+Security & compliance notes
+
+- All replication traffic must use HTTPS endpoints and SSE-KMS with encryption context set to {"service": "redwood-checkpoints", "env": "prod"}.
+- Replication roles must be constrained by condition: aws:SourceAccount and aws:SourceArn to limit which replication configurations can use them.
+- Key rotation: enable automatic key rotation and maintain a 90-day rotation audit in compliance artifacts.
+
+Rollout plan
+
+1. Module alpha in sandbox (2 weeks): implement and smoke test with a single team (e.g., eval-run workloads).
+2. Canary (3 weeks): enable replication for a non-critical tenant in prod account. Run continuous integrity checks.
+3. Gradual rollout (4–8 weeks): enable replication for additional buckets while monitoring metrics and cost.
+4. Post-rollout: handoff to storage-ops and include monthly audit schedule.
+
+Change management and approvals
+
+- All Terraform changes must be code-reviewed and pass automated policy checks.
+- Any increase in cross-region egress forecast > $2k/mo requires approval from finance and infra leadership.
+
+Appendix: example Terraform snippet (module usage)
+
+```
+module "checkpoint_replication" {
+  source                   = "git::ssh://git@repo.internal/redwood/tf-module/checkpoint-replication.git//modules/replication"
+  source_bucket            = "gpu-checkpoint-bucket-prod"
+  replica_bucket           = "gpu-checkpoint-bucket-replica-prod"
+  kms_key_arn_primary      = "arn:aws:kms:us-west-2:111122223333:key/abcd-1234"
+  kms_key_arn_replica      = "arn:aws:kms:us-east-1:111122223333:key/wxyz-7890"
+  replication_role_arn     = "arn:aws:iam::222233334444:role/replication-service-role-prod"
+  replication_prefixes     = ["checkpoints/", "snapshots/"]
+  enable_replication       = true
+}
+```
+
+Contacts and ownership
+
+- Primary owner: infra/terraform (component lead: Ravi Menon)
+- Secondary: storage-ops (owner: Leah Torres)
+- Security reviewer: infra-security (owner: Marta Ivanova)
+
+Changelog
+
+- 2025-03-18: Initial draft (Ravi Menon).
+- 2025-06-10: Added CI integration tests and OPA policies (reviewed by Leah).
+- 2026-02-20: Hardened KMS policy guidelines and added cost gating thresholds (updated by Ravi).
+
+Related references
+
+- See also: /confluence/eng-infra/terraform-and-iac/gpu-checkpoint-storage-tiering-iac-spec.json
+- KMS cross-account patterns: internal security cookbook (link: /confluence/security-and-compliance/kms-cross-account-patterns.json)
+
+End of playbook

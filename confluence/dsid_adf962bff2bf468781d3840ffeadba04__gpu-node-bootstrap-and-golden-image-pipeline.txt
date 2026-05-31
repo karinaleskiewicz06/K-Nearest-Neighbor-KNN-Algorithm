@@ -1,0 +1,173 @@
+GPU Node Golden Image & Bootstrap Pipeline
+
+Overview
+-------
+This document describes the end-to-end golden image and node bootstrap pipeline we use to produce immutable GPU node images for Redwood Inference (AWS AMIs and GCP custom images). The goal is to provide a reproducible, secure, and verifiable artifact used by autoscaling groups, Dedicated clusters, and Private on-prem node pools. This doc covers:
+- baking process and tooling (Packer + bake jobs)
+- CI/CD jobs and gate checks (GitHub Actions + internal helm/tf apply gates)
+- validation test-suite and acceptance criteria
+- rollout and rollback playbooks for replacing node pools
+- ownership, runbook steps, and common troubleshooting
+
+Why we bake images
+------------------
+- Determinism: identical base OS, drivers, and system-level tuning across fleets.
+- Faster node startup: preinstalled drivers and runtime layers reduce kubelet warmup.
+- Security & compliance: images are scanned and signed before release.
+- Reproducible rollbacks: image version pinning in Terraform to restore previous state.
+
+Scope and supported variants
+--------------------------
+- AWS: Amazon Linux 2023 based AMIs, NVidia driver bundle (driver 535.x), CUDA 12.1, containerd 1.8.x, runtimes preconfigured for MIG-aware scheduling.
+- GCP: cos-custom or Ubuntu image families with identical package sets and kernel tuning.
+- On-prem/air-gapped: image tarballs (OCI-compressed) and attestation artifacts for manual import.
+
+Key SLAs for the pipeline
+-------------------------
+- Bake job completion target: 45 minutes (95th percentile).
+- Post-bake acceptance tests must pass: 100% for gate to progress.
+- Image publishing delay: <= 10 minutes from acceptance to repo/AMI family update.
+
+Pipeline components and responsibilities
+--------------------------------------
+- Packer recipes: sources/infra/packer/gpu-node/ (maintained by infra/images-team).
+- Bake runners: ephemeral EC2/GCE build agents launched by GitHub Actions.
+- Artifact registry: AWS AMI families (redwood-gpu-ami-*), GCP image families (redwood-gpu-*).
+- Signing and metadata: cosign signatures and SLSA-like metadata written to S3/GCS.
+- Terraform modules: modules/compute/gpu-node-image (referenceable by consumer infra stacks).
+- CI gates: GitHub Actions + internal pipeline that triggers acceptance tests and publishes promotion results to Slack #infra-images.
+
+Packer configuration highlights (concrete)
+--------------------------------------
+- HCL packer template: gpu-node.pkr.hcl
+- Example snippets (kept concise here):
+  - builders: amazon-ebs / googlecompute with kms_encrypted_root = true
+  - provisioners: shell scripts that call bootstrap scripts from infra-artifacts repo
+  - post-processors: manifest and cosign signing step producing manifest.json and manifest.sig
+
+Security and compliance requirements
+----------------------------------
+- Root device encrypted (KMS key: arn:aws:kms:us-east-1:123456789012:key/redwood-images).
+- Image hardening: CIS benchmark baseline automation (CIS-Audit exit code 0 required).
+- Vulnerability scanning: Trivy CVE scan; no critical CVEs with public exploit for included packages.
+- Signed artifacts: cosign signature and packer manifest stored in s3://redwood-image-manifests/{image-version}/
+
+Acceptance test-suite (post-bake)
+--------------------------------
+The acceptance step runs a short test-suite on an instance launched from the baked image. All tests run in < 5 minutes where possible. Key tests:
+1) Kernel and driver verification
+   - nvidia-smi shows driver 535.x and CUDA visible to container runtimes
+   - NCCL tests (simple allreduce small message) run without error
+2) Kubelet / kube-proxy smoke
+   - kubelet registers, node Ready within 90s of kubelet start
+3) Container runtime
+   - containerd pull + run of minimal runtime image (redwood/ci-gpu-smoke:latest)
+4) Security checks
+   - CIS audit pass, rootfs readonly when expected, systemd hardening checks
+5) Runtime perf smoke (optional)
+   - Token throughput microbenchmark completes and latency within expected range (< 12ms median for 512-token synthetic workload)
+
+Promotion and tagging policy
+---------------------------
+- Image semantic versioning: vYYYY.MM.DD+build (e.g., v2024.06.03+42)
+- AMI/GCP family tags: latest -> updated only after a green acceptance run and manual approval (unless auto-promote label is set).
+- Terraform pinning: terraform modules should reference image_id or image_family with a required "image_ref" variable; auto-updates only via infra image bump PR.
+
+CI/CD job flow (GitHub Actions canonical flow)
+-------------------------------------------
+1) PR to infra/artifacts with Packer or bootstrap changes triggers: packer-lint -> packer-bake-test -> publish-manifest (draft).
+2) Acceptance job launches ephemeral instance, runs acceptance-suite, collects logs and metrics, uploads to S3/GCS.
+3) On success, job creates a release artifact and posts to Slack + creates an infra PR to update module default image_ref.
+4) Manual approver in the reviewers list merges the infra PR to propagate the image to Terraform staging.
+
+Terraform integration and module contract
+--------------------------------------
+- Module: modules/compute/gpu-node-image (inputs):
+  - image_ref (string) - required
+  - instance_type_overrides (map) - optional
+  - kms_key_id (string) - optional
+- Output: image_id, image_family, bake_metadata_url
+- Consumers: aws/eks/gke node pools and autoscaling groups must consume module outputs and expose a single variable image_ref for release management.
+
+Rollout playbook (canary -> staggered -> full)
+-----------------------------------------------
+1) Pre-rollout checks
+   - Check that SLOs are healthy for serving clusters (error budget >= 75% available)
+   - Verify image acceptance artifact and cosign signature URL exists
+   - Notify #oncall and schedule a maintenance window for Dedicated clusters if > 10% of fleet will cycle
+2) Canary (a small pool)
+   - Update Terraform for one node-pool with max_unavailable=1 and set image_ref to new image
+   - Apply with plan and wait 10 minutes for nodes to become Ready and smoke tests to pass
+   - Observe application tail latency and pod restart rates for 30m
+3) Staggered rollout
+   - Batch updates in 10-25% increments with 15-minute observation windows per batch
+   - If any worker-level metrics spike (pod crashloop > 0.5% or 99th tail latency > x2 baseline), pause and rollback
+4) Full rollout
+   - Apply to remaining pools during low-traffic windows; monitor closely for 2 hours
+
+Rollback playbook (quick revert)
+------------------------------
+1) If canary fails or > threshold triggers: immediately set image_ref back to prior known-good image and apply with force-replace set to true where supported.
+2) For AWS ASG: set autoscaling group LaunchTemplate to previous AMI and perform instance refresh with MinHealthyPercentage = 90 to gradually replace nodes.
+3) For GKE: use node pool versioning to pin to previous image family and cordon/drain failing nodes.
+4) Post-rollback: open an urgent incident, collect bake logs, acceptance logs, and packer manifests for triage.
+
+Monitoring and drift detection
+----------------------------
+- Image metadata exporter (Prometheus) emits: current_image_ref{pool,region}, bake_duration_seconds, acceptance_status{pass|fail}, last_bake_timestamp.
+- Alerts:
+  - Bake failure rate > 3 in 1hr -> PagerDuty P1 to infra-images team.
+  - Node bootstrap time > 6m (Ready not reached) -> P2 to oncall.
+  - Image drift alert: if node pool reports image_ref != terraform-applied image_ref -> P2.
+
+Common troubleshooting checklist
+------------------------------
+1) Instance fails to boot after bake
+   - Verify encrypted root KMS grants to build account
+   - Inspect serial console logs via cloud provider console
+2) GPU driver missing or wrong version
+   - Confirm driver package in /opt/nvidia and compare against manifest.json
+   - Check systemd service nvidia-persistenced status
+3) Kubelet not registering
+   - Check kubelet logs (/var/log/syslog or journalctl -u kubelet) for certificate/auth errors
+4) Acceptance test failures
+   - Download acceptance logs from s3://redwood-image-logs/{build-id}/ and run locally against an equivalent instance
+
+Owner and contact matrix
+------------------------
+- Primary owner: infra/images-team (oncall: @infra-images-oncall)
+- CI pipeline owner: infra-ci-team
+- Security reviewers: security/compliance team
+- Escalation: file an incident and tag @infra-eng @platform-sre
+
+Appendices
+----------
+A) Useful commands
+- Trigger a local packer build for debugging: packer build -var 'version=local-debug' gpu-node.pkr.hcl
+- Launch a manual acceptance instance (AWS): 
+  aws ec2 run-instances --image-id ami-0123456789abcdef0 --instance-type p3.2xlarge --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=redwood-image-test}]'
+- Inspect manifest and signature: aws s3 cp s3://redwood-image-manifests/v2024.12.12+5/manifest.json -
+
+B) Minimum image bake checklist
+- Base OS kernel pinned
+- GPU driver and CUDA present and versioned
+- containerd and cri-tools installed
+- Kubelet version aligned with cluster minor version
+- CIS and Trivy scans completed
+- Cosign signature present
+- Bake manifest uploaded and accessible
+
+C) Future work / backlog items
+- Add ephemeral MIG partitioning bake variants for A100/MIG3 profiles
+- Introduce automated perf regression detection using historical microbenchmarks
+- Move to SLSA v1 attestation for deeper provenance
+
+D) Related policies and docs
+- Image publishing policy: /confluence/policies-and-process/image-publishing-policy (TBD)
+- Node pool lifecycle runbook: /confluence/eng-infra/oncall-and-incident-response/runbooks/node-pool-lifecycle
+
+Document maintenance
+--------------------
+- Owner: infra/images-team (maintain content and update on driver or OS upgrades)
+- Review cadence: quarterly or on every major driver/kernel bump.
+- Edit process: open PR in infra/docs and request reviewers listed above.

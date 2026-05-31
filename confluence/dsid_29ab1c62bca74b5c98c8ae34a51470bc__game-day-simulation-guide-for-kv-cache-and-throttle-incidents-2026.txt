@@ -1,0 +1,190 @@
+Game Day Simulation Guide for KV Cache Corruption and Request Throttling Incidents
+
+Summary
+======
+This document is a reproducible game-day simulation and operational playbook for two correlated incident classes we see in model-serving: KV cache corruption (leading to incorrect or blank continuations and elevated latency) and request throttling (adaptive service-side backpressure that causes elevated error rate and queued requests). The intent is to exercise detection, handoff, mitigation, automated status updates, and customer communication templates specific to LLM inference platforms.
+
+Scope
+-----
+- Audience: SREs, Serving Runtime Engineers, On-call Engineers, Customer Success on-call liaisons.
+- Systems in scope: kvcache-service, request-proxy, inference-worker-pool, autoscaler, routing-service, status page automation.
+- Excluded: data-plane storage corruption outside KV cache (file system-level), and billing systems.
+
+Game day objectives
+-------------------
+1) Validate early detection for silent correctness regressions introduced by KV cache corruption.
+2) Validate containment and mitigation for adaptive throttling events that cause customer-facing 5xx/429s.
+3) Exercise handoffs across teams and the automated status page + customer comm pipeline.
+4) Measure playbook timing: detection -> mitigation -> customer notice -> full restoration.
+5) Capture actionable postmortem artifacts and runbook gaps.
+
+Preconditions & environment setup
+--------------------------------
+- Test namespace in cluster: inference-gameday-2026 (isolated infra with synthetic traffic).
+- Synthetic workload: open-source LLM prompts and token distribution representative of production (50% chat, 30% generation, 20% embeddings).
+- Canary model variant that loads an intentionally corrupted optional KV prefix to simulate subtle divergence (flagged as model: canary-kv-corrupt:v3).
+- Observability hooks enabled: traces (x-request-id propagated), per-request KV checksum header, token-latency histogram, prefix-mismatch counter.
+
+Game day schedule (3 hours)
+---------------------------
+1. 00:00–00:20 — Pre-brief: objectives, success criteria, safety killswitch review.
+2. 00:20–00:30 — Baseline run: synthetic workload at 25% normal traffic. Capture baseline metrics.
+3. 00:30–01:10 — Inject KV cache corruption on 10% of inference-worker-pool instances. Watch for silent correctness signals.
+4. 01:10–01:40 — Introduce upstream traffic spike that triggers adaptive throttling policies.
+5. 01:40–02:20 — Run mitigation handoffs and customer comms.
+6. 02:20–03:00 — Restore normal state and conduct retro + artifact collection.
+
+Success criteria
+----------------
+- Detection: Alert for prefix-mismatch rate > 0.25% within 10 minutes.
+- Containment: Throttling fallback to safe-route (cpu-infer variant) applied within 15 minutes of elevated 5xx rate.
+- Customer comms: First public status page update posted within 30 minutes of impact confirmation.
+- Postmortem: Action items and owner assignments captured within 48 hours.
+
+Scenario narrative (play-by-play)
+--------------------------------
+- KV cache corruption is simulated by toggling a feature flag that swaps the in-memory KV version on a subset of nodes. This produces subtle divergence: some responses incomplete or with hallucinations; token-latency may not spike immediately.
+- As divergence accumulates, the prefix-mismatch counter increments. The routing service sees higher latency variance and moves traffic to the regional fallback pool, which then triggers autoscaler churn and adaptive throttling.
+
+Detection & alerting setup (examples)
+------------------------------------
+- Alert 1: KV_CACHE_PREFIX_MISMATCH_RATE
+  - Expression (PromQL): sum(rate(kv_prefix_mismatch_total[5m])) / sum(rate(inference_requests_total[5m])) > 0.0025
+  - Severity: P1 if >0.25% sustained for 10m.
+  - Notify: #sre-oncall, pager, rotate to serving-runtime-oncall.
+
+- Alert 2: INFERENCE_ADAPTIVE_THROTTLE_ERROR_RATE
+  - Expression: increase(inference_response_errors_total{status=~"5..|429"}[5m]) > 100
+  - Severity: P1 if >100 errors in 5m AND request_queue_length > 50.
+  - Notify: #sre-oncall, customer-success-backup.
+
+Playbook: KV cache corruption (step-by-step)
+-------------------------------------------
+1) Acknowledge the KV cache alert and set an incident bridge.
+2) Immediately mark incident impact: "Partial correctness regression for subset of requests in region X". Post to incident bridge.
+3) Run local triage commands (see runbook commands below) to confirm mismatch and node scope.
+4) If scope <= 10% of nodes: cordon affected nodes from the routing-service and restart kvcache-service with previous known-good KV binary.
+5) If scope > 10% or symptoms escalate: fail traffic over to canary-safe-route (cpu-infer variant) using the routing policy: POST /routing/v1/override {"route":"cpu-infer","pct":100} with a 5 minute TTL.
+6) Capture sample requests and store traces for postmortem: include x-request-id, model-version, kv-checksum header.
+7) Annotate status page and send customer comms using templates below.
+
+Playbook: Adaptive throttling / request backpressure
+--------------------------------------------------
+1) Confirm throttling origin: autoscaler, proxy, or worker-level. Correlate with autoscaler events and queue depth.
+2) If autoscaler is reacting to noisy neighbors, throttle less critical routes and unpin lower-priority customers: use rate-limit policy update.
+3) If proxy-level queuing: identify abnormal request patterns and temporarily increase token-per-request budget for critical customers.
+4) If emergent 5xx cascade: apply circuit-breaker policies to affected routes and route traffic to fallback models.
+5) Monitor SLO impact and revert rate-limit relaxations once healthy.
+
+Escalation matrix & responsibilities
+-----------------------------------
+- First responder (on-call SRE): owns bridge, initial triage, and the first status page update.
+- Serving runtime lead: accountable for KV cache remediation steps and kernel-level diagnostics.
+- Platform on-call: executes traffic routing overrides and autoscaler configuration.
+- Customer Success on-call: drafts customer notices for affected customers and coordinates targeted DMs.
+- Incident commander: assigned if incident meets P1 criteria or crosses teams; owns postmortem and executive updates.
+
+Runbook commands and snippets
+---------------------------
+- Identify nodes with prefix mismatches:
+  - kubectl -n inference get pods -l app=kvcache -o json | jq '.items[] | {name:.metadata.name, podIP:.status.podIP}'
+  - curl -s http://kvcache-<pod>/internal/metrics | grep kv_prefix_mismatch_total
+
+- Restart kvcache on a node safely (cordon & restart):
+  - kubectl -n inference cordon <node-name>
+  - kubectl -n inference delete pod <kvcache-pod> --grace-period=30
+  - kubectl -n inference uncordon <node-name>
+
+- Route override (example):
+  - curl -X POST -H 'Authorization: Bearer $ROUTE_ADMIN_TOKEN' \n    -d '{"route":"cpu-infer","pct":100,"ttl":"5m"}' https://routing.redwood.internal/v1/override
+
+- Collect sample traces quickly and upload to evidence bucket:
+  - go-run collect-traces --ids "$(cat sample-ids.txt)" --out s3://redwood-evidence/gameday/kvcorrupt/$(date +%F_%T).tgz
+
+Status page & customer communications automation
+------------------------------------------------
+- We use status.redwood.com as the canonical first-public channel. Status posts are automated via the incident API. Required fields: impact, affected-services, regions, severity, expected_update, technical_summary, mitigation_steps, contact.
+
+- Minimal status page template (first post)
+  - Title: Service degradation — model responses intermittently incorrect or delayed (Region X)
+  - Impact: Customers in Region X may receive incomplete or incorrect responses and see elevated error rates.
+  - Affected services: inference API, kvcache-service, routing-service.
+  - Severity: Partial outage (P1).
+  - What we are doing: Routing traffic to safe-route variants, restarting affected kvcache nodes, capturing traces for root cause analysis.
+  - Next update: in 30 minutes or earlier.
+
+Customer notice templates (examples)
+----------------------------------
+- Short public blurb (status page / public):
+  - "We are investigating an issue impacting model responses in Region X. Some requests may return incorrect or delayed responses. We have routed traffic to fallback capacity and are actively restoring affected nodes. We will update in 30 minutes."
+
+- Targeted customer DM (CS-personalized):
+  - Subject: "Incident: Inference degradation affecting Region X — <customer short name>"
+  - Body: "Hello <FirstName>, we detected a partial degradation affecting inference results in Region X starting at <time>. We temporarily routed your traffic to a fallback model variant to preserve availability. You may see slight differences in output quality. We will notify you as services are fully restored. If you need a dedicated rollback or data isolation, reply and we will prioritize an assisted restore. - Redwood Ops"
+
+Incident timeline capture checklist
+----------------------------------
+- Record: detection timestamp, alert IDs, incident commander, SRE lead, all major actions (route overrides, restarts), exact CLI commands, and on-call participants.
+- Preserve evidence: traces, sample requests, kv-checksum samples, autoscaler event logs, routing decisions.
+- Tag all artifacts with incident id: GAMEDAY-KV-<YYYYMMDD>-<NN>.
+
+Post-incident retro agenda (30–60 minutes)
+----------------------------------------
+1) Quick readout of timeline (10m)
+2) What went well (10m)
+3) What didn’t (10m)
+4) Action items, owners, and deadlines (10m)
+5) Plan for runbook changes & next game-day (10m)
+
+Suggested retro prompts
+----------------------
+- Did our alerts fire with the right signal-to-noise ratio?
+- Were handoffs clear and timely between SRE and serving runtime?
+- Could any steps be automated (hotfix rollout, route failover)?
+- Which tests or prechecks would have prevented this divergence?
+
+Artifacts & follow-ups (expected within 48 hours)
+------------------------------------------------
+- Postmortem draft with timeline and blameless root cause analysis.
+- Action items (owner, priority, ETA) — sample: add a KPI alert for kv_checksum_delta (owner: runtime team, ETA: 2026-09-01).
+- Runbook updates: include exact promql alerts, CLI examples added above, and a canary healthcheck that rejects nodes with mismatched kv checksums.
+
+Appendix: Selected observability queries and thresholds
+-----------------------------------------------------
+- Prefix mismatch rate (PromQL):
+  - 100 * sum(rate(kv_prefix_mismatch_total[5m])) / sum(rate(inference_requests_total[5m]))
+
+- Request queue depth (PromQL):
+  - histogram_quantile(0.95, sum(rate(request_queue_seconds_bucket[5m])) by (le,job))
+
+- SLO table (example)
+  - "Service", "SLO target", "Error budget"
+  - "Inference API", "99.9% availability (5xx+429s)", "0.1% monthly budget"
+  - "Region X model responses (quality)", "99.75% prefix-match within tolerance", "0.25%"
+
+Notes and caveats
+----------------
+- This game-day intentionally uses an isolated namespace and canary model to avoid cross-contamination. Never toggle flags or binaries in production without approval and runbook sign-off.
+- Use the documented evidence bucket and incident id metadata so artifacts are discoverable during postmortem.
+
+Related pages and references
+---------------------------
+- Runtime architecture overview: /confluence/eng-serving-runtime/runtime-architecture
+- Incident postmortem template: /confluence/oncall-and-incident-response/incident-comm-and-postmortem-framework-2026.json
+
+Contacts
+--------
+- On-call SRE rotation: #sre-oncall (pager)
+- Serving runtime pager: +1-555-0112 (team rotation)
+- Customer Success on-call: cs-oncall@redwood.internal
+
+Document owners
+---------------
+- Primary: Maya Thompson (Serving Runtime)
+- Secondary: Priya Desai (Platform)
+
+Revision history
+----------------
+- 2026-02-15: Created (Maya Thompson)
+- 2026-06-22: Added routing override examples and status automation updates (Liam O'Connor)
+- 2026-08-10: Clarified success criteria and added KV-prefix promql (Maya Thompson)

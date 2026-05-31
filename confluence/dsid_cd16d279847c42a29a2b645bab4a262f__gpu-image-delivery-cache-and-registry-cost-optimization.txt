@@ -1,0 +1,168 @@
+GPU image delivery, registry cache, and cost optimization
+
+Overview
+
+This document defines the delivery pattern, caching topology, CI/CD integration, and cost-optimization controls for GPU runtime images and model-serving artifacts. It targets teams that publish large OCI images (GPU runtimes, model bundles, operator sidecars) and want stable, low-cost delivery for production fleets and ephemeral evals across cloud accounts and regions.
+
+Goals
+
+- Reduce egress and registry costs for high-frequency image pulls.
+- Ensure predictable cold-start times for inference pools (SLOs).
+- Provide a repeatable Terraform/IaC contract for registry cache components.
+- Integrate with existing CD pipelines to enable safe promotion, signature verification, and controlled rollbacks.
+
+Non-goals
+
+- This doc does not replace per-tenant image security scanning guidance (see security-and-compliance).
+- It does not define GPU node bootstrap scripts in detail; see gpu-node-bootstrap pipeline page for that.
+
+Owner and stakeholders
+
+- Service owner: eng-infra image-delivery squad (oncall: image-delivery@redwood.dev)
+- Primary stakeholders: serving-runtime, infra-sre, ci-cd platform, security
+
+Constraints and assumptions
+
+- Primary clouds: AWS (us-west-2, eu-west-1). Pattern should be cloud-agnostic but examples use ECR/ALB/CloudFront equivalents.
+- Typical image sizes: 1GB–12GB. Model artifacts may be >20GB; those are handled by the model bundle CDN layer (separate doc).
+- Some tenants use private VPC endpoints; caches must support private endpoint peers.
+
+SLOs and key metrics
+
+- Cold-pull latency SLO: 95th percentile < 18s for 4–8GB images when pulled to a warm pool node in same region.
+- Registry egress cost cap per month: owner-defined (example threshold $5k/month per team).
+- Cache hit-rate target (regional caches): >= 88% for production pools.
+- Image verification success ratio (signed images): 100% for promoted images.
+
+Design overview
+
+1) Two-tier caching topology
+   - Regional pull-through caches: lightweight pull-through registry (proxy) deployed per-region and per-cloud-account group. Handles common layers and reduces cross-region pulls.
+   - Node-local LRU cache: on-disk cache on GPU nodes (configured via container runtime — containerd overlay) to avoid repeated pulls across containers on same node.
+
+2) Promotion and immutable tags
+   - CI/CD must publish artifacts with an immutable digest tag and a short-lived semver-like staging tag. Promotion to production sets a signed immutable tag (immutable digest + signature) and updates a production pointer (prod@stable).
+
+3) IaC contract (Terraform module)
+   - Module: image-cache/registry-proxy
+   - Inputs (required): region, account_id, vpc_id, subnet_ids, cache_size_gb, allowed_ecr_repositories
+   - Outputs: proxy_endpoint, cache_sg_id, private_endpoint_id
+
+Table: Minimal Terraform inputs
+
+| name | type | description | example |
+|------|------|-------------|---------|
+| region | string | target region for cache | eu-west-1 |
+| account_id | string | cloud account hosting cache | 123456789012 |
+| vpc_id | string | VPC to deploy proxy in | vpc-0ab3cd |
+| subnet_ids | list(string) | private subnets for proxy | [subnet-1, subnet-2] |
+| cache_size_gb | number | retained layer disk capacity | 512 |
+
+Implementation notes: module spins up a small fleet of EC2/ECS tasks behind an internal ALB, with lifecycle hooks to drain existing connections during scale down. The module provides an option to enable S3-backed cold-store for very large layers to limit root disk usage.
+
+CI/CD integration and pipeline pattern
+
+- Build step (Buildkite template): compile -> produce OCI layer image(s) -> run local container digest verification.
+- Push step: push to ephemeral registry namespace (builds.redwood-internal).
+- Test step: deploy to ephemeral eval cluster that uses regional caches; measure pull times and runtime smoke tests.
+- Promote step (manual or gated automated): sign image with cosign and call registry-promote job which moves digest to production namespace and updates prod@stable pointer.
+
+Example Buildkite snippet (bash):
+
+  # build and push
+  docker build -t ${REGISTRY}/${REPO}:${BUILD_ID} .
+  docker push ${REGISTRY}/${REPO}:${BUILD_ID}
+  digest=$(docker inspect --format='{{index .RepoDigests 0}}' ${REGISTRY}/${REPO}@${BUILD_ID})
+  cosign sign --key ksm://projects/image-keys/${TEAM} ${digest}
+
+Cache sizing and eviction policy
+
+- Regional cache sizing guidance: target 5x the working set of production image layers for that region. Estimate working set by sampling registry pull logs (recommended query provided below).
+- Node local LRU: configure containerd with snapshotter settings and a 10GB base reserved cache for RTX-class nodes; smaller for test sandboxes.
+
+Log query example (CloudWatch/Datadog) to estimate working set:
+
+  service:registry AND operation:pull | group_by(region, layer_digest) | top(200) by count
+
+Cost model and controls
+
+- Major cost levers:
+  - Registry storage vs egress (keep fewer immutable copies, prefer deduplicated layered images).
+  - Cache cross-region replication (avoid expensive replication; instead rely on regional pull-through caches).
+  - TTL for ephemeral tags (shorten to avoid bloating registry storage).
+
+- Suggested guardrails (enforced via cost-exporter):
+  - Monthly egress alert if registry egress > $X for team (default $2k).
+  - Automatic TTL prune job for tags older than 30 days unless exempted.
+
+Runbook: cache outage or high egress event
+
+1) Detection
+   - Alert: registry-ejector.high-egress OR regional-cache.hit-rate < 70% OR pull-latency-95th > 30s
+
+2) Immediate steps (0–15 minutes)
+   - Pager: oncall image-delivery receives the alert.
+   - Confirm scope: check internal ALB metrics and proxy error rates.
+   - If proxy is overloaded: increase target ASG/replica count by +50% using terraform/apply if autoscaling is disabled.
+
+3) Short-term mitigation (15–60 minutes)
+   - Add temporary HTTP cache header relaxation to allow client-side reuse for 5 minutes.
+   - If egress spike is billing-critical, add firewall rule to block non-essential CI builds (use feature flag) and notify teams.
+
+4) Recovery and postmortem (60–240 minutes)
+   - Rehydrate cache from nearest healthy region (run cache-warmup job to pull top N images).
+   - Run cost-analysis report and set an owner for follow-up.
+
+Monitoring and alerts (recommended list)
+
+- regional-cache.hit_rate (Datadog gauge) — warn < 85%, critical < 70%
+- regional-cache.latency_p95 — warn > 20s, critical > 35s
+- registry.egress_usd_30d — warn > $2k/team, critical > $5k/team
+- buildkite.image-push-failures — warn > 5% per day
+
+Testing and validation matrix
+
+- Unit: verify terraform plan for image-cache module with mocked inputs.
+- Integration: deploy cache to staging region and run a 24h synthetic runner that pulls images at production-like rates.
+- Performance: measure cold-pull 95th percentile and ensure it meets SLO.
+- Security: run cosign verification for promoted images and check vulnerability scan reports (Trivy/Clair) before sign-off.
+
+Operational playbook for upgrades
+
+1) Canary: deploy new proxy version to 10% of proxy nodes and run warmup job for top-20 images.
+2) Monitoring: ensure hit-rate and latency remain within 5% of baseline for 30 minutes.
+3) Gradual rollout: 25% -> 50% -> 100% with 10-minute observation windows.
+4) Rollback: use terraform to pin previous AMI/container image and scale down new pool; do not perform destructive pruning during rollback window.
+
+Security and compliance notes
+
+- All promoted images must be signed via org-managed cosign keys. Keys are stored in KMS/HSM and usage is audited.
+- Private VPC caches must enforce RBAC via service accounts and support VPC endpoint policies to limit which repos can be pulled.
+
+Appendices
+
+A. Sample terraform module usage (pseudo-HCL)
+
+module "regional_cache" {
+  source = "git::ssh://git@repo.redwood.ai/image-cache-module.git//modules/registry-proxy"
+  region = "us-west-2"
+  account_id = "123456789012"
+  vpc_id = "vpc-0abc"
+  subnet_ids = ["subnet-011","subnet-012"]
+  cache_size_gb = 512
+}
+
+B. FAQ
+
+Q: Why use pull-through rather than a single global registry replica?
+A: Global replication increases storage costs and cross-region egress. Pull-through caches reduce duplication and allow per-region control over eviction and private endpoint access.
+
+Q: How do we handle very large model artifacts (>20GB)?
+A: Those are served via a separate model-bundle CDN with range requests and S3-backed cold store; see model-bundles-doc.
+
+C. Related pages and links
+
+- gpu-node-bootstrap-and-golden-image-pipeline (node bootstrap pipeline)
+- ci-cd-gpu-image-promotion-canary-cd-playbook (promotion and canary examples)
+
+If you are implementing the Terraform module or integrating pipelines, reach out to image-delivery squad (image-delivery@redwood.dev) for onboarding and access to test accounts.

@@ -1,0 +1,181 @@
+Dispatch Telemetry Schema and Fallback Playbook
+
+Summary
+-------
+This document defines the canonical telemetry schema emitted at the dispatch layer, describes the signal->decision mapping used by the runtime to enact fallbacks, and provides an operational playbook for on-call and engineering teams to diagnose and remediate dispatch-induced degradations. The intent is to ensure consistent instrumentation, make fallback triggers auditable, and provide a reproducible validation and benchmarking process prior to rollout.
+
+Scope
+-----
+Applies to: dispatch-svc (request router), kernel-orchestrator, runtime-admission-controller, and the observability pipelines that consume their telemetry.
+Excludes: user-facing application logs, customer prompts, and post-hoc analysis performed by product analytics.
+
+Why this matters
+-----------------
+- Dispatch is the first decision point that affects latency, model fidelity, and per-token cost.
+- Inconsistent telemetry or opaque fallback decisions have caused missed SLAs and customer surprises in previous incidents.
+- This playbook standardizes signals so automated escalation and incident playbooks can be deterministic.
+
+Telemetry Schema (dispatch layer)
+--------------------------------
+Emit these fields on every request event (JSON schema example):
+
+Example event (flattened JSON):
+{
+  "timestamp": "2026-02-03T14:11:22Z",
+  "req_id": "req_6a2f9b",
+  "tenant_id": "team-alpha",
+  "route": "/v1/generate",
+  "model_variant": "rw-13b-quant-a",
+  "dispatch_decision": "scheduled",  // scheduled | fallback | queued | rejected
+  "kernel_id": "k-03",
+  "kernel_queue_time_ms": 12.4,
+  "kernel_exec_time_ms": 78.2,
+  "end_to_end_latency_ms": 142.8,
+  "token_count": 64,
+  "cost_estimate_units": 0.024,
+  "priority": "standard",
+  "cohort": "mixed-burst",
+  "prefetch_hit": false,
+  "kv_cache_hit_rate": 0.0,
+  "fallback_reason": "kernel-unavailable", // optional string when dispatch_decision == fallback
+  "decision_trace": ["slot-claim","kernel-hedge"],
+  "sampling_score": 0.63
+}
+
+Signal catalog and semantic definitions
+--------------------------------------
+- dispatch_decision: high-level outcome of routing. Values and semantics in table below.
+- kernel_queue_time_ms: time spent waiting in kernel dispatch queue (critical for tail latency).
+- kernel_exec_time_ms: wall time of in-kernel execution. Excludes queue time
+- end_to_end_latency_ms: total time from HTTP ingress to response commit
+- prefetch_hit: whether a prefetcher predicted and warmed the KV cache for this session
+- decision_trace: ordered list of decision checkpoints (useful for replay and audit)
+
+Alerting thresholds and SLO mappings
+-----------------------------------
+We maintain per-tenant and global SLOs. The dispatch layer maps signal anomalies to alerts and automated fallbacks. Use the following baseline thresholds (table):
+
+| Metric | Warning threshold | Critical threshold | Action | Owner |
+|---|---:|---:|---|---|
+| p95 end_to_end_latency_ms (global) | 120 ms | 180 ms | Trigger latency-alert, cascade to autoscaler and runtime fallback policy | eng-sre |
+| kernel_queue_time_ms (p99) | 50 ms | 150 ms | Increase priority for pinned kernels; enable hedging; if persists >5m -> fallback to compressed variant | runtime |
+| dispatch_decision == rejected (rate) | 0.5% | 2% | Backpressure review; open incident if sustained >1m | eng-sre |
+| fallback_rate (tenant, 1m) | 1% | 5% | Page product on degrading quality, run triage | runtime/product |
+| kv_cache_hit_rate (cohort) | - | <10% sustained | Trigger KV cache warmup re-eval; run prefetcher audit | runtime |
+
+Decision categories and recommended policies
+-------------------------------------------
+1) scheduled: proceed with selected kernel/model variant.
+2) queued: admitted but awaiting slot. If queue exceeds 250ms (p95), enable short hedging to an opportunistic kernel.
+3) fallback: routed to lower-cost or lower-fidelity variant to preserve latency SLO. Record fallback_reason.
+4) rejected: admission controller refused due to quota or emergency backpressure. Return 429 with debug code.
+
+Fallback decision matrix (example)
+--------------------------------
+If a decision point detects an anomaly, use tenant tier and request priority to calculate allowed fallback strategies.
+
+- High priority (enterprise SLA): prefer region fallback before fidelity fallback.
+- Standard: prefer fidelity fallback (quantized or distilled variant) before cross-region.
+- Low: allow admission rejection if autoscaler capacity unavailable.
+
+Matrix (simplified):
+
+| Trigger | Enterprise | Standard | Low |
+|---|---:|---:|---:|
+| kernel-unavailable | cross-region swap -> scheduled | model-quantized fallback -> scheduled | reject |
+| kernel-thermal-throttle | migrate to warm node -> scheduled | model-quantized fallback -> scheduled | fallback -> reject if persists |
+| sustained-high-queue | burst-scale slots + hedging | fidelity fallback + hedging | queue or reject |
+
+Operational playbook (step-by-step)
+-----------------------------------
+The following steps assume an alert was raised for p99 kernel_queue_time_ms above critical for multiple kernels.
+
+1) Triage (first 5 minutes)
+  a) On-call reviews the alert, pulls the live dispatch dashboard (Dash: Dispatch/Kernel Queues).
+  b) Check correlation between queue spike and recent deployments (check /releases and kernel-rollout feed).
+  c) Inspect decision_trace sample stream for pattern (e.g., repeated "slot-claim-timeout").
+2) Immediate mitigations (5--20 minutes)
+  a) If spike is caused by a specific kernel_id and thermal/host issues: mark kernel node as drain-candidate and migrate sessions (CLI snippet below).
+  b) Increase short-lived hedging for affected routes: set hedging multiplier to 2 for 10 minutes.
+  c) Enable fidelity fallback for standard tenants: config change in runtime-admission-controller config map.
+3) Root cause and resolution (>20 minutes)
+  a) Capture representative traces (use sampling_score >0.5) and upload to incident artifact store.
+  b) Run targeted microbenchmarks against kernel_id with synthetic corpus.
+  c) If code regression suspected, roll back kernel/driver rollout per the kernel rollback playbook.
+4) Post-incident
+  a) Update incident report with timeline, decision_trace snippets, and corrective config changes.
+  b) Propose adjustments to thresholds and fallback rules if behavior was expected under new traffic patterns.
+
+Commands and examples
+---------------------
+Drain a kernel node (cli):
+
+$ ri-runtimectl kernel drain --kernel-id k-03 --reason "thermal-throttle" --deadline 300s
+
+Increase hedging for route (api):
+
+POST /admin/runtime/hedging
+Content-Type: application/json
+{
+  "route": "/v1/generate",
+  "multiplier": 2,
+  "duration_s": 600
+}
+
+Patch admission controller to enable quantized fallback (kubectl patch example):
+
+kubectl -n runtime patch configmap admission-config --patch '{"data":{"enable_quantized_fallback":"true"}}'
+
+Benchmarks and validation before rollout
+---------------------------------------
+Before changing any dispatch decision logic or adding a new fallback path:
+- Run the dispatch synthetic workload harness (see runbook: dispatch-synthetic-harness).
+- Execute a fidelity-vs-latency sweep: quantify quality delta (BLEU/ROUGE/LLM-eval metric) vs latency improvements for the candidate fallback.
+- Validate end-to-end SLOs using the mixed-workload-slo-simulation suite with the same traffic signatures produced by our production traffic mirror.
+
+Validation checklist (must pass all):
+1) No more than 0.5% increase in error rate for enterprise tenants.
+2) p95 latency improvement >= 10% in overloaded scenarios.
+3) Rollback path tested in staging and rehearsal performed with chaos injection.
+
+Observability and auditing
+-------------------------
+- Decision_trace must be retained for 30 days for all requests sampled with sampling_score > 0.5; store in compressed parquet in observability cluster.
+- Fallbacks must emit a structured event (fallback_event) with metadata: {req_id, tenant_id, original_variant, fallback_variant, reason, latency_before, latency_after}.
+- Maintain a daily fallback-rate report by tenant and route (automated job).
+
+Ownership and contact list
+--------------------------
+- Dispatch service: runtime-dispatch@redwoodinternal (owner: Marcus Chen)
+- Runtime admission controller: runtime-admission@redwoodinternal (owner: Priya Rao)
+- Eng SRE on-call: see oncall roster
+
+Rollout checklist (pre-deploy)
+------------------------------
+- [ ] Schema validated by telemetry team and CI schema checks pass.
+- [ ] Synthetic harness pass at 10% and 100% load profiles.
+- [ ] Canary rollout to 1% traffic for 4 hours with live metrics.
+- [ ] Audit log retention and decision_trace retention configured.
+- [ ] Runbook links and owner tags added to release notes.
+
+Diagnostics tips and common failure modes
+----------------------------------------
+- Symptom: many fallbacks recorded with fallback_reason == "kernel-unavailable" but kernel hosts show healthy metrics.
+  - Likely cause: admission-controller slot accounting mismatch. Check slot-claim timeout in decision_trace.
+- Symptom: p95 latency improves after fallback but product quality complaints spike.
+  - Action: revert fidelity fallback for affected tenant cohort and open product escalation.
+
+Appendix: Lightweight schema registry (how to evolve)
+---------------------------------------------------
+1) Add new fields as optional and increment telemetry schema minor version.
+2) Update CI schema-lint job to validate new fields against the registry.
+3) Consumers must declare compatibility: any consumer that depends on a field must list it in the registry.
+4) Deprecation policy: mark field deprecated for 60 days before removal; provide a migration adapter.
+
+References
+----------
+- Execution contracts and stable fallbacks (see related pages)
+- Kernel rollout and rollback playbook (kernel-and-scheduling)
+- Mixed-workload SLO simulation suite (benchmarking-and-perf-suite)
+
+If you find gaps or ambiguous signal semantics, open a PR against this page and ping the reviewers listed above.

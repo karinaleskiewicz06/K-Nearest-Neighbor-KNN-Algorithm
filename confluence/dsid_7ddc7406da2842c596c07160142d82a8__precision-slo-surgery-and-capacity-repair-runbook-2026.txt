@@ -1,0 +1,145 @@
+Precision SLO Surgery and Capacity Repair Runbook
+
+Overview
+This runbook defines a surgical approach to triage, repair, and postmortem when a targeted SLO (latency or availability) is breached for Redwood inference services. It is intended for on-call SREs and service owners running model-serving lanes (inference-proxy, model-runtime, kv-cache, batcher). The emphasis is on minimal customer impact, reproducible forensics, and capacity healing without broad blunt throttles.
+
+When to use this runbook
+- Any single-service SLO violation that is not resolved by first-response playbook (e.g., 99th latency > SLO for 10m).
+- Non-binary degradations where selective capacity surgery (eviction, soft-preempt, drain) can restore headroom.
+- When error budget depletion threatens customer-affecting rollbacks or credits.
+
+Goals
+- Stabilize the metric within the containment window (usually 15–30 minutes).
+- Preserve up to 80% of remaining error budget where possible.
+- Produce forensic artifacts for post-incident analysis.
+- Automate repeatable mitigation steps where safe.
+
+Key definitions and thresholds
+- Primary SLOs: request_latency_p99 <= 800ms (inference-proxy) and success_rate >= 99.95% (per-tenant).
+- Containment window: 15 minutes (start mitigation) and 60 minutes (stabilize or escalate).
+- Critical error budget thresholds: 50% (notify on-call lead), 25% (start tiered-mitigation), 0% (escalate to incident commander).
+
+Preflight checks (first 5 minutes) — gather evidence
+1) Identify scope
+   - Is the SLO breach global, regional, or tenant-scoped? Check dashboard filters and the SLO-portrait view.
+2) Snapshot metrics (instrumentation queries we use)
+   - PromQL: sum(rate(http_request_duration_seconds_bucket{job="inference-proxy"}[1m])) by (le) -> compute p99
+   - PromQL: increase(http_requests_total{status!~"5.."}[5m]) / increase(http_requests_total[5m]) -> success rate
+3) Check upstream model-runtime health
+   - kubectl get pods -n serving -l service=model-runtime -o wide
+   - Check OOMKill / restartCount in last 15m.
+4) Examine queue/backpressure signals
+   - Redis/KV queue length (batcher_work_queue_len), batcher latency p95.
+5) Error budget ledger
+   - Query ledger: /internal/slo-ledger?service=inference-proxy -> remaining_minutes, burn_rate
+6) Collect traces and representative token-level logs
+   - Trace sampling: ensure at least 50 traces captured across fast and slow requests (use trace sampler quick-run).
+
+Immediate containment (0–15 minutes) — low-risk actions first
+- Announce on-call channel with current facts: scope, p99 delta, remaining error budget. Use the incident template short summary.
+- Route short-lived bursts: apply traffic-shepherd quick cap
+  - CLI: curl -X POST https://telemetry/control/traffic-shaper -d '{"service":"inference-proxy","policy":"cap-per-tenant","value":0.2}'
+- Increase batcher concurrency with caution (only if batcher backlog is low):
+  - kubectl patch deployment batcher -n serving -p '{"spec":{"template":{"spec":{"containers":[{"name":"batcher","env":[{"name":"BATCH_CONCURRENCY","value":"8"}]}]}}}}'
+- Toggle KV cache warm-pool to readonly to avoid rebuild storms:
+  - /ops/cachectl set-mode kv-cache readonly --reason "SLO containment"
+
+Surgical capacity repair (15–45 minutes) — targeted, reversible operations
+Follow the checklist in order. If any step resolves the SLO, stop and record actions exactly in the incident timeline.
+
+1) Tenant isolation (if tenant-scoped)
+   - Identify top 10 tenants by current QPS and token consumption (billing/telemetry).
+   - Apply per-tenant soft-limit: traffic-steering policy that queues new requests into degraded fast-path for non-critical tenants. Example policy: degrade_response_for_tier("non-paying", 50ms trim)
+   - Verify impact on p99 and success_rate.
+
+2) Model-variant fallback (if model-runtime memory pressure present)
+   - Promote compatible lower-memory variant (v2-quant) for affected model:
+     - API: POST /runtime/variants/promote {"model":"gpt-lite","to_variant":"gpt-lite-q4_0"} --dry-run=false
+   - Ensure KV cache migration window < 10 minutes; monitor cache hit ratio.
+
+3) Soft-preempt non-critical background jobs
+   - Suspend batch replays, offline evals, and large embedding jobs:
+     - airflow pause_dag offline-embedding-daily
+     - /jobsctl suspend --tag=background-embedding
+
+4) Surgical node eviction (prefer soft-drain)
+   - Use node labels to pick nodes with the smallest tenancy impact. Run node-drain with preemption=false to soft-evict only idle model replicas.
+   - kubectl drain <node> --ignore-daemonsets --delete-local-data --grace-period=60 --timeout=5m --force=false
+   - Monitor pod distribution and p99 in real time.
+
+5) Controlled autoscaling and pre-warm
+   - If headroom insufficient and capacity provider available: increase dedicated pool by incremental step (20%) with pre-warm: call capacity API: POST /capacity/adjust {"pool":"dedicated-gpu-1","delta_pct":20,"prewarm":true}
+   - If pre-warm not possible, fall back to routing to compatible region with warm caches.
+
+Monitoring during repair (continuous)
+- Maintain a rolling 1-minute dashboard with these charts:
+  - p99 latency (per service, per region, per tenant top 5)
+  - request success_rate (5m window)
+  - model-runtime restart rate and memory RSS (per-node)
+  - batcher backlog and average batch size
+  - kv-cache hit ratio and eviction rate
+  - error budget burn_rate and projected exhaustion time
+- Post any configuration change, watch the metric for 3x the service p95 period before making another change (to avoid flip-flopping).
+
+Escalation criteria (when to move to incident mode)
+- Containment actions have not reduced p99 by >=25% within 30 minutes.
+- Error budget projected to hit 0% within 60 minutes.
+- Multiple services show correlated degradations (proxy + runtime + kv-cache).
+
+Incident mode (IC playbook summary)
+If escalation criteria met, call the incident commander and follow the full incident response playbook. Briefly:
+1) Declare incident and capture timeline checkpoints.
+2) Freeze non-essential changes (including non-critical deploys).
+3) Open an incident doc and capture all actions and artifacts.
+4) Coordinate customer communications (CS lead).
+
+Forensics artifacts to collect (mandatory)
+- SLO metric snapshot CSV (1m granularity covering last 2 hours).
+- Top 100 slow traces (trace IDs + flame graphs).
+- Pod lifecycle events (kubectl describe for restarted pods) and node syslogs (last 2 hours).
+- Batch queue snapshots (JSON) and batcher config at time-of-incident (env/cmdline).
+- Error budget ledger entry and burn-rate projection chart image.
+- Any traffic-shaper / policy changes (audit log).
+
+Post-incident: repair verification and retrospective
+1) Repair verification checklist (to mark incident closed):
+   - p99 and success_rate stable for at least 3x the SLO window (typically 180 minutes).
+   - All suspended background jobs resumed gradually with a ramp policy.
+   - Autoscales reversed to nominal guardrails.
+   - Artifacts uploaded to incident evidence bucket and linked in incident doc.
+2) Root cause analysis scope decisions:
+   - Was this capacity shortage (need more headroom) or a policy/regression causing uneven load?
+   - If capacity, estimate additional reserved headroom required and present to capacity planning.
+3) Follow-ups and owner assignments (example):
+   - Increase model-runtime memory headroom: owner @riley-chen, due 2026-03-01
+   - Implement early-detection synthetic canary for kv-cache eviction storms: owner @daniel-kim, due 2026-03-15
+
+Automation guidance and safe-guards
+- All automation that touches production capacity must require a two-step confirmation for on-call (tokenized allow-list): stage 1 = propose, stage 2 = approve.
+- Add unit tests for autoscaler change-proposals that validate latency simulations on synthetic workload (use capacity-sim harness).
+
+Runbook maintenance and ownership
+- Primary owner: eng-sre (team: capacity-ops). Secondary owner: eng-serving-runtime.
+- Review cadence: quarterly or after any SLO breach > 12h.
+- How to update: create PR against this Confluence page, list reviewers, and publish after two approvals.
+
+Appendices
+A) Quick PromQL snippets
+- p99 (approx): histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{job="inference-proxy"}[2m])) by (le))
+- Error budget burn: (1 - success_rate) / allowed_error_rate -> burn_rate
+
+B) Emergency CLI snippets (copyable)
+- Suspend background jobs: /jobsctl suspend --tag=background-embedding --reason="SLO containment"
+- Promote model variant: curl -X POST https://runtime-api/promote -d '{"model":"gpt-lite","variant":"gpt-lite-q4_0"}'
+- Example traffic-shaper rollback: curl -X DELETE https://telemetry/control/traffic-shaper?service=inference-proxy&policy=cap-per-tenant
+
+C) Contact matrix
+- On-call SRE: rotation in PagerDuty (see schedule)
+- Capacity lead: Riley Chen (riley.chen@redwood.ai)
+- Runtime lead: Daniel Kim (dan.kim@redwood.ai)
+- CS comms: Maria Gonzalez (m.gonzalez@redwood.ai)
+
+Document history
+- 2025-11-04: Created by Asha Patel (initial draft).
+- 2026-01-10: Added model-variant fallback and cache migration guidance (reviewers: Daniel Kim).
+- 2026-02-12: Formalized escalation criteria and forensics artifact list; published.

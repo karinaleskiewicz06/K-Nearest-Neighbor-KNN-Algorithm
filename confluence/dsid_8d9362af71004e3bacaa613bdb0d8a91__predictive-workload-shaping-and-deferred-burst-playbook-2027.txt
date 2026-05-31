@@ -1,0 +1,224 @@
+predictive-workload-shaping-and-deferred-burst-playbook
+
+Overview
+========
+
+This playbook describes Redwood's approach for predictive workload shaping and deferred-burst handling for private deployments (VPC and on-prem). It defines policy primitives, telemetry signals, operator runbooks, rollout validation, and templates for implementing request shaping that preserves tenant SLAs while reducing peak capacity costs and improving stability.
+
+Goals
+-----
+
+- Smooth peak utilization without introducing large latency regressions.
+- Allow safe, observable deferred-burst behavior for non-critical workloads.
+- Provide operator-safe rollouts and rapid rollback paths.
+- Ensure per-tenant fairness and predictable billing alignment.
+
+Audience
+--------
+
+This document is for SREs, runtime engineers, field operators, and customer success engineers who operate private deployments. Product managers and solutions engineers may use the policy templates when scoping tenant contracts.
+
+Key concepts and definitions
+---------------------------
+
+- Predictive shaping: Using forecasted telemetry (short-term forecast window, 1–10 minutes) to proactively reduce or redistribute request admission.
+- Deferred burst: Temporary deferral of low-priority requests with a retry window, backed by guaranteed minimum throughput for critical tenants.
+- Elastic credits: Per-tenant burst budget that accrues during low usage and can be consumed during spikes.
+- Shaping tiers: latency-sensitive (tier A), best-effort (tier B), background (tier C).
+
+Constraints and requirements
+---------------------------
+
+- Hard SLOs must be honored for tier A (p50 <= 50ms, p95 <= 250ms) unless an operator-approved incident state is declared.
+- Deferred bursts allowed only for tier B and C. Tenant billing/contract must reflect allowed deferral (see Customer Onboarding contract clause 3.2).
+- Must work in both single-region private deployments and multi-zone VPC control-plane topologies.
+
+Telemetry signals used
+--------------------
+
+Telemetry sources and the primary signals the policy consumes:
+
+- Serving runtime metrics: inflight_requests, tokens_per_second, kv_cache_hit_rate, avg_request_latency
+- GPU level: gpu_utilization_pct, elf_queue_depth, thermal_throttle_flag
+- Node level: cpu_load_1m, mem_free_mb, disk_iops
+- Network: egress_qps, packet_drop_rate
+- Billing/usage: per-tenant token_count_5m, burst_credit_balance
+
+Architecture and dataflow
+------------------------
+
+1. Ingress gate: lightweight admission filter attached to the mesh edge. It evaluates policy and either admits, defers (HTTP 202 with Retry-After), or rejects (HTTP 429) requests.
+2. Predictive agent: short-lived service that pulls the last 2–10 minutes of telemetry, runs an ARIMA-like forecast and exposes a score (0–1) representing imminent overload risk. Runs every 10s.
+3. Shaper: centralized controller (leader election) that converts scores into per-tenant shaping directives and publishes to a config store consumed by ingress gates.
+4. Metrics sink: Prometheus + long-term TSDB for retrospective analysis and elastic credit accounting.
+
+Policy primitives (YAML example)
+-------------------------------
+
+The following YAML is a canonical shaper policy used by the shaper controller. Operators can edit policy files and trigger a staged rollout.
+
+policy_version: v1
+shaper: predictive-deferred-burst
+forecast_window_seconds: 120
+action_thresholds:
+  warning: 0.4  # risk score where operators are notified
+  shape: 0.6    # risk score where shaping begins
+  emergency: 0.85 # immediate emergency fallback
+tenants_default_tier: B
+tiers:
+  A:
+    min_alloc_qps: 10
+    max_latency_ms: 250
+    allow_defer: false
+  B:
+    min_alloc_qps: 2
+    allow_defer: true
+    defer_retry_after_s: 15
+  C:
+    min_alloc_qps: 0
+    allow_defer: true
+    defer_retry_after_s: 60
+elastic_credits:
+  accrual_rate_per_minute: 1  # credits earned per minute when underutilized
+  max_credits: 60
+fallbacks:
+  - fallback_model: small-quantized-v2
+    max_tokens: 256
+
+Admission gate HTTP samples
+---------------------------
+
+- Admit: 200 + response normal.
+- Deferred: 202 + Retry-After header (seconds). Response body must include a short code and a structured reason: {\"defer_code\":\"deferred_burst\", \"retry_after\": 15}.
+- Reject: 429 + {\"error\":\"quota_exceeded\"}.
+
+Implementation and operator runbook
+----------------------------------
+
+1. Deploy predictive agent as a Deployment with replicaCount=3 and a PodDisruptionBudget minAvailable=2.
+2. Configure RBAC so shaper controller can write to the config store (etcd/consul) and read metrics from Prometheus remote read.
+3. Apply initial policy in dry-run mode: shaper publishes directives with dryRun: true for 10 minutes. Observe effects and metrics.
+4. Enable active shaping for a single low-risk tenant group (canary) for 30 minutes. Monitor latency and retry rates.
+5. Gradually expand to 25%, 50%, then 100% of tenants configured as eligible for deferred burst.
+6. Maintain a human-in-loop escalation channel during expansion (oncall + SRE principal).
+
+Operator commands and checks
+---------------------------
+
+- Check predictive agent health: kubectl -n runtime get pods -l app=predictive-agent
+- Fetch current shaper directives: curl -sS http://shaper.internal/config | jq
+- Simulate forecast: kubectl exec -it deploy/predictive-agent -- /bin/sh -c 'forecast-sim --ramp 2m --qps 500'
+- Query elastic credits for tenant T123: prometheus query: tenant_burst_credit_balance{tenant=\"T123\"}
+
+Monitoring, alerts and SLOs
+--------------------------
+
+Primary alerting rules (severity and actions):
+
+1) Predictive risk warning
+- Expr: predictive_risk_score_avg > 0.4 for 2m
+- Severity: P3
+- Action: notify #sre-shaping and attach recent 10m spans
+
+2) Shaper enforcement increase
+- Expr: deferred_request_rate_total_increase > 50% over 5m
+- Severity: P2
+- Action: escalate to oncall and pause policy rollout if not expected
+
+3) Tier A latency breach
+- Expr: histogram_quantile(0.95, rate(request_latency_bucket{tier=\"A\"}[5m])) > 350
+- Severity: P1
+- Action: immediately revert to safe-mode (disable shaping for all tiers except C) and page SRE lead
+
+SLOs and objectives
+- Target: no more than 1% of tier A requests experience latency > 350ms due to shaping per week.
+- Target: deferred retry success rate >= 80% for tier B within retry window.
+
+Testing and validation plan
+---------------------------
+
+- Synthetic traffic scenarios: 10x baseline qps spikes, gradual ramp to 50% of sustained peak, and bursty 1 minute spikes.
+- Chaos validation: kill 1/3 predictive-agent replicas to ensure leader election and graceful degradation.
+- Regression harness: nightly job runs canary trials against a sanitized tenant set and archives results to s3://redwood-shaper-test-results/
+
+Rollout and rollback procedures
+------------------------------
+
+Staged rollout checklist:
+1. Dry-run policy for 10 minutes. Confirm no deferred responses.
+2. Canary: enable for named canary tenants (max 5) for 30 minutes.
+3. Progressive expansion: 25% -> 50% -> 100% over at least 4 hours with monitoring gates.
+4. Operator sign-off at each gate.
+
+Rollback steps (fast):
+- kubectl -n runtime apply -f safe-mode-policy.yaml  # disables shaping for tiers A/B
+- Scale predictive-agent to 0: kubectl scale deployment/predictive-agent --replicas=0 -n runtime  # triggers fallback to static thresholds
+- Notify customers via support templates (see Customer communications section).
+
+Customer communications template (support use)
+---------------------------------------------
+
+Subject: Brief delay window during short-term capacity shaping
+
+Hi <Customer Name>,
+
+We wanted to let you know we implemented a short-term capacity shaping window to maintain stability in your private deployment. During this window, lower-priority requests may be deferred up to <retry_after>s and will be retried automatically. Critical (latency-sensitive) requests are not affected. If you want to opt-out or adjust your tenant priority, please reply and we will schedule a configuration change.
+
+Operator playbook: incident flows
+--------------------------------
+
+Scenario A: Unexpected latency for tier A
+1. Pager received (P1).
+2. Immediate action: flip safe-mode policy (kubectl apply safe-mode-policy.yaml).
+3. Confirm tier A latency returns to baseline in 2 minutes. If not, start rollback and open an incident.
+4. Post-incident: run retrospective and adjust forecasting thresholds.
+
+Scenario B: Large deferred queue growth for tier B
+1. Investigate deferred queue length: deferred_queue_length{tenant=\"X\"}
+2. If retry success < 60% after 30m, increase min_alloc_qps for tenant or temporarily grant 10 elastic credits.
+3. Notify customer success and document root cause.
+
+Operational metrics to record for RCA
+------------------------------------
+
+- Forecast horizon accuracy (MAE) at 10s, 30s, 120s
+- Deferred request ratio by tenant and class
+- Retry success within retry window
+- Impact on p50/p95 latency for each tier
+
+Ownership and contacts
+----------------------
+
+- Shaper controller: runtime-shaper-team@redwood.com (owner: Maya Chen)
+- Predictive agent: infra-ml@redwood.com (owner: Omar Patel)
+- Oncall escalation: #sre-shaping (PagerDuty: role-sre-shaper)
+
+References and related pages
+---------------------------
+
+- Tenant burst forecast and guardrails playbook (internal)
+- Private deploy observability, capacity, and spot recovery guide
+- Customer onboarding deployment readiness and risk checklist
+
+Appendix: safe-mode policy YAML
+-------------------------------
+
+safe_mode_policy.yaml content: 
+policy_version: v1
+shaper: safe-mode
+force_disable_shaping_for_tiers: [A, B]
+emergency_fallback: true
+
+Appendix: sample Prometheus queries
+----------------------------------
+
+- Deferred rate per tenant (5m): rate(requests_deferred_total{tenant=\"T123\"}[5m])
+- Elastic credits: tenant_burst_credit_balance{tenant=\"T123\"}
+- Predictive risk score: predictive_risk_score{host=\"shaper-1\"}
+
+Document change log
+-------------------
+
+- 2027-03-15: Created by Maya Chen.
+- 2027-04-01: Expanded monitoring rules and added rollback commands (Omar Patel).
+

@@ -1,0 +1,176 @@
+ADR-0142: Tier-aware SLI tagging at ingress (Hosted vs Dedicated)
+
+## Status
+Published (effective for SLO reporting + error budget enforcement starting Q1 2026 rollout).
+
+## Context / Problem
+Redwood is formalizing tiered SLOs and error budgets for **Hosted (shared)** vs **Dedicated (reserved capacity)**. We must be able to compute SLIs (success rate, latency percentiles, streaming reliability) with correct tier attribution across:
+- API Gateway handling (auth, rate limits, request normalization)
+- Smart Routing (policy evaluation, fallback, retries)
+- Model serving request path (batching, execution)
+- Observability pipelines (metrics, logs, traces)
+
+We have recurring reliability escalations tied to burst traffic where:
+- Requests may be **retried** or **routed to fallback capacity**.
+- Failures can occur at multiple layers (gateway, routing, serving, stream transport).
+- Dedicated customers need **account-level visibility**, while Hosted must avoid **metric cardinality explosions**.
+
+Prior to this ADR, tier attribution was inconsistent:
+- Some metrics inferred tier from where the request was executed (e.g., which GPU pool), which breaks when fallback occurs.
+- Some services did not propagate tier context, causing “unknown” attribution and gaps in SLO accounting.
+
+**Requirement:** Tier attribution must reflect the customer’s contracted service tier (Hosted vs Dedicated), not the execution path chosen at runtime, and must be preserved end-to-end so that SLO/error budget calculations are correct and explainable.
+
+## Decision
+We will **attach a tier-aware SLI tag set at ingress (API Gateway)** and **propagate it through routing, retries, fallback, and serving** via request context, trace attributes, and metric labels.
+
+Specifically:
+1) The **API Gateway (edge-gw)** is the source of truth for tier classification. It sets tier tags immediately after authentication and before request dispatch.
+2) The tier tags are treated as **immutable** for the lifetime of the request (including internal retries). Downstream systems may add analysis tags (e.g., where it executed) but **must not overwrite the ingress tier**.
+3) SLI metrics used for SLO/error budgets will be computed primarily from gateway + routing boundary metrics, with tier tags included as first-class dimensions.
+
+## Tier tag set (canonical)
+### Required tags (present on all in-scope request metrics)
+- `slo_tier`: one of `hosted` | `dedicated` | `unknown`
+  - Meaning: tier to be used for SLO/error budget accounting.
+- `endpoint_class`: one of `chat` | `completions` | `embeddings` | `rerank` | `other`
+  - Meaning: stable grouping used for SLO targets and dashboards.
+- `region`: standard Redwood region identifier (e.g., `us-east`, `us-west`, `eu-west`).
+- `streaming`: `true` | `false`
+
+### Optional tags (allowed, with constraints)
+- `dedicated_account_id`: stable internal account identifier (string).
+  - **Only emitted for `slo_tier=dedicated`** and only on an allowlisted metric set used by Dedicated SLO dashboards.
+  - Must not be emitted for Hosted to avoid cardinality blowups.
+- `execution_tier`: `dedicated_pool` | `hosted_pool` | `fallback_pool` | `unknown`
+  - Meaning: where the request actually executed. Used for analysis and mitigation; **not used** for SLO accounting.
+- `fallback_reason`: small controlled vocabulary (e.g., `capacity`, `health`, `policy`, `region_failover`).
+  - Must be rate-limited and taxonomy-controlled.
+
+### Explicit non-goals / forbidden in high-volume metrics
+- No per-model, per-customer, per-api-key dimensions on gateway request counters/histograms (except the Dedicated allowlist noted above).
+- No raw customer names/slugs in metric labels.
+
+## Propagation rules
+### Ingress tagging (edge-gw)
+- edge-gw resolves tier using the authenticated principal (API key / token) via Control Plane metadata.
+- edge-gw attaches tier tags to:
+  - internal request context (headers or metadata, service-to-service)
+  - trace context (OTel attributes / baggage)
+  - gateway metrics (Prometheus labels / OTLP metric attributes)
+
+### Routing and fallback
+- Routing **must preserve `slo_tier`** from the ingress context.
+- If routing chooses fallback execution (e.g., Dedicated spilling to a compatible pool), it adds `execution_tier` and `fallback_reason` but does not change `slo_tier`.
+- If tier is missing or `unknown`, routing does not attempt to infer tier from pool selection for SLO purposes.
+
+### Retries
+- Internal retries (gateway or routing) keep the same `slo_tier`.
+- SLI accounting rules for retries are handled in the SLI specification (e.g., whether we count request-level vs attempt-level failures), but tier tags must be consistent across attempts.
+
+### Streaming
+- For streaming requests, `slo_tier` must be present on:
+  - stream-open events
+  - stream-close events
+  - disconnect/error events
+- Disconnection events must preserve the original tier even if subsequent fallback is attempted (e.g., reconnect behavior).
+
+## Options considered
+### Option A (Chosen): Tag at ingress and propagate
+Pros:
+- Single source of truth for tier attribution.
+- Correct under fallback, retries, and multi-hop execution.
+- Matches customer expectation: tier is a contract/property of the customer, not of a GPU pool.
+Cons:
+- Requires coordinated plumbing across gateway, routing, telemetry, and dashboards.
+
+### Option B: Infer tier from execution pool
+Pros:
+- Simplifies tagging for serving/runtime.
+Cons:
+- Incorrect when Dedicated falls back to shared capacity.
+- Breaks SLO accounting and customer reporting; leads to under/over-counting dedicated impact.
+
+### Option C: Determine tier in routing (not gateway)
+Pros:
+- Routing already has policy context.
+Cons:
+- Gateway-level failures (auth proxying, overload shedding, request parsing, upstream 5xx) would be un-attributed.
+- Adds complexity during partial outages when routing metadata is unavailable.
+
+## Rationale
+Tiered SLOs and error budgets require:
+- **Correct attribution** even when the system behaves dynamically (fallback, retries, shifting regions).
+- **Consistency** across metrics, traces, and logs.
+- **Controlled cardinality** to keep observability cost and reliability manageable.
+
+Ingress (edge-gw) is the only location that:
+- Always sees the request for in-scope endpoints.
+- Has stable access to identity metadata (API key → account → tier).
+- Can tag before any failure modes in routing/serving occur.
+
+## Implementation details
+### Source of tier truth
+- Control Plane will expose a simple mapping for authenticated principals:
+  - `principal_id` → `account_id`, `deployment_mode`, `slo_tier`
+- Canonical mapping:
+  - Hosted API keys → `slo_tier=hosted`
+  - Dedicated API keys (or Dedicated sub-accounts) → `slo_tier=dedicated`
+  - Any unrecognized/malformed/legacy principals → `slo_tier=unknown`
+
+### Data model notes
+- `deployment_mode` may exist internally (e.g., hosted_shared, dedicated_reserved, private_vpc), but SLO scope for this program is `hosted` and `dedicated`. `private` is out of enforcement scope and will map to `unknown` or a future value once included.
+
+### Telemetry constraints (cardinality)
+- Gateway request metrics will include only low-cardinality dimensions by default.
+- Dedicated per-account SLO dashboards require `dedicated_account_id` on a narrow set of metrics (request totals, error totals, latency histograms) and only when `slo_tier=dedicated`.
+- Hosted will not include any customer identifiers in metrics; customer-level troubleshooting relies on logs/traces and sampled analytics.
+
+### Validation and rollout
+- SLO toolkit validation will require that all in-scope services emit `slo_tier` on the canonical metric series.
+- Rollout is phased:
+  1. Warn-only: `unknown` tier is tracked and surfaced on dashboards; no enforcement.
+  2. Soft gating: missing tier tags block new SLO configs for affected endpoint/region.
+  3. Hard requirement: SLO/error budget reporting excludes `unknown` traffic from tier-specific dashboards and flags as a data-quality incident when above threshold.
+
+### Data-quality SLO for tagging
+We will track:
+- `% requests with slo_tier != unknown` by endpoint_class/region.
+Target:
+- Dedicated: >= 99.99% correctly tagged
+- Hosted: >= 99.9% correctly tagged
+
+## Consequences
+### Positive
+- Accurate and explainable tier-specific SLO/error budget accounting.
+- Enables Dedicated customer reporting without polluting Hosted metrics.
+- Improves incident triage: responders can immediately see if an event is tier-scoped.
+
+### Negative / trade-offs
+- Requires careful coordination to ensure tags survive all hops (gateway → routing → serving → telemetry).
+- Dedicated per-account metrics introduce bounded cardinality; must be actively managed (allowlist, relabeling, and periodic audits).
+
+## Security / Privacy considerations
+- `dedicated_account_id` is an internal identifier and must not expose customer names.
+- Any customer-identifying tags must not be emitted on public/shared dashboards.
+- Access to Dedicated account dashboards is controlled via RBAC (Console + Grafana).
+
+## Open questions
+- Private tier tagging strategy once Private is included in enforcement (future ADR).
+- Exact treatment of multi-account keys and sub-tenant rollups for Dedicated customers with multiple environments.
+
+## Action items
+- Implement ingress tier tagging and propagation (edge-gw, routing context, OTel trace propagation). (Owner: Amara Diallo / Mina Haddad)
+- Update dashboards and recording rules to require `slo_tier`. (Owner: Sergio Costa)
+- Add SLO toolkit validation for metric coverage and missing tier tags. (Owner: Logan Wright)
+- Document SLI formulas and exclusions with tier semantics, including fallback accounting. (Owner: Aisha Bello)
+
+## Appendix: Controlled vocabularies
+- `slo_tier`: `hosted`, `dedicated`, `unknown`
+- `execution_tier`: `dedicated_pool`, `hosted_pool`, `fallback_pool`, `unknown`
+- `fallback_reason` (initial): `capacity`, `health`, `policy`, `region_failover`
+
+---
+Changelog:
+- 2026-02-06: Clarified dedicated per-account metric allowlist and introduced `execution_tier` as analysis-only.
+- 2026-02-02: Added data-quality targets for `% tagged` coverage and phased rollout notes.

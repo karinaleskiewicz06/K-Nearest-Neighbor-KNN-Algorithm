@@ -1,0 +1,161 @@
+Fairness Observability and Quantile Audit Guide
+
+Summary
+
+This guide defines how the runtime and scheduler teams observe, detect, and audit tenant-level fairness regressions using quantile-based metrics. It describes the telemetry, dashboard views, alerting rules, and a step-by-step reproducible audit procedure for fairness incidents (unbalanced slot allocation, credit drift, or sustained latency skew across tenants).
+
+1. Purpose and Scope
+
+- Purpose: Provide a single operational runbook for detecting fairness issues in the serving runtime and performing a reproducible quantile audit that produces evidence useful for triage and rollbacks.
+- Scope: Applies to multi-tenant serving clusters (hosted + dedicated), scheduler credit systems, kernel admission controllers, and cross-layer tracing. Does NOT cover quota- or billing-related disputes (handled by finance).
+
+2. Background & Definitions
+
+- Fairness regression: a sustained (>10 minutes) deviation where a tenant's critical SLO quantiles (p95 or p99) degrade relative to their baseline and cannot be explained by customer-driven workload changes.
+- Baseline window: 7-day rolling window ending 24 hours before incident start.
+- Quantile audit: compare matching quantiles (p50/p95/p99) per-tenant against baseline and population to detect outliers.
+
+3. Key metrics and instrumentation (concrete names)
+
+- scheduler_credit_balance{tenant_id, pool, region} — per-tenant scheduler credit balance (tokens).
+- scheduler_credit_rate{tenant_id, pool, region} — credit accrual rate.
+- request_latency_ms_bucket{tenant_id, route, le} — histogram for request latency (ms).
+- runtime_kv_prefetch_hit_rate{tenant_id} — cache hit rate affecting effective latency.
+- kernel_dispatch_utilization{gpu_id, kernel_variant} — GPU-side utilization by kernel.
+- request_trace_id and request_provenance labels are captured and persisted to trace-store (ClickHouse) for sample reconstruction.
+
+4. Quantile calculation examples (PromQL and ClickHouse)
+
+- PromQL p95 by tenant (30m):
+```
+histogram_quantile(0.95, sum(rate(request_latency_ms_bucket[30m])) by (tenant_id, le))
+```
+- PromQL fairness score (p95 ratio vs population median):
+```
+( histogram_quantile(0.95, sum(rate(request_latency_ms_bucket[30m])) by (tenant_id, le)) )
+/
+( scalar(quantile_over_time(0.5, sum(rate(request_latency_ms_bucket[7d])) by (le))[7d:1h]) )
+```
+- ClickHouse example: compute per-tenant p95 latency over a window and join to baseline
+```
+SELECT
+  tenant_id,
+  quantiles(0.5, 0.95, 0.99)(latency_ms)[2] AS p95
+FROM requests_local
+WHERE timestamp >= toDateTime('2026-07-01 12:00:00')
+  AND route IN ('/v1/generate','/v1/chat')
+GROUP BY tenant_id
+ORDER BY p95 DESC
+LIMIT 200
+```
+
+5. Dashboards & suggested panels
+
+Create a "Fairness Observability" dashboard with at minimum:
+- Per-tenant quantiles (p50/p95/p99) heatmap (time x tenant).
+- Top-k tenants by p95 deviation vs baseline (sparkline + % change).
+- Scheduler credit balance timeline for affected tenants.
+- Kernel dispatch utilization overlayed with request p95 by tenant.
+- Trace sample picker panel that links to trace-store filters (tenant + time window + route).
+
+6. Alerting rules (severity, thresholds, and rationale)
+
+- alert:Tenants_P95_Fairness_Deviation
+  severity: page
+  condition: tenant_p95 / median_population_p95 > 2.0 AND increase(unavailable_errors[10m]) < 1
+  window: 10m
+  rationale: A 2x gap suggests scheduling or kernel starvation rather than workload shift.
+
+- alert:Credit_Drift_High
+  severity: ticket
+  condition: rate(scheduler_credit_balance[5m]) < -0.1 for any tenant_id in production pool
+  window: 15m
+  rationale: Rapid credit depletion can indicate runaway batching or accounting bug.
+
+7. Reproducible audit procedure (ordered steps)
+
+1) Triage intake: record incident start time, alert ids, impacted tenant_ids, route(s), and correlation trace ids.
+2) Run baseline comparison (ClickHouse query above) for incident window vs baseline window. Save CSV of results to: s3://redwood-inference-audit/<incident-id>/quantile-diff.csv
+3) Inspect scheduler_credit_balance and scheduler_credit_rate for tenants and neighbors (±15 minutes around start). Pull minute-level time series and save as JSON.
+4) Reconstruct top-n representative traces: use trace-store query to pull 30 traces per tenant that are above the 95th percentile latency, include full request provenance and kernel variant annotations. Save traces to s3://redwood-inference-audit/<incident-id>/traces/
+5) Correlate kernel_dispatch_utilization and GPU metrics: export 1s-sampled utilization for GPUs serving the tenants for the window.
+6) Run root-cause hypothesis checklist (below). Mark which hypotheses are confirmed/ruled out.
+7) If scheduler misallocation is suspected, run controlled replay of a synthetic workload in sandbox to reproduce credit drift (use QA cluster).
+8) Produce an executive audit summary with a 1-page summary, a 3-page technical appendix, and a list of recommended mitigations; publish to the incident tracker and tag the oncall rotation.
+
+8. Root-cause hypothesis checklist (fast triage)
+
+- H1: Workload change (sudden token/sequence-length increase) — check usage telemetry and customer release notes.
+- H2: Scheduler credit accounting bug — inspect ledger events and compare accrual vs consumption.
+- H3: Kernel variant regression (new kernel promoted) — correlate kernel_variant label with p95 bump.
+- H4: Hot GPU/numa/thermal noise — check node-level watchdog and thermal metrics.
+- H5: Cross-tenant noisy neighbour — inspect co-located tenant metrics and admission logs.
+
+9. Runbook for oncall when fairness page fires (quick actions)
+
+- Step 1: Acknowledge the page; create incident with severity and attendees (scheduler, runtime, observability).
+- Step 2: Run the quantile baseline query and upload CSV to the incident S3 path.
+- Step 3: Pin dashboards and grab the trace samples.
+- Step 4: If evidence indicates kernel regression, follow the kernel rollback playbook (link in related_pages).
+- Step 5: If evidence indicates scheduler misallocation and impact is severe, enact short-term routing policy to divert affected tenant(s) to a safe pool (use the routing console with canary config).
+- Step 6: Document all steps and escalate to PL when customer SLAs are violated.
+
+10. Evidence packaging and retention
+
+- Required artifacts for any audit: quantile CSV, timeseries JSON (credits + latency), trace package (ndjson), kernel-utilization CSV, and incident notes.
+- Retention: keep packaging in s3://redwood-inference-audit/<incident-id>/ for 90 days by default; mark longer retention with finance/legal approval.
+- Hash evidence archives and attach SHA256 to the incident ticket.
+
+11. Post-audit reporting template (to include in incident tracker)
+
+- Title / Incident id
+- Summary (1 paragraph)
+- Impacted tenants and routes (list)
+- Measured regression (p95 change, absolute values, duration)
+- Root cause hypothesis and supporting evidence
+- Actions taken (mitigations, rollbacks, routing changes)
+- Long-term recommendations and owners
+
+12. Ownership and escalation matrix
+
+- Primary owner: runtime-team/scheduler-subteam (oncall rotation lead: @runtime-oncall)
+- Observability contact: observability-team (dashboard maintainers)
+- Kernel engineering: serving-runtime/kernel-team (for kernel variant rollbacks)
+- Customer escalation: customer-success-escalations (for billing/contract questions)
+
+13. Sample scheduler observer config (appendix)
+
+A small JSON snippet that the observer runs to sample and emit per-tenant quantiles to Prometheus remote write. Replace <ENV> and <BUCKET> with runtime config values.
+```
+{
+  "observer_name": "fairness-quantile-observer",
+  "scrape_interval": "30s",
+  "tenants": "production",
+  "export": {
+    "prometheus_remote_write": "https://remote-write.service.prod",
+    "s3_audit_bucket": "s3://redwood-inference-audit/<ENV>/"
+  },
+  "sampling": {
+    "window": "30m",
+    "quantiles": [0.5, 0.95, 0.99]
+  }
+}
+```
+
+14. FAQ and pitfalls
+
+- Q: How do we avoid false positives when a tenant deploys a new model?
+  A: Cross-check the tenant release notes, sequence-length distribution changes, and recent model-version labels in traces; if model rollout is the cause, mark as "customer-change" and route to success.
+
+- Pitfall: Triggering mitigation too early (diverting traffic) can obscure evidence. Prefer collecting a 10–15 minute evidence set before aggressive mitigations, unless customer SLA requires immediate action.
+
+15. Appendices and links
+
+- Related runbooks: kernel rollback, priority inversion mitigation, runtime-fallback-orchestration. See related_pages for direct links.
+- Contact list: runtime@s.redwood.com, observability@s.redwood.com, scheduler-leads (see team roster).
+
+Document history
+
+- 2026-03-15: Created by Riley Chen (initial draft).
+- 2026-05-10: Added PromQL examples and alert tuning after a field incident.
+- 2026-07-03: Finalized retention policy and added evidence packaging conventions.

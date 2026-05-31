@@ -1,0 +1,163 @@
+GPU Warm Pool & Eviction Minimizer Runbook
+
+Overview
+
+This runbook documents the design, operational run procedures, CI/CD references, and Terraform/IaC considerations for Redwood's GPU warm pool service (gpu-warm-pool). The warm pool is a short-lived reserved set of GPU instances kept pre-warmed to reduce cold-start latency and reduce application impact during spot/interruptible instance evictions. This doc is intended for oncall infra, platform engineers, and SREs responsible for GPU capacity and preemption mitigation.
+
+Scope
+
+- Systems: gpu-warm-pool (Kubernetes Deployment), capacity-orchestrator (control plane service), spot-fallback-service, autoscaler-controller.
+- IaC: terraform/modules/gpu-warm-pool, terraform/modules/spot-fallback, account IAM modules that allow instance lifecycle management.
+- CI/CD: pipelines/gpu-warm-pool-deploy (CircleCI -> ArgoCD); test pipelines described in the CI section.
+- Excludes: customer-facing routing and application-level retry policies (see related pages).
+
+Goals and SLOs
+
+- Reduce cold-start tail latency for serving runtime SLOs: 95th percentile cold-start time < 500ms for pooled requests that use warm cache.
+- Maintain warm-pool fill >= 90% during business hours (08:00-20:00 PT) and >= 70% off-hours.
+- Eviction mitigation target: reduce request-level retry due to eviction by 80% vs. no-warm-pool baseline.
+- Fail-open safety: no single warm-pool control-plane failure should take down > 5% of cluster-wide GPU capacity.
+
+Key Concepts
+
+- Warm pool: Short-lived instances (pre-configured GPU node images) kept ready and attached to node pools, not bound to workloads until claimed. Warm nodes are tainted with node-role/gpu-warm so scheduler avoids direct pod assignment unless kube-claim label is set.
+- Fill latency: time between a warm-pool node termination and the system replacing it with a ready node. Target fill latency < 45s for on-demand and < 120s for spot fallback.
+- Eviction spike: sustained increase in instance interruption events (AWS EC2 Spot Interruptions or Azure low-priority preempts) resulting in eviction_rate > 1.0%/minute over a 5-minute window.
+
+Architecture and Service Map
+
+- capacity-orchestrator (control plane): tracks target capacities, policies (on-demand ratio, min-warm-count), and reconciliation loops. Exposes /v1/targets and emits metrics: warm_pool_fill, warm_pool_fill_latency, warm_pool_evictions.
+- gpu-warm-pool (k8s operator + Deployment): reconciles NodeGroup CRDs, pre-provisions nodes via cloud-account APIs and attaches taints/labels.
+- spot-fallback-service: when interruptions spike, promotes fallback NodeGroup of lower-cost on-demand-compatible instances or reserved capacity.
+- autoscaler-controller: integrates with HPA/VPA/LLM-serving routing; scales by demand but respects warm-pool reservations.
+
+Terraform / IaC Notes
+
+- Modules of interest: terraform/modules/gpu-warm-pool (creates node group, instance templates, autoscaling config), terraform/modules/spot-fallback (fallback pool and cross-account role bindings).
+- Typical module variables:
+  - var.min_warm_nodes (default 2)
+  - var.business_hour_target_fill (default 0.9)
+  - var.fallback_on_demand_ratio (default 0.25)
+  - var.preemptible_types (list)
+- IAM: grant to role infra/gpu-warm-pool-manager to call CreateFleet/RunInstances and TerminateInstances in customer cloud accounts. Restrict to resource tags: Tag:Redwood:WarmPool=true.
+- State: keep remote-state per account with locking. When making changes that affect node template names, follow the module-stability testing guidance to avoid orphaned instances.
+
+CI/CD and Promotion Pipeline
+
+- Pipeline: pipelines/gpu-warm-pool-deploy
+  1) unit tests (go and controller unit tests)
+  2) terraform plan (module changes) -> gated by terraform policy tests (policy-cft)
+  3) cluster integration (ephemeral cluster) verification: ensure warm nodes are created and tainted correctly.
+  4) ArgoCD application promotion to staging -> canary -> production.
+- Canary strategy: 10% of warm-pool capacity in new region or new instance type. Observe metrics for 60 minutes before full promotion.
+- Rollback: ArgoCD application revert; terraform module re-apply with previous instance_profile. Documented rollback tags: warm-pool:rollback=<timestamp>.
+
+Operational Metrics and Dashboards
+
+Alerting thresholds (example):
+- GPUWarmPool.FillDrop (pager): warm_pool_fill < 60% for 5m AND demand_ratio > 0.3.
+- GPUWarmPool.EvictionSpike (pager): eviction_rate > 1.0%/m sustained for 5m OR eviction_count > 20 in 5m.
+- GPUWarmPool.FillLatency (page if severe, otherwise slack): fill_latency_p95 > 120s for 5m.
+- GPUWarmPool.ControlPlaneErrors (Slack): 5xx rate > 5% on /v1/targets for 2m.
+
+Recommended dashboards:
+- Warm Pool Health: warm_pool_fill, warm_pool_fill_latency (p50/p95/p99), warm_node_age_distribution.
+- Evictions & Recovery: eviction_rate, reclaimed_nodes_count, fallback_promotion_count, instance_termination_reasons (by cloud provider tag).
+- Cost vs. Savings: warm_pool_on_demand_pct, estimated_saved_spend_per_hour.
+
+Runbook: Detection and Immediate Actions
+
+Trigger: GPUWarmPool.EvictionSpike alert fires (pager duty).
+
+1) Triage (first 10 minutes)
+  - Acknowledge alert in PagerDuty and create incident channel (Slack #incident-gpu-warm-pool).
+  - Capture immediate metrics:
+    - curl -s http://capacity-orchestrator.internal/v1/targets | jq '.'  # inspect desired vs actual
+    - kubectl get nodes -l node-role=gpu-warm -o wide
+    - grafana dashboards: Warm Pool Health / Evictions & Recovery
+  - Determine scope: single region vs multi-region by checking eviction_count per region metric.
+
+2) Mitigate (10–40 minutes)
+  - If warm_pool_fill < 60%: increase fallback_on_demand_ratio temporarily to 0.5 via the control API and trigger reconciliation.
+    - curl -X POST -H "Content-Type: application/json" http://capacity-orchestrator.internal/v1/targets/update -d '{"fallback_on_demand_ratio":0.5}'
+  - If cluster experiencing high pod restarts: scale the fallback NodeGroup up by 2x via terraform plan/apply OR use cloud-console quick scale (preferred if time-critical).
+  - Disable non-critical batch/eval jobs by flipping label batch-job:pause=true in job scheduler (see ci-cd/eval-runbook).
+  - If control plane 5xx errors present, restart capacity-orchestrator: kubectl rollout restart deployment/capacity-orchestrator -n infra.
+
+3) Contain (40–120 minutes)
+  - Promote reserved on-demand pools: run the prepared terraform runbook step to set desired_count on the on-demand group: terraform apply -var='override_on_demand_count=XX' -target=module.spot-fallback
+  - If provider-level outage suspected: open cloud provider status and escalate to cloud-provider-support channel. Attach instance termination logs and instance ids.
+  - If multiple regions affected, enable cross-region routing to healthy pools using smart-routing policy: update routing via control-plane API to prefer region with capacity: curl -X POST http://control-plane.internal/v1/route/update -d '{"policy":"prefer_capacity"}'
+
+4) Recover and stabilize (120+ minutes)
+  - Validate fill latency and eviction rate returning to baseline for 30m.
+  - Reduce fallback_on_demand_ratio back to configured target in staged steps (e.g., 0.5 -> 0.35 -> configured) and monitor.
+  - Re-enable paused batch/eval workloads after warm_pool_fill >= 85% for 30m.
+
+Post-Incident Actions and RCA
+
+- Owner: oncall responder must create a postmortem within 48 hours and tag as "eviction-incident". Include timeline, root cause, and corrective actions.
+- Suggested RCA checkpoints:
+  - root cause (market price surge, AZ capacity reclaim, orchestration bug).
+  - detection gap (alerting thresholds, missing region-level metrics).
+  - automation gap (manual terraform apply used instead of automated promotion).
+  - cost implications and billing anomalies.
+- Permanent fixes: consider increasing minimum warm nodes during predictable events (e.g., major eval runs), add auto-promotion policies, and tune the spot_fallback module to include instance diversification.
+
+Troubleshooting Playbook (common scenarios)
+
+- Warm-pool nodes present but NotReady:
+  1) kubectl describe node <node> | grep -i 'Kubelet'
+  2) Check node kubelet logs: journalctl -u kubelet -f
+  3) If imagePullBackOff on warm initializers, verify golden image pipeline promotion (see ci-cd/gpu-image-promotion-canary-cd-playbook).
+
+- Control plane not reconciling desired capacity:
+  1) kubectl logs deployment/capacity-orchestrator -n infra --since=1h
+  2) curl http://capacity-orchestrator.internal/health; if unhealthy, kubectl rollout undo deployment/capacity-orchestrator -n infra to previous revision and escalate.
+
+- Unexpected cost spike after fallback promotion:
+  1) Query cost dashboard: tag:WarmPool & instance_type filter.
+  2) Run compensation: revert on-demand promotion and adjust fallback_on_demand_ratio to configured target.
+
+Operational Ownership and Escalation Matrix
+
+- Primary oncall: infra/gpu-team (pager duty rotation: infra-gpu-primary).
+- Secondary: infra/cluster-sre.
+- Escalate to platform lead (Marco Rivera) if incident > 90 minutes without stabilization.
+- For billing disputes or unexpected spend, notify finance-legal and cost-control (sam.accounting@redwood.ai) within 24 hours.
+
+Change Management and Testing Guidance
+
+- Any terraform changes to the warm-pool module that alter instance templates, labels, or IAM must go through the module-stability testing pipeline and a canary promotion described in CI/CD.
+- Preflight checks before deploy:
+  - terraform plan exit code 0 and policy checks passed.
+  - Integration test: create 2 ephemeral warm nodes in staging and validate taint/label behavior.
+  - Dry-run control-plane API: POST /v1/targets/simulate with the new settings and confirm no negative scale-down.
+
+Related documents and references
+
+- GPU demand forecasting and ML-backed scaling playbook (forecasting).
+- GPU spot fallback autoscaler module and runbook (fallback patterns).
+- CI/CD GPU image promotion and golden image pipeline.
+
+Appendix: Useful Commands and Snippets
+
+- Inspect warm nodes: kubectl get nodes -l node-role=gpu-warm -o json | jq '.items[] | {name:.metadata.name, status:.status.conditions[-1]}'
+- Adjust control-plane target (example):
+  curl -X POST -H "Content-Type: application/json" http://capacity-orchestrator.internal/v1/targets/update -d '{"min_warm_nodes":4}'
+- Quick-scale fallback group (example terraform override):
+  terraform apply -var='override_on_demand_count=8' -target=module.spot-fallback -auto-approve
+- Health check endpoint: curl -s http://capacity-orchestrator.internal/health | jq '.'
+
+Contact and Ownership
+
+- Document owner: Aisha Patel (infrastructure platform)
+- Primary contacts: infra-gpu-oncall (PagerDuty), Marco Rivera (platform lead), Jin Soo Park (runtime engineer)
+- For module changes: tag PRs with "infra/gpu-warm-pool" and request review from the reviewers listed above.
+
+Notes and future work
+
+- Planned feature: predictive warm pool growth using short-term demand forecast (ML model) and cost optimization to minimize on-demand promotions.
+- Investigate support for fractional GPU warm instances (multiplexed via MIG) to reduce cost during low-util periods.
+
+This document should be updated whenever the warm-pool Terraform module, control-plane APIs, or canary strategy changes.

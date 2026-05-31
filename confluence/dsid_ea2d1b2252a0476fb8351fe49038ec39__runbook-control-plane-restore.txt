@@ -1,0 +1,441 @@
+Runbook: Redwood Private Control Plane Restore
+
+## Purpose
+This runbook describes how to restore the **Redwood Private control plane** from a previously created backup artifact.
+
+It covers:
+- Restore prerequisites (cluster, tooling, access, keys)
+- Restore modes (in-place vs. new cluster)
+- Bootstrap order and dependency sequencing
+- Validation (functional + data integrity)
+- Abort/rollback criteria
+- How to confirm **tenant configuration** and **routing policies** are restored correctly
+
+This runbook is intended for:
+- Redwood SRE / Private Deployments teams running DR drills or assisting customers
+- Customer platform teams operating a supported Redwood Private deployment
+
+---
+
+## Scope and non-goals
+### In scope (this runbook)
+- Restoring Redwood control-plane state captured by the Redwood backup toolkit (configuration database, control-plane object/state, release metadata, policy/config state)
+- Restoring Kubernetes objects that are part of the Redwood control plane where the toolkit includes them (via manifests/Helm values, as applicable)
+- Post-restore validation for:
+  - Tenant inventory and tenant-level configuration
+  - Routing policies (model pins, fallback rules, regional/capacity policies)
+  - Control-plane API readiness for normal operations
+
+### Explicitly out of scope
+- Kubernetes cluster disaster recovery via **etcd snapshot restore** (see: `eng-infra/runbooks/restore-k8s-cluster-from-etcd-snapshot`)
+- Data-plane customer application recovery (data plane is designed to be redeployable; see: `runbook-data-plane-state-backup`)
+- Restoring external dependencies not managed by Redwood (e.g., customer-managed DNS provider, external IdP settings) except as validation checkpoints
+
+---
+
+## Roles and ownership
+**Primary on-call / escalation:**
+- SRE lead: Sean Gallagher
+- Control plane engineering: Ethan Park
+- Security review (keys/encryption): Marcus Lin / Hanae Suzuki
+- Release/packaging (air-gapped bundles): Connor O'Brien
+
+**Customer-facing execution (when applicable):**
+- Solutions lead: Markus Klein
+
+---
+
+## Preconditions (must be true before you start)
+### 1) You have a valid backup artifact
+You must have:
+- Backup **manifest** (JSON) that includes:
+  - backup_format_version
+  - platform_version
+  - timestamp
+  - artifact checksums
+  - encrypted payload metadata (cipher, envelope/KMS info)
+- Backup **payload** (encrypted tarball or equivalent)
+- Access to the **backup storage backend** (S3/NFS/GCS or offline bundle)
+
+If you cannot validate checksums/signatures *before* restore, stop and escalate.
+
+### 2) You have required credentials and keys
+Depending on environment:
+- **VPC / cloud**: IAM role/credentials to read backup bucket and use KMS key (Decrypt)
+- **On-prem / air-gapped**: local artifact access + signature verification keys/materials
+
+Security requirement: backups must remain encrypted end-to-end; do not manually decrypt to disk unless explicitly required by a documented break-glass procedure.
+
+### 3) Target environment is prepared
+Choose one restore mode:
+
+**A. Restore into a clean cluster (recommended for DR drills and most incidents)**
+- New Kubernetes cluster is provisioned and reachable
+- The correct Redwood Private version is available (installer + charts) and matches compatibility policy
+
+**B. In-place restore (only when explicitly approved)**
+- The existing cluster is stable enough to run restore tooling
+- You have confirmed what will be overwritten and have a rollback plan
+
+### 4) Versions are compatible
+- The restore workflow enforces compatibility checks between the backup format and the target platform version.
+- If the installer reports a format/version mismatch:
+  - Do not bypass by hand-editing the manifest.
+  - Escalate to Control Plane Engineering (format migration may be required).
+
+---
+
+## Safety / risk notes
+- Restores are **destructive** to control-plane state. Treat restore as a change with the same rigor as a production deployment.
+- Always restore into a clean namespace/cluster when possible.
+- Avoid mixing partial data sources (e.g., restoring DB from backup but leaving old policy config CRs in place).
+- If you suspect cluster-level corruption, do not proceed with application-level restore until infra confirms cluster integrity.
+
+---
+
+## Inputs you must collect (copy/paste block)
+Record these in the incident/DR ticket before starting:
+
+- Environment name:
+- Restore mode: (clean cluster / in-place)
+- Backup ID / timestamp:
+- Backup storage backend (S3/NFS/offline bundle):
+- Manifest path:
+- Payload path:
+- Target Redwood Private version:
+- KMS key ID (if applicable):
+- Target cluster context (kubectl context name):
+- DNS plan (same hostname vs. temporary hostname):
+
+---
+
+## High-level restore sequence (bootstrap order)
+Follow this order to avoid common failure modes (including missing CRDs and webhook ordering issues):
+
+1. **Pre-flight checks** (cluster connectivity, storage access, key access, version compatibility)
+2. **Install/verify CRDs and core control-plane scaffolding** (no restore yet)
+3. **Restore control-plane datastores and state** using the installer restore workflow
+4. **Bring up control-plane services** (API, controllers) in a controlled manner
+5. **Post-restore reconciliation** (controllers reconcile desired state)
+6. **Validation** (health, tenant configs, routing policies, smoke checks)
+7. **Cutover** (DNS/TLS, routing) if restoring into a new cluster
+
+---
+
+## Step-by-step procedure
+
+### Step 0 — Announce change window (production / customer environments)
+If this is production or a customer-assisted restore:
+- Announce in the relevant channel and update the incident timeline.
+- Freeze changes:
+  - Pause automated rollouts
+  - Disable scheduled backups temporarily (avoid confusing signals)
+  - Confirm no ongoing upgrades
+
+---
+
+### Step 1 — Pre-flight checks
+#### 1.1 Confirm cluster access
+Run:
+- `kubectl config current-context`
+- `kubectl get nodes`
+- `kubectl get ns`
+
+Abort if:
+- API server is unstable (timeouts)
+- Nodes are NotReady and not actively being repaired
+
+#### 1.2 Confirm required namespaces and baseline components
+Expected namespaces vary by install, but typically include:
+- `redwood-system` (or customer-specific equivalent)
+- `redwood-observability` (if observability pack installed)
+
+If restoring into a clean cluster, namespaces may not exist yet. That is OK.
+
+#### 1.3 Validate backup artifact integrity (required)
+- Verify manifest checksums match payload.
+- If using an offline bundle, verify signature and checksum manifest per packaging doc.
+
+Typical commands (examples; adjust to your environment and tooling):
+- `redwood-private backup verify --manifest ./backup-manifest.json --artifact ./backup.enc.tar`
+
+If verification fails, **stop** and obtain a known-good backup.
+
+#### 1.4 Validate key access (KMS/HSM)
+For KMS envelope encryption, ensure the restore identity can call Decrypt on the key.
+- Cloud: confirm IAM policy includes `kms:Decrypt` for the key and the bucket read permissions.
+- On-prem HSM: confirm client configuration and key slot availability.
+
+Abort if:
+- KMS is unavailable and you do not have an approved break-glass plan.
+
+---
+
+### Step 2 — Install CRDs and baseline chart scaffolding (do not restore yet)
+This step prevents a common on-prem failure mode where the restore re-applies custom resources before their CRDs exist.
+
+#### 2.1 Install Redwood control-plane CRDs
+Install the CRDs for the target Redwood version. Use the supported installation path (Helm/installer).
+
+Example (Helm-based installs):
+- `helm repo update`
+- `helm upgrade --install redwood-crds redwood/redwood-crds -n redwood-system --create-namespace --version <TARGET_VERSION>`
+
+Validate CRDs exist:
+- `kubectl get crds | grep -i redwood`
+
+Abort if:
+- CRDs fail to install or are an unexpected version.
+
+#### 2.2 Install minimal control-plane chart prerequisites
+Install charts/components required to run restore jobs/hooks (RBAC, service accounts, configmaps, job templates).
+
+Example:
+- `helm upgrade --install redwood-control-plane redwood/redwood-control-plane -n redwood-system --version <TARGET_VERSION> -f values.yaml --set restore.enabled=true`
+
+Validate:
+- `kubectl -n redwood-system get sa,role,rolebinding`
+- `kubectl -n redwood-system get jobs`
+
+---
+
+### Step 3 — Execute restore workflow
+Use the supported installer restore command. Do not hand-apply objects unless explicitly instructed by engineering.
+
+#### 3.1 Dry-run / plan (recommended)
+If supported by the installer version, generate a restore plan:
+- `redwood-private restore plan --manifest <PATH> --target-cluster <CONTEXT>`
+
+Review for:
+- Which components will be overwritten
+- Any required manual steps (e.g., external DNS)
+
+#### 3.2 Run restore
+Typical command shape (examples; flags vary by version):
+- `redwood-private restore apply --manifest <PATH_TO_MANIFEST> --artifact <PATH_OR_URI_TO_ARTIFACT> --namespace redwood-system`
+
+For S3-backed artifacts:
+- `redwood-private restore apply --manifest s3://<bucket>/<prefix>/manifest.json --artifact s3://<bucket>/<prefix>/payload.enc.tar --kms-key <key-arn> --namespace redwood-system`
+
+For air-gapped restores:
+- `redwood-private restore apply --manifest ./manifest.json --artifact ./payload.enc.tar --offline --namespace redwood-system`
+
+What this step does (conceptually):
+- Fetches artifact(s) from storage
+- Validates checksums
+- Decrypts payload in-memory / ephemeral workspace
+- Restores control-plane datastore snapshot(s)
+- Rehydrates platform configuration state (including tenant config and routing policy objects)
+- Emits a restore report (store it in the ticket)
+
+#### 3.3 Monitor restore jobs
+Watch jobs/pods:
+- `kubectl -n redwood-system get pods -w`
+- `kubectl -n redwood-system get jobs`
+- `kubectl -n redwood-system logs job/<restore-job-name> --tail=200`
+
+Abort criteria (immediate):
+- Decryption failures that indicate wrong key or tampered artifacts
+- Persistent RBAC permission errors (fix RBAC, then re-run from a clean state)
+- Database restore fails with data corruption errors
+
+---
+
+### Step 4 — Bring up control-plane services and allow reconciliation
+After restore completes successfully:
+
+#### 4.1 Confirm control-plane deployments are healthy
+- `kubectl -n redwood-system get deploy`
+- `kubectl -n redwood-system rollout status deploy/<name>`
+
+#### 4.2 Confirm webhooks/controllers are running
+- `kubectl -n redwood-system get pods | egrep -i "controller|webhook|api"`
+
+If controllers are crashlooping, check:
+- Missing secrets references (expected if secrets are references-only; see validation)
+- Misconfigured external endpoints (IdP, KMS, object storage)
+
+---
+
+## Validation checklist (required)
+Record results in the restore report / incident ticket.
+
+### A) Basic health and readiness
+1. Kubernetes health:
+   - No CrashLoopBackOff in `redwood-system`
+   - Core services Ready
+2. Control-plane API health:
+   - `curl -k https://<control-plane-endpoint>/healthz` returns OK (or equivalent)
+3. Backup status endpoint (if enabled):
+   - Confirm the platform reports the restored last-known backup metadata as expected (do not treat this as proof of restore correctness; it is an indicator).
+
+### B) Datastore integrity checks
+Perform the supported read-only checks:
+- Confirm schema migrations did not run unexpectedly (compare platform version from manifest to running version)
+- Confirm expected counts of key entities (tenants, routes, policies) are non-zero and plausible
+
+### C) Tenant configuration verification (must-pass)
+Goal: ensure tenant inventory and tenant-level settings (authz, quotas, pinned models, rate limits, routing configuration) match the pre-incident state.
+
+#### C.1 Enumerate tenants
+Using the supported admin tooling/API (examples):
+- `redwood-private admin tenants list`
+
+Validate:
+- Tenant count matches expectations
+- Critical tenants present (top customers / internal tenants)
+
+#### C.2 Spot-check tenant configuration
+For 3–5 representative tenants (including at least one “most complex” tenant):
+- `redwood-private admin tenants get --tenant <TENANT_ID>`
+
+Confirm:
+- Correct tenant status (enabled/disabled)
+- Correct quota / rate limit values
+- Correct auth settings (OIDC issuer URL, audience, required claims) where applicable
+
+#### C.3 Confirm secrets handling is correct
+Backups should not embed raw secret material unless explicitly configured; most environments store **references**.
+Validate:
+- Secret references resolve (KMS/HSM reachable; external secret manager reachable)
+- No unexpected plaintext secrets exist in restored objects
+
+If secret references fail to resolve:
+- Do not proceed to cutover.
+- Fix external secret integration first.
+
+### D) Routing policies verification (must-pass)
+Routing policies are a primary restore correctness signal because they directly affect inference behavior.
+
+#### D.1 Enumerate routing policies
+Examples (names vary by implementation):
+- `redwood-private admin routing policies list`
+- Or via API: `GET /admin/routing/policies`
+
+Validate:
+- Policies exist for expected tenants
+- Default global policy is present
+
+#### D.2 Verify model pins and fallbacks
+For each of the same 3–5 tenants:
+- Confirm pinned model versions (e.g., `model: llama-3.1-70b-instruct@<version>`)
+- Confirm fallback chain ordering (primary → secondary variant → last-resort)
+- Confirm any region/capacity tier routing rules match pre-incident configuration
+
+Common failure modes:
+- Policies restore but are not applied due to controller reconciliation failures
+- Policies applied but model version IDs differ from what tenants expect
+
+#### D.3 Validate route-level behavior with smoke traffic
+Run a minimal end-to-end inference call per tenant:
+- One chat completion request
+- One embedding request (if used)
+
+Confirm:
+- Requests are authorized correctly
+- Request is routed to the expected model
+- Latency is within reasonable bounds for a cold start
+- No repeated fallback due to missing capacity (unless expected)
+
+### E) Observability signals (recommended)
+- Restore duration and outcome metrics present
+- Control-plane error rate normalizing
+- No sustained authz failures
+
+---
+
+## Cutover procedure (new cluster restores)
+If restoring into a clean cluster and you need to move production traffic:
+
+1. Use a **temporary hostname** first (e.g., `cp-restore.<domain>`).
+2. Validate using the checklist above.
+3. Confirm TLS certificates are valid for the cutover hostname(s).
+4. Switch DNS (or load balancer target) to the restored control plane.
+5. Monitor:
+   - Control-plane 5xx rate
+   - Auth failures
+   - Tenant request success
+
+Rollback (cutover-specific):
+- If DNS cutover causes failures, revert DNS immediately to prior endpoint while you diagnose.
+
+---
+
+## Abort and rollback criteria
+### Abort immediately if
+- Artifact integrity verification fails
+- Decryption fails due to wrong key or tampered artifact
+- Restore tool reports an unsupported version/format and no migration path is approved
+- Control-plane services cannot reach required external dependencies (KMS/secret manager/object storage) and you cannot remediate quickly
+
+### Rollback options
+**New cluster restore (preferred):**
+- Rollback is typically “do not cut over” or “revert DNS,” then re-run restore in a fresh environment.
+
+**In-place restore:**
+- You must have captured pre-restore snapshots (or an equivalent rollback point) before running restore.
+- If a restore partially applies:
+  - Stop controllers to prevent drift
+  - Escalate to Control Plane Engineering for the cleanest recovery path
+
+Important: Avoid manual, piecemeal rollback of restored objects unless directed by engineering; it often creates a harder-to-debug mixed state.
+
+---
+
+## Troubleshooting guide (common issues)
+### 1) Restore fails due to missing CRDs
+Symptoms:
+- Errors like “no matches for kind …” or “resource mapping not found”
+
+Fix:
+- Ensure CRDs are installed for the target version (Step 2.1)
+- Re-run restore from a clean state
+
+### 2) RBAC permission denied for restore job
+Symptoms:
+- Restore job logs show `Forbidden` errors (list/get/patch)
+
+Fix:
+- Apply the recommended RBAC from the Helm values / chart templates
+- Confirm service account is correct
+- Re-run restore
+
+### 3) KMS decrypt fails intermittently
+Symptoms:
+- Timeouts or throttling during decrypt
+
+Fix:
+- Confirm KMS availability and quotas
+- Ensure retry/backoff settings are enabled in the restore tooling
+- If KMS is down, stop and follow incident process (do not implement ad-hoc encryption changes)
+
+### 4) Tenants present but routing policies not applied
+Symptoms:
+- Tenants exist but requests route to defaults
+
+Fix:
+- Check controller reconciliation logs
+- Confirm policy CRs exist and are in Ready state
+- Ensure any dependent resources (model catalog entries, capacity tiers) are present in the restored environment
+
+---
+
+## Post-restore actions
+1. Re-enable scheduled backups (if disabled) and confirm next run is successful.
+2. If this was a DR drill:
+   - Capture RTO (time from start to validated readiness)
+   - File follow-ups for any manual steps that should be automated
+3. Update the DR readiness dashboard signals:
+   - last_restore_drill_success
+   - restore_drill_latency
+   - backup_job_success_rate
+
+---
+
+## Appendix: Minimum evidence to attach to ticket
+Attach or link:
+- Restore command invocation (sanitized)
+- Restore report output from `redwood-private restore apply`
+- Logs for restore job (last ~500 lines)
+- Validation checklist results (tenants + routing policy spot checks)
+- If cutover occurred: DNS change record + monitoring screenshots

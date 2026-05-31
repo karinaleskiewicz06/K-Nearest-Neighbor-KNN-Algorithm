@@ -1,0 +1,221 @@
+Enterprise priority: 429 / quota / overload behavior (Support guide)
+
+## Purpose
+This page is a Support/CS reference for explaining **429** responses after the **Hot-route capacity protection** rollout. It covers:
+- What customers may see (payload + headers)
+- How to distinguish **quota** vs **rate-limit** vs **overload shedding/admission control**
+- Recommended customer-side retry/backoff behavior
+- When and how to escalate (and what data to collect)
+
+This doc is written for Support and TAMs. For implementation details, see the Platform design/ADR pages linked in Related pages.
+
+---
+
+## What changed (customer-visible)
+Beginning with the enterprise priority rollout, Redwood enforces **tier-aware capacity protection** on a set of “protected routes” (commonly: `/v1/chat/completions`, `/v1/embeddings`, `/v1/rerank`).
+
+Customers may observe:
+- **More predictable 429s** for best-effort/self-serve traffic during regional pressure.
+- **Enterprise traffic preserved** longer (priority routing + per-tier budgets), but enterprise requests can still receive 429s when:
+  - the account’s own limits are reached, or
+  - the route is in sustained overload and the enterprise budget is exhausted.
+- **New reason codes** and additional headers to explain why the request was rejected.
+
+Important framing for customers:
+- 429 is **not** a “generic outage” signal. It is a deliberate backpressure mechanism to protect overall fleet health and enterprise SLOs.
+- 429 responses are **safe to retry** when the reason indicates transient pressure, using the guidance below.
+
+---
+
+## 429 response format (what Support should look for)
+
+### Common JSON fields (all 429s)
+Most clients will receive an error payload shaped like:
+- `error.type`: `rate_limit_exceeded` or `quota_exceeded` or `overloaded`
+- `error.code`: a stable machine-readable reason code (see table below)
+- `error.message`: human-readable summary
+- `error.request_id`: request identifier (also returned in response headers)
+
+If a customer claims the payload is missing or inconsistent, ask for:
+- raw response body
+- full response headers
+- SDK version / client library
+
+### Standard headers (may vary by route)
+Support should request and record these headers when present:
+- `x-redwood-request-id`: request ID used for internal tracing
+- `retry-after`: seconds to wait before retry (only set for some transient reasons)
+- `x-redwood-retry-after-ms`: millisecond retry hint (preferred when present)
+- `x-redwood-limit-scope`: `account` | `api_key` | `route` (where enforcement applies)
+- `x-redwood-limit-policy`: policy identifier (internal-friendly string; customer can share as opaque)
+- `x-redwood-429-reason`: short reason token (maps to reason codes below)
+- `x-redwood-rate-limit-limit`: numeric limit (requests per window) when applicable
+- `x-redwood-rate-limit-remaining`: remaining requests in current window (when applicable)
+- `x-redwood-rate-limit-reset`: epoch time or seconds-until-reset (when applicable)
+
+Notes:
+- Some enterprise customers will only see a subset of limit headers depending on contract configuration and route group settings.
+- Absence of headers is not automatically a bug; it can indicate a rejection occurred upstream of quota evaluation (e.g., admission control).
+
+---
+
+## Reason codes (how to interpret 429s)
+Use the following table to classify the issue and advise the customer.
+
+### A) Quota- and rate-limit-driven 429s (customer-specific)
+These are expected when a customer exceeds their configured limits.
+
+| Category | error.type | x-redwood-429-reason (typical) | Meaning | Customer guidance |
+|---|---|---|---|---|
+| Hard quota exceeded | quota_exceeded | quota_window_exhausted | Customer has consumed their quota for the current window. | Do not retry immediately. Wait until reset. Consider limit increase request. |
+| Rate limit exceeded | rate_limit_exceeded | rate_limit_account | Customer exceeded account-level request rate. | Retry with exponential backoff + jitter. Reduce concurrency / smooth bursts. |
+| Route-group rate limit | rate_limit_exceeded | rate_limit_route_group | Customer exceeded a per-route or route-group cap. | Same as above; ask them to spread load or request a higher burst allowance. |
+| Token / compute guardrail | rate_limit_exceeded | token_budget_exceeded | Customer exceeded a token/compute budget (if enabled for contract). | Reduce max_tokens / request size; smooth traffic; discuss contract sizing. |
+
+### B) Overload protection / admission control 429s (fleet pressure)
+These indicate transient capacity protection behavior.
+
+| Category | error.type | x-redwood-429-reason (typical) | Meaning | Customer guidance |
+|---|---|---|---|---|
+| Admission control (best-effort shed) | overloaded | shed_best_effort | Fleet/route is under pressure; best-effort traffic is being throttled first. | Retry with exponential backoff + jitter. Prefer queueing client-side. |
+| Admission control (enterprise budget exhausted) | overloaded | shed_enterprise_budget | Protected route is overloaded and enterprise budget is fully utilized. | Retry using Retry-After if present; reduce concurrency; contact Support if sustained. |
+| Regional capacity constraint | overloaded | region_capacity | Selected region is capacity constrained; request rejected to prevent tail latency cascade. | Retry with backoff; if multi-region is enabled, allow client failover. |
+| Policy evaluation deny | overloaded | policy_deny_overload | Policy engine denied admission due to active overload rule (e.g., queue depth trigger). | Treat as transient. Retry with backoff. Provide request IDs for investigation if frequent. |
+
+Support positioning:
+- For enterprise accounts: “This is protective backpressure to preserve latency/availability for protected routes. It can occur during unusual bursts or regional pressure.”
+- For self-serve/best-effort: “During peak pressure, the platform prioritizes higher-SLA traffic; your requests may be throttled earlier.”
+
+---
+
+## Recommended customer retry & backoff guidance
+Provide the following general guidance (tailor to the customer’s stack):
+
+### When to retry
+- Retry 429s when:
+  - `error.type = overloaded` (most cases)
+  - `error.type = rate_limit_exceeded`
+- Do NOT aggressively retry when:
+  - `error.type = quota_exceeded` and the response includes a reset hint (wait until reset)
+
+### How to retry (recommended algorithm)
+- Use **exponential backoff with full jitter**.
+- Start with 250–500ms base delay.
+- Cap max delay at 10–30s.
+- Add client-side request queueing to avoid stampedes.
+- Respect `retry-after` and/or `x-redwood-retry-after-ms` when present (prefer the ms header).
+
+Suggested pseudocode guidance to share (language-agnostic):
+1) if `retry-after` present → sleep for that duration (+ small jitter) then retry
+2) else backoff = random(0, min(cap, base * 2^attempt))
+3) stop after a reasonable max attempts (typically 5–8) and surface a retriable error to the application
+
+### Concurrency guidance
+Customers with high parallelism should:
+- Implement a per-route concurrency limiter (token bucket / semaphore)
+- Smooth bursty workloads (batching where possible)
+- Avoid synchronized retries across many workers (jitter)
+
+### Idempotency guidance
+- For non-streaming requests, retries are generally safe.
+- For streaming requests, see “Streaming semantics” below.
+
+---
+
+## Streaming semantics during shedding (common ticket driver)
+Some customers report “inconsistent termination” on streaming responses during load shedding.
+
+Support guidance:
+- If a request is rejected **before** streaming begins, they should receive a normal 429 with reason + headers.
+- If a request is accepted and then terminated due to downstream pressure, behavior depends on the transport:
+  - Customers should treat early stream termination as retriable if they did not receive a completed response.
+  - Advise customers to log the `x-redwood-request-id` and last event received.
+
+Escalate if:
+- customers see a successful HTTP status but the stream ends without an explicit termination signal and without consistent client-visible error handling, or
+- the customer provides multiple request IDs showing premature termination correlated with new overload reasons.
+
+---
+
+## What Support should ask for (intake checklist)
+Request the following in the initial reply to reduce ping-pong:
+1) Affected route(s): e.g., `/v1/chat/completions`
+2) Region/endpoint base URL (if multi-region)
+3) Time window (with timezone) and approximate request rate
+4) Sample `x-redwood-request-id` values (3–10 IDs)
+5) Full 429 response headers + body (raw)
+6) Whether they are using streaming
+7) Their current retry policy (backoff, max attempts, concurrency)
+8) Whether it’s isolated to a single API key or all keys in the account
+
+Internal-only (if available to TAM/CS): contract tier (Hosted API vs Dedicated), priority class, and any approved exceptions.
+
+---
+
+## Escalation criteria (when to page/loop in Engineering)
+Escalate to SRE/Platform when ANY of the following are true:
+
+### Enterprise impact thresholds
+- Enterprise customer reports sustained 429s on a protected route for **>10 minutes** AND:
+  - reason indicates overload protection (`overloaded/*`), OR
+  - they claim traffic is within contracted limits but still seeing 429s
+- Enterprise customer reports p95/p99 latency degradation plus 429 spikes (possible mis-tuned thresholds)
+
+### Suspected misconfiguration
+- `x-redwood-limit-policy` changes unexpectedly after rollout / config migration
+- A single tenant is denied while peers are not, and headers indicate route-group limits that don’t match the contract
+
+### Possible platform bug
+- Missing/incorrect reason codes across multiple requests
+- `retry-after` values that are clearly wrong (e.g., negative, extremely large, inconsistent with window)
+- Streaming termination inconsistencies correlated with overload events
+
+### Security / access concerns
+- Customer requests details about other tenants, fleet state, or priority policy internals beyond what we disclose. Route via TAM/CS + Security as needed.
+
+---
+
+## Escalation process (internal)
+1) Create/attach a ticket in the Support queue and tag: `overload-protection` + `enterprise`.
+2) Post in `#incidents` (if active event suspected) or `#eng-sre` with:
+   - customer/account
+   - affected routes/regions
+   - timeframe
+   - reason codes + sample request IDs
+   - whether Retry-After was present and followed
+3) Link the relevant dashboards (SRE on-call will pull). If you have access, include:
+   - enterprise route SLO dashboard
+   - overload protection shed-rate panel
+   - admission control trigger annotations
+
+If immediate paging is warranted, follow the runbook: “Overload protection and admission control” (Related pages).
+
+---
+
+## Approved external explanation (copy/paste)
+Use this when responding to customers (edit for their tier/route):
+
+“HTTP 429 indicates the request was throttled or temporarily rejected to protect latency and availability. For protected enterprise routes, Redwood prioritizes higher-SLA traffic under peak load to prevent fleet-wide degradation. Please implement exponential backoff with jitter and respect any Retry-After headers. If you share a few request IDs and the full response headers/body, we can confirm whether the 429s are due to your configured limits (quota/rate) or transient overload protection.”
+
+---
+
+## FAQ (Support)
+
+**Q: Is a 429 an outage?**
+A: Not necessarily. For many overload cases, it’s intentional backpressure to avoid tail latency/5xx cascading failures.
+
+**Q: Can enterprise customers still get 429s?**
+A: Yes—if they exceed their contracted limits, or in rare cases when a protected route’s enterprise budget is fully consumed during sustained overload.
+
+**Q: Should customers increase retry aggressiveness to “push through”?**
+A: No. Aggressive retries worsen overload. Encourage backoff + jitter + client-side queueing.
+
+**Q: Customer says they stayed under their “RPM” but still got 429.**
+A: Ask for headers and request IDs. They may be hitting a route-group limit, a token/compute guardrail, or experiencing transient admission control without Retry-After being honored.
+
+---
+
+## Change log
+- 2026-02-06: Added streaming termination guidance + escalation triggers for inconsistent SSE termination.
+- 2026-01-23: Updated reason-code table to include `shed_enterprise_budget` and `region_capacity`.
+- 2026-01-09: Initial publication for Support enablement ahead of GA rollout.

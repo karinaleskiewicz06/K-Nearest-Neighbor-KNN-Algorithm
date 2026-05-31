@@ -1,0 +1,167 @@
+Tenant Impact Scorer & Priority Gating Runbook
+
+Overview:
+
+This runbook defines the Tenant Impact Scorer (TIS), a deterministic scoring algorithm and automation flow that:
+- Quantifies incident impact at the tenant/customer level.
+- Converts impact into a prioritized remediation level (P0..P3).
+- Drives automated gating of non-critical deployments and throttles via the gatekeeper-service when error budgets or capacity signals cross thresholds.
+
+Goal:
+- Reduce time-to-prioritize for multi-tenant incidents.
+- Ensure capacity/economics aware mitigation (avoid global throttles for a small set of high-error tenants).
+- Provide a reproducible signal for oncall and product owners to take action.
+
+Scope:
+- Applies to all customer-facing inference endpoints and long-running background jobs that surface tenant errors (service prefixes: inference-api/*, embeddings/*, reranking/*).
+- Not applicable to internal platform-only pipelines (use eng-sre/internal-playbook).
+
+Owners and Contacts:
+- Primary owner: eng-sre (oncall alias: eng-sre-oncall@redwood.com)
+- Gatekeeper service owner: infra-platform (owner: Aaron Patel)
+- Product escalation: product-support@redwood.com
+- Incident CLI & automation maintainer: Liam Chen
+
+Definitions and Signals:
+- tenant_error_rate: percentage of failing requests over last 5m for a tenant (Prometheus metric: inference_request_errors_total / inference_request_total by (tenant_id)).
+- tenant_traffic_share: tenant requests / total requests over 1h.
+- error_budget_burn_rate: rate at which a tenant is consuming its Service SLO error budget (30m exponential window).
+- active_complaints: number of customer support tickets opened in last 30m for the tenant (from Zendesk API).
+- tier_score: numeric mapping for plan tier: enterprise=1.0, standard=0.6, free=0.2 (enterprise gets higher weight because impact is higher).
+
+Scoring formula (deterministic):
+- Normalize each signal into 0..1 range using soft-floor/ceiling per metric (see params below).
+- TenantImpactScore = 0.35*norm_error_rate + 0.25*norm_traffic_share + 0.20*norm_burn_rate + 0.10*norm_active_complaints + 0.10*tier_score
+
+Parameter normalization thresholds (default):
+- norm_error_rate: 0% -> 0, 1% -> 0.25, 5% -> 0.75, 20% -> 1.0
+- norm_traffic_share: 0% -> 0, 0.5% -> 0.2, 5% -> 0.7, 30% -> 1.0
+- norm_burn_rate: 1x -> 0, 2x -> 0.25, 5x -> 0.75, 20x -> 1.0
+- norm_active_complaints: 0 -> 0, 1 -> 0.4, 3 -> 0.8, 10 -> 1.0
+
+Priority mapping (TenantImpactScore -> Action):
+- P0 (>= 0.85): Immediate incident response; page SRE; auto-gate deploys for tenant; apply temporary traffic diversion or aggressive throttles.
+- P1 (0.6 - 0.85): High priority; assign incident commander within 10 minutes; auto-throttle to soft limit; notify account owner and CS.
+- P2 (0.35 - 0.6): Monitor and mitigate; schedule regression test, consider targeted retry/backoff policies for affected tenant.
+- P3 (<0.35): Low priority; record and window into next reliability retrospective.
+
+Automated gating and policy enforcement:
+- gatekeeper-service: internal HTTP API that accepts decisions to quarantine tenants or set dynamic throttles.
+- Default gate actions: {
+    "quarantine": {"traffic_cap_pct": X},
+    "throttle": {"qps_limit": N},
+    "pause_deploys": true/false
+  }
+
+Sample gatekeeper request (curl):
+
+curl -X POST https://internal-api.redwood.com/gatekeeper/v1/tenants/action 
+  -H 'Authorization: Bearer $GATEKEEPER_TOKEN' 
+  -H 'Content-Type: application/json' 
+  -d '{"tenant_id":"acct_1234", "action":"quarantine", "params": {"traffic_cap_pct": 20}, "reason":"TIS P0 auto-respond"}'
+
+PromQL examples used by scorer (replace $TENANT with tenant label):
+- tenant_error_rate: sum(increase(inference_request_errors_total{tenant="$TENANT"}[5m])) / sum(increase(inference_request_total{tenant="$TENANT"}[5m]))
+- tenant_traffic_share: sum(increase(inference_request_total{tenant="$TENANT"}[1h])) / sum(increase(inference_request_total[1h]))
+- tenant_burn_rate: rate(error_budget_consumed_total{tenant="$TENANT"}[5m]) / (error_budget_total{tenant="$TENANT"} / 3600)
+
+Zendesk quick lookup (example curl):
+curl -s -H "Authorization: Bearer $ZENDESK_TOKEN" 
+  "https://redwood.zendesk.com/api/v2/search.json?query=type:ticket organization:acct_1234 created>now-30m" 
+  | jq '.results | length'  # returns active_complaints
+
+Operational runbook: step-by-step
+1) Detect: TIS runs every 60s and emits tenant_impact_score{tenant_id}. Alert fires when any tenant score crosses 0.6 (P1) or 0.85 (P0).
+2) Page: For P0 -> page eng-sre-oncall and product-owner of tenant. For P1 -> page eng-sre-oncall. Include a generated summary (top signals, top endpoints, recent deploys).
+3) Observe: Run automated diagnostic queries (PromQL + slowlog extraction) via the incident CLI:
+   - incident-cli query --tenant acct_1234 --duration 15m --metrics errors,latency,traffic
+4) Decide: Use the decision matrix below to choose gate action. The first responder should confirm suggested gate in Slack #oncall-decisions with the JSON payload.
+5) Enforce: POST to gatekeeper-service (see sample) and record action in incident tracker (Jira/Confluence incident page).
+6) Mitigate: Depending on action, apply fixes: rollback last deploy for tenant routing, increase capacity if capacity-related, or roll out a targeted config patch.
+7) Validate: Verify tenant metrics return to baseline for 30m before removing quarantine.
+8) Post-incident: Create an incident review using templates in /confluence/eng-sre/incident-review. Include TIS telemetry and gate decisions as artifacts.
+
+Decision matrix (quick reference):
+- If TenantImpactScore >= 0.85 -> gate: quarantine to 10-25% traffic and pause deploys; escalate to P0.
+- If 0.7 <= score < 0.85 and error_budget_burn_rate > 5x -> gate: throttle to safe qps and notify billing/CS.
+- If score driven primarily by traffic spike (traffic_share > 10% but low error rate) -> consider autoscale/allocate burst pool instead of quarantining.
+- If score driven by active_complaints > 3 -> immediately notify account owner and enable crash-only logging for tenant requests for 1h.
+
+Safety knobs and overrides:
+- human_override: any SRE with role "incident_responder" can annotate the gate action with reason: human_override=true and set manual expire timestamp.
+- auto_ttl: automated gate actions default to 30 minutes unless extended by explicit operator or a follow-up automation that keeps sampling.
+- dry_run_mode: during holiday weekends or platform upgrades, TIS runs in "dry_run" and will not call gatekeeper-service but will still page and log decisions. Toggle via feature flag: feature.tis.enable_gating=false
+
+Telemetry and dashboards:
+- Dashboards: Tenant Impact Overview (Grafana board id: SRE-TIS-012) showing top 25 tenants by score, trend sparkline, and active gates.
+- Alerts: TIS-P1 (score>=0.6) and TIS-P0 (score>=0.85) in PagerDuty. Alert payload includes: tenant_id, computed_score, top contributing signal, last_deploy_id.
+
+Rollout plan for the scorer and gating automation:
+1) Developer preview (week 1-2): run TIS in dry_run against production data; gather feedback from top 50 enterprise tenants.
+2) Gradual enable (week 3-6): enable auto-gating for internal/test tenants only; schema and webhook contract validated.
+3) Canary (week 7-10): enable gating for low-risk customer buckets; monitor false positive rate < 2% over 2 weeks.
+4) Full launch (week 11+): enable for all tenants with monitoring guardrails; SRE oncall trained on playbook.
+
+Testing guidance and QA:
+- Unit test scoring logic with synthetic tenants: include edge cases (zero traffic, heavy error burn for free tier, sudden bursty traffic).
+- Load test gatekeeper-service at 10k ops/s and ensure <200ms median response.
+- Chaos tests: simulate API gateway failures and ensure TIS degrades to read-only (no gating) and still pages SRE.
+
+Runbook snippets & templates (Confluence copy candidates):
+- Incident summary template: include computed TIS score, rationale, gate action, and validation checklist.
+- Postmortem artifact checklist: log of gate actions, PromQL queries, deploy ids, and Zendesk ticket ids.
+
+Example incident timeline (illustrative):
+- 09:02: TIS detects acct_1234 score 0.88 (P0) due to 12% error rate and 8% traffic share.
+- 09:03: Eng-sre-oncall paged and auto-suggested action: quarantine 20% traffic + pause deploys.
+- 09:04: SRE lead approves in #oncall-decisions and gatekeeper-service POSTs quarantine action.
+- 09:20: Errors fall to 1.2% for tenant; score drops to 0.45.
+- 09:55: Gate auto-ttl expires; first responder validates 30m baseline and removes quarantine.
+
+Audit and compliance notes:
+- All gatekeeper actions are logged to audit-log-service (retention 13 months).
+- For regulated customers, additional manual approval is required to apply quarantines (see security-and-compliance/gated-actions-policy).
+
+Appendix: Example scoring pseudo-code
+
+# python-style pseudo-code
+
+def normalize(value, thresholds):
+    # thresholds = [(x1, s1), (x2, s2), ...] linear interp clamp
+    # returns 0..1
+    ...
+
+def compute_tis(tenant_id):
+    err = query_promql(tenant_error_rate)
+    traffic = query_promql(tenant_traffic_share)
+    burn = query_promql(tenant_burn_rate)
+    complaints = query_zendesk_count(tenant_id)
+    tier_score = lookup_tier(tenant_id)
+    return 0.35*norm(err) + 0.25*norm(traffic) + 0.20*norm(burn) + 0.10*norm(complaints) + 0.10*tier_score
+
+# CI/CD gating example (GitHub Actions snippet)
+name: Deploy
+on: [push]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Query gatekeeper before deploy
+        run: |
+          curl -s -X POST https://internal-api.redwood.com/gatekeeper/v1/ci/check \
+            -H "Authorization: Bearer $GATEKEEPER_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"target":"svc/inference-api", "tenant_id":"${{ matrix.tenant }}"}' \
+          | jq '.status'
+
+Notes and future work:
+- Integrate tenant sentiment from support conversations (NLP score) to increase sensitivity for enterprise customers.
+- Add machine-learning calibration to dynamically tune normalization thresholds per-service.
+- Expand the gate actions to include fine-grained model-variant fallback for inference endpoints.
+
+References:
+- Grafana board: SRE-TIS-012
+- Gatekeeper API docs: https://internal-api.redwood.com/docs/gatekeeper
+- Incident CLI: https://internal-tools.redwood.com/incident-cli
+
+End of document

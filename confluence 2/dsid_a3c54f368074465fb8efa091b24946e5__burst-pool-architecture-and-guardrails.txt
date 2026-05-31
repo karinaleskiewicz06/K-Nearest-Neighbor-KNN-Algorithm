@@ -1,0 +1,324 @@
+Dedicated Burst Capacity: Burst Pool Architecture & Guardrails (Design Spec)
+
+## 1. Overview
+This design specifies how Redwood Dedicated customers can temporarily exceed their reserved baseline GPU allocation by borrowing from Redwood-managed shared “burst pools,” while preserving platform-wide SLOs and protecting non-bursting tenants.
+
+This document covers:
+- Burst pool topology (per region and hardware class)
+- Admission control and deterministic decisioning
+- Fairness model for shared pools (token bucket / WFQ hybrid)
+- Guardrails: per-tenant caps, cooldowns, global fleet safety, circuit breakers
+- Routing/data plane integration and fallback behavior
+- Failure modes and rollback strategy
+
+Out of scope (initial release):
+- Cross-region bursting (burst is constrained within the region)
+- Customer-specific dedicated burst pools (initially shared Redwood-managed pools with strict segmentation)
+- Market/spot style reservation trading
+
+## 2. Definitions
+- **Baseline (reserved) capacity**: GPUs reserved for a Dedicated tenant; always prioritized for that tenant.
+- **Burst**: additional capacity above baseline, served from shared burst pools, subject to admission control and guardrails.
+- **Burst pool**: a Redwood-managed GPU pool per (region, hardware class) providing spare capacity for burst.
+- **Hardware class**: a deployment grouping such as `H100-80GB`, `L40S-48GB`.
+- **Tenant**: a Dedicated customer environment with isolation boundaries and contract/SLA.
+- **Burst ratio**: (baseline + burst) / baseline. Used for policy limits (e.g., max 1.5x baseline).
+- **Admission decision**: allow/deny plus a denial reason code, produced by the admission controller.
+
+## 3. Goals and non-goals
+### 3.1 Goals
+1) **Provide paid burst** for Dedicated customers to cover predictable peaks without permanent over-provisioning.
+2) **Protect the fleet and neighbors**: strict guardrails, fairness, and fast circuit breakers.
+3) **Make behavior debuggable**: consistent reason codes, dashboards, audit trails.
+4) **Keep decisions deterministic** enough for reliable routing and customer support (“why was I denied?”).
+5) **Enable safe rollout**: feature flags, per-region allow lists, SLO-based gates, and rollback switches.
+
+### 3.2 Non-goals
+- Guarantee that burst capacity is always available.
+- Provide burst beyond the customer’s region.
+- Offer arbitrary customer-defined priorities beyond supported tiers.
+
+## 4. High-level architecture
+### 4.1 Components
+1) **Routing / Gateway** (data plane):
+- For each request, computes desired placement (baseline vs burst) and requests an admission decision if burst is needed.
+- Applies backpressure/fallback based on decision and route policy.
+
+2) **Burst Admission Controller** (control-plane-adjacent service):
+- Evaluates tenant config + pool telemetry + guardrail policy.
+- Enforces fairness (token bucket / WFQ hybrid) and returns a deterministic decision.
+
+3) **Policy Engine**:
+- Stores and evaluates rules: max burst ratios, cooldown windows, per-tenant caps, global fleet caps, tiering.
+
+4) **Fleet Telemetry + Pool Manager**:
+- Exposes pool health signals: available GPU capacity, saturation, queue depth, telemetry freshness.
+- Implements region/hardware allow lists and emergency pool-level disables.
+
+5) **Metering / Billing Export**:
+- Emits burst usage signals (GPU-seconds and/or token-attribution, per tenant, per region/hardware class).
+
+6) **Observability stack**:
+- Metrics, dashboards, alerts (saturation, denials, tail latency deltas, telemetry lag).
+
+### 4.2 Request flow (text diagram)
+1) Request arrives at Gateway/Router for tenant T, model M, region R.
+2) Router queries capacity allocator for baseline availability for T in (R, HW).
+3) If baseline sufficient → schedule on baseline; no burst admission needed.
+4) If baseline insufficient and tenant has burst enabled → Router calls Admission Controller with (tenant_id, region, hw_class, requested_units, route_key, idempotency_key).
+5) Admission Controller returns ALLOW or DENY(reason_code, retry_after_ms optional).
+6) Router:
+- If ALLOW → routes to burst pool capacity partition.
+- If DENY → applies configured fallback policy (queue/backoff, 429, downgrade model variant, or route to baseline with increased queuing if allowed).
+7) Metering emits burst usage attribution for admitted burst work.
+
+## 5. Burst pool topology
+### 5.1 Pool partitioning
+Burst pools are provisioned by **(region, hardware class)**. Examples:
+- `us-east-1 / H100-80GB` burst pool
+- `eu-west-1 / L40S-48GB` burst pool
+
+Rationale:
+- Keeps failure domain bounded.
+- Aligns with procurement and cluster scheduling constraints.
+- Avoids cross-region network latency and data residency issues.
+
+### 5.2 Segmentation inside a burst pool
+Within each (region, hardware class) burst pool we maintain logical segmentation:
+- **Tier partitions** (optional at GA; enabled if enterprise tiering is active): `gold`, `silver`, `standard`.
+- **Safety reserve**: a non-allocatable buffer (e.g., 10–20%) to absorb telemetry error and sudden utilization spikes.
+
+Segmentation is enforced via admission policies and scheduler quotas; it is not purely “best effort.”
+
+### 5.3 Baseline vs burst compute isolation
+- Baseline Dedicated clusters remain isolated and reserved.
+- Burst workloads are scheduled onto burst pool nodes, not onto another tenant’s baseline.
+- If a region has both Dedicated and burst pool nodes, they share the physical data center and network but are separated by capacity partitions and admission control.
+
+## 6. Admission control: semantics and guarantees
+### 6.1 Decision semantics
+Admission Controller returns one of:
+- **ALLOW**: the request may consume burst capacity within the tenant’s configured limits.
+- **DENY**: request must not consume burst capacity.
+
+A denial includes:
+- `reason_code` (stable enum)
+- optional `retry_after_ms` (used only for explicit backoff guidance)
+
+We do not require Router to queue at Admission Controller. Queueing, if used, is handled at Router (or in a separate queueing layer) to keep Admission Controller fast and predictable.
+
+### 6.2 Determinism principles
+We aim for deterministic outcomes per (tenant_id, route_key, time window) given the same policy config and telemetry snapshot.
+
+Practically:
+- Admission uses **monotonic counters** and **token bucket state** per tenant per pool.
+- Telemetry is “snapshotted” at a configured freshness threshold; if stale, we fail closed (deny burst) with an explicit reason.
+- Idempotency keys are supported so retries do not accidentally double-consume burst quota or double-count metering.
+
+### 6.3 Inputs
+Admission decision uses:
+- Tenant configuration: burst enabled, caps, max ratio, tier, cooldown parameters.
+- Pool state: allocatable capacity, saturation, queue depth, error state (degraded/disabled).
+- Fleet safety state: global cap status, circuit breaker state.
+- Telemetry freshness: age of signals.
+
+## 7. Guardrails (policy rules)
+Guardrails are enforced in the following order (fail-fast):
+
+1) **Feature flag / allow list gates**
+- Burst must be enabled globally.
+- Region/hardware class must be allow-listed.
+- Tenant must be enabled (and not suspended).
+
+2) **Telemetry freshness gate**
+- If telemetry age > `telemetry_max_age_ms`, deny burst with `TELEMETRY_STALE`.
+
+3) **Global fleet safety caps**
+- If burst pool allocatable fraction exceeds safety thresholds (or pool saturation exceeds threshold), deny with `FLEET_SAFETY_CAP`.
+- Circuit breaker may shift from “deny new burst” to “disable all burst” depending on severity.
+
+4) **Per-tenant caps**
+Enforced limits (examples; actual values are configuration):
+- `max_burst_gpus` (absolute cap)
+- `max_burst_ratio` (e.g., up to 1.5x baseline)
+- `max_burst_rps` or `max_burst_tokens_per_min` (optional; for request-level fairness)
+
+5) **Cooldown window**
+- After a tenant hits a hard cap or experiences repeated denials, apply cooldown to reduce thrash.
+- Cooldown also used for safety after a circuit breaker event.
+
+6) **Fairness enforcement** (shared pool)
+- Tenants compete fairly for remaining allocatable pool capacity.
+
+### 7.1 Config surface (control plane)
+Tenant-level burst config includes (conceptual fields):
+- `burst_enabled`: true/false
+- `burst_tier`: standard|silver|gold
+- `max_burst_ratio`: float (>=1.0)
+- `max_burst_gpus`: integer
+- `cooldown_seconds`: integer
+- `burst_priority_weight`: integer (derived from tier; not arbitrary per tenant at GA)
+
+Validation rules:
+- `max_burst_ratio` must be within allowed band per tier.
+- `max_burst_gpus` must be <= tier max and <= region/hardware class max.
+- Changes are audited (see Audit Logging page).
+
+## 8. Fairness model (token bucket / WFQ hybrid)
+### 8.1 Summary
+We implement fairness in two layers:
+1) **Token bucket per tenant per pool** (primary enforcement)
+2) **Weighted scheduling / WFQ-like weighting** for tenants within a tier and across tiers
+
+Rationale:
+- Token bucket provides predictable burst allowance over time and is easy to reason about.
+- Weighting provides flexibility so higher tiers can have proportionally higher access without starvation.
+
+### 8.2 Token bucket details
+Each tenant has a bucket in each (region, hardware class) pool:
+- Tokens represent “burst capacity units” (normalized GPU-seconds or concurrency units).
+- Bucket has:
+  - `capacity_tokens`
+  - `refill_rate_tokens_per_sec`
+  - `min_floor_tokens` (optional: anti-starvation)
+
+Admission consumes tokens proportional to the requested burst work estimate.
+
+Work estimate:
+- For streaming generation, we use a conservative estimate based on model profile and request size.
+- When actual usage differs, metering reconciles totals; admission is designed to be conservative to protect neighbors.
+
+### 8.3 Tier weighting
+Tier weights set relative refill rates and/or bucket capacities:
+- Standard: weight 1.0
+- Silver: weight 1.5
+- Gold: weight 2.0
+
+Constraints:
+- Anti-starvation: standard tenants retain a minimum share when pool is not fully exhausted.
+- Hard safety: tiers do not override global circuit breakers.
+
+### 8.4 Anti-gaming and retry behavior
+- Admission decisions are idempotent with `idempotency_key` within a short TTL.
+- Router must not “spin” on deny; it must respect `retry_after_ms` and apply exponential backoff.
+- If a tenant repeatedly sends burst requests while at cap, cooldown may be applied to reduce churn.
+
+## 9. Denial behavior and reason codes
+### 9.1 Router behavior on denial
+Router behavior is policy-driven per route; defaults:
+- If burst denied due to `TENANT_CAP_REACHED` or `FAIRNESS_LIMIT` → return 429 with a stable error body and `Retry-After` header.
+- If burst denied due to `TELEMETRY_STALE` or `ADMISSION_CONTROLLER_UNAVAILABLE` → fail closed and route to baseline if possible; otherwise return 503.
+- If burst denied due to `FLEET_SAFETY_CAP` → fail closed; do not attempt retries more frequently than configured.
+
+### 9.2 Stable denial reason codes (v1)
+The following codes must be stable (for Support, dashboards, and customer docs):
+- `BURST_DISABLED` (tenant or region/hardware not enabled)
+- `TENANT_NOT_ELIGIBLE` (contract/tier mismatch)
+- `TELEMETRY_STALE`
+- `POOL_SATURATED`
+- `FLEET_SAFETY_CAP`
+- `TENANT_CAP_REACHED`
+- `MAX_BURST_RATIO_EXCEEDED`
+- `COOLDOWN_ACTIVE`
+- `FAIRNESS_LIMIT`
+- `ADMISSION_CONTROLLER_UNAVAILABLE`
+- `POLICY_EVALUATION_ERROR`
+
+## 10. Global safety: circuit breakers and SLO gates
+### 10.1 Fleet safety caps
+Each pool enforces:
+- `max_allocatable_fraction` (e.g., only 80–90% of physical burst pool capacity is allocatable)
+- `max_tail_latency_delta_ms` (neighbor impact indicator)
+- `max_denial_rate` (used as a symptom; not a cause)
+
+If breached, Admission Controller denies new burst admissions. If severe or persistent, the global circuit breaker disables burst for that pool.
+
+### 10.2 Neighbor impact protection
+We track and alert on:
+- p95/p99 latency deltas for non-burst tenants in the same region/hardware class
+- tail amplification signals in the serving runtime
+- queue depth growth and batch latency growth
+
+If non-burst latency regresses beyond SLO thresholds for a sustained window, burst is automatically reduced/disabled (SLO regression gate).
+
+## 11. Failure modes and expected behavior
+### 11.1 Admission Controller outage
+- Default is **fail closed for burst**.
+- Router continues serving baseline.
+- If baseline insufficient and burst required → return 503 or 429 depending on route policy.
+- Alert: “admission-controller-unavailable” pages Platform on-call.
+
+### 11.2 Telemetry lag / partial telemetry loss
+- If telemetry freshness exceeds threshold, deny with `TELEMETRY_STALE`.
+- If telemetry is present but noisy, smoothing is applied; conservative decisions are preferred.
+- Guard condition prevents starvation where telemetry lag causes persistent denials (see hotfix notes referenced in PR history).
+
+### 11.3 Pool saturation
+- Admission denies with `POOL_SATURATED` or `FLEET_SAFETY_CAP`.
+- Router applies backoff and may surface clear customer messaging.
+- SRE runbook: reduce caps, disable tier partitions if needed, or disable burst for pool.
+
+### 11.4 Policy/config mistakes
+- All config changes are audited.
+- Control plane validates bounds; out-of-range configs rejected.
+- Emergency kill switch exists to disable burst globally or per pool.
+
+### 11.5 Billing/metering mismatch
+- Metering is idempotent on request IDs.
+- Reconciliation checks compare admission “allowed burst units” vs metered usage.
+- On mismatch above threshold: alert Finance/Billing on-call and optionally suspend burst metering export (without stopping service) until resolved.
+
+## 12. Rollout and rollback plan (design requirements)
+### 12.1 Rollout controls
+- Global feature flag (default off)
+- Per-region + hardware class allow list
+- Per-tenant enablement
+- SLO-based automatic gates (disable burst when neighbor SLO degrades)
+
+### 12.2 Rollback mechanisms
+Ordered from least to most disruptive:
+1) Reduce per-tenant caps (control plane)
+2) Disable burst for a tenant
+3) Disable burst for a region/hardware class pool
+4) Global kill switch
+
+Rollback should complete within minutes. All rollback actions must be audited.
+
+## 13. Observability requirements (what must exist for GA)
+Dashboards (minimum):
+- Pool saturation: allocatable capacity, utilization, queue depth
+- Admission outcomes: allow/deny counts by reason_code
+- Per-tenant burst usage: burst units over time, peak concurrency
+- Telemetry freshness and error rates
+- Neighbor impact: non-burst p95/p99 latency deltas, tail amplification indicators
+
+Alerting (minimum):
+- Burst pool saturation sustained
+- Non-burst latency regression sustained (SLO gate trigger)
+- Admission Controller elevated errors/timeouts
+- Telemetry stale rate elevated
+- Denial reason shifts (e.g., sudden spike in `POLICY_EVALUATION_ERROR`)
+
+## 14. Open questions (tracked to ADRs/tickets)
+- Exact unit for token bucket accounting (GPU-seconds vs normalized concurrency units) and how quickly we can reconcile to metering.
+- Whether to introduce optional Router-side queueing for certain routes, versus strict 429 behavior.
+- Tier partitioning: whether tiers are enforced purely via weights or with reserved slices inside the burst pool.
+
+## 15. Appendix A: Recommended default parameters (initial beta/GA baselines)
+Note: actual defaults are configured per region/hardware class and may differ based on supply risk and fleet utilization targets.
+- `telemetry_max_age_ms`: 2000–5000ms
+- `safety_reserve_fraction`: 10–20%
+- `max_burst_ratio` (standard): up to 1.25–1.5
+- `max_burst_ratio` (gold): up to 2.0 (with strict anti-starvation)
+- `cooldown_seconds`: 30–120s after cap hit
+
+## 16. Appendix B: Supportability and customer messaging requirements
+- All customer-visible errors related to bursting must include:
+  - a stable denial reason code
+  - a short human-readable description
+  - suggested retry/backoff guidance when appropriate
+- Console must display:
+  - whether burst is enabled
+  - configured limits (ratio and absolute)
+  - current usage and recent denials breakdown
+- Support tooling must provide a redacted “why was I denied?” explanation using the same reason codes and policy snapshot identifiers.

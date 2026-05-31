@@ -1,0 +1,286 @@
+ADR: Rollout policy evaluation order and precedence (Hosted canary rollouts)
+
+## Status
+Published.
+
+## Summary
+This ADR defines how **rollout policies** (guardrails, approvals, stop/rollback) compose with existing **routing policies** (fallback chains, region routing / data residency, quotas/rate limits) for **Hosted canary rollouts**. It also defines precedence and deny semantics so the Console, control plane, and data plane behave consistently.
+
+Key decision: we treat policies as a layered system with **hard denies first**, then **routing constraints**, then **rollout split selection**, then **runtime fallback execution**. Explicit deny always wins.
+
+---
+
+## Context
+Redwood Hosted routing already supports:
+- Route-level model selection and fallback chains (e.g., Model A → Model B)
+- Region routing and data residency constraints
+- Quotas / rate limits and tenant suspension mechanisms
+- Reliability behaviors (timeouts, retries, circuit breakers)
+
+Hosted canary rollouts introduce:
+- A rollout object that selects a **baseline** and **canary** target (usually model version/config variants)
+- Percentage-based traffic splitting with deterministic cohorting
+- Guardrails (max step size, min soak time, approvals) and stop conditions (auto-pause/rollback)
+
+We need a single, predictable evaluation order for:
+1) **Write-time actions** (create/start/advance/pause/rollback), evaluated in Console/backend/control plane
+2) **Request-time routing** (which model/variant actually serves a given request), evaluated in Smart Routing/data plane
+
+We also need to avoid ambiguous behavior when multiple policies apply (e.g., canary says “send 10% to canary” but region routing or quota rules force otherwise).
+
+---
+
+## Decision
+### 1) Policy composition model
+Policies are evaluated under three domains with distinct execution points:
+
+**A. Authorization policies (who can do what)**
+- Evaluated at request time for Console/API actions.
+- Driven by RBAC permissions (e.g., rollout:create, rollout:start, rollout:approve, rollout:rollback).
+
+**B. Control-plane validation policies (is the config/action allowed)**
+- Evaluated at write time by the policy engine and orchestrator.
+- Includes guardrails (max jump %, min soak) and approval gates.
+
+**C. Data-plane runtime policies (how requests are served safely)**
+- Evaluated per inference request.
+- Includes quotas/rate limits, region constraints, traffic splitting enforcement, fallback execution.
+
+These domains are intentionally separated: control-plane policies prevent invalid rollout plans from being stored; data-plane policies ensure safety and correctness under partial failure or inconsistent state.
+
+---
+
+### 2) Precedence and deny semantics
+**Explicit deny wins.**
+- If any applicable policy yields a deny for an action or request, evaluation stops and the deny is returned.
+- When multiple policies can deny, we return the most actionable error (see “Reason codes”).
+
+**Most restrictive constraint wins** for constraints (not denials), e.g.:
+- Region allowlist intersection
+- Capacity tier constraints
+- Max-concurrency restrictions
+
+**Rollout policy may not override hard safety/availability controls**, including:
+- Tenant suspension
+- Route disabled
+- Quota/rate limit exceeded
+- Data residency/region constraints
+
+Rollout policy is a *traffic selection mechanism*, not an entitlement bypass.
+
+---
+
+## Request-time routing evaluation order (Hosted data plane)
+This is the normative order for Smart Routing when a Hosted route has an active rollout.
+
+### Step 0 — Normalize identity and routing context
+Inputs:
+- tenant_id, project_id
+- route_id
+- request_id
+- end_user_id (optional)
+- selected region (if client pinned) / inferred region
+- headers affecting routing (e.g., debug, internal override; subject to allowlist)
+
+Outputs:
+- effective_route_config (resolved)
+- effective_rollout (if active)
+
+Note: Deterministic cohorting inputs are governed by ADR “Cohorting and traffic splitting”. This ADR assumes we can compute `cohort = baseline|canary` deterministically when rollout is active.
+
+### Step 1 — Hard denies (fail closed)
+Evaluate and enforce, in order:
+1. Tenant/project suspended or billing lock → DENY
+2. Route disabled / route deleted → DENY
+3. Authentication invalid → DENY
+4. Quota/rate limit exceeded (tenant, project, route) → DENY
+5. Regional hard deny (data residency / region disallow) → DENY
+
+Rationale: these are correctness and compliance requirements; any attempt to “route around” them violates guarantees.
+
+### Step 2 — Compute eligible serving regions and capacity constraints
+Apply region routing policy:
+- If route has region pinning or residency constraint, restrict eligible regions.
+- If client requested a region, enforce allowlist; otherwise choose per existing region policy (latency/cost/capacity).
+
+Output:
+- selected_region
+- selected_capacity_tier (if applicable)
+
+Important: rollout splitting is applied **within** the selected region/tier. We do not “count” traffic percentage globally across regions because it makes percentages unpredictable under region failover. (Metrics are still aggregated cross-region, but the selection decision is region-scoped.)
+
+### Step 3 — Compute candidate targets (baseline/canary/fallback)
+Construct an ordered candidate set:
+- Primary target(s): baseline target and canary target as defined by rollout (often same model family, different version/config)
+- Route fallback chain: existing fallback targets for that route (if configured)
+
+We do not allow a rollout to define a target that violates route-level allow/deny lists (e.g., blocked models).
+
+### Step 4 — Apply rollout split selection (if rollout active)
+If rollout is active and in a “serving” state:
+1. Compute cohort assignment (baseline vs canary) deterministically.
+2. Select the cohort’s primary target.
+
+If rollout is paused/rolled back/completed:
+- Paused: cohort selection freezes; continue serving last stable configuration (see “Paused behavior”)
+- Rolled back: serve baseline
+- Completed: serve promoted target (implementation defined; typically the canary target becomes baseline)
+
+**Paused behavior (normative):**
+- When a rollout is paused, new requests are served by the baseline target by default unless the rollout is explicitly configured with “freeze cohorts on pause”. For GA we default to **baseline-on-pause** because it is safer and simpler to reason about for customers.
+
+### Step 5 — Dispatch and apply runtime fallback (cohort-aware)
+Dispatch to the selected primary target.
+
+On failure, apply fallbacks in the following order:
+1) **Intra-rollout fallback:**
+   - If canary primary fails due to capacity/5xx/timeout, fallback to baseline primary **within the same route/region**, unless explicitly disabled by policy.
+   - If baseline primary fails, do not “fallback up” to canary. Continue to route fallback chain.
+
+2) **Route fallback chain:**
+   - Apply existing fallback chain for the route (Model A → Model B → …).
+
+3) If no fallbacks succeed → return error.
+
+Rationale:
+- Canary should never reduce availability when baseline is healthy.
+- Fallback to baseline from canary reduces blast radius and makes stop conditions more meaningful.
+- Allowing baseline → canary fallback creates confusing “hidden canary traffic” during incidents and distorts cohort comparisons.
+
+### Step 6 — Emit reason codes + telemetry tags
+For every request, emit:
+- rollout_id (nullable)
+- cohort (baseline|canary|none)
+- selected_target (logical target id)
+- fallback_used (true/false)
+- decision_reason_code (see below)
+
+---
+
+## Control-plane action evaluation order (Console/API)
+This defines how we evaluate actions like create/start/advance/pause/rollback.
+
+### Actions and evaluation layers
+For any action, evaluate in order:
+1) **RBAC authorization** (Marcus/Kaitlyn ownership; enforced at API gateway and/or Console backend)
+2) **Entitlements** (is tenant allowed to use canary rollouts / approvals / auto-rollback)
+3) **Guardrails validation** (max step size, min soak time, required approvals)
+4) **State machine validity** (orchestrator: can this transition occur from current state)
+5) **Write config + emit events** (audit + telemetry)
+
+If any layer denies, stop and return the error.
+
+### Precedence between guardrails and state machine
+Guardrails are evaluated **before** state transitions to provide clearer errors. Example:
+- If a user attempts to jump from 5% → 50% and max step size is 20%, return a guardrail error rather than “invalid transition”.
+
+---
+
+## Reason codes (standardized)
+To avoid inconsistent UX, we standardize a small set of reason codes surfaced in Console and logs.
+
+Recommended set (initial):
+- DENY_TENANT_SUSPENDED
+- DENY_ROUTE_DISABLED
+- DENY_QUOTA_EXCEEDED
+- DENY_REGION_NOT_ALLOWED
+- DENY_MODEL_NOT_ALLOWED
+- ROLLOUT_INACTIVE
+- ROLLOUT_PAUSED_BASELINE_FORCED
+- ROLLOUT_COHORT_SELECTED
+- ROLLOUT_CANARY_FAILED_FALLBACK_TO_BASELINE
+- ROUTE_FALLBACK_APPLIED
+
+Notes:
+- Reason codes must be stable across minor releases; add new codes without changing semantics.
+
+---
+
+## Examples
+### Example 1 — Quota exceeded should not “spill” to baseline/canary
+- Tenant exceeds route QPS limit.
+- Result: DENY_QUOTA_EXCEEDED.
+- No cohort selection occurs; no routing attempts occur.
+
+### Example 2 — Region residency constraint overrides rollout split
+- Rollout configured on route, 10% canary.
+- Request arrives pinned to a region not in allowlist.
+- Result: DENY_REGION_NOT_ALLOWED.
+
+### Example 3 — Canary fails; fallback to baseline; cohort attribution remains canary
+- Request assigned to canary cohort.
+- Canary target returns 5xx.
+- Data plane falls back to baseline target.
+- Telemetry:
+  - cohort=canary
+  - fallback_used=true
+  - decision_reason_code=ROLLOUT_CANARY_FAILED_FALLBACK_TO_BASELINE
+
+Rationale: for canary analysis, we want visibility into canary-induced failures even if baseline served the final response.
+
+---
+
+## Alternatives considered
+### A) Apply rollout split before region selection
+Rejected.
+- Would make cohort assignment inconsistent under region failover.
+- Causes unpredictable canary percentage per region and increases debugging complexity.
+
+### B) Allow baseline to fall back to canary to preserve availability
+Rejected.
+- Canary is explicitly the “riskier” target; using it as an availability fallback contradicts expectations and distorts cohort comparisons.
+
+### C) Treat rollouts as an overlay that can override quotas/limits
+Rejected.
+- Violates fairness and safety properties.
+- Increases attack surface (users could create rollouts to bypass enforcement).
+
+---
+
+## Consequences
+### Positive
+- Predictable precedence: hard denies and compliance constraints always win.
+- Canary blast radius is reduced: canary failures degrade to baseline without requiring customer action.
+- Metrics remain interpretable: canary cohort includes fallback events.
+
+### Negative / tradeoffs
+- Percentages are effectively **region-scoped**. Cross-region aggregate traffic may not match exact configured percentage during capacity shifts.
+- Baseline-on-pause may surprise customers who expected cohorts to freeze. We mitigate with explicit UI copy and an advanced setting later.
+
+---
+
+## Implementation notes
+- Smart Routing must have a single “effective routing plan” structure that includes:
+  - selected_region/tier
+  - cohort selection result
+  - target list with fallback ordering
+  - reason codes
+
+- Control plane should persist:
+  - rollout state
+  - step schedule
+  - policy evaluation results at time of change (for auditability)
+
+- Orchestrator emits audit events for:
+  - create/start/advance/pause/resume/rollback
+  - approval granted/denied
+  - auto-pause/auto-rollback triggers
+
+- Telemetry cardinality control:
+  - rollout_id tagging is required but must be capped by retention and sampling strategies as per Observability guidance.
+
+---
+
+## Open questions / follow-ups (non-blocking for GA)
+1) Add an optional tenant setting for “freeze cohorts on pause” for advanced users.
+2) Define how retries interact with cohort selection for streaming requests (see cohorting ADR; ensure stickiness across retries).
+3) Extend reason codes to cover policy-denied rollout actions with user-friendly remediation hints.
+
+---
+
+## Owners
+- Policy engine semantics: Jordan Lee / Benji Okafor
+- Control plane/orchestrator: Ethan Park
+- Smart Routing/data plane: Mina Haddad / Ravi Menon
+- SRE signals/stop conditions: Sean Gallagher / Rafael Mendes
+- Audit/RBAC: Marcus Lin / Kaitlyn Nguyen

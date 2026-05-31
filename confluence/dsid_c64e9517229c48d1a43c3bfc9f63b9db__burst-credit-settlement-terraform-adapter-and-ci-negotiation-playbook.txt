@@ -1,0 +1,166 @@
+burst-credit-settlement-terraform-adapter-and-ci-negotiation-playbook
+
+Overview
+
+This playbook describes the design, Terraform adapter contract, CI negotiation workflow, and runbook for settling burst-credit usage across accounts and teams. It applies to Burst-Orchestrator v2 and associated billing pipelines (Credit-Settler service). The goal is accurate cross-account settlement, safe Terraform changes to allocation rules, and automated negotiation when account owners disagree about credit transfers.
+
+Why this exists
+- Burst credits are used to permit short-term GPU capacity bursts across tenant accounts. Settlement must be: auditable, idempotent, and safe to apply via IaC.
+- We need a Terraform adapter that can: declaratively bind credit budgets to accounts, emit intent-only plans for negotiation, and apply agreed transfers.
+- CI must coordinate multi-team approvals (owner negotiation) before state-mutation applies.
+
+Scope and definitions
+- Burst credit: transient credit bucket consumed when a tenant bursts above committed capacity.
+- Allocation rule: a declarative entry in Terraform defining budget, priority, recovery-window, and settlement-policy.
+- Credit-Settler: internal microservice that reconciles usage events to transfers and posts accounting entries to Billing Pipeline (internal).
+- Terraform adapter (terraform-burst-credit): a small provider module that talks to Credit-Settler service via signed API.
+
+High-level design
+1) Desired state expressed in terraform-burst-credit module.
+2) CI (buildkite/github-actions) runs plan and a negotiation step that posts the plan to the Negotiation Queue.
+3) The affected account owners receive a review request with a diff and proposed transfers. They can Accept / Propose Counteroffer / Reject.
+4) Once consensus is reached, CI triggers apply that calls Credit-Settler apply API. The apply is idempotent and produces a settlement report.
+
+Service-level constraints and SLOs
+- Credit-Settler availability SLO: 99.95% (regional).
+- Plan-to-applied latency target for small changes (<5 accounts): <= 10 minutes end-to-end (negotiation excluded).
+- Audit retention: settlement reports retained for 7 years in audit-bucket (GCS).
+
+Terraform Adapter: API and example usage
+- Module name: redwood/terraform-burst-credit/aws
+- Responsibilities: validate allocation rules, produce an "intent" document, sign requests with module-level service account keys, and submit to Negotiation Queue when plan contains transfers.
+
+Example module usage (root module snippet):
+
+```hcl
+module "tenant_burst_credit" {
+  source = "redwood/terraform-burst-credit/aws"
+
+  tenant_id          = "acct-1234"
+  budget_tokens      = 25000
+  priority           = "standard" # low|standard|high
+  recovery_window    = "1h"
+  settlement_policy  = "deferred" # immediate|deferred|manual
+  notification_emails = ["infra-ops@redwood.ai", "team-owner@customer.com"]
+
+  // Optional: a human-readable justification used in negotiation messages
+  justification = "Q4 eval season expected burst for retraining and evals"
+}
+```
+
+Module plan behavior
+- On terraform plan, the module will:
+  - Emit a plan artifact to the CI build (artifact/key: burst-credit-intent.json).
+  - If the plan includes cross-account transfers or budget reductions, it will POST the intent to /negotiation/intents with an HMAC header.
+  - Terraform apply is gated on a confirmed negotiation token.
+
+Negotiation workflow (CI side)
+1) CI detects burst-credit intents in plan artifacts.
+2) CI uploads the intent to Negotiation UI (internal). The UI shows proposed transfers with estimated dollar impact and a 72-hour window to respond.
+3) Notification delivered to owner emails + Slack channel (#burst-negotiations).
+4) Owners can: Accept (single-click), Propose Counteroffer (adjust budget or time window), or Reject. Counteroffers produce a new intent revision and restart the 72-hour timer.
+5) If an owner does not respond within 72 hours, a default escalation policy applies (Auto-approve if low-dollar impact < $50; otherwise escalate to infra-manager).
+
+CI/Apply safety checks
+- Apply requires:
+  - Negotiation token (negotiation/confirmed/<token>)
+  - Signed plan hash matches stored artifact
+  - Proposal age <= 30 days
+  - Billing account healthy (billing-service.health == OK)
+- Apply command (example):
+
+```bash
+# within CI job after negotiation token received
+terraform apply -auto-approve \ 
+  -var=negotiation_token=$NEG_TOKEN 
+  -var=plan_hash=$ARTIFACT_PLAN_HASH
+```
+
+Credit-Settler service contract (summary)
+- Endpoints: 
+  - POST /v1/intents -> validate and store intent (returns intent_id)
+  - GET /v1/intents/{id}/status -> status (pending/accepted/applied/rejected)
+  - POST /v1/apply -> apply an accepted intent (idempotent)
+  - GET /v1/settlement-reports/{id} -> full report (CSV/JSON)
+- Security: all calls require signed JWT from terraform-burst-credit provider principal.
+- Response example (apply):
+
+```json
+{
+  "settlement_id": "setl-20260111-abc123",
+  "status": "applied",
+  "transfers": [
+    {"from": "acct-ops", "to": "acct-1234", "tokens": 1000, "units": "burst_tokens"}
+  ],
+  "audit_url": "gs://audit-bucket/settlements/setl-20260111-abc123.json"
+}
+```
+
+Monitoring, metrics and alerts
+- Metrics emitted by Credit-Settler: intents_received, intents_accepted, intents_rejected, applies_succeeded, applies_failed, reconciliation_lag_seconds.
+- Dashboard (Burst Billing) should surface: 7-day rolling unsettled tokens, top 10 accounts by unsettled tokens, recent failed applies.
+- Alerts:
+  - P0: applies_failed > 5 in 5m -> paging to infra-oncall
+  - P1: reconciliation_lag_seconds > 24h for > 1000 tokens -> slack alert to #billing-ops
+  - P2: intents_rejected_rate > 10% for 24h -> email to product and infra teams
+
+Testing and CI validation matrix
+- Unit tests: module validation of inputs and HMAC signing.
+- Integration tests (CI staging): a simulated Credit-Settler endpoint (test double) that validates idempotence and signed calls. These run in ephemeral envs and must pass before merge.
+- E2E smoke test: create two test accounts, propose a 1k token transfer, accept via API, run terraform apply via CI runner, assert settlement report exists and tokens reflected in simulated billing.
+
+Operational runbook: failed apply
+1) Triage: Check CI job logs and settlement report retrieval.
+2) If apply returned 409 conflict: check whether settlement_id already exists. If yes, fetch settlement report and correlate.
+3) If apply returned 5xx or timeout: retry with exponential backoff (3 retries). If still failing, open incident and manually run apply via admin tool with a privileged key.
+4) If settlement created but accounting not reflected in billing: run reconciliation job (billing-reconciler) with settlement_id and attach trace id.
+
+Owner matrix and responsibilities
+- infra-infra-team: Maintain terraform-burst-credit module and CI negotiation pipeline.
+- billing-ops: Run Credit-Settler service and reconciliation pipeline.
+- tenant-owners: Respond to negotiations and maintain justification fields.
+- security: Approve the provider principal and JWT signing policy.
+
+Rollout plan (3 phases)
+- Phase 1 (canary): Single region, test tenants (5 internal teams). Monitor applies_succeeded and reconciliation_lag_seconds for 72h.
+- Phase 2 (wider): Production accounts under $500 monthly burst budget. Add evaluation accounts and expand to 3 regions.
+- Phase 3 (global): All accounts, enable auto-approve policy for low-impact transfers.
+
+Backout and emergency manual settlement
+- Backout: If a terraform apply accidentally transfers tokens incorrectly, use settlement reversal API: POST /v1/reversals with settlement_id + justification. Reversals are audited and require two infra-manager approvals.
+- Emergency manual settlement: billing-ops can create a manual settlement via the admin UI; the action produces a reconciliation ticket that must be attached to the terraform change PR.
+
+Auditing and compliance
+- Every intent, acceptance, rejection, and apply produces an audit record with user, principal, plan hash, and IP.
+- Audit records are immutable and stored in gs://audit-bucket/burst-settlements/<year>/<month>/. Access governed by IAM group: billing-audit-readonly.
+
+Appendix A — Negotiation message template
+Subject: [Burst Credit] Proposed transfer for acct-1234 (25000 tokens -> 24000 tokens)
+Body:
+- Proposed transfer: acct-ops -> acct-1234 1000 tokens
+- Reason: short-term eval season
+- Estimated cost impact: ~$32
+- Owner action: Accept | Propose Counteroffer | Reject (links in UI)
+
+Appendix B — Example Terraform plan artifact (trimmed)
+```json
+{
+  "plan_hash": "sha256:abcd...",
+  "changes": [
+    {"tenant_id":"acct-1234","old_budget":25000,"new_budget":24000,"delta":-1000,"policy":"deferred"}
+  ]
+}
+```
+
+Appendix C — Contact and escalation
+- Primary oncall: infra-oncall@redwood.ai (rotation: infra SRE)
+- Billing ops PagerDuty: PD ID 2345
+- Slack channels: #burst-negotiations (notifications), #billing-ops (incident triage)
+
+Related docs
+- See also: gpu-tenant-eviction-predictor-and-provisioning-guidelines.json for eviction implications when budgets change.
+
+Revision history
+- 2025-03-18: Initial draft (Anika Patel)
+- 2025-10-22: Added negotiation window default and auto-approve rules (Miguel Santos)
+- 2026-01-12: Finalized CI checks and security contract (Priya Kapoor)

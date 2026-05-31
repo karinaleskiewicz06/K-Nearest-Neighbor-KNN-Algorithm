@@ -1,0 +1,163 @@
+Session Affinity and Degraded Routing Playbook
+
+Summary
+
+This playbook documents the recommended runtime configuration, operational runbooks, and troubleshooting steps for session affinity (sticky sessions) combined with graceful degraded routing for latency-sensitive tenants. It is intended for on-call engineers, runtime owners, and SREs operating Redwood's inference pools when we need to: preserve KV-cache locality, enforce soft SLOs for premium tenants, or gracefully degrade capacity during GPU pressure.
+
+Goals
+
+- Keep 99th-percentile tail latency within SLOs for latency-sensitive tenants while minimizing token-cost overhead.
+- Preserve KV cache hit-rate for conversational sessions where possible.
+- Provide deterministic failover behavior and clear rollout / rollback procedures.
+
+Scope and applicability
+
+- Applies to workloads classified as: conversational chat (KV-cache dependent), low-latency text-completion, and mixed chat + function-calling flows.
+- Targets: Dedicated and Hosted routing layers that support kernel affinity and shard locality.
+- Not intended for: batch embedding workloads or long-running non-interactive generation jobs.
+
+Key concepts and behavior
+
+1) Session affinity modes
+   - strict: bind a session to a single runtime shard until explicit session end. Best for very small sessions and when KV cache is critical.
+   - soft: preferential routing to the last-serving shard; allow fallback after a short backoff. Balances cache-hit vs availability.
+   - stateless: no affinity; always route using policy (cost or region). Only for cache-less or idempotent workloads.
+
+2) Degraded routing strategies (in order of preference)
+   - local-evict-and-shed: if a shard is memory-starved, evict cold KV entries and continue serving with degraded cache-hit.
+   - variant-fallback: route to a quantized/cheap variant of the model on the same or nearby shard.
+   - inter-shard-redirect: if affinity cannot be preserved, redirect with a short-circuit session-transfer protocol.
+   - best-effort-broadcast (last resort): fan-out to multiple shards and return the first response (used only for low-QPS, high-criticality flows).
+
+SLOs and thresholds
+
+- Primary SLO for premium latency-sensitive tenants: 99th percentile P99 latency <= 220ms for <512 token responses, and P99 <= 450ms for 512-1024 tokens.
+- Cache hit-rate target: session-level KV-cache hit-rate >= 85% for conversational sessions.
+- Degradation trigger thresholds (per shard):
+
+| Metric | Warning | Critical | Action |
+|---|---:|---:|---|
+| GPU memory free (%) | 25% | 10% | issue local-evict-and-shed (step A) |
+| Kernel queue depth | 80% of capacity | 95% | escalate to priority-preempt and trigger variant-fallback |
+| KV-cache eviction rate (entries/s) | 50 | 200 | mark as degraded; prefer soft-affinity falls back |
+
+Configuration examples
+
+Example runtime routing policy (YAML)
+
+```yaml
+routing_policy:
+  name: premium-session-soft-affinity-v1
+  affinity_mode: soft
+  max_sticky_duration_s: 3600
+  fallback_sequence:
+    - type: local-evict-and-shed
+      max_evictions: 500
+    - type: variant-fallback
+      allowed_variants: [gptq-8bit, int8-fast]
+    - type: inter-shard-redirect
+      max_redirect_hops: 1
+  priority: high
+  sla_tags: [premium, chat]
+```
+
+Scheduler kernel hints (JSON blob used by kernel mapper)
+
+```json
+{"priority":"high","expected_seq_len":256,"kv_locality_weight":0.9,"preferred_kernel_profile":"low-latency"}
+```
+
+Operational runbook: automated response flow (on-call play)
+
+1) Alert: "shard memory critical" (critical) or "kernel queue saturation" (critical). Pager to runtime-oncall.
+2) Immediately mark incoming requests for the affected shard with route_hint:degraded. This activates soft-affinity-only routing.
+3) Execute step A: local-evict-and-shed (automated):
+   a) Run: /opt/redwood/bin/kvctl evict --policy=cold-first --max 500
+   b) Monitor kv_cache_hit_rate and memory_free for 30s.
+   c) If memory_free > 18% within 30s, continue monitoring; annotate incident.
+4) If step A fails or kernel queue remains saturated for >60s, trigger variant-fallback: update Edge routing table with allowed_variants priority.
+5) If variant-fallback does not restore P99 within 2 minutes, perform inter-shard-redirect for new sessions only. Sessions with strict affinity must be offered a graceful-transfer token (see API below).
+6) If all above fail and P99 > 600ms for the premium tier after 5 minutes, activate cross-tenant shedding policy (move best-effort tenants off affected pool).
+
+Session transfer protocol (graceful-transfer)
+
+- Purpose: move a session's KV state to another shard without dropping the user's experience. Used when strict-affinity sessions must be migrated.
+- Steps:
+  1) Acquire ephemeral lock on session_id via rendezvous service: POST /internal/rendezvous/lock {"session_id": "<id>", "ttl_s": 30}
+  2) Dump session delta: /opt/redwood/bin/kvctl dump --session <session_id> --format=json > /tmp/session-<id>.json
+  3) POST /internal/shard-transfer/import {"target_shard": "s-1023", "payload": <file>}
+  4) Update routing: PUT /internal/routing/sessions/<session_id> {"shard":"s-1023","affinity_mode":"strict"}
+  5) Release lock.
+
+Observability and dashboards
+
+Required dashboards and panels:
+- shard_overview: P50/P95/P99 latencies, kernel queue depth, GPU memory free, active_sessions, kv_cache_hit_rate.
+- session_affinity_telemetry: session bind events, transfer attempts, transfer latency, transfer failures.
+- degraded_routing_incidents: count and duration per shard, actions executed, rollback events.
+
+Essential alerts (examples)
+- alert: shard-mem-critical -> expr: gpu_memory_free_pct < 10 for 30s -> severity: critical -> runbook: this doc step 2
+- alert: kernel-queue-saturated -> expr: kernel_queue_depth / kernel_capacity > 0.95 for 30s -> severity: critical -> runbook: escalate immediate preemption
+- alert: session-transfer-failures -> expr: rate(session_transfer_failures[5m]) > 1 -> severity: high -> runbook: inspect rendezvous logs
+
+Testing and benchmarking guidance
+
+- Synthetic test to validate affinity benefit: run parallel A/B across same shard (sticky) vs random routing for 10k sessions, 95th-percentile delta should show >=8% latency improvement and >=20% KV-cache hit-rate improvement for typical chat workloads.
+- Stress test for variant-fallback: overlay 50% additional burst and assert fallback switch completes within 45s and maintains functional correctness (no truncated JSON responses).
+
+Maintenance and rollout checklist
+
+1) Canary rollout schedule: 5% traffic (10 minutes) -> 25% (30 minutes) -> 50% (60 minutes) -> 100% (2h).
+2) During canary watch: P50/P95/P99, kv_cache_hit_rate, error rates, model output quality (sample diff tests).
+3) On failure during a stage: immediate rollback to previous routing_policy snapshot and file an incident.
+
+Troubleshooting matrix
+
+| Symptom | Likely cause | First-step action | Escalation |
+| --- | --- | --- | --- |
+| Rapid KV eviction spike | Memory pressure from a noisy tenant | Run kvctl top-sessions --sort=mem and throttle top 5 sessions | Engage runtime lead, consider tenant-shielding |
+| Session-transfer failures | Rendezvous service timeouts / auth issues | Check rendezvous logs and auth tokens; retry manual import | Repro with local import and open ticket to infra |
+| P99 regression after variant-fallback | Variant produces slower decode due to kernel mismatch | Revert variant order; re-run microbench; file kernel ticket | Temporary increase capacity (burst pool) |
+
+Operational ownership and contacts
+
+- Runtime service owner: eng-serving-runtime team (runtime-core subteam). Primary oncall: runtime-oncall rotation.
+- Pager escalation: runtime-oncall -> runtime-sre -> infra-gpu-pager -> eng-platform lead.
+- Runbook steward: Priya Raman.
+
+Appendices
+
+A. Example CLI snippets
+
+- Trigger a soft-affinity toggle for a tenant:
+  curl -X POST -H 'Authorization: Bearer <token>' -d '{"tenant":"acme","affinity_mode":"soft"}' https://internal-api.redwood/v1/routing/tenants/update
+
+- Dump session payload for transfer:
+  /opt/redwood/bin/kvctl dump --session s_abc123 --format=json | gzip > /tmp/s_abc123.json.gz
+
+B. Quick reference config table
+
+| Setting | Recommended value (premium) | Notes |
+|---|---|---|
+| max_sticky_duration_s | 3600 | avoid unbounded affinity; use tokens for explicit renewals |
+| affinity_mode | soft | default for most tenants; strict only when required |
+| variant_fallback_timeout_s | 30 | time to wait before accepting variant answer |
+
+C. Known caveats
+
+- Session transfers increase transient network and CPU overhead; avoid during large-scale bursts.
+- Variant-fallback may change model output characteristics. Always run sample-diff checks during rollouts.
+
+Document change log
+
+- 2025-11-05: Draft created by Priya Raman.
+- 2025-12-10: Added session-transfer protocol & YAML examples (reviewer: Marco Silva).
+- 2026-02-14: Expanded alerts and canary rollout guidance; added testing guidance (reviewer: Aisha Patel).
+
+References
+
+- Runtime decision graph: /confluence/eng-serving-runtime/runtime-architecture/runtime-decision-graph-and-observed-behaviour-catalog-2026
+- Runtime fallback playbook: /confluence/eng-serving-runtime/runbooks/runtime-fallback-and-degradation-playbook-2026
+
+End of document.

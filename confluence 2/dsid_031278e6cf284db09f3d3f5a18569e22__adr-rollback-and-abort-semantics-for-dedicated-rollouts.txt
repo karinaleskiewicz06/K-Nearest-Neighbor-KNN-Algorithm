@@ -1,0 +1,217 @@
+ADR: Rollback and abort semantics for Dedicated staged rollouts
+
+## Status
+Published (v1). This ADR defines rollback/abort semantics for the initial GA of Dedicated staged rollouts.
+
+## Context
+Dedicated staged rollouts introduce explicit stages (e.g., 1%/10%/50%/100% or replica partitions) to safely deploy changes to a customer’s reserved GPU pool. The rollout system must support deterministic, auditable, reversible progression with clear behavior during failures.
+
+Key requirements driving this ADR:
+- **Safety:** Rollouts must not jeopardize Dedicated customer SLOs.
+- **Determinism:** Under retries and partial failures, the system must converge to a single, consistent outcome.
+- **Operational clarity:** Oncall/SRE must know when the system will auto-abort, what “abort” actually does, and what remains running.
+- **Auditability:** Every promotion/abort/override must be attributable to an actor with a reason and the exact before/after traffic split.
+- **Streaming & session behavior:** Dedicated traffic includes streaming responses and, for some customers, session-affinity routing for multi-turn chat.
+
+This ADR defines:
+- When the system **auto-aborts** vs when it merely **holds**.
+- How we **revert traffic splitting** and capacity partitions.
+- How we handle **in-flight requests, streaming sessions, and session affinity**.
+- Required **audit events** and idempotency semantics.
+
+Non-goals:
+- Cross-service “global rollback” across multiple Dedicated pools; this ADR is scoped to one pool rollout plan.
+- Customer-defined arbitrary gate signals; gate definitions are addressed in the gate signals ADR.
+
+## Definitions
+- **Rollout plan:** A versioned plan applied to a specific Dedicated pool (and optionally per-region partitions) describing stages, gates, and actions.
+- **Stage:** A discrete partition of traffic/capacity directed to the candidate change.
+- **Candidate:** The new version/config being rolled out (model version, runtime build, routing policy, or configuration set).
+- **Stable (baseline):** The currently serving configuration prior to the rollout.
+- **Abort:** Stop the rollout and revert routing back to stable.
+- **Rollback:** In this doc, treated as an effect of abort (reverting traffic). We avoid introducing a separate “rollback action” API for v1.
+- **Hold:** Pause the rollout at the current stage without changing the current stage split (unless an auto-safety rule triggers an abort).
+- **Auto-abort:** System-initiated abort based on gate failures or critical safety signals.
+
+## Decision
+### 1) Rollout state machine and action semantics
+We standardize on the following primary states:
+- **DRAFT:** Plan created/edited; no traffic changes applied.
+- **RUNNING:** Plan is executing and currently at a stage.
+- **HELD:** Plan is paused (manual hold or due to non-critical uncertainty).
+- **ABORTED:** Plan terminated; traffic reverted to stable; candidate capacity is drained (best effort) and isolated.
+- **COMPLETED:** Final stage reached and finalized; candidate becomes stable.
+
+Allowed actions:
+- `promote` (advance to next stage) — only from RUNNING/HELD when gates allow.
+- `hold` (pause at current stage) — from RUNNING.
+- `resume` (continue evaluation at current stage) — from HELD.
+- `abort` (revert traffic to stable) — from RUNNING/HELD.
+- `force_promote` (admin override) — from RUNNING/HELD.
+- `force_abort` (admin override) — from RUNNING/HELD (synonym of abort but separately auditable).
+
+Invariants:
+- The system maintains a single **current_stage_index** and a **routing_intent** record (desired split/partition) which is applied to the routing layer.
+- All actions are **idempotent** via idempotency key + optimistic concurrency (expected plan version).
+- The routing layer must be able to apply a “stable-only” routing intent even when candidate partitions exist.
+
+### 2) Auto-abort vs hold behavior
+We split signals into **critical** (auto-abort) and **non-critical/ambiguous** (auto-hold).
+
+#### Auto-abort triggers (system-initiated)
+Auto-abort the rollout when *any* of the following conditions are true for the candidate partition(s), evaluated over the configured gate window(s), and after minimum sample requirements are met:
+
+1. **Hard gate failure:** One or more required gates are evaluated as FAIL.
+   - Examples: candidate p99 latency above threshold; candidate error rate above threshold; OOM rate above threshold; drop/429 rate above threshold.
+2. **Safety circuit breaker trips (routing/data plane):**
+   - Candidate partition is causing severe overload (queue depth and saturation exceed safety threshold) and routing protection determines that continued exposure risks violating the pool’s SLO.
+3. **Fleet health critical:** Candidate partition nodes show critical GPU/node health signals (e.g., high ECC error rate, repeated GPU resets) above a “critical” threshold (as defined by Fleet Signals).
+4. **Capacity starvation detected:** The stage split/partition materially reduces effective serving capacity for baseline in a way that violates minimum headroom constraints (see partitioning guidelines). This is typically a validation guardrail, but if it is detected post-apply (e.g., due to fleet change), abort.
+
+Auto-abort behavior is **fail-closed** for critical safety conditions: if safety circuit breakers cannot determine safety due to an internal error, the system should prefer aborting candidate traffic (revert to stable-only) and page the owning team.
+
+#### Auto-hold triggers (system-initiated)
+Auto-hold (pause) when signals are **unknown** or **insufficient**, rather than immediately aborting:
+- **Missing/lagging metrics** such that required gates cannot be evaluated (UNKNOWN), *and* stable SLO indicators are healthy.
+- **Insufficient sample size** (e.g., too few requests in window) to make a statistically meaningful evaluation.
+- **Partial telemetry outage** limited to candidate partition attribution tags, where overall pool health appears normal but attribution is broken.
+
+Rationale:
+- We avoid aborting for observability gaps when stable traffic appears healthy, because aborting can hide underlying instrumentation issues and causes unnecessary operational churn.
+
+Exception:
+- If required gates are UNKNOWN due to missing metrics for longer than the **max_unknown_duration** (default 30 minutes), the plan transitions to HELD with an explicit “telemetry staleness” reason and emits an alert. Operators can then decide to abort or force-promote.
+
+### 3) What abort does: routing reversion and candidate drain
+Abort is defined as:
+1. **Routing intent reverts to stable-only** for the pool (100% stable, 0% candidate) across all regions included in the plan.
+2. **Candidate partitions are drained best-effort**:
+   - No new requests are routed to candidate.
+   - In-flight handling rules apply (see below).
+   - Candidate compute may remain allocated temporarily (to avoid thrash) but is marked “inactive for serving”.
+3. **Plan execution stops**: no further promotions occur until a new plan is created or the aborted plan is explicitly re-run (v2 feature; not in v1).
+
+We do **not** attempt to automatically roll back artifacts (e.g., uninstall runtime build, delete images). Abort is a routing and plan-state operation; fleet cleanup follows existing lifecycle processes.
+
+### 4) In-flight requests, streaming responses, and session affinity
+#### Request types
+- **Non-streaming requests:** typical completion/embedding requests with bounded latency.
+- **Streaming requests:** server-sent events / chunked responses that may remain open for long durations.
+- **Session-affinitized multi-turn chat (where enabled):** subsequent turns prefer the same partition for cache locality and consistent behavior.
+
+#### Rules on abort/rollback
+On abort, we apply the following rules:
+
+1. **Non-streaming in-flight requests**
+   - Requests already admitted to candidate continue to completion on candidate (best effort). We do not “kill” in-flight inference.
+   - Rationale: killing in-flight work can increase error rate and degrade customer experience. It is safer to stop new admissions.
+
+2. **Streaming in-flight requests**
+   - Streaming responses already established on candidate remain pinned to candidate until the stream completes or hits a max stream duration.
+   - We do not mid-stream reroute.
+   - A new rollout state (ABORTED) does not terminate streams; it only prevents new streams from being established on candidate.
+
+3. **Session affinity after abort**
+   - After abort, session-affinity routing keys that would have mapped to candidate are remapped to stable.
+   - We do not preserve candidate affinity after abort. Any “sticky” mapping should expire immediately.
+
+4. **Timeouts and forced drain**
+   - Candidate drain is best-effort with guardrails:
+     - If candidate has active streams beyond **stream_drain_grace_period** (default 15 minutes), the system marks them as “over-grace” and emits an operational alert.
+     - Operators may choose to forcibly terminate long-running streams using existing data-plane mechanisms if required by incident response. This is outside the rollout controller’s responsibility, but must be auditable (see audit section).
+
+5. **Data-plane safety precedence**
+   - If the data plane detects candidate instability that threatens node integrity or widespread customer impact, it may reject/terminate candidate requests even if they are in-flight. Such actions must emit a corresponding data-plane safety event.
+
+#### Why not “reroute mid-stream”
+Mid-stream rerouting is complex (state transfer, token continuity, tool-call semantics) and risks double-responses, corrupted streams, or inconsistent output. For v1, we prefer stable behavior: pin established connections, stop new candidate admissions.
+
+### 5) Multi-region behavior
+Dedicated pools may be multi-region. Abort semantics must be consistent across regions:
+- **Abort applies to all regions in the plan**. We do not support “abort only us-west-2” in v1, because partial abort complicates audit and can cause surprising customer-visible behavior.
+- If one region is impaired mid-stage, the routing layer may temporarily shift stable traffic cross-region according to existing Dedicated routing policies. The rollout controller still treats abort as “no candidate anywhere.”
+
+### 6) Required audit events and minimum fields
+All actions that change rollout execution state or routing intent must emit audit events (see the audit logging spec for canonical schema). This ADR requires the following event types at minimum:
+
+| Event type | Emitted when | Actor | Notes |
+|---|---|---|---|
+| `dedicated_rollout_plan.created` | Plan created | user/service | includes initial stage definitions and target candidate |
+| `dedicated_rollout_plan.updated` | Plan edited (DRAFT only) | user/service | includes diff summary |
+| `dedicated_rollout_plan.started` | Transition DRAFT → RUNNING | user/service | includes initial routing intent |
+| `dedicated_rollout_stage.promoted` | Stage changes via promote | user/service | includes from/to stage, gate results snapshot |
+| `dedicated_rollout_stage.held` | Transition RUNNING → HELD | user/service/system | includes reason (manual, telemetry_unknown, operator_investigation) |
+| `dedicated_rollout.aborted` | Transition to ABORTED | user/service/system | includes reason (gate_fail, safety_circuit, manual) |
+| `dedicated_rollout.force_promoted` | Admin override promotion | user/service | requires `override_reason` |
+| `dedicated_rollout.force_aborted` | Admin override abort | user/service | requires `override_reason` |
+| `dedicated_rollout.completed` | Transition to COMPLETED | user/service | includes finalization info |
+
+Minimum required fields (normative):
+- `actor_id`, `actor_type` (human/service), `actor_role` (if human), and `impersonated_actor` (if applicable)
+- `request_id`, `idempotency_key` (if supplied), and controller `plan_version` (optimistic concurrency)
+- `pool_id`, `account_id`, `regions` affected
+- `candidate_ref` (model version/runtime build/config hash)
+- `previous_routing_intent` and `new_routing_intent` (serialized string payload)
+- `reason` (enum) and optional `reason_detail` (free text)
+- For promotions/aborts driven by gates: `gate_evidence_ref` (pointer/id to stored evaluation snapshot)
+
+Audit retention and export requirements are defined in the audit logging spec; this ADR asserts that abort/force actions are **always** auditable and exportable.
+
+### 7) API and UX implications (summary)
+- The controller must expose an `abort` endpoint that is safe under retries and always converges to ABORTED + stable-only routing intent.
+- Console must display:
+  - The reason for abort (gate failure vs manual vs safety).
+  - Which stage was active at abort time.
+  - A link to gate evidence and routing intent diff.
+  - A clear warning that in-flight streams may still complete on candidate for a limited time.
+
+## Considered alternatives
+### A) Fail-open on missing metrics (allow promotions)
+Rejected. Missing or stale metrics can hide real regressions; promotions should not proceed without evidence unless an authorized operator explicitly overrides (force_promote) with audit logging.
+
+### B) Immediately terminate in-flight candidate requests on abort
+Rejected. This increases user-visible errors and can worsen incident impact. We instead stop new admissions and allow in-flight to complete, with an operational escape hatch for extreme cases.
+
+### C) Region-scoped abort
+Deferred to v2. Region-scoped abort complicates customer comms, audit interpretation, and routing correctness when pools have cross-region fallback.
+
+### D) Separate “rollback” action distinct from abort
+Rejected for v1. The operational need is “stop rollout and revert traffic.” A separate rollback action adds confusion and additional state transitions without clear benefit.
+
+## Consequences
+### Positive
+- Deterministic and auditable behavior for the most common failure mode: gate fails → auto-abort → revert traffic.
+- Minimizes customer impact by avoiding mid-flight termination and by applying consistent semantics across regions.
+- Creates clear operational levers: hold (investigate), abort (revert), force_promote/force_abort (admin-only).
+
+### Negative / trade-offs
+- Candidate resources may remain allocated post-abort (temporarily), requiring separate fleet lifecycle actions to reclaim capacity.
+- Long-running streams can delay “full” rollback; we mitigate via drain grace period and operational alerts.
+- Auto-hold due to telemetry gaps can block progress; mitigated via alerting and manual override.
+
+## Implementation notes (normative requirements)
+1. **Abort is atomic with routing intent update**: controller must write plan state + routing intent in a single transaction (or equivalent), and routing must be applied idempotently.
+2. **Idempotency**: promote/abort endpoints must accept idempotency keys; repeated calls must not double-advance or oscillate.
+3. **Gate evidence snapshotting**: on any decision that changes state (promote/auto-abort/auto-hold), store the evaluated metrics window, observed values, thresholds, and evaluation result.
+4. **Streaming pinning**: data plane must ensure that established streams are not rebalanced during abort unless a separate safety mechanism triggers.
+5. **Alerts**:
+   - Page/ticket routing is defined in the runbook, but at minimum:
+     - Auto-abort emits an alert to Dedicated SRE/oncall.
+     - Auto-hold due to telemetry unknown > max_unknown_duration emits a ticket.
+
+## Open questions
+- Do we need a per-customer configurable `stream_drain_grace_period`, or is a single platform default sufficient?
+- Should we introduce an explicit “DRAINING” state between abort and aborted to reflect stream drain reality? (Current decision: no, to keep state machine simple; represent draining in telemetry.)
+- Do we need a “safe retry” mechanism to re-run an aborted plan after remediation (v2)?
+
+## Appendix: Default timing values (v1)
+These defaults can be adjusted via config (service-level), but are not customer-configurable in v1.
+
+| Parameter | Default | Notes |
+|---|---:|---|
+| `max_unknown_duration` | 30m | time gates may remain UNKNOWN before auto-hold w/ alert |
+| `stream_drain_grace_period` | 15m | after abort, active streams beyond this emit alert |
+| `min_sample_requests_per_stage_window` | 200 | evaluated per gate window; see gate thresholds ADR |
+
+## Changelog
+- 2025-03-10: Clarified auto-hold vs auto-abort for telemetry UNKNOWN; added explicit session-affinity remap rule; added required audit fields list.

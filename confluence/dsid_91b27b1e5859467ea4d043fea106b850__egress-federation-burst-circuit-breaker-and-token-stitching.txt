@@ -1,0 +1,143 @@
+Egress federation, burst circuit-breaker, and token-stitching playbook
+
+Summary:
+This playbook defines the egress federation pattern, a burst circuit-breaker, and a token-stitching protocol to coordinate cross-account GPU bursting while protecting upstream network egress and tenant billing accuracy. It codifies recommended Terraform primitives, runtime guardrails, alert thresholds, and an operational runbook for safe rollout and troubleshooting.
+
+Goals:
+- Allow tenants to burst across regional and partner egress fabrics without blowing egress caps or producing incorrect token-to-infra billing mappings.
+- Fail fast and return graceful degradation (circuit-breaker) when downstream egress saturation, NAT port exhaustion, or billing-token mismatch is detected.
+- Provide a Terraform module contract and CI gating checklist for any change to egress operators and federation shims.
+
+When to use this pattern:
+- Multi-account GPU bursting across regions or partner clouds where egress billing or quota enforcement is enforced at the NAT/egress layer.
+- Workloads that can tolerate graded degradation (reduced QPS or compressed payloads) but must avoid hard failures impacting unrelated tenants.
+
+High-level architecture:
+- Egress Federation Controller (EFC): control-plane service that maintains a global view of tenant egress budgets, regional proxies, and warm-pool capacity. Owned by eng-infra/networking.
+- Local Egress Sidecar (LES): per-node service that enforces circuit-breaker decisions and stitches request tokens to billing metadata before crossing shared NATs.
+- Token Stitching Service (TSS): validates and mints stitching-IDs that bind inference request tokens to tenant egress buckets; provided as an internal HTTP API.
+- Circuit-breaker policy store: hierarchical policies (global -> region -> account -> tenant) stored in Consul/Redis with TTL, updated by EFC.
+
+ASCII diagram:
+  +-------------+    control   +---------------+    push    +-----------+
+  | Platform UI | <---------  | Egress Fedty  | ---------> | Fleet EFC |
+  +-------------+             +---------------+            +-----------+
+                                      |                         |
+                      +---------------v-----------------+       |
+                      | Regional Proxy / NAT (egress)    | <-----+
+                      +---------------+-----------------+
+                                      |
+                    +-----------------v------------------+
+                    | GPU nodes w/ LES and inference-routes |
+                    +--------------------------------------+
+
+Policy & SLOs:
+- Egress-utilization SLO: no single tenant may exceed 60% of a regional egress pipe for > 10s without being throttled.
+- Circuit-breaker target: fail-open early with synthetic 429, aim to return to allowlist within 30s after capacity recovers.
+- Token-stitching correctness: 100% of invoiced requests must include a valid stitching-ID; mismatch rate must be < 0.01%.
+
+Terraform contract (suggested module inputs/outputs - described as YAML for readability):
+- module "egress_federation" inputs:
+  - names: list(string) of regional-proxy IDs
+  - nat_capacity_map: map(region -> capacity_tokens_per_sec)
+  - billing_bucket_id: string (per-tenant default)
+  - les_image: string (container image tag for Local Egress Sidecar)
+- outputs:
+  - egress_controller_endpoint: string
+  - les_daemonset_manifest: string (k8s manifest location)
+  - stitch_api_url: string
+
+Example Terraform usage (CLI hints):
+- terraform plan -var='region=us-west-2' -var='nat_capacity_map={us-west-2=10000}'
+- Gate any changes to nat_capacity_map with ci/integration tests that simulate NAT port saturation (see CI/CD section).
+
+LES runtime behavior (detailed):
+1) On incoming inference request, LES extracts: tenant-id, request-token, model-id, estimate_tokens (client-provided estimate optional).
+2) LES calls TSS /stitch with (tenant-id, request-token, estimate_tokens) -> returns stitch_id or error code 409 if tenant budget exceeded.
+3) If 200 OK, LES attaches header X-Stitch-ID and forwards to regional proxy.
+4) LES samples telemetry for token-efficiency and reports token-to-egress mapping to EFC every 10s.
+5) If EFC pushes a circuit-breaker update (status=TRIPPED), LES will:
+   - return 429 with body {"retry_after": 20, "reason": "egress_saturation"} for best-effort routes,
+   - and route critical SLO routes to pre-configured low-bandwidth fallbacks (quantized responses) if allowed.
+
+Circuit-breaker state machine (summary):
+- CLOSED: normal forwarding.
+- PENDING: local short-circuiting for observed metric spikes (30s).
+- TRIPPED: global reject for non-critical routes (duration configurable, default 60s).
+- PROBING: allow small percentage of traffic to test recovery (10% ramp).
+
+Operational runbook: Incident: downstream egress saturation detected (alert: egress_utilization > 85% for 15s)
+1) Pager fires to networking-oncall and infra-fleet oncall.
+2) Oncall: check EFC dashboard -> confirm which region and proxy reported saturation.
+3) If single-proxy saturation: 1) verify NAT port counts (aws ec2 describe-network-interfaces + CloudWatch NAT metrics), 2) check cross-account bursting logs for token stitching errors.
+4) If NAT port exhaustion: initiate short-term mitigation: increase proxy SNAT ephemeral port pool via support-runbook (cloud provider API), enable warm-pool shift to less-loaded region, and activate pre-approved partner-burst if allowed. Document the command snippet to increase ephemeral ports in provider console (provider runbook link).
+5) If token-stitching mismatch rate > 0.05%: run the stitch-reconciliation job (k8s job name: stitch-reconcile-YYYYMMDD) and open a billing-accuracy incident for SRE/Finance.
+6) Post-mitigation: set a 2-hour watch, capture detailed traces (LES logs, TSS traces, EFC policy updates) and create post-incident timeline.
+
+CI/CD gating and tests (must be part of any change to EFC/LES/TSS):
+- Unit tests: policy evaluation, TTLs, state transitions for circuit-breaker.
+- Integration tests (required in merge pipeline):
+  - Synthetic NAT port exhaustion: run a containerized test that opens ephemeral connections to simulate port exhaustion and measure LES behavior.
+  - Token-stitch correctness: replay a sample of production tokens against TSS in a sandbox and compare stitch IDs.
+  - Regression test: ensure default failover returns quantized responses but does not leak tenant-identifiers.
+- Canary rollout policy: 5% traffic for 2 hours -> 25% for 1 hour -> full. Abort if stitch-mismatch > 0.01% or circuit breaker false-positive rate > 1%.
+
+Monitoring & alerting (suggested Prometheus rules - described in prose):
+- ALERT EgressPipeHighUtilization if egress_utilization > 85% for 15s, severity=P1.
+- ALERT StitchMismatch if stitch_mismatch_rate > 0.01% for 5m, severity=P1 for billing teams.
+- ALERT CircuitBreakerFiresFrequently if circuit_breaker_trips > 5 in 1h for same tenant, severity=P2.
+- Dashboards: per-region egress utilization, per-tenant stitch success/latency, LES per-node rejection rates.
+
+Rollout checklist (preflight):
+- [ ] Terraform plan reviewed and approved by networking and infra teams.
+- [ ] CI integration tests for NAT-saturation simulation pass.
+- [ ] Canary config and rollback playbook encoded in the deployment manifest.
+- [ ] Finance confirms TSS reconciliation format and invoices parsing.
+- [ ] Observability: dashboards, alerts, and tracing spans instrumented and smoke-tested.
+
+Rollback checklist:
+1) Disable global federation in EFC (button in console) to fail back to single-region egress for affected tenants.
+2) Revert LES image via ghost deployment and force node reattach.
+3) If billing mismatches occurred, run stitch-reconcile and mark affected invoices as provisional. Notify Finance.
+
+Ownership matrix:
+- EFC service: eng-infra/networking (primary), eng-sre (oncall).
+- LES: eng-infra/serving-runtime (primary), eng-infra/networking (secondary).
+- TSS: eng-platform/billing-infra (primary), eng-infra (secondary).
+
+Troubleshooting quick commands:
+- k get pods -l app=les --namespace=inference -o wide
+- kubectl logs deployment/egress-controller -n infra | grep "circuit_tripped"
+- curl -sS -H 'X-Tenant: T123' -d '{"token":"abc"}' https://tss.internal/stitch | jq
+
+Post-incident analysis template (required fields):
+- Triggering signal and metric snapshot.
+- Timeline of control-plane updates (EFC).
+- LES and TSS traces correlated by stitch_id.
+- Root cause hypothesis and proposed IaC or config change.
+- Financial impact (if any) and remediation actions with owners.
+
+Appendix: Example LES config snippet (k8s annotated YAML fragment):
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: les-config
+data:
+  stitch_api_url: "https://tss.internal"
+  circuit_breaker_thresholds: "{\"egress_util_pct\": 80, \"window_s\": 15}"
+  low_bandwidth_routes: "/compact,/summary"
+
+Notes and rationale:
+- We favor early, short-duration tripping to avoid cascading failures across tenants.
+- Token-stitching prevents blind egress accounting which causes billing disputes and silent cost blowouts.
+- Terraform modules must make capacity maps explicit to force reviewers to consider egress economics at merge time.
+
+Related docs and links:
+- Network runbook: ../cloud-accounts-and-networking/egress-proxy-failover-resilience-pattern.json
+- Billing reconciliation job: ../terraform-and-iac/gpu-chargeback-exporter-and-iac-pattern-playbook.json
+- CI integration harness: ../ci-cd-and-build/gpu-burst-simulation-lab-playbook.json
+
+Change log:
+- 2025-11-10: Initial draft by Diego Alvarez.
+- 2025-12-08: Added CI gating checklist and NAT-saturation simulation notes (reviewers: Lena Park).
+- 2026-01-12: Added stitch-mismatch thresholds and rollback playbook (reviewers: Maya Chen, Omar Farouk).

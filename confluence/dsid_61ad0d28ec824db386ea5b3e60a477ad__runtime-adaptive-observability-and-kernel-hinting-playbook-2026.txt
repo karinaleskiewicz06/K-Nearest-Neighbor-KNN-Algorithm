@@ -1,0 +1,185 @@
+Adaptive Observability and Kernel Hinting Playbook
+
+Summary
+
+This playbook documents the Adaptive Observability & Kernel Hinting subsystem: the design, telemetry model, operational controls, and runbook for using kernel hints to steer the serving runtime. The goal is to reduce tail latency and per-token cost by leveraging request-level signals to select kernel execution paths and sampling strategies while keeping trace overhead bounded.
+
+Why this exists
+
+- Production inference workloads have widely varying sequence lengths, model architectures, and client SLAs. Static monitoring and static kernel selection produce suboptimal latency/cost tradeoffs.
+- Kernel hints are lightweight signals (tagged on request metadata) that bias scheduler choices (kernel variant, prefetch, KV warmstart) for the current request cohort.
+- Adaptive observability is necessary to validate that hints are safe, reduce false positives, and capture causal signals for regression detection.
+
+Scope
+
+This playbook covers:
+- Design and components of the hinting + observability pipeline
+- Data model, sampling policies, and trace budget rules
+- Operational thresholds and incident runbooks for common failure modes
+- Rollout and canary guidance for hinting rules and kernel profiles
+
+Out-of-scope: model training, model quality evals, and on-device kernel internals beyond documented control signals.
+
+Design overview
+
+Architecture (text diagram)
+
+Client -> Ingress Router -> Request Classifier -> Hint Enricher -> Hint Broker -> Scheduler/KV Prefetch/Kernels
+                                         \u2022 Shadow Tracer -> Sampling Controller -> Observability Sink (TSDB / TraceDB)
+
+Components
+
+- Request Classifier: lightweight policy service that maps headers, route config, and proto attributes to request_cohort ids. Runs in the edge ingress so hint decisions travel with requests. Owned by serving-runtime/classification.
+- Hint Enricher: attaches hint metadata (kernel_hint, prefetch_hint, expected_seq_len_bucket, sampling_weight) to the request context. Hints are cryptographically signed by the control plane to prevent tampering in dedicated/private deployments.
+- Hint Broker: central service that resolves cohort->kernel_variant mappings and exposes a fast gRPC lookup for the scheduler. Supports versioned mappings and rollout tags.
+- Scheduler Hooks: Scheduler reads kernel_hint and sampling_weight, consults runtime policy, and chooses a kernel variant, batch-slice, and prefetch action.
+- Shadow Tracer & Sampling Controller: decides which requests get full end-to-end traces. Sampling is adaptive: when a hint is new or flips mapping, sampling weight temporarily increases for affected cohorts.
+
+Data model and fields
+
+Table: (rendered as text)
+| field | description | type | examples |
+|-------|-------------|------|----------|
+| request_id | globally unique id for a request | string | r-0a1b2c |
+| cohort_id | classifier-assigned cohort | string | search-embed-small |
+| kernel_hint | suggested kernel profile tag | string | fast-fp16, stable-quant |
+| prefetch_hint | kv cache warmstart preference | enum | none, aggressive, conservative |
+| expected_seq_len_bucket | bucketed input length | string | short(<=64), med(65-512), long(>512) |
+| sampling_weight | relative trace sampling weight | float (0.0-1.0) | 0.05 |
+
+Operational invariants and SLOs
+
+- Hint Safety: kernel_hint should not increase CPU GPU utilization > 5% above baseline for steady cohorts. Monitored via kernel_variant_resource_delta.
+- Hint Efficacy: cohort p95 latency with kernel_hint-enabled should be <= 0.95x baseline p95 for the same workload when target is performance-optimized.
+- Sampling budget: end-to-end trace capture should consume <= 0.5% of request airtime budget for high-volume cohorts.
+- Rollout guard: any hint mapping change that increases p99 by > 10% triggers automatic rollback.
+
+How sampling works (algorithmic summary)
+
+1. Baseline sampling rate per cohort (configurable).
+2. Change amplification: if a cohort's kernel mapping is changed, Sampling Controller increases sampling_weight by factor 5 for 30 minutes for that cohort.
+3. Entropy hedging: if trace diversity drops (identical stack signatures exceed 90% of traces), controller reduces weight to focus on unique traces.
+
+Config example (runtime hint controller YAML)
+
+hint_controller:
+  default_sampling_rate: 0.01
+  change_amplification_factor: 5.0
+  amplification_window_minutes: 30
+  max_trace_budget_percent: 0.5
+  cohort_overrides:
+    - cohort: search-embed-small
+      sampling_rate: 0.02
+      allowed_kernel_variants: [fast-fp16, stable-quant]
+
+(Place this in /etc/redwood/hint-controller.yaml on control plane nodes for Hosted; equivalent k8s ConfigMap for Dedicated.)
+
+Trace schema example (JSON line format)
+
+{
+  "request_id": "r-0a1b2c",
+  "cohort_id": "search-embed-small",
+  "kernel_hint": "fast-fp16",
+  "expected_seq_len_bucket": "short",
+  "latency_ms": 12.3,
+  "kernel_variant": "fast-fp16-v7",
+  "cpu_pct": 23.4
+}
+
+Runbook: Tail-latency spike after hint rollout
+
+Symptoms
+- p99 latency for cohort X increases by > 15% within 10 minutes of hint rollout.
+- Kernel variant CPU/GPU utilization delta > 7% vs baseline.
+
+Immediate actions (1–10 minutes)
+1. Identify affected cohort IDs from the alert payload.
+2. Query trace sink for recent traces tagged with cohort_id and kernel_hint. Use the trace window 15m back.
+3. If traces show higher kernel_cpu_pct or prefetch stalls, rollback the mapping in Hint Broker to previous version:
+
+# rollback using hint-brokerctl
+hint-brokerctl rollback --cohort search-embed-small --to-version v12
+
+4. If rollback is not possible or unexpected: cascade to scheduler soft-fallback: set policy: honor_hint=false for affected nodes.
+
+Post-incident analysis (within 48 hours)
+- Run a fidelity experiment: replay representative requests against both kernel_variant A and variant B in the lab using the Operational Workload Simulator. Capture per-token cost, p95, and resource deltas.
+- Update decision log with hypothesis and root cause.
+
+Runbook: Missing or malformed hints observed
+
+Symptoms
+- Hints absent for > 0.1% of requests from an ingress cluster.
+- Classifier latency spikes or returns default cohort frequently.
+
+Immediate actions
+1. Confirm ingress health and classifier logs for KeyError/timeout.
+2. If classifier is degraded, switch ingress to classifier-fallback config: static cohort map.
+3. Re-enable entropy-bounded sampling for the cluster to capture request variability until classifier is healthy.
+
+Diagnostic commands (internal)
+- kubectl -n serving logs deploy/ingress-classifier --since=10m | grep ERROR
+- hint-brokerctl status --cohort search-embed-small
+- tracesql 'select * from traces where cohort_id="search-embed-small" order by ts desc limit 100'
+
+Testing and rollout guidance
+
+Canary matrix
+- Phase 0: lab validation (shadow run against replay corpus).
+- Phase 1: 1% traffic canary for single AZ (monitor 30m).
+- Phase 2: 10% traffic multi-AZ (monitor 2h).
+- Phase 3: 100% traffic with gradual ramp (monitor 24h).
+
+Gates to advance
+- p95 change <= 3% on canary compared to baseline.
+- kernel CPU/GPU delta <= 5% for the canary nodes.
+- No increase in error rate or queueing indicators.
+
+Telemetry and dashboards (recommended panels)
+- cohort_p99_latency (split by kernel_variant)
+- kernel_variant_cpu_pct and gpu_pct (time series with delta from baseline)
+- hint_coverage_rate (percent requests with valid hints)
+- trace_sampling_rate and trace_uniqueness_ratio
+- sampling_controller_amplification_events
+
+Security and safety notes
+
+- Signed hints: in Dedicated/Private installs, hints must be signed by the control plane using the customer-managed KMS key (see security-and-compliance/rbac-and-auth for signing policy).
+- Rate limits: the hint broker enforces a per-cohort mutation rate to avoid thrashing (default 1 change per 15 minutes).
+
+Troubleshooting checklist (fast-reference)
+
+1. Is hint coverage within expected range? If not, check classifier and ingress.
+2. Are traces representative? Check sampling_controller_amplification events.
+3. Is kernel_variant causing resource hotspots? Check kernel_variant_cpu_pct/gpu_pct panels.
+4. If rollback needed, use hint-brokerctl rollback.
+
+Owners and contacts
+- Hinting & Sampling: runtime-observability team (team alias: #runtime-obsv). Primary oncall: Michael Chen.
+- Scheduler integration: runtime-scheduler team. Contact: Sofia Alvarez.
+
+Change log and decision trace
+
+- 2026-09-15: Playbook created by Asha Patel.
+- 2026-10-04: Added amplification window policy after canary experiment showed under-sampling.
+- 2026-12-01: Safety guard added (automatic rollback on p99 regression > 10%).
+
+References
+
+- See runtime-architecture/dispatch-and-fidelity-bridging-playbook-2026 for routing policies.
+- See kernel-and-scheduling/kernel-telemetry-annotation-guidelines-2025 for kernel metric naming.
+
+Appendix: lightweight kernel hint examples
+
+- fast-fp16: select FP16-optimized kernels, aggressive occupancy, hero prefetch enabled. Target: short sequences, latency-sensitive.
+- stable-quant: select quantized kernels, conservative prefetch, disable speculative prefetching. Target: long sequences, cost-sensitive.
+
+Appendix: example CLI snippets
+
+# Inspect current mapping
+hint-brokerctl get --cohort search-embed-small --output json
+
+# Apply new mapping (creates versioned mapping)
+hint-brokerctl apply --cohort search-embed-small --mapping '{"kernel_hint":"fast-fp16","allowed_variants":["fast-fp16-v7","fast-fp16-v8"]}' --author "asha.patel@redwood.ai" --message "canary fast-fp16 for search embed small"
+
+End of playbook.

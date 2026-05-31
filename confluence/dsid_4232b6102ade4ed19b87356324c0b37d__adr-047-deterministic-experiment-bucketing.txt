@@ -1,0 +1,245 @@
+ADR-047: Deterministic experiment bucketing for route-level experiments
+
+## Summary
+We will use deterministic bucketing for route-level experiments by hashing a stable stickiness key (chosen via a defined precedence order) together with an experiment-specific salt. The resulting hash is mapped into fixed bucket ranges to select a variant according to the configured traffic allocation.
+
+Key outcomes:
+- Assignment is reproducible across process restarts, hosts, and regions.
+- Bucketing does **not** depend on ephemeral request attributes by default.
+- When no stable stickiness key is available, the request is treated as **ineligible** for the experiment (routes to the baseline policy) and is explicitly attributed as “unassigned due to missing key”.
+
+## Status
+**Accepted** (implemented behind feature flag; required for beta/GA correctness).
+
+## Context
+Route-level A/B/n experiments operate at the request-routing layer, and must:
+- Assign requests to variants **deterministically** (stickiness) for consistent user experience and valid comparisons.
+- Produce consistent assignment decisions across:
+  - Multiple router instances
+  - Multiple regions
+  - Retries/streaming continuations
+  - Control-plane config propagation delays
+- Avoid assignment mechanisms that create skew (e.g., low-entropy defaults) or depend on unstable identifiers (e.g., request_id).
+
+This ADR focuses on how the policy engine evaluates an experiment and chooses a variant.
+
+## Decision
+### We will deterministically assign eligible requests to a variant using:
+1) A **stickiness key** chosen from request context via a strict precedence order.
+2) A **stable hashing function** with a fixed algorithm and version.
+3) A **bucket space** (0–9,999) to implement allocations with predictable resolution.
+4) A defined behavior for **missing identifiers**: the request is not bucketed (ineligible) by default.
+
+## Requirements
+1. **Determinism:** Same inputs must yield the same variant across hosts/regions.
+2. **Stability:** Assignment should be stable for a user/customer across requests.
+3. **Low overhead:** Router evaluation is latency-sensitive.
+4. **Config safety:** Variant choice must be stable under innocuous config changes (e.g., reordering variants) and explicit about when re-bucketing occurs.
+5. **Debuggability:** Support and on-call must be able to explain “why this request got variant X”.
+6. **Privacy:** Avoid hashing raw PII when possible; avoid logging raw keys.
+
+## Terminology
+- **experiment_id:** Unique ID for the experiment.
+- **variant_id:** Stable ID for a variant (not derived from display name).
+- **stickiness key:** Stable identifier used for bucketing (e.g., customer_id).
+- **assignment salt:** Data used to ensure buckets are unique per experiment and reduce correlation.
+- **bucket space:** Integer range used for allocation selection.
+
+## Stickiness key precedence
+The policy engine will derive `sticky_key` from the request context using the following precedence order (highest to lowest):
+
+1. `X-Redwood-Sticky-Key` (explicit override; intended for customers)
+2. Authenticated `customer_id` (Redwood tenant/account)
+3. Customer-provided `end_user_id` (if present in request metadata)
+4. Customer-provided `session_id` (if present in request metadata)
+
+Notes:
+- The explicit header is preferred because some customers want stickiness at end-user granularity even when `customer_id` is constant.
+- `customer_id` is a reliable fallback for enterprise tenants who do not have per-user identifiers.
+- `session_id` is allowed but discouraged for long-running experiments (short-lived stickiness).
+
+### Normalization rules
+To ensure cross-language and cross-region consistency, the stickiness key is normalized as follows before hashing:
+- Input is treated as a UTF-8 byte sequence.
+- Leading/trailing whitespace is trimmed.
+- No case folding is performed (keys are case-sensitive).
+- Empty strings are treated as **missing**.
+
+## Hashing and bucketing algorithm
+### Chosen algorithm
+- **Hash function:** xxHash64
+- **Seed:** Fixed constant seed `0x524544574F4F44` (“REDWOOD” in hex-ish form; constant is documented and versioned)
+- **Versioning:** `bucketing_algo_version = 1`
+
+Rationale:
+- xxHash64 is fast and deterministic across implementations.
+- We explicitly version the algorithm to enable safe migration in the future.
+
+### Hash input
+We compute a 64-bit hash over the following string (joined with `\n`):
+
+- `bucketing_algo_version`
+- `experiment_id`
+- `assignment_salt`
+- `sticky_key`
+
+Where:
+- `assignment_salt` is stored in experiment config and is generated at experiment creation time.
+- `assignment_salt` must remain stable for the lifetime of the experiment.
+
+### Bucket space and allocation resolution
+We map the 64-bit hash into a fixed bucket space:
+- `bucket = hash64 % 10000` (range 0–9999)
+
+Allocations are expressed as integer “basis points” (bps) summing to 10,000.
+
+Example allocation:
+- Control: 9000 bps
+- Treatment-A: 1000 bps
+
+### Allocation selection rules
+- Variants are sorted by `variant_id` (lexicographic) before building cumulative ranges to prevent accidental re-bucketing due to list order changes in config.
+- The selected variant is the first whose cumulative range includes the bucket.
+
+#### Example
+| variant_id | allocation_bps | cumulative_range |
+|---|---:|---|
+| control | 9000 | [0, 8999] |
+| v2-model | 1000 | [9000, 9999] |
+
+## Handling missing identifiers
+### Default behavior (GA)
+If no stickiness key can be derived (all precedence sources missing/empty), the request is **ineligible** for the experiment:
+- The router will proceed as if the experiment does not apply and will use the baseline routing policy (including canary/fallback as configured).
+- Telemetry must indicate an explicit assignment outcome:
+  - `experiment_assignment_status = "not_assigned"`
+  - `experiment_assignment_reason = "missing_sticky_key"`
+
+Rationale:
+- “Best-effort” bucketing based on low-entropy or unstable keys caused measurable skew and confusing results in staging.
+- Non-sticky assignment (e.g., per-request) is not acceptable for most customer workloads and makes rollbacks noisier.
+
+### Optional behavior (internal/testing only)
+A non-default mode may be enabled for internal testing environments:
+- `allow_unstable_assignment = true`
+- Fallback sticky key becomes `hash(client_ip_prefix + user_agent)` with a documented caveat that cross-region consistency is not guaranteed.
+
+This mode is **not supported** for customer GA and must remain off in production unless explicitly approved by SRE + Product.
+
+## Cross-region consistency
+To ensure requests bucket identically across regions:
+- Do **not** include `region` in the hash input.
+- Use the same `bucketing_algo_version`, hash algorithm, and seed across all deployments.
+- Ensure config replication preserves:
+  - `experiment_id`
+  - `assignment_salt`
+  - `variant_id` values
+  - `allocation_bps`
+
+### Interaction with region-based routing policies
+If a route uses region-aware routing (latency-based, residency-based, or capacity-based):
+- Region selection occurs **before** final model endpoint selection.
+- Experiment bucketing determines the variant within the eligible region’s policy outcome (unless the experiment explicitly specifies region constraints as eligibility rules).
+
+This prevents region drift from changing the variant assignment for a given sticky key.
+
+## Reproducibility constraints and config changes
+### What must remain stable to preserve assignment
+To keep assignments stable for an experiment:
+- `experiment_id` must not change.
+- `assignment_salt` must not change.
+- `variant_id` for an existing variant must not change.
+
+### What can change (and expected effects)
+- Changing `allocation_bps` will re-bucket some percentage of users. This is expected and is the mechanism for ramping.
+- Adding/removing variants will re-bucket by definition. This must be treated as a new experiment phase and should be audited.
+
+### Config versioning
+The router will record:
+- `experiment_config_version` (monotonic integer)
+
+This is used for:
+- Debugging discrepancies during propagation lag
+- Correlating results with config changes
+
+## Debuggability and observability
+The policy engine must attach the following fields to request context for logs/traces/metrics:
+- `experiment_id`
+- `variant_id`
+- `experiment_config_version`
+- `experiment_assignment_status` (assigned/not_assigned)
+- `experiment_assignment_reason` (e.g., eligible, missing_sticky_key, excluded_by_rule)
+- `bucketing_algo_version`
+
+### Explain endpoint requirement
+An internal-only “explain assignment” endpoint must be able to return:
+- Which stickiness key source was selected (header/customer_id/end_user_id/session_id)
+- Hash input components (with stickiness key redacted or truncated)
+- Computed bucket value (0–9999)
+- Variant range table used
+
+This endpoint must be RBAC-gated and must not return raw PII.
+
+## Security and privacy considerations
+- Stickiness keys may be customer identifiers. Do not log raw stickiness keys.
+- Hashing does not remove privacy obligations; treat hashed identifiers as potentially sensitive.
+- Redaction rules:
+  - Logs/traces: store only a short prefix of `hash64(sticky_key)` for correlation (e.g., 16 hex chars)
+  - Audit logs: store the selected key source type, not the key
+
+## Options considered
+### Option A: Hash request_id (or server-generated ID)
+Pros: always available.
+Cons: not sticky; invalidates most experiments; highly sensitive to retries/streaming; produces noisy results.
+Decision: Rejected.
+
+### Option B: Default to customer_id only
+Pros: stable.
+Cons: too coarse for many customers; prevents end-user level experiments.
+Decision: Rejected (used as a fallback in precedence chain).
+
+### Option C: Best-effort using low-entropy defaults when missing (e.g., "unknown")
+Pros: simple.
+Cons: leads to severe skew and misleading dashboards; concentrates traffic into a single bucket.
+Decision: Rejected.
+
+### Option D: IP/User-Agent derived sticky key when missing
+Pros: better than "unknown".
+Cons: unstable across networks/devices; region inconsistencies; privacy concerns.
+Decision: Rejected for GA; allowed only for internal testing with explicit flag.
+
+## Consequences
+### Positive
+- Strong determinism and reproducibility across regions.
+- Predictable ramp behavior via allocation changes.
+- Clear semantics for missing identifiers reduce silent data quality failures.
+
+### Negative / tradeoffs
+- Some customers will see “not assigned” traffic until they provide a stickiness key (or have authenticated identifiers). This must be addressed via Console UX and docs.
+- Allocation changes and variant set changes inherently cause re-bucketing; Console must communicate this.
+
+## Implementation notes
+- Validation (control plane + Console):
+  - Warn (and optionally block) experiments on routes where typical traffic lacks eligible identifiers.
+  - Require allocations sum to 10,000 bps.
+  - Enforce unique `variant_id` and stable IDs across updates.
+- Policy engine:
+  - Implement bucketing as a pure function with unit test vectors.
+  - Ensure variant ordering is stable (sort by `variant_id`).
+- Telemetry:
+  - Emit “not_assigned” outcomes to track attribution drop vs. missing-key eligibility.
+
+## Test vectors (sanity)
+These are used to confirm cross-language determinism across router implementations.
+- bucketing_algo_version: 1
+- experiment_id: exp_01J3A2B9K8ZQ7
+- assignment_salt: 5f3f7b0c-2e9d-4c7a-8d6a-1a2f5c9e0d11
+- sticky_key: customer_12345
+Expected:
+- bucket space: 0–9999
+- (Exact bucket value is asserted in unit tests per language implementation; do not hardcode in docs beyond the test suite.)
+
+## Follow-ups
+- Document customer guidance for stickiness keys (recommended: stable end_user_id; fallback: customer_id).
+- Ensure Console surfaces “Not assigned (missing stickiness key)” as a first-class metric.
+- Revisit algorithm migration plan if we need cryptographic hashing for compliance-driven customers (would require versioned rollout).

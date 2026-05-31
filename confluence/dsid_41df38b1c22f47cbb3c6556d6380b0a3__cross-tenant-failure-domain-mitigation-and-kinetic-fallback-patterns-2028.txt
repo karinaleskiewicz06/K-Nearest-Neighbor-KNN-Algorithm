@@ -1,0 +1,172 @@
+Cross-tenant failure domain mitigation and kinetic fallback patterns
+
+Summary
+
+This document defines operational patterns, scheduling knobs, profiling and benchmarking steps for mitigating cross-tenant failure domains and implementing kinetic fallback behaviors in the runtime. It consolidates architecture intent, kernel scheduling recommendations, specific runbooks for incidents, and a minimal benchmarking protocol to validate mitigations before rollout.
+
+Audience
+
+- Runtime engineers (kernel and scheduler owners)
+- SREs who operate GPU pools and admission controllers
+- Platform product managers planning fallbacks and SLAs
+
+Context and problem statement
+
+Cross-tenant failure domains occur when a fault (hardware, thermal, driver, model regression, or noisy neighbor) degrades quality-of-service for multiple tenants sharing a GPU node, a rack, or a scheduler queue. Without explicit mitigation, symptoms include elevated p95/p99 latency, KV-cache churn, kernel timeouts, and degraded throughput. Traditional single-tenant isolation strategies are expensive; instead we use kinetic fallback patterns — adaptive, fast-acting fallbacks that proactively reduce fidelity or change routing to preserve SLOs for unaffected tenants while isolating failure impact.
+
+Goals and SLOs
+
+- Preserve tenant-facing availability: 99.95% uptime per customer pool (monthly).
+- Maintain latency SLOs under degraded conditions: p95 <= 60ms, p99 <= 200ms for standard generation routes; critical routes p95 <= 40ms, p99 <= 120ms.
+- Contain token cost increase for unaffected tenants to <= 10% during mitigation windows.
+
+Principles
+
+1. Fast detection — prioritize cheap, high-signal telemetry (kernel queue latency, GPU utilization spikes, KV cache miss-rate) for initial decisioning.
+2. Graceful degradation — step down fidelity in controlled stages (e.g., quantized variant, smaller context window, prefix cache warmup) instead of abrupt circuit breakers.
+3. Isolation by policy — prefer routing heuristics and tenant-weighted admission controls over full-host quarantine where possible.
+4. Observable and reversible — every fallback must emit a decision trace and be reversible via automatic rollback or manual operator action.
+
+Key components and service names
+
+- runtime-scheduler: admission control, slot allocation, kernel hint emitter.
+- kernel-agent: per-GPU kernel selector / binder and health checker.
+- kvcache-manager: prefix KV cache owner, warmup controller.
+- fallback-router: policy engine to reroute requests to alternative variants/regions.
+- telemetry-pipeline: high-frequency telemetry ingestion and decision-triggering alerts.
+
+Decision graph (high level)
+
+1) Detect anomaly — telemetry-pipeline raises condition (e.g., node_kernel_timeout_rate > 0.5% over 1m).
+2) Evaluate impact window — runtime-scheduler queries kvcache-manager and kernel-agent for eviction rates and kernel latencies.
+3) Apply kinetic fallback Stage A (non-disruptive): increase per-tenant slot circuit cap, enable local KV cache aggressive rewarm, issue kernel preference hints (prefer fused-kernel-lite).
+4) If condition persists, Stage B (fidelity reduction): fallback-router switches non-critical tenants to quantized model_variant-q8 and reduces max-generation-length to 512 tokens.
+5) Stage C (isolation): runtime-scheduler enacts tenant-weighted throttling and migrates hot tenants off the degraded node.
+6) Recovery: reverse stages in order; verify telemetry returns below thresholds for 5m.
+
+Kernel scheduling guidance
+
+- Priority buckets: map request classes to 4 buckets (realtime, high, standard, background). Realtime and high get preemptible kernel credits; standard uses expected latency slotting; background is best-effort.
+- Credit accounting: maintain per-tenant credit ledger (rolling 1m window). Trigger preemption when a tenant exceeds 120% of its baseline consumption.
+- Eviction policy: prefer stochastic gentle-eviction (randomized per-session) for background workloads to avoid synchronized mass evictions.
+- Kernel hinting: use kernel-agent to supply two orthogonal hints to the scheduler — preferred kernel (e.g., fused-attention-v2) and memory-mode (evictable / pinned). These hints are advisory and scoped to the current affinity.
+
+Profiling and triage playbook (short)
+
+1. Immediate triage (0–10 minutes)
+   - Run: curl -sS http://telemetry.local/query?metric=node_kernel_timeout_rate | jq .last
+   - Inspect sample traces: tracer query with timeframe = last 5m and span=kernel: tracer-cli fetch --from="now-5m" --tag node:gpu-XX --limit 100
+   - Correlate with GPU telemetry: nvidia-smi dmon or internal gpu-telemetry streams (streams/gpu-telemetry/metrics).
+2. Root-cause hypotheses (10–30 minutes)
+   - Hypothesis A: kernel bug or regression (check recent kernel and driver rollouts).
+   - Hypothesis B: thermal or NVLink degradation (confirm with hvac and NIC alerts).
+   - Hypothesis C: noisy neighbor / model with pathological sequence lengths.
+3. Short-term mitigations (30–90 minutes)
+   - If noisy neighbor: apply tenant-weighted throttling and migrate heavy sessions: runtime-cli migrate-sessions --from-node gpu-XX --to-pool spill-pool-3 --tenant tenant-id --grace 30s
+   - If kernel regression suspected: shift affected routes to fused-kernel-fallback via fallback-router toggle: fallback-cli set-policy --route /v1/generate --policy fused-kernel-fallback --duration 1h
+4. Post-incident profiling (90m–72h)
+   - Capture deterministic replay of representative requests: replay-capture export --tenant tenant-id --window "incident" --format tar.gz
+   - Run microbenchmarks against candidate kernels and quantization levels. See Benchmarking Protocol below.
+
+Minimal benchmarking protocol for fallbacks
+
+Purpose: validate Stage B fallback variants (quantized models, smaller context, kernel swap) do not cause unacceptable regressions on quality and cost.
+
+Steps:
+1) Build representative request set (1k–5k requests) from recent production traffic for impacted routes. Mask PII and persist to bench-corpus/incident-yyyy-mm-dd.jsonl.
+2) Run controlled A/B sweep:
+   - Baseline: model-v1 (float16, fused-attention-v2) with concurrency 4, target p95 measured.
+   - Variant 1: model-v1-q8 (quantized), concurrency 8.
+   - Variant 2: model-v1 (float16) with fused-attention-v1 (alternative kernel).
+3) Metrics to collect: latency (p50/p90/p95/p99), token cost per request, output quality (BLEU/ROUGE or application-specific heuristics), repetition/degeneration scores.
+4) Acceptance criteria: variant p95 <= baseline p95 * 1.25 and quality delta <= 4% (or application-specific threshold).
+5) Run cost-simulation for projected traffic for 24h to estimate cost delta.
+
+Release note practices for fallback rollouts
+
+- Each fallback policy change must accompany a release note entry in "release-notes/fallback-policies" with: rationale, staged rollout matrix, rollback criteria, and benchmark artifacts (bench-corpus and aggregated metrics).
+- Small emergency toggles may be applied without a full release, but must be followed by a post-mortem and a release-note augmentation within 48h.
+
+Known issues and caveats
+
+- KV cache thrash during migrations: migrating high-churn sessions can temporarily increase KV cache miss-rate and amplify latency; mitigation: pre-warm target node kvcache via kvcache-manager warmup API before migration.
+- Quantization mismatch regressions: some layers are sensitive to q8 quantization on small batch sizes; benchmark on realistic concurrency shapes.
+- Scheduler oscillation: naive reactive weight-based migration can cause oscillation; heuristics must include hysteresis (minimum 5m hold) and randomized jitter on migration timing.
+
+Operational runbooks (recipes)
+
+1) Fast degrade and protect primary tenants (operator steps)
+   - Owner: oncall-runtime (SRE)
+   - Preconditions: telemetry alert P95 spike > 2x baseline and node_kernel_timeout_rate > 0.3%
+   - Steps:
+     1. Set Stage A: fallback-cli apply-template --name kinetic-stage-a --target node:gpu-XX
+     2. Increase slot caps for critical tenants: runtime-cli set-slot-cap --tenant tenant-prodx --cap 1.5x
+     3. Enable KV cache aggressive rewarm: kvcache-cli set-policy --node gpu-XX --policy aggressive-warm --ttl 60s
+     4. Monitor: wait 5m and check telemetry; if p95 decreases < 1.5x baseline, revert slot caps; otherwise proceed to Stage B.
+2) Controlled migration of hot tenants
+   - Owner: runtime-scheduler team
+   - Steps:
+     1. Identify top 10 sessions by kernel-time on node:psql -c "SELECT session_id, avg_kernel_ms FROM sessions WHERE node='gpu-XX' ORDER BY avg_kernel_ms DESC LIMIT 10"
+     2. For each session: runtime-cli migrate-session --session <id> --to-pool spill-pool-3 --grace 25s
+     3. After migration, issue kvcache warmup: kvcache-cli preheat --session <id> --target-node new-node --timeout 60s
+     4. Confirm decrease in avg_kernel_ms and kernel timeout rate.
+
+Automated telemetry and alerts (config snippet)
+
+- Example alert rule (Prometheus-like):
+  ALERT CrossTenantKernelTimeout
+  IF increase(node_kernel_timeout_rate[1m]) > 0.002
+  FOR 1m
+  LABELS { severity = "page" }
+  ANNOTATIONS { summary = "Kernel timeouts rising on {{ $labels.node }}", runbook = "/confluence/eng-serving-runtime/runbooks/cross-tenant-failure-domain-mitigation-and-kinetic-fallback-patterns-2028" }
+
+Safety, testing, and rollout requirements
+
+- Canary matrix: changes to fallback-router or kernel-agent must be validated in a 3-stage canary (dev -> canary-pool -> 5% production traffic) with rollback automation on metric regressions.
+- QA: require bench-corpus runs and a small human-eval (20 samples) for conversational routes.
+- Chaos testing: simulate noisy neighbor and NVLink degradation in staging once per quarter.
+
+Ownership and contact points
+
+- Runtime scheduler: Marcus Lee (marcus@redwood.com)
+- Kernel agent: Priya Nair (priya@redwood.com)
+- KV cache: Diego Alvarez (diego@redwood.com)
+- Oncall escalation: runtime-oncall@redwood.com
+
+References and further reading
+
+- Runtime observability model: /confluence/eng-serving-runtime/team-wiki/runtime-observability-data-model-and-tracebook-2026
+- Fallback orchestration design: /confluence/eng-serving-runtime/runtime-architecture/execution-stitching-and-fallback-orchestration-2026
+- Quantization rollout safety playbook: /confluence/eng-serving-runtime/runbooks/quantization-rollout-safety-and-quality-gate-playbook-2026
+
+Appendix A — CLI snippets
+
+- Toggle a kernel hint:
+  kernel-cli set-hint --node gpu-XX --hint preferred_kernel=fused-attention-lite --ttl 600s
+- Quick migration command:
+  runtime-cli migrate-sessions --from-node gpu-XX --to-pool spill-pool-3 --top-k 10 --dry-run
+Appendix B — Minimal YAML policy (example)
+  fallbackPolicy: |
+    name: kinetic-default
+    stages:
+      - id: stageA
+        type: hinting
+        actions:
+          - set_kernel_hint: fused-attention-lite
+          - kvcache_policy: aggressive-warm
+      - id: stageB
+        type: fidelity
+        actions:
+          - switch_model_variant: model-v1-q8
+          - reduce_max_len: 512
+      - id: stageC
+        type: isolation
+        actions:
+          - migrate_heavy_sessions: true
+          - tenant_throttle_factor: 0.6
+
+Change history
+
+- 2026-11-04: Created by Aisha Mahadevan (initial draft).
+- 2026-12-09: Added benchmarking protocol and runbook steps (reviewed by Diego Alvarez).
+- 2027-01-12: Updated SLOs and alert thresholds; clarified migration jitter heuristics (published).

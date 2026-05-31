@@ -1,0 +1,238 @@
+Mixed-workload scheduler prototype: known issues and edge cases
+
+## Overview
+This page tracks known issues, edge cases, and operational pitfalls for the mixed-workload scheduler prototype (short/long classification + two-queue dispatch + token budget guardrails). It is intended for runtime engineers and SREs during benchmarking and canary.
+
+**Scope:** scheduler behavior under mixed prompt-length distributions, interactions with the prefill/decode pipeline, KV cache pressure, and hardware/runtime-specific anomalies.
+
+**Non-goal:** this is not a full QoS/tenancy policy document. For intended behavior and configuration semantics, see the design doc.
+
+## Quick triage checklist (when something looks wrong)
+1. Confirm the issue is actually *mixed-workload* related:
+   - Compare metrics on a homogeneous workload run (all short or all long) vs mixed (e.g., 80/20).
+2. Check scheduler health metrics:
+   - Per-class queue depth
+   - Per-class time-in-queue p50/p95
+   - Dispatch share per class
+   - Starvation/aging counters
+3. Check prefill/decode split metrics:
+   - TTFT (time-to-first-token)
+   - Prefill latency p50/p95
+   - Decode iteration duration and tokens/iter
+4. Check KV cache pressure signals:
+   - KV cache utilization
+   - Cache eviction/compaction events
+   - Prefill recompute rates (if available)
+5. Rule out kernel auto-selection instability:
+   - Sudden changes in selected kernel paths across iterations
+   - Increased kernel compile/cuda graph recapture events
+
+If the issue reproduces only in a specific GPU SKU or driver/CUDA version, jump to **Hardware-specific anomalies**.
+
+## Known issues and edge cases
+
+### 1) Long queue starvation under sustained short traffic (parameter-dependent)
+**Summary:** With aggressive bias toward the short queue, long requests can make insufficient progress when short traffic is continuous. This was the primary starvation corner case found in load tests and is largely mitigated by the current aging function and minimum long-share guardrail, but it remains possible with extreme tuning.
+
+**Typical trigger conditions**
+- Short traffic at or above saturation (queue never drains)
+- Long requests classified correctly but token budgets for long set too low
+- Aging half-life too slow (long requests do not gain priority fast enough)
+
+**Symptoms**
+- `long` time-in-queue p95 steadily increases and does not stabilize
+- Starvation counter increments for long queue (or “aging override” activates continuously)
+- Customer-visible p95 latency improves for `short` while `long` p99 becomes unbounded
+
+**Mitigations / operational guidance**
+- Ensure a hard minimum dispatch share for `long` (even during short bursts). Avoid setting it below a low single-digit percentage in production unless the pool is dedicated to short traffic.
+- Enable/validate aging overrides (do not disable them for benchmarks).
+- If canary: rollback if long-queue time-in-queue p95 exceeds the guardrail in the Hosted tail latency SLO doc.
+
+**References**
+- Fix/adjustment: github://redwood/pr-24905-fix-long-queue-starvation-edge-case
+- Runbook rollback section: confluence://eng-serving-runtime/runbooks/mixed-workload-scheduler-rollout-runbook
+
+---
+
+### 2) Classification boundary thrash (requests oscillate around short/long threshold)
+**Summary:** Requests near the short/long threshold can be sensitive to minor estimation differences (tokenization variance, prompt formatting, system prompt changes). This can lead to unstable queue composition across time, producing oscillatory behavior in queue depths and dispatch share.
+
+**Typical trigger conditions**
+- Short/long threshold defined purely by raw prompt tokens, close to a common prompt size in production
+- Heavy use of templates where small changes push prompts across the boundary
+- Retries/continuations where “same logical request” ends up classified differently
+
+**Symptoms**
+- Queue depth for `short` and `long` alternates with a regular period (sawtooth)
+- Dispatch share oscillates; per-class p95 variance increases run-to-run
+- Kernel selection instability can appear second-order (see issue #6)
+
+**Mitigations / recommendations**
+- Prefer a predicted prefill-cost classifier (when available) over a strict token threshold.
+- Add hysteresis (two thresholds) if you observe boundary effects in a specific deployment:
+  - e.g., classify as `short` under threshold A, classify as `long` over threshold B, keep prior class in-between.
+- Re-evaluate threshold candidates using the latest prompt-length distribution sheet before production ramps.
+
+---
+
+### 3) Long-prefill bursts cause head-of-line blocking despite two-queue policy (prefill dominates)
+**Summary:** Two-queue scheduling reduces head-of-line blocking at the request level, but prefill can still monopolize GPU time if dispatch repeatedly selects long-prefill work (especially when long requests arrive in bursts). This is an interaction between request dispatch and the prefill/decode split.
+
+**Typical trigger conditions**
+- “Long-spike” scenario (sudden influx of long-context requests)
+- Prefill and decode not sufficiently separated in the scheduler decision loop
+- Token budgets configured per-request but not per-iteration
+
+**Symptoms**
+- TTFT regresses for short requests during long-prefill bursts
+- GPU utilization stays high but short throughput/latency worsens
+- Prefill latency p95 dominates the end-to-end p95 movement
+
+**Mitigations**
+- Ensure prefill/decode separation hooks are enabled for the pool (if controlled by feature flag).
+- Use per-iteration token budgets (prefill and/or class-based) to cap worst-case amplification.
+- For canary, monitor TTFT specifically; TTFT regressions are often the earliest signal.
+
+**References**
+- Prefill/decode separation: github://redwood/pr-24857-prefill-decode-separation-hooks
+- Token budgets: github://redwood/pr-24872-scheduler-token-budget-guardrails
+
+---
+
+### 4) KV cache compaction / eviction spikes under mixed workloads
+**Summary:** Mixed workloads increase variance in KV cache residency and can amplify compaction/eviction churn. When the scheduler biases toward short requests, long requests may wait longer before decode, which can increase cache pressure depending on how the runtime accounts for reserved KV blocks and compaction windows.
+
+**Typical trigger conditions**
+- High long-context share (even at 20%) combined with high concurrency
+- Pools running near KV capacity limits or with small per-request KV reservations
+- Frequent model switching or batch fragmentation (reduces cache locality)
+
+**Symptoms**
+- Spiky prefill latency correlated with cache compaction/eviction events
+- Unexpected increase in “prefill recompute” or similar proxy metrics
+- p95 improves for short, but overall throughput drops due to churn
+
+**Mitigations / tuning guidance**
+- Avoid enabling the prototype in pools already KV-constrained without first validating cache headroom.
+- If available in the runtime config, increase KV cache target headroom (lower target utilization) to reduce eviction/compaction frequency.
+- Prefer stable batching/route pinning during canary to reduce batch fragmentation.
+
+**Notes**
+- This is frequently misattributed as “scheduler regression” when the underlying cause is cache churn that the new policy makes more visible (by changing interleaving patterns).
+
+---
+
+### 5) Fairness regressions across request classes (not multi-tenant safe)
+**Summary:** The prototype is designed for internal short/long class bias, not customer-configurable multi-tenant QoS. If traffic includes heterogeneous tenants (or endpoints) with different prompt-length distributions, the policy can inadvertently reallocate capacity across tenants.
+
+**Typical trigger conditions**
+- Mixed traffic from multiple routes/endpoints in the same pool
+- One route predominantly short, another predominantly long
+- A/B tests or canaries share a pool with production traffic
+
+**Symptoms**
+- One endpoint’s p95 improves while another degrades more than expected
+- Support tickets reference “only one route got worse”
+
+**Mitigations**
+- Canary in isolated pools where possible.
+- Monitor by route/model where dashboards allow; do not rely solely on global p95.
+- If isolation isn’t possible, set conservative bias and minimum long share.
+
+---
+
+### 6) Kernel auto-selection instability under rapid sequence length variation (hardware/runtime dependent)
+**Summary:** When the sequence length distribution changes quickly (common in mixed short/long interleaving), the runtime may thrash between kernel variants or execution paths. This can show up as increased overhead (kernel selection, compilation, cuda graph recapture) and may negate p95 gains.
+
+**Typical trigger conditions**
+- Very mixed lengths within the same short time window (not just a stable 80/20 mix)
+- Small batch sizes combined with frequent class switching
+- Deployments with stricter kernel eligibility constraints (driver/CUDA combinations)
+
+**Symptoms**
+- Increased variance in iteration time
+- Spikes in “graph recapture”/“compile”/“kernel selection” counters (names vary by runtime build)
+- Throughput regression with minimal changes in average tokens/sec
+
+**Mitigations / recommendations**
+- If kernel thrash is suspected, run the profiling playbook to confirm selection path churn.
+- Consider widening the kernel eligibility window (if safe) or pinning to a stable kernel in canary for the affected SKU.
+- Prefer dispatch policies that reduce rapid alternation (avoid overly strict round-robin between classes at very small batch sizes).
+
+**References**
+- Profiling guidance: confluence://eng-serving-runtime/profiling-playbook/profiling-mixed-prefill-decode-contention
+
+---
+
+### 7) Token budget guardrails can reduce throughput more than expected (misconfiguration)
+**Summary:** Per-iteration token budgets are a primary safety mechanism for tail latency, but overly tight budgets can fragment work, reduce effective batching, and cause avoidable throughput loss.
+
+**Typical trigger conditions**
+- Token budget set below what is needed to amortize prefill overhead on the given SKU
+- Budget enforced per-class without considering actual arrival rates
+- Aggressive caps combined with low max batch size
+
+**Symptoms**
+- p95 improves but tokens/sec drops materially beyond benchmark expectations
+- High frequency of “budget overrun prevented dispatch” debug logs
+- Short queue depth stays low, but GPU utilization dips intermittently
+
+**Mitigations**
+- Use SKU-specific defaults from the results summary rather than copying settings across A100/H100/L4.
+- During canary, ramp budgets in small steps and watch throughput deltas alongside p95.
+
+---
+
+### 8) Pathological mixes that are not representative but break assumptions
+**Summary:** Certain synthetic mixes (or adversarial customer behavior) can defeat the expected p95 improvements or create misleading results.
+
+**Examples**
+- **Alternating extremes:** one 16-token prompt followed by one 16k-token prompt, repeating at steady state.
+- **Long-only bursts every N seconds:** causes periodic prefill cliffs.
+- **“Short” requests with huge generation:** prompt is short, but `max_new_tokens` is extremely large; classification by prompt length alone is insufficient.
+
+**Mitigations**
+- Include max generation length (or predicted total work) in classification for environments where this is common.
+- Add benchmark scenarios beyond simple 80/20 mixes (long-spike, alternating extremes).
+
+## Hardware-specific anomalies (observed / reported)
+This section is intentionally operational: it lists issues we have seen at least once in benchmarking or canary.
+
+### A) H100: higher sensitivity to kernel selection churn in mixed micro-batches
+- **What we see:** iteration time variance increases when dispatch alternates classes at small batch sizes.
+- **Why it matters:** p95 tail improvements can disappear even though average throughput is fine.
+- **What to do:** bias toward fewer class switches per second (slightly larger effective batches), or pin stable kernels during canary if approved by kernels team.
+
+### B) A100 (older driver/CUDA combinations): increased cuda graph recapture events
+- **What we see:** more frequent graph recapture when sequence lengths vary widely.
+- **What to do:** verify driver/CUDA compatibility matrix used by the pool; consider disabling graphs for the canary window only if the trade-off is acceptable.
+
+### C) L4 / smaller memory SKUs: KV cache pressure dominates scheduler improvements
+- **What we see:** cache eviction/compaction drives p95 more than dispatch policy changes.
+- **What to do:** validate KV headroom first; do not interpret a “no improvement” result as evidence the policy doesn’t work.
+
+## Observability gaps and footguns
+- **Metric cardinality risk:** per-class + per-route + per-model labeling can explode cardinality if enabled indiscriminately. Prefer per-pool and per-model first; only add per-route during focused debugging.
+- **Dashboards lag reality during config ramps:** short ramp intervals can outpace dashboard refresh and lead to misreads. Use raw timeseries queries for the ramp window.
+- **Sampling artifacts in traces:** a low trace sampling rate can hide queue time variance. For canary triage, temporarily increase sampling for the canary pool only.
+
+## Canary guardrails (known-bad signals)
+Treat the following as “stop the line” signals unless you have a clear, validated alternative explanation:
+- Long-queue time-in-queue p95 trending up without bound for > 10–15 minutes at steady traffic
+- TTFT p95 regression that exceeds the SRE guardrail during the ramp window
+- Starvation counters continuously incrementing (not just occasional)
+- KV eviction/compaction spikes tightly correlated with latency cliffs after enabling the flag
+- Kernel selection/graph recapture counters spike immediately after enablement and do not stabilize
+
+For explicit thresholds and rollback triggers, use: confluence://eng-sre/slo-and-error-budgets/hosted-api-tail-latency-slo-guardrails
+
+## Open items / follow-ups
+- Validate classifier uses both prompt length and expected generation length where feasible (prevents “short prompt, huge decode” misclassification).
+- Add a benchmark scenario for alternating extremes and publish expected outcomes.
+- Tighten documentation around SKU-specific defaults and which knobs are safe to change during an incident.
+
+## Change log
+- 2026-02-20: Updated hardware anomalies and expanded KV cache interaction notes (post-canary findings).
+- 2026-01-28: Added starvation corner case details and explicit guardrail signals.
+- 2025-12-12: Initial publication for Phase 1 prototype rollout prep.

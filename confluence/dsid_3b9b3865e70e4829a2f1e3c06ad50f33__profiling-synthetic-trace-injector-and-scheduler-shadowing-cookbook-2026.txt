@@ -1,0 +1,205 @@
+Profiling Synthetic Trace Injector and Scheduler Shadowing Cookbook
+
+Overview
+
+Purpose: This cookbook documents a repeatable, low-risk process for reproducing, profiling, and quantifying scheduler- and kernel-sensitive performance behaviors using synthetic trace injection and scheduler shadowing. The goal is to create deterministic synthetic inputs that exercise known hot paths (KV cache thrash, long-sequence attention, quantized kernel fallbacks) and to run a scheduler shadow to evaluate policy changes without impacting production traffic.
+
+Scope: covers tooling, safe injection channels, synthetic trace templates, experiment run matrix, telemetry correlation, post-run analysis, and rollback/cleanup. This playbook is intended for runtime engineers owning kernel scheduling, profiling, and the benchmarking suite.
+
+Owner and contacts
+
+- Doc owner: Maya Patel (runtime profiling team)
+- Primary oncall for injections: runtime-sre rotation (see /confluence/eng-sre/oncall-rotations)
+- Reviewers: Ethan Zhang (scheduler), Lina Fernández (observability), Jordan Kim (benchmarks)
+
+When to use this playbook
+
+- Investigating reproducible tail-latency spikes suspected to be scheduling interactions
+- Validating scheduler policy changes (crediting, preemption thresholds) against representative workloads
+- Debugging KV cache coherence regressions under composite load shapes
+- Generating controlled regression candidates for the benchmarking and perf-suite
+
+Safety model and constraints
+
+- Never inject synthetic traces into live customer traffic channels. Use the dedicated shadow ingress (ingress-shadow.redwood.internal) or the local experiment harness.
+- All experiments must run in the sandbox cluster or a reserved staging ring; do not point to Dedicated customer pools.
+- Maximum allowed synthetic QPS: 25% of the node pool baseline for the targeted cluster (enforced by the shadow-admission controller).
+- If any of the SLO gates (95p latency, error rate, GPU utilization) degrade by >20% compared to baseline within the first 5 minutes, abort automatically. Abort uses the circuit-breaker endpoint (POST /admin/experiment/{id}/abort).
+
+Prerequisites
+
+1) Access: experiment-runner role and shadow-cluster credentials (see /confluence/eng-sre/credentials).
+2) Tooling: experiment-runner CLI (v1.14+) and trace-injector service binary. Install: curl -fsS https://internal.redwood/bin/experiment-runner | sh
+3) Baseline capture: a 30-minute production shadow capture (compressed protobuf) representative of the workload you will emulate. See capture naming convention: capture-{service}-{date}-{env}.pb.gz
+
+High-level flow
+
+1) Derive synthetic trace templates from baseline capture using the extractor.
+2) Augment templates to produce fault/edge cases (e.g., long prefix reuse, kvcache cold starts, model-variant switch).
+3) Validate templates locally in the sandbox harness (dry run + trace-level assertions).
+4) Launch scheduler-shadow run in a staging ring with the current scheduler and an alternate policy patched into the shadow controller.
+5) Collect and correlate kernel traces, scheduler telemetry, and application observability.
+6) Run benchmark-suite scenarios to quantify delta and generate regression tickets if necessary.
+
+Step-by-step procedure
+
+A. Generate synthetic traces from a capture
+
+1. Fetch the baseline capture: experiment-runner capture fetch --id capture-frontend-20260104-staging --out /tmp/cap.pb.gz
+2. Extract request surface and KV cache events: 
+
+   trace-extractor --input /tmp/cap.pb.gz --output /tmp/template.json --include events:request,kvcache,session
+
+   - The template.json contains arrays of request objects with fields: seq_len, prompt_token_counts, kv_key_prefixes, model_variant_hint.
+
+3. Edit the template to add edge cases. Example additions (append to array):
+
+   - a long-prefix case: {"seq_len": 4096, "prompt_token_counts": [1024, 3072], "kv_key_prefixes": ["user:prefetch-heavy"], "model_variant_hint": "llama-2-q8"}
+   - kvcache cold-flush windows: add interval markers for forced cache eviction
+
+B. Sanity-check templates in local harness
+
+1. Start local harness (isolated docker image): docker-compose -f harness/docker-compose.yml up -d
+2. Dry-run injection with assertions enabled: trace-injector --template /tmp/template.json --mode dryrun --asserts /etc/experiment/asserts.yaml
+3. Expected dryrun outputs: per-request latency distributions and assertion report. If any assertion fails, modify template and repeat.
+
+C. Schedule a shadow run with scheduler shadowing
+
+1. Create experiment record: 
+
+   experiment-runner create --name "sched-shadow-kvcoh-2026-06" --cluster staging-shadow --owner @maya --config experiments/sched-shadow-config.yaml
+
+2. Example sched-shadow-config.yaml (annotated, included inline here for convenience):
+
+   - name: sched_policy_patch
+     type: patch
+     description: "enable preemptive-shepherding at 80% GPU mem and lower affinity weight for best-effort"
+     patch_location: runtime/scheduler/patches/preemptive-shepherding-v2.patch
+
+   - name: injector_settings
+     qps: 600
+     concurrency_profile: bursty
+
+3. Attach the template and set monitoring hooks: 
+
+   experiment-runner attach --id <exp-id> --artifact /tmp/template.json --monitor hooks/sched-shadow-monitors.yaml
+
+4. Start the experiment in dry-observe mode: 
+
+   experiment-runner start --id <exp-id> --mode dry-observe --duration 00:45:00
+
+   - dry-observe routes the synthetic traffic into the shadow admission pipeline and runs the scheduler patch in a non-invasive shadow controller; it does not alter live scheduling decisions but collects what would have happened under the patched policy.
+
+D. Collect telemetry and kernel artifacts
+
+Required telemetry buckets:
+
+- scheduler-decision.trace (per-request decision log)
+- kernel-invocations.ndjson (kernel start/stop with parameters)
+- kvcache-events.pb (prefetch/evict/hit/miss counts)
+- metrics.timeseries (prometheus-compatible)
+- object-store: /experiments/<id>/profiles/ (profiling flamegraphs and pprof)
+
+Collection command example: 
+
+   experiment-runner collect --id <exp-id> --artifacts scheduler-decision.trace,kernel-invocations.ndjson,kvcache-events.pb,metrics.timeseries --out /tmp/exp-results
+
+E. Correlate and analyze results
+
+1. Run the correlation script: 
+
+   scripts/exp-correlation --input /tmp/exp-results --output /tmp/exp-analysis.html
+
+   The correlation script performs:
+   - request-to-kernel join (match request id to kernel invocations)
+   - compute latency delta window between baseline and shadow decisions
+   - compute kernel utilization uplift and preemption counts
+
+2. Key signals to inspect:
+
+   - percent of requests that would have been preempted under the patched policy
+   - changes to 95/99/99.9p token-latency
+   - KV cache miss amplification due to preemption or affinity reduction
+   - kernel queue length and average kernel execution time per sequence length bin
+
+3. Example failure modes and diagnostic actions:
+
+   - Observation: 20% increase in 99.9p token latency coinciding with preemption spikes.
+     Action: examine kernel-invocations.ndjson for prolonged kernel cold-starts, verify whether preemption caused cache thrash; reduce preemption aggressiveness and rerun shadow.
+
+   - Observation: increased tail correlated with model-variant switch events.
+     Action: inspect scheduler-decision.trace to verify fallback routing and sequence-length misclassification; add model_variant hint alignment in template and re-evaluate.
+
+F. Promoting changes and benchmarking
+
+1. If shadow analysis is favorable, run a full benchmark suite against a tuning ring. Use the specific manifest for the suite: benchmarking/manifests/sched-fidelity-manifest.yaml
+2. Launch: benchmark-runner run --manifest benchmarking/manifests/sched-fidelity-manifest.yaml --experiment <exp-id> --save results/sched-fidelity-2026-06-15.json
+3. Required outputs: per-model per-route cost deltas, token-energy-profile, SLO-simulated pass/fail. Attach results to the experiment record and create a PR for scheduler patches with the artifacts.
+
+Metrics, SLOs, and acceptance criteria
+
+- Baseline SLOs for acceptance:
+  - 95p token latency: <= baseline + 5%
+  - 99.9p token latency: <= baseline + 10%
+  - Error rate: no more than baseline + 0.1% absolute
+  - GPU utilization: not increase > 8% sustained
+
+- If the change improves cost per token by >7% while meeting SLOs, it is a candidate for staged rollout.
+
+Observability and dashboards to check
+
+- /dashboards/runtime/scheduler-shadow-overview
+- /dashboards/runtime/kernel-hotpath-fingerprint
+- /dashboards/benchmarks/sched-fidelity-comparison
+
+Templates and example snippets
+
+- Minimal inject template (JSON single line):
+  [{"id":"synthetic-1","seq_len":512,"priority":"interactive","kv_prefix":"user:smallctx","model":"redwood-rlm-7b"}]
+
+- Sample asserts.yaml (used in dryrun):
+  - name: max-95p-latency
+    metric: request.latency.p95
+    threshold_ms: 200
+
+- Recommended admission controller payload (YAML):
+  admission_override:
+    mode: shadow
+    max_qps: 600
+    owner: maya@redwood.internal
+
+Post-experiment cleanup and artifacts retention
+
+- Remove experiment artifacts older than 90 days unless attached to a release PR (policy enforced by exp-cleaner service).
+- Archive approved experiments under /archive/experiments/{year}/{id} and tag in the benchmarking index.
+
+Common gotchas and troubleshooting checklist
+
+- If the scheduler shadow shows no decision differences but you see performance delta in kernel profiles: verify tracer clock sync (ntp/chrony) across nodes.
+- For noisy baselines, increase capture window and apply stratified sampling before template derivation.
+- When evaluating quantized kernels, ensure the profiler is launched with QUANT_PROF=1 to capture quantization fallback events.
+
+Runbook snippets and quick recovery steps
+
+- Abort an experiment quickly: curl -X POST -H \"Authorization: Bearer $(cat /etc/exp/token)\" https://api.internal/experiment/<id>/abort
+- Revert a scheduler policy rollout: use rollout-manager revert --component scheduler --to-tag v2026-05-21 --force-annotate \"rollout-rollback due to tail-latency\"
+
+Appendix: example analysis checklist (for experiment postmortem)
+
+1. Experiment metadata: id, owner, start/end, cluster, patch applied.
+2. Baseline vs shadow summary tables: p50/p95/p99/p999 deltas, error rate, GPU util, kernel invocation rate.
+3. Top 5 correlated signals and their suspected causal path.
+4. Suggested next steps (tune preemption thresholds, add KV warmup hints, revert affinity changes).
+5. Attachment links: flamegraphs, kernel-pprof, scheduler-trace, benchmark manifest.
+
+References and related pages
+
+- Kernel telemetry model (see /confluence/eng-serving-runtime/team-wiki/kernel-telemetry-annotation-guidelines-2025)
+- Benchmark manifest conventions (see /confluence/eng-serving-runtime/benchmarking-and-perf-suite/operational-workload-simulator-and-signature-guide-2026)
+
+Document revision history
+
+- 2026-01-12: initial draft by Maya Patel
+- 2026-03-02: added dry-observe mode and admission constraints (reviewers: Ethan Zhang)
+- 2026-06-15: expanded analysis checklist and acceptance criteria (reviewers: Lina Fernández, Jordan Kim)
+

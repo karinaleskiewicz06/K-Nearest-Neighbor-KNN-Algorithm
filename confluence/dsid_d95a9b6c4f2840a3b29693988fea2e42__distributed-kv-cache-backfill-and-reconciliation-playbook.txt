@@ -1,0 +1,127 @@
+Distributed KV cache backfill and reconciliation playbook
+
+Summary:
+This playbook describes the safe procedure for performing a coordinated backfill and reconciliation of the distributed KV cache used by the inference serving runtime. It covers preflight checks, orchestrated backfill steps, verification queries, monitoring thresholds, rollback actions, and post-run follow-ups. This document is intended for oncall, platform engineers, and anyone running cluster-wide cache operations.
+
+Overview and motivation:
+- Problem: cache corruption, large cold-cache after large deploys, or migration between cache backends (in-memory cluster -> persisted L2) can require a coordinated backfill so that active inference nodes have warmed KV entries without creating large thundering-herd loads or violating latency SLOs.
+- Goals: restore cache correctness and hit-rate to operational baseline while preserving 95th/99th latency SLOs for interactive inference.
+- Constraints: backfill must respect tenant priority, avoid saturating egress (S3/Redis), and be reversible within the maintenance window.
+
+Ownership and roles:
+- Run owner: platform-runtime-oncall (@platform-runtime) — coordinates execution, approves rollouts and rollbacks.
+- Executor: infra-team (engineers running the orchestration job).
+- Stakeholders: SRE (monitoring and alerting), GPU fleet owners, security (if customer data is re-populated), product (if feature gating required).
+
+Preflight checklist (must be green before starting):
+1) Maintenance window advertised: 60m reserved, page sent to #platform-ops and affected tenant owners.
+2) Last good configuration snapshot taken: git tag for running serving runtime (eg: v2025.02.15-runtime).
+3) Telemetry baseline captured: record current 95th/99th latency, error-rate, cache hit-rate, and egress bandwidth for the previous 30 minutes.
+4) Storage/egress quotas verified: ensure S3 PUT/GET and Redis connection quotas have at least 2x headroom.
+5) Backfill plan validated in staging: successful dry-run with representative traffic.
+6) Rollback artifacts ready: cached snapshots and a fast cache-eviction toggle.
+
+Required SLOs and thresholds:
+- Latency SLO (interactive): p95 < 120ms, p99 < 350ms
+- Error budget: spike must not exceed 3% errors across maintenance window
+- Cache hit-rate target: at least 70% within 45 minutes of completing backfill for steady workloads
+- Egress cap: do not exceed 60% of regional egress burst budget for more than 10 minutes
+
+Rate limiting and shaping rules (recommended defaults):
+| stage | parallelism | per-node qps | global qps cap | notes |
+|---|---:|---:|---:|---|
+| initial-scan | 2 | 5 | 200 | light pass to discover hot prefixes |
+| prioritized-backfill | 6 | 20 | 1000 | honors tenant priority; retries with backoff |
+| catchup | 12 | 40 | 2000 | run only if latency headroom > 25% |
+
+High-level procedure (numbered steps):
+1. Announce maintenance in channels and run preflight checklist. Capture baseline metrics IDs.
+2. Run discovery job (read-only) to enumerate hot keys and prefixes from request traces (last 24h). Output: ranked_key_list.{region}.ndjson.
+3. Apply tenant-priority filter: mark keys belonging to priority-tenants (gold/premium) and user-facing endpoints first.
+4. Start a canary backfill in a single region and single availability zone (AZ) with reduced QPS caps (50% of normal canary target). Monitor latency/egress for 5 minutes.
+5. If canary is healthy (see verification below), scale to other AZs in region in a rolling fashion, maintaining per-AZ pause of 3 minutes between starts.
+6. After regional warmup, increase global concurrency to planned levels, but throttle catchup phase if p95 latency approaches 80% of SLO.
+7. Run a final verification suite (described below). If results are within thresholds, mark the run successful and unwind temporary throttles.
+
+Detailed commands and examples:
+- discovery job (example):
+  # run in k8s job; outputs ranked keys to GCS
+  kubectl -n platform-runner run kv-discover --image=redwood/kv-tools:stable --restart=OnFailure -- 
+    --mode=discover --lookback=24h --out=gcs://redwood-ops/backfills/ranked_key_list.${REGION}.ndjson
+
+- sample backfill worker CLI (reads ranked keys and writes to cache):
+  ./kv-backfill --source=s3://feature-cache-seed/${REGION} --target=redis://cache-proxy:6379 
+    --parallelism=6 --qps=20 --tenant-priority-file=priority-tenants.json --dry-run=false
+
+- Terraform snippet (safety circuit toggle, comment into ops-iac repo):
+  resource "aws_ssm_parameter" "kv_backfill_toggle" {
+    name  = "/platform/kv_backfill/allow"
+    type  = "String"
+    value = "false"
+  }
+
+Verification and guard rails (automated checks):
+- Essential checks that an automated runner must validate after each stage:
+  - p95 latency (by endpoint) does not exceed 80% of SLO for two consecutive 1m buckets.
+  - 5xx rate increase < 1.5x baseline for the last 10 minutes.
+  - Egress throughput < configured cap for the region for at least the last 5 minutes.
+  - Cache hit-rate must not drop below 40% for more than 5 minutes during prioritized backfill.
+
+Monitoring queries (Prometheus / Loki pseudo queries):
+- p95 latency by service:
+  histogram_quantile(0.95, sum(rate(http_request_latency_seconds_bucket[2m])) by (le, service))
+- cache hit rate by endpoint:
+  sum(rate(cache_hits_total[5m])) / (sum(rate(cache_hits_total[5m])) + sum(rate(cache_misses_total[5m])))
+- egress bytes (GCS/S3):
+  sum(rate(aws_s3_client_bytes_transferred_sum[5m])) by (region)
+
+Rollback criteria and steps (if any threshold violated):
+1) Immediate rollback triggers:
+  - p95 latency > SLO for 2 consecutive 1m buckets after stage start.
+  - 5xx rate > 2x baseline for 5 minutes.
+  - Egress quota consumption > 90% burst cap.
+2) Rollback actions (order matters):
+  a) Pause backfill job via SSM toggle: aws ssm put-parameter --name /platform/kv_backfill/allow --value false --overwrite
+  b) Drain backfill pods: kubectl -n platform-runner scale deployment/kv-backfill --replicas=0
+  c) Re-enable cached-serving fallback: set runtime flag runtime.kv_fallback.enabled=true via configmap rollout
+  d) If errors persist, revert to last known good runtime image: kubectl set image deployment/serving runtime=registry/redwood/runtime:v<previous>
+
+Post-run hygiene and follow-ups:
+- Commit artifacts: ranked_key_list.*, backfill-run-{timestamp}.manifest, and perf-baseline-{timestamp}.json to the ops S3 bucket.
+- Run an after-action review within 72 hours. Capture: what keys had highest churn, any tenants affected, and cost of egress.
+- Create follow-up tickets for: improving key discovery accuracy, adding tenant-level backoff controls, and tuning per-node qps heuristics.
+
+Troubleshooting common failure modes:
+- Symptom: backfill completes but hit-rate stays low for >30m
+  Possible causes: wrong key namespace, mismatch in serialization, TTLs too short.
+  Actions: verify serialization config between source and target; run incremental rehydrate of top-10k keys; inspect logs for deserialization errors.
+
+- Symptom: regional egress hitting quotas unexpectedly
+  Possible causes: duplicate parallel workers reading from same storage, missing shard routing.
+  Actions: reduce global_qps cap, check worker-id uniqueness, enable operator-level dedupe flag --dedupe-reads.
+
+- Symptom: sudden spike in 5xx after scaling to catchup
+  Possible causes: runtime GC pressure, connection pool exhaustion at Redis
+  Actions: lower per-node qps by 25%, increase connection pool size (config: redis.pool.max=200) and retry the canary.
+
+Appendix A — sample reconciliation algorithm (described):
+1) compute per-key vector of: last-read-timestamp, miss-count, tenant-priority, size-bytes.
+2) score = weight_age * age_rank + weight_miss * miss_rank + weight_priority * tenant_priority
+3) sort keys by score and feed to backfill workers; use reservoir sampling to trim very large objects if memory pressure observed.
+
+Appendix B — minimal APIs and library versions tested:
+- kv-backfill v2.1.3 (go)
+- runtime-cache-proxy v3.0.0
+- redis client: go-redis v8.2.1
+- discovery: redwood/traffic-tools v1.6
+
+Appendix C — runbook contacts:
+- Platform oncall: #platform-runtime-oncall
+- Infra Pager: oncall+infra@redwood.com
+- SRE lead: Ethan Ross (ethan.ross@redwood.com)
+
+Change log:
+- 2024-11-12: initial published draft (Maya Chen)
+- 2025-02-18: updated verification thresholds and added Terraform safety toggle (Maya Chen)
+
+End of document.

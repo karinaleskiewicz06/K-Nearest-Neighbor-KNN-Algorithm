@@ -1,0 +1,318 @@
+TP stall triage playbook (tensor-parallel hangs/timeouts)
+
+## Purpose
+This playbook covers step-by-step triage for **tensor-parallel (TP) stalls** (a.k.a. hangs/timeouts) in the serving runtime. It is written for on-call SRE + runtime engineers to quickly answer:
+- Is the stall **compute**, **NCCL/collectives**, or **scheduler/starvation**?
+- Which replicas/ranks are stuck, and is it isolated or systemic?
+- What data should we capture (metrics/logs/traces/NCCL debug) without making the incident worse?
+
+This is **triage + profiling**. For mitigation actions (drain/replace, concurrency caps, feature flags), use the runbook: *Runtime TP hang mitigation*.
+
+---
+
+## Definitions (what we mean by “TP stall”)
+A TP stall is a condition where a multi-GPU replica stops making forward progress for a request or decode loop. Typical external symptoms:
+- Streaming responses stop mid-stream (client sees partial tokens then timeout).
+- Request p99 and timeout rate spike for a subset of replicas (often a single model + HW type).
+- GPU utilization becomes skewed by rank (one GPU at high util while others idle) or all GPUs look “busy” but throughput drops.
+
+Internal signatures commonly fall into:
+1) **Collective mismatch / ordering bug** (ranks enter different collectives or different order)
+2) **Stream/event sync hazard** (collective enqueued but waits on an event never recorded / wrong stream)
+3) **Scheduler starvation** (collectives or rank coordination starved by prefill-heavy batches or unfair queueing)
+4) **Memory/KV cache pressure divergence** (rank divergence due to compaction/fragmentation edge cases)
+
+---
+
+## Before you start (scope + safety)
+### Don’t worsen the blast radius
+- Avoid enabling verbose NCCL debug on broad fleets. Prefer **single replica**, **short window**, **Dedicated-first**, and **off-peak** when possible.
+- NCCL debug can create large logs and measurable overhead; it can also expose topology and environment details. Treat as internal-only.
+- If customer traffic is impacted (timeouts), prioritize mitigation (drain/replace, cap concurrency) before deep profiling.
+
+### What to capture (minimum useful packet)
+Collect these for every suspected TP stall:
+- Cluster/region, model name/version, runtime version, GPU type, TP degree (e.g., TP=4/8)
+- Affected replica IDs + node IDs
+- Time window (start, peak, end), and whether retries/fallback triggered
+- Links to:
+  - TP Stall & Timeout dashboard panels
+  - Request trace IDs (at least 2–3 from timeouts)
+  - Logs for the affected replica(s)
+
+---
+
+## Fast triage (5–10 minutes)
+### Step 1: Confirm it’s TP-related vs generic overload
+Use the dashboard: **TP stall and timeout dashboard**.
+
+Look for:
+- **Request timeouts** concentrated on TP replicas vs all replicas
+- **TP rank heartbeat gaps** (per-rank progress stops)
+- **Replica drain events** spiking (watchdog/abort path firing)
+- **Scheduler queue depth** rising without corresponding throughput
+
+If timeouts are uniform across all replicas, treat as broader capacity/overload and use standard overload playbooks.
+
+### Step 2: Identify the blast radius
+Answer:
+- Is it **one replica** (likely wedged) or **many replicas** (likely systemic regression)?
+- Is it tied to **one model**, **one GPU SKU**, **one cluster**, or **one recent rollout**?
+
+Checklist:
+- Compare Dedicated vs Hosted clusters
+- Compare A100/H100/L40S pools
+- Check recent runtime canary changes and feature flags
+
+### Step 3: Determine stall class with 3 signals
+Use these three signals together to classify quickly:
+
+1) **Rank heartbeat age** (progress signal)
+- Symptom: heartbeat age increasing on some/all ranks.
+
+2) **In-flight collective counters** (comms signal)
+- Symptom: collectives “in-flight” stuck (not decrementing) or ranks report different collective sequence.
+
+3) **Scheduler queue depth / fairness** (scheduler signal)
+- Symptom: queue depth grows; prefill-heavy batches dominate; decode iterations stop being scheduled.
+
+If (1) is bad and (2) shows stuck collectives → suspect NCCL/collectives ordering or stream sync.
+If (1) is bad but (2) is normal and (3) is bad → suspect scheduler starvation.
+If (1) is bad and memory/KV errors appear in logs → suspect KV cache divergence/compaction.
+
+---
+
+## Metrics to use (names + interpretation)
+Metric names may differ slightly by environment; prefer the dashboard panels as source of truth.
+
+### Core TP health
+- `runtime_tp_rank_heartbeat_age_seconds{model,replica_id,rank}`
+  - **Actionable:** if > 10–30s sustained for any rank, suspect stall.
+- `runtime_tp_stall_reason_total{model,replica_id,reason}`
+  - **Reason codes** (common): `COMMS_COLLECTIVE_STUCK`, `SCHED_STARVATION`, `KV_ALLOC_WAIT`, `CANCEL_PATH_WAIT`, `UNKNOWN`.
+- `runtime_tp_inflight_collectives{model,replica_id,rank,collective}`
+  - Rising and never decreasing → stuck collective.
+
+### Scheduler/backpressure
+- `runtime_scheduler_queue_depth{queue,model}`
+- `runtime_scheduler_prefill_decode_ratio{model}`
+- `runtime_scheduler_starvation_events_total{model}`
+
+### Timeouts + mitigations
+- `api_request_timeouts_total{route,model,cluster}`
+- `runtime_replica_drain_events_total{reason,model}`
+- `runtime_overload_rejections_total{reason,model}`
+
+---
+
+## Logs (what to grep for)
+### Structured runtime log fields to pull
+For the suspected replica, gather logs around the stall window and extract:
+- `replica_id`, `rank`, `tp_degree`, `model`, `request_id`, `trace_id`
+- `stall_reason`, `collective_seq`, `collective_type`, `stream_id`, `cuda_graph_enabled`
+- `kv_cache_bytes_free`, `kv_compaction_in_progress`, `oom/alloc_wait`
+
+### Common log patterns
+- Collective mismatch / ordering:
+  - “collective sequence mismatch”
+  - “rank entered ALLREDUCE but peer entered ALLGATHER”
+  - “expected collective_id=X observed Y”
+- Stream/event sync:
+  - “waiting on cuda event” with long durations
+  - “stream synchronize timed out”
+- Scheduler starvation:
+  - “prefill batch admitted while decode pending”
+  - “fairness guardrail triggered” (if enabled)
+- Cancellation path deadlock:
+  - “client disconnected” followed by stuck collective / no further progress
+
+---
+
+## Traces (how to correlate stalls to collectives)
+### What to look for in traces
+For 2–3 timed-out requests:
+- Identify the server-side spans for decode iterations.
+- Check span attributes:
+  - `tp.rank`, `tp.degree`
+  - `tp.collective.inflight` counters
+  - `tp.collective.seq` (if present)
+  - `stall_reason` tag (if emitted)
+
+### Minimal trace workflow
+1) Pull a timeout request ID from API logs.
+2) Find the associated `trace_id`.
+3) Open trace and confirm where time is spent:
+   - compute kernel spans vs NCCL spans vs scheduler wait spans.
+
+If trace shows long gaps without spans, rely on heartbeat + logs; the process may be stuck below instrumentation.
+
+---
+
+## Node/replica inspection (commands)
+The exact tooling differs by cluster. The commands below are representative for Redwood’s Kubernetes-based runtime clusters.
+
+### Identify the pod and node
+- Find pods for a model:
+  - `kubectl -n runtime get pods -l app=redwood-runtime,model=<MODEL> -o wide`
+- Filter to a specific replica:
+  - `kubectl -n runtime get pod | grep <replica_id>`
+
+### Quick GPU health (on the node)
+If you have node access (or via privileged debug pod):
+- `nvidia-smi -L`
+- `nvidia-smi pmon -c 1`
+- `nvidia-smi dmon -s pucvmt -c 5`
+
+What you’re looking for:
+- Rank imbalance (one GPU pegged while others idle)
+- PCIe/NVLink issues (if visible)
+- Memory near OOM or rapid allocation churn
+
+### Collect pod logs around the stall
+- `kubectl -n runtime logs <pod> --since=30m > /tmp/<pod>.log`
+- If multi-container:
+  - `kubectl -n runtime logs <pod> -c runtime --since=30m`
+
+### Capture a lightweight runtime debug snapshot (preferred over heavy profilers)
+If the runtime exposes a debug endpoint (varies by env):
+- `kubectl -n runtime port-forward <pod> 6060:6060`
+- Then (examples):
+  - `curl -s http://localhost:6060/debug/tp/status`
+  - `curl -s http://localhost:6060/debug/scheduler/queues`
+  - `curl -s http://localhost:6060/debug/kv/summary`
+
+If endpoints are unavailable, rely on logs + metrics.
+
+---
+
+## Safely capturing NCCL debug traces
+### When to enable NCCL debug
+Enable NCCL debug only when:
+- The issue reproduces and **appears comms/collective-related**.
+- The blast radius is controlled (single replica or small canary).
+- You have a clear rollback plan and a short time window (10–30 minutes).
+
+### Recommended NCCL debug settings (balanced)
+Use the least-verbose settings that still show collective sequencing.
+
+Suggested env vars:
+- `NCCL_DEBUG=INFO`
+- `NCCL_DEBUG_SUBSYS=COLL,INIT`
+- `NCCL_DEBUG_FILE=/var/log/redwood/nccl/%h_%p_rank%r.log`
+
+Optional (only if needed):
+- `NCCL_DEBUG_SUBSYS=COLL,INIT,GRAPH`
+- `NCCL_DEBUG=WARN` (if INFO is too noisy)
+
+Avoid unless specifically requested by kernel team:
+- `NCCL_DEBUG=TRACE` (very noisy)
+- Broad `NCCL_DEBUG_SUBSYS=ALL`
+
+### Operational safety checklist
+Before enabling:
+1) Confirm **disk space** for logs on node/pod (NCCL logs can be large).
+2) Confirm log retention and export path (avoid shipping huge logs to default pipelines).
+3) Get explicit approval in the incident channel if customer impact is ongoing.
+
+During capture:
+- Keep capture window short.
+- Prefer a canary replica with synthetic load or limited customer traffic.
+
+After capture:
+1) Turn off NCCL debug env vars.
+2) Collect logs from the replica only.
+3) Scrub and store logs in the incident artifact location (internal only).
+
+### How to enable in practice
+Preferred: use Redwood runtime config / feature flag mechanism for canary-only enablement.
+
+If a rollout-based toggle exists (example):
+- Enable flag: `runtime.nccl_debug_logging=canary` or `runtime.tp.nccl_debug=enabled` (exact names vary by release).
+- Validate by searching logs for “NCCL version” and “NET/Topology” lines.
+
+If you must patch a single deployment (last resort):
+- Patch env vars on one replica deployment and restart only that replica.
+- Coordinate with release/on-call owner to avoid triggering autoscaling thrash.
+
+---
+
+## Decision tree (compute vs comms vs scheduler)
+### A) Suspect comms/collectives
+Indicators:
+- Heartbeats stop and `inflight_collectives` is stuck.
+- Many timeouts cluster on a single replica; draining fixes temporarily.
+- Logs show collective sequence mismatch or long waits on stream sync.
+
+Next actions:
+1) Capture NCCL debug logs (safe mode) on a canary replica.
+2) Capture trace IDs for 2–3 timeouts.
+3) Escalate to Kernel team with: model, TP degree, GPU type, runtime version, NCCL logs, and stall window.
+
+### B) Suspect scheduler starvation
+Indicators:
+- Queue depth increases; prefill-heavy admission continues while decode progress halts.
+- `stall_reason_total{reason="SCHED_STARVATION"}` increases.
+- Switching workload mix (reduce long prefill / lower concurrency) improves.
+
+Next actions:
+1) Capture scheduler queue snapshot (`/debug/scheduler/queues`) if available.
+2) Capture metrics: queue depth, prefill/decode ratio, starvation events.
+3) Escalate to Scheduling team with workload distribution details (prompt length mix, streaming enabled, concurrency pattern).
+
+### C) Suspect KV cache / memory pressure divergence
+Indicators:
+- Errors/warnings around compaction, allocation waits, or near-OOM.
+- Stalls appear under long context + high concurrency.
+
+Next actions:
+1) Capture KV cache summary (`/debug/kv/summary`) if available.
+2) Capture memory metrics + logs around compaction.
+3) Escalate to KV/cache owner with stress suite parameters (context length, batch size, concurrency, cache settings).
+
+---
+
+## What to include in an escalation (copy/paste template)
+**Subject:** TP stall suspected (comms/scheduler/KV) – <cluster> <model> TP=<N> GPU=<SKU> runtime=<ver>
+
+- Cluster/region:
+- Customer impact (Dedicated/Hosted, accounts):
+- Model + version:
+- Runtime version + recent changes/flags:
+- GPU type + TP degree:
+- Start time / peak / end:
+- Symptoms:
+  - Timeout rate:
+  - p99 latency:
+  - Streaming affected (yes/no):
+- Suspected stall class: comms / scheduler / KV / unknown
+- Evidence:
+  - Dashboard links:
+  - Metrics screenshots/exports:
+  - Trace IDs:
+  - Replica IDs / pod names:
+  - Logs attached (runtime logs, NCCL logs if captured):
+- Mitigations attempted (drain, caps, flags) + outcome:
+
+---
+
+## Common pitfalls
+- Treating a wedged replica as overload: draining the replica may restore service but hides a systemic regression. Always capture artifacts first if feasible.
+- Enabling NCCL TRACE broadly: can overload logging, increase latency, and create noisy data that’s hard to interpret.
+- Failing to capture per-rank context: TP stalls are often rank-specific; always record `rank` and `replica_id`.
+
+---
+
+## Appendices
+### A. Expected “healthy” baselines
+These vary by model and workload, but generally:
+- `runtime_tp_rank_heartbeat_age_seconds` stays near 0–2s with brief spikes under GC/compaction.
+- `runtime_tp_inflight_collectives` oscillates but returns to baseline; it should not monotonically increase.
+- Queue depth should correlate with throughput; sustained queue growth with flat throughput is suspicious.
+
+### B. When to declare a suspected regression
+Strong indicators of a regression (vs isolated node failure):
+- Same stall signature across multiple replicas after a rollout
+- Correlated with a specific GPU SKU or NCCL/CUDA change
+- Reproducible in perf-canary or benchmark-lab using the mixed prefill/decode workload
+
+If regression is suspected, coordinate with release owner to pause rollout and set a clear go/no-go checkpoint.

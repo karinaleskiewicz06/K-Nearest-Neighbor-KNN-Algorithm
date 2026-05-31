@@ -1,0 +1,141 @@
+Runtime capacity fingerprints and diagnostics
+
+Summary
+This page codifies a compact set of operational 'fingerprints' (canonical metric / trace signatures) for common serving runtime capacity and performance modes, plus a diagnostics playbook for triage. The goal is to make oncall and SRE rotations faster: when you see an anomaly, match it to a fingerprint and run the corresponding diagnostic chain.
+
+Audience
+- SREs and runtime engineers handling oncall for serving clusters
+- Performance engineers validating kernel/scheduler changes
+- Solutions engineers troubleshooting customer latency/cost regressions
+
+Scope and intent
+- Focused on inference runtime production clusters (hosted + dedicated) and the colocated control plane pieces that affect routing.
+- Covers observable fingerprints, short reproducible checks, recommended PromQL and tracing queries, escalation steps, and safe remediation patterns.
+
+Key definitions
+- Fingerprint: a short name + canonical metric pattern (time-series shape, correlated traces) that describes a common operational mode.
+- Microburst: short-duration spike in QPS or tokens that overwhelms batching window and increases p50/p95 unexpectedly.
+- Kernel contention: long tail caused by a small subset of kernels blocking GPU thread groups or launching inefficient kernels.
+
+Fingerprint catalog (quick reference)
+1) Cold-KV-warmup
+   - Symptom: brief p50 increase for initial requests after model load or instance restart; p95 returns to baseline after ~30s–2min.
+   - Canonical metrics: high prefix_miss_rate, kv_cache_fill_rate spike, first-request_latency spike.
+   - Trace signature: large size of initial KV writes, cold KV fill spans the first N tokens.
+   - Quick check: `rdinferctl instances list --since 5m` + `promql: rate(runtime_kv_cache_miss_total[1m])`
+   - Remediation: allow warmup traffic (curl warmup endpoint) or prewarm with synthetic requests; avoid rolling all replicas at once.
+
+2) Microburst-induced batching collapse
+   - Symptom: p50/p95 jump while throughput unchanged; batching efficiency metric drops.
+   - Canonical metrics: batch_size_avg drops, request_queue_depth instant spike, scheduling_latency increases for short window.
+   - PromQL snippet: `(avg_over_time(runtime_batch_size[1m]) < 0.5 * avg_over_time(runtime_batch_size[15m])) and increase(runtime_request_queue_depth[1m]) > 10`
+   - Remediation: increase burst capacity or temporarily switch route policy to prefer low-latency nodes; if recurring, tune continuous batching window or add token-bucket smoothing in API gateway.
+
+3) Kernel contention / inefficient kernels
+   - Symptom: sustained p95 elevation with high GPU SM busy but low CUDA-alloc rates; one kernel type shows 10x longer wall time in traces.
+   - Canonical metrics: gpu_sm_utilization high, kernel_launch_duration percentile skewed, GPU_compute_stalls increase.
+   - Tracing: look for traces with long kernel_wait spans and high kernel_relaunch_count.
+   - Quick reproduction: replay a sample request under profiling build (see profiling playbook).
+   - Remediation: pin to alternate kernel path (quantized path vs float path), rollback recent kernel selector changes, file a kernel ticket and add a canary with profiling enabled.
+
+4) Model shard imbalance
+   - Symptom: one host shows high GPU utilization and queue depth while peer hosts idle for same route/model/version.
+   - Canonical metrics: per-host tokens/sec skew, shard_mapping_size changes, per-host request_rate imbalance.
+   - Quick check: `rdinferctl debug shard-mapping --model my-model:v12` + `promql: topk(5, rate(serving_tokens_count[1m])) by (host)`
+   - Remediation: rotate shards, check placement constraints, validate that autoscaler sees correct pod/resource requests.
+
+Observability recipes
+- PromQL snippets (examples)
+  - Tokens per second (cluster): `sum(rate(serving_tokens_count[1m]))`
+  - Batching efficiency: `sum(runtime_batch_size * runtime_batch_count) / sum(runtime_batch_count)`
+  - Request queuing: `histogram_quantile(0.99, sum(rate(runtime_request_queue_time_bucket[5m])) by (le))`
+  - Kernel contention signal: `sum(rate(kernel_launch_duration_seconds_sum[5m])) / sum(rate(kernel_launch_duration_seconds_count[5m]))`
+
+- Trace queries (Jaeger/OpenTelemetry)
+  - Find traces with long kernel spans: `span.name=kernel_execute AND span.duration>500ms`
+  - KV cache miss traces: look for `kv_miss=true` tag on spans and sort by duration
+
+Diagnostic runbook (step-by-step)
+1) Initial impact assessment (0–5m)
+   - Identify affected routes/models: `promql: topk(10, rate(serving_request_count[1m])) by (route,model)`
+   - Check SLA impact: compare p95/p99 to SLO thresholds (see SLO table below).
+   - Open incident with short summary and estimated blast radius; add priority and assign an owner.
+2) Match fingerprint (5–15m)
+   - Compare metric shapes to fingerprint catalog above.
+   - If match found, follow contained remediation. If unknown, proceed to deeper capture.
+3) Capture evidence (15–30m)
+   - Turn on sampling=100% traces for affected route for 10 minutes: `rdinferctl traces sampling set --route my-route --rate 1.0 --duration 10m`
+   - Collect a targeted perf profile (GPU) on affected hosts: `rdinferctl host profile gpu --duration 60s --out /tmp/gpu-profile.json`
+   - Snapshot runtime state: `rdinferctl state dump --instance <id> --out /tmp/instance-state.json`
+4) Targeted remediation (30–60m)
+   - If cold-warmup: roll small warmup job or scale replicas to restore warm caches.
+   - If microburst: temporarily enable route-level burst capacity: `rdinferctl route update --route my-route --burst-capacity 10`
+   - If kernel issue: pin model to previous kernel selector: `rdinferctl model update --model my-model:v12 --kernel-selector legacy` and trigger canary rollout.
+5) Post-incident actions (within 24–72h)
+   - Attach collected traces, GPU profiles, and state dumps to the incident ticket.
+   - Run a reproducible benchmark with the workload (see benchmarking suite) and open a perf-issue if kernel or scheduler tuning required.
+
+SLO reference (short)
+- p50 latency target: < 60ms (text generation short prompts)
+- p95 latency target: < 350ms
+- request_success_rate: > 99.9%
+- kernel_error_rate: < 0.1%
+Note: exact SLOs per-customer may differ; consult per-route SLO dashboards.
+
+Safe remediation commands (examples)
+- Scale to additional replicas: `rdinferctl scale --model my-model:v12 --replicas 6`
+- Re-route traffic to low-latency pool: `rdinferctl route set-policy --route my-route --policy prefer-low-latency`
+- Collect a CPU/GPU flame graph: `rdinferctl profile collect --type gpu --duration 30s --format collapsed > /tmp/flames.collapsed`
+
+Kernel scheduler policy example (YAML snippet)
+- This is a minimal example used by runtime to prefer small-kernel execution on latency pools:
+
+```
+policy_name: latency_optimized
+priorities:
+  - name: small_kernel
+    match:
+      kernel_cost: <= 10
+    weight: 100
+  - name: large_kernel
+    match:
+      kernel_cost: > 10
+    weight: 10
+fallbacks:
+  - policy: throughput_default
+    condition: gpu_queue_length > 50
+```
+
+Known pitfalls and gotchas
+- Aggressive autoscaler churn (scale-to-zero or frequent downscales) amplifies cold-KV-warmup; use minimum replicas for popular models.
+- Batch-window tuning tradeoff: wider windows increase efficiency but hurt p50 for single-user interactive workloads. Always validate with real prompt-distribution.
+- Kernel selector changes should be rolled out to canary with profiling builds enabled — silent regressions are common when memory layout changes.
+
+Observability additions we recommend
+- Add a derived metric `batching_efficiency_ratio` and surface it on per-route dashboard.
+- Expose `kernel_selector_version` and `kv_cache_fill_seconds` as request tags for easy tracing correlation.
+
+Ownership and escalation
+- Primary owner: eng-serving-runtime oncall (team: eng-sre).
+- Long-term fixes: eng-serving-runtime performance squad (owners: Marcus Li, Elena Orlov).
+- Security-sensitive incidents escalate to security@redwood.com. For customer-impacting SLA incidents, page Customer Success lead (CS-L1) and Account Manager.
+
+Related artifacts and playbooks
+- GPU kernel profiling playbook (see profiling-playbook directory)
+- Workload catalog and reproducible benchmarks (benchmarking-and-perf-suite)
+- Runtime fallback and degradation playbook (runbooks)
+
+Appendix: reproducible diagnostic payloads (examples)
+- Synthetic prompt generator (curl):
+```
+POST /v1/generate?model=my-model:v12
+{ "prompt": "repeat('x', 512)", "max_tokens": 128 }
+```
+- Heavy microburst test: ramp from 10 qps to 200 qps for 10s using locust/rd-load-test and confirm batch window behaviour.
+
+If you're unsure, open a ticket in the #runtime-ops Slack channel and attach the sampled traces and the output of the `rdinferctl` collection commands above.
+
+Document history
+- 2025-11-02: created by Marcus Li
+- 2026-01-08: added kernel scheduler policy example (Aisha Gomez)
+- 2026-02-15: added microburst remediation guidance and PromQL snippets (Ravi Patel)

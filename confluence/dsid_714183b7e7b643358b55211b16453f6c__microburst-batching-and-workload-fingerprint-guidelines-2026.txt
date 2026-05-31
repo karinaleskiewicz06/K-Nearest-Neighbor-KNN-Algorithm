@@ -1,0 +1,165 @@
+Microburst Batching and Workload Fingerprint Guidelines
+
+Summary
+
+This document defines a reproducible approach for detecting microburst-style workload fingerprints and applying adaptive batching strategies in the eval harness and production serving runtime. Goal: reduce cost and tail latency variance caused by short, bursty traffic patterns while preserving throughput and output quality.
+
+Problem statement
+
+Microbursts are short-lived spikes of high QPS with small request sizes (commonly 8–128 tokens) that: 
+- Cause inefficient GPU occupancy (many tiny batches).
+- Inflate p95/p99 latency dramatically due to scheduling overhead.
+- Confuse static batching heuristics tuned for average load.
+
+Definitions and abbreviations
+
+- Microburst: a contiguous window (default 10s) where arrival rate > burst_qps_threshold.
+- Burst QPS threshold (burst_qps_threshold): default 300 reqs/s per front-end shard.
+- Short-request: request with prompt_length <= 128 tokens.
+- Adaptive batching: dynamic change to batching parameters (max_batch_size, batch_timeout_ms) based on observed fingerprint.
+- Serving components referenced: serving-runtime (CUDA kernels), batch-orchestrator (batch assembly), traffic-router (policy routing), eval-harness (shadow replay).
+
+Workload fingerprint taxonomy
+
+We classify fingerprints to drive policies: 
+1) Short-HighBurst: >300 QPS, median tokens <=64. Typical: chat message bursts, notifications.
+2) Short-Spiky: bursts where QPS spikes > 2x baseline for <30s.
+3) Mixed-Long: long-context requests interleaved with short ones.
+4) Steady-High: sustained high QPS for >5 minutes (not a microburst).
+
+Telemetry signals to detect fingerprints
+
+Collect and evaluate these signals at 1s and 10s windows: 
+- arrival_rate_per_shard (reqs/s)
+- median_prompt_tokens, p90_prompt_tokens
+- batch_assembly_time_ms (mean, p95)
+- avg_batch_size_tokens and avg_batch_size_reqs
+- kernel_utilization (GPU active time fraction)
+- queue_length (requests waiting to be batched)
+
+Detection rule (example): 
+1) If arrival_rate_per_shard (10s) >= 300 AND median_prompt_tokens <= 64 THEN fingerprint = Short-HighBurst.
+2) If arrival_rate_per_shard increases >2x over 1s baseline AND duration <30s THEN fingerprint = Short-Spiky.
+
+Adaptive batching design patterns
+
+We support three modes that the batch-orchestrator may apply per route and per model-variant: 
+- Conservative (default): max_batch_size_reqs=64, batch_timeout_ms=12
+- Burst-friendly: max_batch_size_reqs=128, batch_timeout_ms=6, prefer prefix caching for repeated prefixes
+- Low-latency passthrough: max_batch_size_reqs=8, batch_timeout_ms=3 (used for latency-critical routes)
+
+Switching policy: 
+- At detection of Short-HighBurst, move route from Conservative -> Burst-friendly. 
+- If kernel_utilization < 0.3 and p95 latency > slo_p95_threshold for 2 consecutive 10s windows, escalate batch_timeout_ms += 4ms (to increase aggregation) up to 40ms.
+- If Mixed-Long detected, enable request-slicing and per-request prioritization to avoid head-of-line blocking.
+
+Default thresholds and acceptance criteria
+
+Below is the recommended starting configuration used by the eval-harness and can be tuned per workload. Operators must validate changes in shadow before rollout.
+
+| Metric | Default | Notes |
+|---|---:|---|
+| burst_qps_threshold | 300 req/s | per front-end shard |
+| short_request_token_cutoff | 128 tokens | <= is considered short |
+| conservative.max_batch_size_reqs | 64 | typical steady workloads |
+| conservative.batch_timeout_ms | 12 | balances latency and aggregation |
+| burst-friendly.max_batch_size_reqs | 128 | increases throughput during bursts |
+| burst-friendly.batch_timeout_ms | 6 | smaller timeout but larger cap |
+| passthrough.max_batch_size_reqs | 8 | minimizes batching overhead |
+| passthrough.batch_timeout_ms | 3 | for sub-50ms p50 targets |
+
+YAML example: configuring adaptive-batching (serving-runtime v1.8)
+
+adaptive_batching:
+  route_match: "/v1/chat"
+  fingerprints:
+    short_highburst:
+      qps_threshold: 300
+      max_window_s: 10
+      action: burst_friendly
+  modes:
+    conservative:
+      max_batch_size_reqs: 64
+      batch_timeout_ms: 12
+    burst_friendly:
+      max_batch_size_reqs: 128
+      batch_timeout_ms: 6
+    passthrough:
+      max_batch_size_reqs: 8
+      batch_timeout_ms: 3
+
+Design rationale and tradeoffs
+
+- Larger max_batch_size_reqs improves throughput and GPU utilization but can increase worst-case latency if batch_timeout_ms is high.
+- Short bursts benefit more from tighter batch_timeout_ms combined with a larger cap because requests are short and can be coalesced quickly.
+- For Mixed-Long fingerprints we prefer to slice long requests (e.g., chunk kv-cache friendly segments) so short requests can get through.
+
+Evaluation and shadow testing protocol (eval-harness)
+
+1) Fingerprint replay generation: use the eval-harness workload generator to synthesize three trace types (Short-HighBurst, Short-Spiky, Mixed-Long) with user intent labels.
+2) Shadow run against new batching config for 30m across 3 shards.
+3) Collect metrics: p50/p95/p99 latency, avg tokens/sec/GPU, kernel_utilization, failed_batches_rate.
+4) Acceptance gates: 
+   - p95 (short requests) must not increase > 15% vs baseline for production routes.
+   - tokens/sec/GPU must not decrease > 10% for sustained loads.
+   - tail error rate (5xx from runtime) must remain <= 0.1%.
+5) If gates fail, run 2-step bisect: A/B configs with toggled timeout_ms then cap size to localize.
+
+Regression triage: microburst-induced latencies
+
+When a regression is reported with spike in p95 during bursts, follow this incident triage: 
+1) Triage owner (oncall-serving) tags incident with fingerprint suspected.
+2) Pull 10s- and 1s-window telemetry around spike. 
+3) If arrival_rate increased > burst_qps_threshold: confirm Short-HighBurst.
+4) Run replay of observed trace in eval-harness with baseline and current config. 
+5) If replay reproduces regression: revert adaptive changes (if recently rolled) or apply passthrough to critical routes while continuing investigation.
+6) Produce postmortem with root cause: config parameter, scheduling regression, model change, or infra degradation.
+
+Rollout plan for adaptive-batching changes
+
+- Canary: 1% traffic routed to new config for 2 hours, monitor p95/p99 and error rates.
+- Progressive rollout: 1% -> 5% -> 20% -> 100% across 24–72 hours with rollback on gate failure.
+- Safety net: automatic fallback to Conservative mode when p95(latency) > configured slo_p95_threshold for 3 consecutive 10s windows.
+
+Ownership, SLAs and dashboards
+
+- Owner: serving-runtime team (primary), eval-harness (secondary)
+- SLOs to monitor (per-route): 
+  - short-request p95 <= 250ms (hosted), <=150ms (dedicated SLA routes)
+  - error rate <=0.1%
+  - batch_assembly_time p95 <= 40ms under burst conditions
+- Dashboards: 
+  - Route-level fingerprint heatmap (10s granularity)
+  - Adaptive mode state timeline (per route)
+  - Kernel utilization vs tokens/sec/GPU
+
+Operational runbook (quick actions)
+
+1) If p95 spikes during burst: switch route to passthrough mode for immediate mitigation.
+2) If kernel_utilization drops below 20% and batch sizes small: switch to burst-friendly with increased cap.
+3) If errors increase after mode change: rollback to last stable mode and open an incident.
+
+FAQ
+
+Q: Why not always use burst-friendly?
+A: Some steady workloads with long contexts can suffer head-of-line blocking and increased memory pressure; we prefer targeted mode changes.
+
+Q: How do we avoid oscillation between modes?
+A: Use hysteresis: require fingerprint condition to be stable for min_stable_window (default 10s) before switching and a cool-down of 30s before re-evaluation.
+
+References and related pages
+
+- Throughput vs fidelity matrix (see related page).
+- Runtime batching internals and kernel selection docs in eng-serving-runtime runtime-architecture.
+
+Appendix: Example detection queries
+
+Prometheus (pseudo):
+
+# 10s arrival rate per shard\sum by(shard) (increase(serving_requests_total[10s]))
+
+# median prompt tokens in 10s window (approx)\histogram_quantile(0.5, sum(rate(prompt_tokens_bucket[10s])) by (le))
+
+Contact
+
+Priya Kaur (serving-runtime) — priya@redwood.example.com

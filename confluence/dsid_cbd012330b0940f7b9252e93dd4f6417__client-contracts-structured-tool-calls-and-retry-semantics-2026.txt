@@ -1,0 +1,122 @@
+Client Contracts for Structured Tool Calls and Retry Semantics
+
+Guidelines and decision rationale for the client-side contract used when making structured tool calls (function/tool invocation) to Redwood inference endpoints, including envelope format, idempotency semantics, retry windows, and telemetry signals required for safe and cost-predictable retries.
+Overview:
+
+This document specifies a cross-cutting client-side contract for making structured tool calls (a.k.a. function or tool invocation) via Redwood inference APIs. It describes: the JSON/YAML envelope, required fields, idempotency and retry semantics, backoff guidance, failure modes and mitigation, observability signals clients must emit, and recommended server-side acceptance tests. The intent is to reduce incorrect duplicate tool executions, limit surprise billing, and make retries diagnosable across hosted, dedicated, and private deployments.
+
+Why this exists:
+- Tool calls can trigger side effects (webhooks, DB writes, external API calls). Poorly specified retries lead to duplicated side effects or inconsistent state.
+- LLM tool-calling increases per-request token usage (function args, structured outputs). Clients should be able to reason about safe retry windows and idempotency.
+- Observability and request metadata are required for post-incident triage and cost allocation.
+
+Scope and non-goals:
+- Scope: client contract and minimal server acceptance expectations for structured tool calls on Redwood inference endpoints. Includes offline SDK behavior and recommended tests for SDKs.
+- Non-goal: a full two-phase commit protocol or distributed transactions for customer tool endpoints. We assume many destination tools are external and uncontrolled.
+
+Contract: request envelope (JSON)
+- Required top-level fields (example):
+  {
+    "request_id": "uuid-v4",
+    "client_id": "string (project or org id)",
+    "model": "string",
+    "prompt": "string",
+    "tool_call": {
+      "tool_name": "string",
+      "inputs": { /* arbitrary JSON */ },
+      "expected_response_schema": "json-schema-v4-string (optional)"
+    },
+    "idempotency_key": "optional-string",
+    "created_at": "RFC3339 timestamp",
+    "safety_hints": ["no-exec", "dry-run"]
+  }
+
+- Semantics: request_id is our canonical correlation id that must be unique per logical client request. idempotency_key is a client-chosen stable key that indicates the same logical operation (e.g., create-invoice-123). If idempotency_key is present, Redwood must make best-effort deduplication within the configured idempotency window (see below).
+
+Idempotency window and guarantees:
+- Default idempotency window: 5 minutes for hosted endpoints (configurable per-customer for Dedicated/Private).
+- Guarantee: If two requests arrive with the same idempotency_key within the idempotency window, Redwood will return the cached response (or the same success/failure disposition) for non-streaming tool-calls. This is an at-most-once best-effort guarantee for side-effecting tool-calls; clients should not rely on absolute deduplication for longer-lived operations.
+- Stronger options: customers can request extended deduplication (up to 7 days) for Dedicated/Private via per-account config with associated storage and billing implications.
+
+Retry classification (client guidance):
+1) Safe to retry immediately (no idempotency concerns): idempotent read-only tool calls (e.g., lookup-by-id), or calls marked with safety_hints: ["dry-run", "no-exec"].
+2) Retry with deduplication: calls with idempotency_key present. Client may retry with exponential backoff but must preserve idempotency_key.
+3) Unsafe to retry automatically: tool calls that mutate external systems without idempotency support. Clients must use human confirmation, manual dedup keys, or server-side orchestration to avoid duplication.
+
+Backoff and retry windows (recommended):
+- Immediate: 200ms jittered initial delay for transient network failures (TCP connection reset, short timeout).
+- Exponential backoff: factor 2, max backoff 30s for single request. Give up after 5 attempts unless idempotency_key is present and client has explicit reason to continue.
+- Token-cost-aware retry: SDKs MUST avoid unbounded rapid retries for streaming responses — track tokens consumed on partial responses and surface partial tokens to clients before retrying.
+
+Server-side acceptance tests (minimum):
+1) Idempotency key echo: server must return an idempotency_status field indicating: ["accepted", "duplicate", "expired", "unsupported"].
+2) Request correlation headers: server returns request_id, server_received_at, and a dedup_cache_hit boolean.
+3) Safety hint enforcement: if client sets safety_hints: ["dry-run"], server must not perform external side effects and should label outputs with dry_run: true.
+
+Telemetry and logging requirements (client and server):
+- Clients must attach these fields to telemetry events: client_id, sdk_version, idempotency_key (if set), request_id, tool_name, estimated_token_budget.
+- Servers must record: received_at, processing_latency_ms, idempotency_status, output_token_count, external_tool_invocations (count), and a trace_id mapping to distributed traces.
+- Labeling convention: all telemetry fields MUST use snake_case keys.
+
+Failure modes and recommended mitigations:
+- Duplicate execution: encourage use of idempotency_key. For legacy clients, server-side replay-detection heuristics may be applied (best-effort).
+- Partial streaming / truncated outputs: SDKs should expose truncated = true and partial_token_count to the caller. Automatic retries are allowed only if client confirms they accept truncated results; otherwise surface an error with code PARTIAL_OUTPUT.
+- Billing surprises: server must report output_token_count and bill only for tokens accepted by the client at acknowledgement time (see billing policy linked below).
+
+Client SDK checklist (minimum implementation for Redwood official SDKs):
+1) Provide automatic idempotency_key generation for common operations and allow client override.
+2) Expose telemetry hooks allowing customers to forward native telemetry to their systems.
+3) Surface partial-stream events with token counts and a simple API to either commit, retry, or discard.
+4) Implement retry backoff policy above and make it configurable.
+
+Compatibility and rollout plan:
+- Phase 0 (internal testing): SDK + server implement idempotency_status echo and minimal telemetry. Run against integration testbed.
+- Phase 1 (opt-in beta): Add idempotency_key support to hosted endpoints behind a feature flag. Invite 10 trust accounts.
+- Phase 2 (default): Gradual ramp to 100% of new endpoints over 4 weeks. Deprecate previous ambiguous retry semantics.
+
+Operational runbook snippets (on-call triggers):
+- Trigger: sharp increase in external_tool_invocations combined with dedup_cache_hit rate < 1% for requests with idempotency_key.
+  - Action: verify idempotency store health, check storage latency, rollback recent change to dedup index writes, notify integrators.
+- Trigger: increase in PARTIAL_OUTPUT errors > 0.5% of requests over 1h.
+  - Action: examine streaming backend latency, verify kernel memory pressure, check client SDK releases for changed read buffer sizes.
+
+Acceptance tests (CI) for SDKs and server: (table)
+- Test name | Purpose | Expected result
+- idempotency-duplicate | ensure same idempotency_key returns duplicate status | duplicate returned, no second external invocation
+- dry-run-safety | ensure dry-run prevents side effects | external_tool_invocations == 0, dry_run == true in response
+- streaming-truncation | simulate partial chunk then abort | SDK surfaces truncated=true and partial_token_count > 0
+
+Security and privacy notes:
+- Idempotency keys must not contain PII. SDKs must sanitize common inputs before using them as idempotency keys.
+- Telemetry fields that may contain user content must be hashed before transmission per privacy policy.
+
+Open decisions (ADRs to follow):
+- ADR 1: long-term storage duration for deduplication keys for Dedicated/Private (trade-offs: cost vs. customer safety).
+- ADR 2: canonical token accounting for partially streamed responses (how many tokens billed on retry).
+
+References and related docs:
+- /confluence/architecture-and-standards/api-standards/request-semantics-and-cost-aware-payload-guidelines-2026
+- /confluence/architecture-and-standards/model-serving-standards/structured-response-contract-testing-guidelines-2026
+- Billing policy (internal link): /confluence/finance-and-legal/revrec-and-billing/token-billing-and-partial-response-policy-2025
+
+Appendix: example server response (minimal):
+{
+  "request_id": "uuid-v4",
+  "status": "ok",
+  "idempotency_status": "accepted|duplicate|expired|unsupported",
+  "server_received_at": "2026-02-08T18:42:00Z",
+  "dedup_cache_hit": false,
+  "output_token_count": "42",
+  "external_tool_invocations": 1,
+  "dry_run": false
+}
+
+Change log:
+- 2025-10-12: created (Priya Nair)
+- 2025-12-01: reviewer feedback incorporated, expanded telemetry requirements (E. Park)
+- 2026-02-08: clarified billing and partial output behavior (L. Gómez)
+
+Owners and contacts:
+- Primary owner: priya.nair@redwood.ai
+- Secondary: eng-api@redwood.ai
+

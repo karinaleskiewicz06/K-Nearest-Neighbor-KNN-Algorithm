@@ -1,0 +1,156 @@
+GPU BIOS & Firmware Orchestration — IaC Spec and Runbook
+
+OVERVIEW:
+
+This page defines the specification, Terraform/IaC contracts, CI/CD pipeline, monitoring, and on-call runbook for coordinated BIOS and firmware updates on Redwood GPU fleet nodes. BIOS and base firmware updates are high-risk operations that can affect node bootability, driver compatibility, and inference SLOs; this doc codifies a safe, repeatable process tied to IaC metadata so updates are auditable, reversible, and can be phased across accounts/regions.
+
+Audience and scope:
+- Primary: eng-infra, eng-sre, eng-serving-runtime.
+- Scope: Fleet-owned GPU hosts (bare-metal and cloud VM accelerators) under Redwood management; NOT customer-managed Private nodes.
+- Excludes OS kernel/security patching workflows (covered in infra-image-rotation).
+
+Goals and design principles:
+- Safety-first: every update must provide an automated rollback path and pre-flight validation.
+- Declarative metadata: firmware versions and desired BIOS configurations are expressed via Terraform variables and tag-based selectors.
+- Minimal blast radius: phased canaries by topology (AZ, rack, instance-family).
+- Observability: telemetry and automated health checks detect boot regressions within 10 minutes of update.
+- Traceability: updates are recorded with audit metadata (operator, changelist, checksum).
+
+Key concepts and terminology:
+- Update Bundle: signed archive containing firmware binaries, vendor tooling, and a manifest (sha256 checksums + supported kernel/driver matrix).
+- Node Selector: tag expression used by the provisioner to choose nodes (e.g., account:gpu-prod && instance-profile:a100-80g && rack:us-west-2a-row3).
+- Drift Tag: fleet tag applied to nodes that have diverged from desired firmware (redwood:firmware_state=drift).
+- Safe Mode Boot: a temporary boot configuration that prevents multi-GPU drivers from initializing; used for rollback validation when supported.
+
+IaC / Terraform contract (module summary):
+- Module name: redwood_gpu_firmware_operator
+- Purpose: register an Update Bundle, define target selectors, and create a controlled run record for the orchestration pipeline.
+- High-level variables (table):
+| variable | type | description | example |
+|----------|------|-------------|---------|
+| name | string | human id for the update | "nv-bios-2026q1-a100" |
+| bundle_s3_uri | string | signed bundle archive location | "s3://redwood-firmware/nv/2026q1.tar.gz" |
+| checksum | string | sha256 of bundle | "abcdef..." |
+| node_selector | string | terraform tag expression (see examples) | "account == 'gpu-prod' && family == 'a100-80g'" |
+| canary_fraction | string | fractional canary (0.0 - 1.0) | "0.02" |
+| maintenance_window | string | UTC cron window for apply | "Mon-Fri 01:00-04:00" |
+| preflight_playbook_id | string | id of validation job (CI) | "firmware-preflight-42" |
+| owner | string | primary owner/team | "eng-infra" |
+
+- Outputs (module):
+  - run_id: unique orchestration run id (string)
+  - bundle_manifest: artifact metadata reference
+  - planned_targets: list of node ids (as CSV)
+
+Terraform usage example:
+```hcl
+module "nv_bios_q1" {
+  source = "git::ssh://git@repo.redwood/infra/modules//gpu_firmware_operator"
+  name = "nv-bios-2026q1-a100"
+  bundle_s3_uri = "s3://redwood-firmware/nv/2026q1-a100.tar.gz"
+  checksum = "sha256:..."
+  node_selector = "account == 'gpu-prod' && family == 'a100-80g' && region == 'us-west-2'"
+  canary_fraction = "0.01"
+  maintenance_window = "Tue 02:00-05:00 UTC"
+  preflight_playbook_id = "firmware-preflight-42"
+  owner = "eng-infra"
+}
+```
+
+Preflight validation (CI job):
+- The preflight CI job validates the bundle against the supported kernel/driver matrix and then runs a signed emulation harness that verifies the vendor flashing tool returns green for a synthetic device.
+- Commands (example):
+  - vendor-tool verify --bundle s3://... --manifest manifest.json
+  - ./validate-driver-compatibility.sh --bundle manifest.json --kernel 6.5.4 --driver 545.92
+- Preflight must produce a signed attestation object uploaded to the bundle S3 path; Terraform module references that attestation before enabling the run.
+
+Orchestration flow (high-level):
+1. Terraform registers Update Bundle via module (creates Run record, planned_targets output).
+2. Operator pipeline validates attestation and locks target nodes into pre-update state (sets redwood:firmware_lock=true).
+3. Canary phase: the worker selects N nodes based on canary_fraction and topology spread.
+4. Apply bundle on canaries with vendor tooling via ephemeral GPU maintenance container; run boot checks and runtime smoke tests.
+5. Monitor for 30 minutes (configurable) for metrics regressions; if green, promote rollout to next wave.
+6. Roll waves until all planned_targets are patched or until failure triggers rollback.
+
+Canary policy and topology spread:
+- Default canary fraction: 1% of matching nodes, min 2 nodes, max 10 nodes per wave.
+- Spread constraints: prefer different racks and AZs, prefer low load tenants (evict ephemeral eval before selecting).
+- Wave cadence: default 60–90 minutes between waves (observability dependent).
+
+Monitoring & SLOs to watch (thresholds):
+- Node boot success rate: target 99.95%; alert if < 99% across canaries within 15 minutes.
+- GPU daemon readiness (driver + nvrm): must reach Ready state within 10 minutes of reboot; alert if >10% of canaries fail.
+- Inference latency p50/p95 for impacted model routes: p95 degradation > 30% triggers rollback evaluation.
+- Kernel oops or dmesg errors with NV vendor strings: page to oncall and pause rollout.
+- Node-level panic or non-responsive consoles: immediate abort and automatic rollback for other waves.
+
+Automated rollback criteria (examples):
+- Any node in canary reports boot failure or fails runtime smoke tests.
+- Aggregate p95 latency increase for any production model > 50% over baseline during the observation window.
+- More than 3% of canaries emit driver requeue/fatal errors.
+- Manual abort by release owner or SRE on-call.
+
+Rollback strategy:
+- If a canary fails, the orchestrator automatically attempts a rollback on that node using the previous bundle (bundle metadata stored in run history).
+- If a failure pattern indicates a systemic issue, orchestrator aborts all pending waves and schedules rollback jobs across all updated nodes.
+- Rollback steps: reflash previous firmware image -> boot -> run smoke tests -> clear drift tags -> update run record.
+
+On-call runbook (condensed):
+1. Page received: "firmware-orchestrator: canary-failure" with run_id.
+2. Open run dashboard: check planned_targets, completed_waves, failed_nodes.
+3. Check boot logs: `journalctl -u systemd -b -o cat` and vendor flash logs at `/var/log/firmware-flash.log` (persisted to central s3).
+4. If node shows boot failure: attach serial console (cloud-systems) or repro via iDRAC/IPMI. Attempt remote power-cycle.
+5. If driver initialization fails: capture dmesg and NVIDIA vendor logs, escalate to runtime owners.
+6. If rollback is necessary: hit the orchestrator rollback API with run_id and reason. Follow post-rollback verification checklist: run smoke tests, confirm driver ready, clear firmware_lock tag.
+7. Post-incident: update the run record with root cause and tag related jira/card.
+
+Operational considerations and checklist:
+- Pre-maintenance checklist (to be completed before registration):
+  - Confirm backup images exist for the previous firmware and are validated.
+  - Confirm maintenance window scheduled and owner approved.
+  - Notify Product/SRE stakeholders and open a transient incident docket.
+  - Confirm ephemeral workloads evacuated from targeted nodes.
+- During update checklist:
+  - Ensure telemetry export (boot traces, flash logs) is enabled and uploaded in real-time.
+  - Verify automated smoke tests include at least: kernel module load, CUDA basic vector ops, small inference round-trip.
+- Post-update checklist:
+  - Reconcile run record with Terraform state and attach attestation.
+  - Check for drift tags and run remediation for any nodes not successfully updated.
+
+Roles and ownership:
+- Release owner: eng-infra release manager (primary contact for go/no-go)
+- On-call escalation: eng-sre primary pager, eng-serving-runtime secondary
+- IaC module maintainers: infra-plat team (module and variable contracts)
+- Firmware validation: research/applied-ml for model-run smoke tests and perf baselines
+
+Security and compliance notes:
+- All bundles must be signed with the vendor key and verified on ingestion; unsigned bundles are rejected.
+- Access to S3 firmware artifacts is limited to the operator role; key usage is audited.
+- For customer-affecting Private deployments, follow Private deployment firmware policy and require CISO approval for vendor-signed binaries.
+
+Audit and post-mortem artifacts:
+- Orchestrator run record contains: run_id, bundle checksum, operator, start/end timestamps, wave-by-wave results, telemetry snapshots (p95 latency, node boot logs).
+- Records are exported to the central audit-index (ELK) and attached to the CI/CD release tag.
+
+Appendix: Useful commands and examples:
+- List planned targets (from module output): `redwoodctl runs describe --run-id $RUN_ID --fields planned_targets`
+- Force a rollback via API: `redwoodctl runs rollback $RUN_ID --reason "canary boot fails" --auto-force`
+- Sample manifest snippet (manifest.json in bundle):
+  {
+    "bundle_version": "2026-01-10",
+    "supported_kernels": ["6.4.0", "6.5.4"],
+    "images": ["bios.bin", "bmc_fw.bin"],
+    "checksums": {"bios.bin": "sha256:...", "bmc_fw.bin": "sha256:..."}
+  }
+
+Related pages and references:
+- infra-image-rotation-and-cve-response-runbook (image rotation)
+- cuda-driver-provenance-and-rolling-upgrade-playbook (driver upgrades)
+- oncall-gpu-egress-surge-mitigation-and-traffic-shaping-runbook (oncall links)
+
+Change log:
+- 2025-09-16: Initial draft by Priya Nair.
+- 2025-12-03: Added Terraform contract and preflight attestation requirement (reviewed by Ethan Park).
+- 2026-01-12: Finalized monitoring thresholds and rollback criteria (published).
+
+Contact: priya.nair@redwood.ai for questions or to schedule a rollout test.

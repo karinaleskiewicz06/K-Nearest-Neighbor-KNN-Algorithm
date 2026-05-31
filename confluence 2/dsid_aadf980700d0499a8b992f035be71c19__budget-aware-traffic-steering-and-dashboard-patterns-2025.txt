@@ -1,0 +1,171 @@
+Budget-aware traffic steering and dashboard patterns
+
+Overview
+======
+This document defines a platform pattern for routing inference requests with awareness of tenant budgets and real-time cost signals, and the associated dashboard and alerting patterns that operators should use. It covers: design goals, policy primitives, implementation recipes, dashboard/Grafana panel and Alertmanager rule examples, runbook actions, ownership, and a short retrospective from pilot deployments. The intended audience is platform engineers, SREs, and product teams running heavy inference workloads.
+
+Goals
+-----
+- Reduce unexpected customer spend by steering traffic when a tenant’s committed budget or burst credits are depleted.
+- Maintain global SLOs for tail-latency and token throughput while applying cost controls.
+- Provide clear operator visibility (dashboards/alerts) and safe automation (fallbacks, canary throttles).
+- Make policy primitives reusable across hosted / dedicated / private modes.
+
+Background and motivation
+-------------------------
+Redwood’s multi-tenant runtime supports: hosted-api, dedicated-pools, and private deployments. Workloads vary: real-time chat (latency-critical), batch embedding pipelines (throughput-oriented), and periodic retraining/evals (cost-tolerant). Historically, sudden surge in long-running streaming generations caused high token spend and overloaded burst credits for some tenants, which resulted in manual escalations and SLA tradeoffs. The Budget-aware Traffic Steering pattern treats budget/burst credit state as a first-class input to routing decisions.
+
+Key concepts and primitives
+--------------------------
+- Budget State Signal: per-tenant metrics (committed_monthly_credits, burst_credits_remaining, forecasted_spend_pct). Provided by billing+quota service and exported to metrics pipeline (Prometheus).
+- Cost Weight: a runtime multiplier used by smart router to prefer lower-cost model variants (e.g., quantized family) when budget constrained.
+- Priority Class: classification for requests (P0 latency-critical, P1 interactive, P2 background) attached at ingress by Auth/Client SDK.
+- Fallback Policy: ordered list of compatible model variants and regions to fall back to when primary route is throttled.
+- Degradation Profile: SLO-aware knobs (reduce max_tokens, switch to faster model_variant, disable streaming) applied gradually.
+
+Design patterns
+---------------
+1) Signal ingestion: ensure billing service emits per-tenant gauges to Prometheus with labels: tenant_id, tier, committed_credits_usd, burst_credits. Export frequency: 60s.
+2) Router decision graph: prioritize by (priority_class, budget_state, latency_headroom). Decision result: route_to=[model_variant, region], cost_weight (0.0-1.0), applied_degradations.
+3) Safe automation: changes are incremental with an observable fail-safe. Every automated steering action must emit an event to events-stream (kafka) and increment a tenant-steering counter with labels for audit.
+4) Policy CDN: store policy YAMLs in platform-config repo. A single policy block example below is the canonical shape.
+
+Policy YAML (example)
+---------------------
+```yaml
+policy_name: low-balance-steer
+conditions:
+  - metric: burst_credits_remaining
+    operator: lt
+    value: 0
+  - metric: forecasted_spend_pct
+    operator: gt
+    value: 90
+actions:
+  - type: set_cost_weight
+    value: 0.6
+  - type: prefer_model_variant
+    variants: ["gpt-small-q4", "gpt-small-fp16"]
+  - type: set_max_tokens
+    value: 128
+audit: true
+```
+
+Implementation recipe (summary)
+--------------------------------
+1) Metrics: Add two Prometheus exporters: billing-exporter (per-tenant budget gauges) and router-exporter (decision labels and applied_degradations).
+2) Router: Extend smart-router service to accept budget label in decision input. New input proto:
+```proto
+message SteeringInput {
+  string tenant_id = 1;
+  string priority_class = 2;
+  map<string,string> labels = 3;
+}
+```
+3) Config: Add policy YAMLs to platform-config/policies/ and a reconciler service which validates and pushes to router via API.
+4) Audit/logging: Emit event to kafka topic events.platform.steering and write a 30d audit log to S3 for compliance.
+
+Dashboards and panels
+---------------------
+Recommended Grafana dashboards (per-tenant and cross-tenant):
+- Tenant Budget Summary (vars: tenant_id):
+  - Gauge: committed_monthly_credits_usd (single stat)
+  - Gauge: burst_credits_remaining
+  - Sparkline: forecasted_spend_pct (30d)
+  - Top table: recent steering actions (last 24h) – query from kafka-backed materialized view
+- Routing Decisions Overview (cluster-level):
+  - Time series: steering_actions_total{action=~"set_cost_weight|prefer_model_variant"} grouped by tenant_tier
+  - Heatmap: cost_weight distribution across pods (last 1h)
+- SLO Impact view (per-model_variant):
+  - p95/p99 latency vs applied_degradations (overlay)
+  - tokens_per_second by variant
+
+Panel configuration excerpts (PromQL)
+- burst_credits_remaining for tenant_id=$tenant: `sum(billing_burst_credits_remaining{tenant_id="$tenant"})`
+- steering_actions_total by action: `sum(increase(router_steering_actions_total[5m])) by (action)`
+- p99 latency for variant: `histogram_quantile(0.99, sum(rate(model_request_duration_seconds_bucket{variant="$variant"}[5m])) by (le))`
+
+Alerts and thresholds
+---------------------
+Define alerts in Alertmanager grouped by severity. Examples: 
+- Alert: TenantBudgetCritical
+  - Expr: `billing_burst_credits_remaining{tenant_tier!="enterprise"} < 1 and forecasted_spend_pct>95`
+  - For: 10m
+  - Severity: page
+  - Runbook: follow "Budget-critical steering runbook" below
+- Alert: SteeringAutomationFailed
+  - Expr: `increase(router_steering_failed_total[10m]) > 0`
+  - For: 5m
+  - Severity: ticket
+
+Runbook: Budget-critical steering runbook
+----------------------------------------
+Objective: Minimize customer surprise while preserving availability.
+1) Triage (0–10m):
+  - Check Grafana tenant budget panel for tenant_id.
+  - Look at steering events: `kubectl logs -n routing deployment/router --since=30m | grep "tenant=<tenant_id>"`
+  - Confirm whether automated steering executed and what actions applied.
+2) Immediate remedial actions (10–30m):
+  - If the tenant needs emergency throughput: increase burst_credits via billing API: `curl -X POST https://billing.internal/v1/tenants/<tenant>/adj-burst -d '{"credits": 500}'` (requires billing team approval)
+  - If steering is producing high latency regression: revert policy: `platform-config-cli policy disable low-balance-steer --tenant <tenant>` and notify customer success.
+3) Post-incident (30m–72h):
+  - Open a retro with customer success and product for billing model changes.
+
+Safe rollout checklist for automation
+------------------------------------
+- Unit tests for policy parser and router decision graph.
+- End-to-end test: synthetic tenant with low-balance flag and injected traffic profiles.
+- Canary percent: start at 1% of traffic, increase to 10% after 24h, then 100% after 72h if no regressions.
+- Telemetry: ensure steering_actions_total, steering_failed_total, and steering_revert_total are emitted.
+
+Ownership and responsibilities
+------------------------------
+- Platform Router team: owns router implementation, decision API, and reconciler (primary contact: Sofia Chen).
+- Observability team: dashboard templates and Alertmanager rules (primary contact: Alex Müller).
+- Billing team: metrics export and burst_credit adjustments (primary contact: Priya Nair).
+- SRE: incident runbook owner and oncall responder for paging.
+
+Roadmap items and next steps
+----------------------------
+- Q2 2025: Add ML-driven forecaster for spend_pct and integrate into policy conditions.
+- Q3 2025: Evaluate per-request token cost attribution and add fine-grained cost_weight per request signature.
+- Q4 2025: Private deployment sync: provide a local reconciler that can run inside customer VPC with restricted telemetry.
+
+Pilot retrospective (lessons learned)
+------------------------------------
+- What went well: automated steering reduced manual escalations by ~60% for mid-tier tenants during pilot window. Dashboards made behavioral patterns visible to CS.
+- Improvements identified: need better jitter control when applying degradations (avoids synchronized latency spikes), and faster rollback primitives inside router to reduce noise.
+- Behavioral note: product teams requested an "opt-out" annotation for premium customers; design approved and will be supported via policy metadata.
+
+Related pages
+-------------
+- /confluence/eng-platform/systems-and-services/service-traffic-shepherding-and-devolution-playbook-2025
+- /confluence/eng-platform/dashboards-and-alerts/runtime-cost-instrumentation-and-alerting-2026
+
+Appendix: quick commands and examples
+------------------------------------
+- Query recent steering events for tenant on materialized view: `SELECT * FROM steering_events_mv WHERE tenant_id='acme-corp' ORDER BY ts DESC LIMIT 50;`
+- Disable a policy in platform-config: `git commit -m "disable low-balance-steer for pilot" && platform-config-cli push --env prod`
+- Example alert rule snippet (Prometheus rule):
+```yaml
+groups:
+- name: steering.rules
+  rules:
+  - alert: TenantBudgetCritical
+    expr: billing_burst_credits_remaining{tenant_tier!="enterprise"} < 1 and forecasted_spend_pct>95
+    for: 10m
+    labels:
+      severity: page
+    annotations:
+      summary: "Tenant {{ $labels.tenant_id }} low burst credits and high forecast"
+```
+
+Contact and escalation
+----------------------
+For questions or to request whitelist/opt-outs for customers, contact platform-router@redwood.com. For billing adjustments, contact billing-ops@redwood.com. For dashboard or alert changes, open a runbook PR in the observability repo and tag @AlexMuller.
+
+Document history
+----------------
+- 2024-09-12: Created by Maya Patel
+- 2024-11-18: Pilot results added (retrospective)
+- 2025-03-08: Added roadmap and private-deploy notes

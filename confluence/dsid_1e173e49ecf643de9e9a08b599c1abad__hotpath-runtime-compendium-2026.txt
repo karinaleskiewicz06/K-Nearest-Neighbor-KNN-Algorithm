@@ -1,0 +1,203 @@
+Hotpath Runtime Compendium: Scheduler, Profiling, and Benchmarking
+
+Summary:
+
+This page consolidates our operational guidance for the serving runtime hotpath: architecture notes, kernel scheduling strategies, a step-by-step profiling playbook, our benchmarking suite workflow, release / rollout checklist for runtime changes, and common runbook actions for incidents. It is intended for runtime engineers, oncall SREs, and performance-focused ML engineers.
+
+Scope and assumptions:
+- Applies to the Redwood serving runtime (hosted + dedicated pools) for transformer-style text models (causal / encoder-decoder).
+- Covers latency-sensitive request flows (inference hotpath) from request ingress to token emission.
+- Assumes familiarity with basic GPU tooling (nvidia-smi, nsight, nvprof alternatives) and our observability stack (Prometheus / Grafana / Jaeger).
+
+1) Hotpath architecture (concise)
+
+Overview:
+- Ingress: API gateway -> rate-limit / auth -> request router
+- Router: policy engine (route by latency tier, model variant, region) -> dispatcher
+- Dispatcher: request admission + slot allocator -> worker pool (CPU warmup, KV cache lookup)
+- Worker: process request (tokenize -> forward cache lookup -> kernel invocation -> emit tokens)
+- Kernel layer: per-model kernel selector chooses optimized operator kernels based on sequence length, dtype, and hardware capability.
+
+Key components and ownership:
+- request-router-service (team: eng-platform) - routing logic and policy config
+- hotpath-dispatcher (team: eng-serving-runtime) - admission, batching, backpressure
+- worker-runtime (team: eng-serving-runtime) - kernel invocation, KV cache, async emission
+- kernel-selector (team: eng-serving-runtime) - maps model profiles -> kernel bundle
+
+SLOs to enforce (examples):
+- tail P99 latency (1-token step): 120ms for "low-latency" tier models
+- request success rate (no internal error): 99.95% monthly
+- GPU utilization target per-pool: 65-85% (avoid sustained 95%+)
+
+2) Kernel scheduling and batching patterns
+
+Design goals:
+- Maximize throughput and GPU utilization while preserving latency SLOs for low-latency tiers.
+- Graceful degradation: when under pressure, reduce batch size and fallback to smaller kernel or quantized variant.
+
+Policies implemented in runtime:
+- Admission control: token-budget based admission (requests carry a token budget calculated from expected tokens * model profile).
+- Continuous batching: sliding-window batching with max batch size and batch-hold windows tuned per-model.
+- Slotting: reserve a fraction of GPU slots (5-15%) for preemptible low-latency tickets.
+- Preemption: long batch jobs (cost-optimized queues) can yield to latency tickets with checkpointed KV cache snapshots.
+
+Kernel selection heuristics (high-level):
+1. If context length <= short_seq_threshold -> use small-seq fused kernels (fast path).
+2. If dtype == int8/4 && accuracy-profile ok -> use quantized kernels.
+3. If requested streaming == true -> prefer kernels that support incremental KV updates with minimal kernel launch overhead.
+4. When GPU SM occupancy low -> consider larger GEMM epilog kernels that increase occupancy at expense of some latency.
+
+Operator-level scheduling knobs (config examples):
+- max_batch_size: 32
+- batch_hold_ms: 6  # max time to wait for additional requests
+- slot_reserve_percent: 10
+- preemption_timeout_ms: 45
+- short_seq_threshold: 64
+
+3) Profiling playbook (step-by-step)
+
+Goal: gather targeted traces that isolate kernel latencies, memory traffic, and scheduler behavior for a failing SLA or performance regression.
+
+A) Pre-collection checklist:
+- Reproduce on staging with same model version and quantization profile.
+- Ensure GPU MIG / VM shape matches production (if applicable).
+- Clear KV cache between runs unless reproducing cached behavior.
+- Note current config: model_profile_id, kernel_bundle_id, dispatcher_config_id.
+
+B) Collection commands (examples)
+- Lightweight traces (first-pass):
+  - Collect runtime spans: curl -sS "http://staging-metrics:4317/trace?span=hotpath" > /tmp/hotpath-spans.json
+  - Prometheus scrape: curl -sS "http://prometheus:9090/api/v1/query?query=hotpath_token_latency_ms"
+- GPU-level sampling (10s sampling to avoid noise):
+  - ncu --target-processes all --set full --duration 10 --output ./ncu-hotpath-10s ./bin/worker-runtime --run-case PROFILE
+- NVTX markers: ensure run compiled with NVTX_ENABLED=1. Use nvtxRangePushA / Pop around scheduling and kernel launches.
+- Kernel timeline: nsight systems capture for 15s: nsys profile --trace=cuda,osrt --output=hotpath-nsys-15s ./bin/worker-runtime --run-case PROFILE
+
+C) What to look for in traces:
+- Frequent short kernels with large launch overheads: indicates high kernel-launch overhead; consider kernel fusion or batched dispatch.
+- Long device-to-device memcpy around KV cache: indicates suboptimal KV layout or host-GPU path.
+- Underfilled GPU SM occupancy during large GEMM: verify tensor shapes and autoshape padding.
+- Kernel thrashing: frequent context switches between kernels tied to many tiny batches.
+
+D) Example NVTX strategy (C++ pseudocode)
+- nvtxRangePushA("dispatch:admit"); admit(); nvtxRangePop();
+- nvtxRangePushA("kernel:attention_fused"); launch_attention(); nvtxRangePop();
+
+E) Reporting checklist:
+- Attach: nsys output, ncu summary, traces (jaeger/spans), Prometheus graphs (p50/p95/p99), GPU metrics (util, mem BW, SM occupancy).
+- Summarize: top 3 suspects, recommended mitigations (config + code change), regression delta vs baseline.
+
+4) Benchmarking suite and reproducibility
+
+Suite components:
+- redwood-runtime-bench (harness): generates synthetic and replayed traffic (replay from production traces redwood-replay-format).
+- model-profile catalog: canonical input shapes, token distributions, quantization settings.
+- harness runner: supports --latency-only, --throughput-saturation, --profile-kernels.
+
+Standard benchmarks (run on a reserved pool):
+1. Latency test (single-tenant, concurrency=1): command example:
+   redwood-runtime-bench --model-id gptx-lite-6B --mode latency --samples 200 --seed 42 --output results/latency-gptx-6b.json
+2. Throughput saturation (find max tokens/sec while keeping p99 <= target):
+   redwood-runtime-bench --model-id gptx-lite-6B --mode throughput --target-p99 150 --max-concurrency 128 --auto-scale
+3. Cold-start memory profile (cold worker startup):
+   redwood-runtime-bench --model-id gptx-lite-6B --mode cold-start --iterations 50
+
+Metrics to record (minimum):
+- p50/p90/p95/p99 latencies (per-token and per-request)
+- tokens/sec and GPU utilization (per-GPU and pool-level)
+- memory high-water marks and swap counts (if any)
+- kernel-level breakdown: top 10 kernels by total time
+
+Reproducibility notes:
+- Use deterministic seeds and fixed tokenizer versions.
+- Record: hardware image, driver version, cuDNN / CUDA versions, kernel bundle hash, model artifact hash.
+- Store benchmark run metadata in artifacts: artifacts/<benchmark-id>/metadata.json
+
+5) Release notes and rollout checklist for runtime changes
+
+When releasing a kernel change, scheduler tweak, or dispatcher patch follow this minimal checklist:
+1. PREP: create RFC and target metrics (p99 latency change allowed, throughput delta).
+2. LAB: run full benchmark suite on a staging pool; attach results to PR.
+3. CANARY: deploy to 1-3% of traffic in non-critical region, enable detailed traces.
+4. OBSERVE: watch the canary for 24h (or 3x the peak window), key metrics: errors, p99, GPU util, slot starvation events.
+5. ROLLOUT: 25% -> 50% -> 100% with 1h stabilization windows; rollback if p99 increased by > 15% or error rate increased > 0.05%.
+
+Rollback steps (quick):
+- pause deployments: kubectl -n runtime scale deploy worker-runtime --replicas=0 (canary pods removed)
+- redirect new traffic to previous model kernel bundle via kernel-selector override: curl -X POST "$ROUTER_API/override" -d '{"model":"gptx-lite-6B","kernel_bundle":"bundle:v23.11"}'
+- if auto-scaling groups are affected, scale down new pool and scale up previous pool.
+
+6) Known issues (brief catalog & mitigations)
+
+- Issue: Kernel-launch jitter causing P99 spikes
+  - Symptoms: many 1–3ms kernels visible, high scheduler queueing, P99 oscillation with low throughput.
+  - Mitigation: enable kernel fusion for short sequences or increase batch_hold_ms by +2ms; short-term, add 5% slot reserve for low-latency traffic.
+
+- Issue: KV cache thrash on long-context workloads
+  - Symptoms: excessive device-host memcpy, cache miss storms, higher latency for streaming requests.
+  - Mitigation: increase KV shard count and use pinned memory for KV mapping; tune cache eviction policy to LRU-approx with time decay.
+
+- Issue: GPU memory OOM during mixed-concurrency bursts
+  - Symptoms: OOM errors, worker restarts, degraded throughput.
+  - Mitigation: enforce per-request memory budgets and backpressure; enable soft-eviction that offloads least-recent tokens to host fallback store.
+
+7) Runtime runbooks (stepped procedures)
+
+A) High P99 incident (triage)
+1. Confirm alert (Grafana) and collect time window + request ids.
+2. Check recent deploys: git tag / image digest for worker-runtime and kernel-bundle.
+3. Run lightweight profiling (2–5s ncu sample) on a canary node to see kernel breakdown.
+4. If kernel-launch jitter suspected, switch to fallback kernel-bundle:
+   curl -X POST "$ROUTER_API/override" -d '{"model":"<model>","kernel_bundle":"<fallback>"}'
+5. If KV thrash suspected, temporarily raise cache-hit padding (eviction_lifetime_ms += 50).
+6. Notify stakeholders via incident channel with status and mitigation actions.
+
+B) GPU OOM recovery
+1. Identify OOMing worker (kubectl logs -n runtime <pod>).
+2. Mark node unschedulable and cordon (kubectl cordon <node>).
+3. Drain non-critical pods and restart the worker-runtime with reduced concurrency profile: set env WORKER_MAX_CONCURRENCY=2.
+4. Verify memory stabilizes for 15 minutes, then gradually restore concurrency.
+5. Root cause follow-up: collect heap + device mem snapshots for forensics.
+
+8) Appendices
+
+A) Example dispatcher config (YAML)
+---
+dispatcher_config_id: hotpath-smallseq-2026
+max_batch_size: 24
+batch_hold_ms: 6
+slot_reserve_percent: 10
+preemption_timeout_ms: 45
+short_seq_threshold: 64
+---
+
+B) Kernel mapping table (abbreviated)
+| Sequence len | Dtype | Kernel bundle | Notes |
+|-------------:|:-----:|:-------------:|:------|
+|  <=32        | fp16  | kbundle:fast-fused-v1 | fused-attn + qkv merge |
+|  33-128      | fp16  | kbundle:balanced-v2   | occupancy vs latency trade |
+|  >128        | fp16  | kbundle:large-batched | padded GEMM for occupancy |
+|  any         | int8  | kbundle:quant-v1      | accuracy-tested quant ops |
+
+C) Useful CLI snippets
+- Check pool GPU status: kubectl -n runtime exec -it pool-manager -- /bin/pool-status --pool hotpath-smallseq
+- Trigger a local benchmark: redwood-runtime-bench --model-id example-7b --mode latency --samples 100
+
+D) Contact / escalation matrix
+- Primary oncall (serving-runtime): @diego (Slack: #oncall-serving-runtime)
+- Secondary: @priya (Slack)
+- Escalation to eng-sre: page SRE pager if incident impact > 30 minutes or P99 > target by 2x.
+
+Change log:
+- 2025-11-03: Initial draft by Ava Martinez.
+- 2026-01-12: Added profiling checklist and NVTX guidance (reviewer: Diego Chen).
+- 2026-02-28: Expanded benchmarking reproducibility section and rollout thresholds (reviewer: Priya Nair).
+
+Notes and next work items:
+- Add automated NVTX insertion compiler pass to reduce instrumentation burden.
+- Formalize bench-to-PR gating to require benchmark artifacts in runtime PRs that touch kernel_selector or dispatcher.
+
+References:
+- kernel-selector design doc: /confluence/eng-serving-runtime/kernel-and-scheduling/scheduler-design-doc
+- performance-standards (company): /confluence/architecture-and-standards/performance-standards
+

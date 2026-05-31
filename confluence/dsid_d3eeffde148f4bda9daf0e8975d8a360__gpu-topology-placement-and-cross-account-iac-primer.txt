@@ -1,0 +1,169 @@
+GPU topology-aware placement and cross-account IaC primer
+
+Summary
+This primer describes a standardized, production-ready pattern for topology-aware GPU placement across multiple cloud accounts and VPCs using Terraform modules and cluster-side constraints. It captures: design goals, Terraform module interfaces, example manifests, rollout steps, monitoring/alerting, and a short runbook for common failures. This is intended for infra engineers owning GPU capacity, platform teams onboarding new tenants, and SREs who operate multi-account GPU pools.
+
+Goals and non-goals
+- Goals:
+  - Ensure latency- and bandwidth-sensitive workloads are scheduled to GPU nodes in the same availability zone and network path when possible.
+  - Provide reusable Terraform modules that encapsulate cross-account IAM, shared VPC attachment, and subnet mapping for GPU node pools.
+  - Expose placement knobs (zone affinity, rack/host-aware labels, taints) that customers and internal services can reference in pod specifications or request-routing.
+  - Provide clear rollback and canary practices for module updates.
+- Non-goals:
+  - Replacing cloud provider scheduler internals. We rely on k8s/cluster-scheduler extensions and node labels to express topology preferences.
+  - Supporting every bespoke on-prem topology. Focus is cloud first (GCP & AWS) with primitives suitable for later on-prem adaptation.
+
+Background and motivation
+As Redwood’s serving runtime pushes traffic through dedicated GPU pools, placement decisions materially affect throughput, tail latency, and KV cache sharing effectiveness. Misplaced pods can cross AZs and incur cross-AZ egress and higher p95 latencies. This doc harmonizes: network topology, Terraform account boundaries, and cluster node metadata to make placement deterministic and auditable.
+
+Core concepts and terminology
+- Topology domain: availability zone (AZ), rack, or host grouping.
+- Placement label: node label that encodes topology, e.g., node.k8s.redwood/az, node.k8s.redwood/rack.
+- Placement policy: configuration a workload uses: hard (nodeSelector/taints), soft (preferredDuringScheduling), or hybrid.
+- Cross-account attachment: networking and IAM wiring that allows a consumer account to access a dedicated GPU account’s nodes via Shared VPC or VPC Peering + route tables.
+
+Design overview
+1) Terraform modules own:
+   - gpu-account-network: creates subnets for GPU node pools per AZ, NAT/gateway, and egress routing S3/metrics endpoints.
+   - shared-vpc-attachment: attaches service/project accounts to the GPU host VPC (GCP) or establishes cross-account ENI routing (AWS).
+   - nodepool-iam: roles and instance-profile provisioning for node bootstrapping (SSM, logging, KMS access).
+2) Cluster/bootstrap agent populates node labels at instance creation time:
+   - node.k8s.redwood/az = us-west-2a (exact AZ)
+   - node.k8s.redwood/slot = gpu-v100-4x (hardware SKU)
+   - node.k8s.redwood/network-segment = tenant-finance (if using isolated subnets)
+3) Workloads express placement using k8s constructs or scheduling policies that the runtime understands.
+
+Module contract and interface (example)
+- Module: redwood/gpu-account-network (inputs)
+  - cloud_provider: "aws" | "gcp"
+  - account_id: string (consumer or host account ID)
+  - az_list: list (comma-separated string: "us-west-2a,us-west-2b")
+  - gpu_subnet_suffix: string (e.g. "gpu-pool-1")
+  - egress_nat: bool
+- Outputs (as strings):
+  - gpu_subnet_ids: "subnet-aaa,subnet-bbb"
+  - vpc_id: "vpc-012345"
+  - route_table_ids: "rtb-1,rtb-2"
+
+Example Terraform snippet (usage):
+```
+module "gpu_network_host" {
+  source           = "git::ssh://git@repo.redwood.ai/infra-modules.git//gpu-account-network?ref=v1.3.0"
+  cloud_provider   = "aws"
+  account_id       = "123456789012"
+  az_list          = "us-west-2a,us-west-2b,us-west-2c"
+  gpu_subnet_suffix= "gpu-prod-01"
+  egress_nat       = true
+}
+```
+
+Node labeling and bootstrap (cloud-init snippet)
+```
+# cloud-init excerpt for node bootstrap
+#!/bin/bash
+AZ=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+SKU=$(detect-gpu-sku.sh)
+kubectl label node $(hostname) node.k8s.redwood/az=$AZ --overwrite
+kubectl label node $(hostname) node.k8s.redwood/slot=$SKU --overwrite
+kubectl label node $(hostname) node.k8s.redwood/network-segment=gpu-prod --overwrite
+```
+
+Scheduling patterns and examples
+- Hard placement (dedicated work):
+  - Use nodeSelector + tolerations to pin to exact GPU SKU and AZ.
+  - Example pod snippet:
+```
+spec:
+  nodeSelector:
+    node.k8s.redwood/slot: "gpu-v100-4x"
+    node.k8s.redwood/az: "us-west-2a"
+  tolerations:
+  - key: "dedicated-gpu"
+    operator: "Equal"
+    value: "true"
+    effect: "NoSchedule"
+```
+- Soft placement (latency preferred):
+  - Use preferredDuringSchedulingIgnoredDuringExecution weight 100 on AZ match plus fallback to same region nodes.
+
+Cross-account networking patterns
+- AWS recommended: account with GPU VPC is the host account. Consumer accounts use VPC peering with route table entries and AWS RAM to share subnets where applicable. For control-plane traffic, we use Transit Gateway for scale > 10 accounts.
+- GCP recommended: Shared VPC where GPU host project exposes subnets to service projects. Use IAM bindings via Terraform gpu-network module.
+
+Security and IAM considerations
+- Node IAM role must be constrained to only necessary S3/metrics and KMS decrypt. Principle: least privilege for node bootstrap and runtime.
+- Cross-account networking must use explicit route tables and security-group egress restrictions. Block 0.0.0.0/0 where possible for node-to-node traffic; prefer service endpoints to S3/observability backends.
+
+Testing and validation checklist (pre-rollout)
+1) Terraform plan shows only expected additions: new subnets, route tables, and IAM roles.
+2) Validate node labels appear within 90s of instance registration.
+3) End-to-end placement test: submit a pod with AZ-specific nodeSelector and verify scheduled node node.k8s.redwood/az matches requested AZ.
+4) Network traffic validation: from a test pod confirm egress path to metrics & S3 uses expected NAT/egress IPs.
+5) Chaos test: simulate AZ down and confirm preferredDuringScheduling falls back to other AZs and no pods stuck Pending beyond 5m.
+
+Rollout and change management
+- Canary strategy for module changes: apply to non-prod account, create a small GPU node pool (2 nodes per AZ), run the validation checklist.
+- Staged rollout sequence:
+  1. Create Terraform plan and PR with module version bump and changelog.
+  2. Apply in staging GPU account.
+  3. Run CI integration which includes the placement E2E test suite.
+  4. Apply to one production host account in a single region (non-peak hours), monitor for 60 minutes.
+  5. Expand to additional host accounts after 24 hours of clean metrics.
+- Rollback: use Terraform state rollback to previous module version; node pools created by new config should be drained and cordoned before destruction. See runbook below.
+
+Monitoring, SLOs and alerting
+- Metrics to emit and dashboards to maintain:
+  - node.label.propagation_latency: target <= 30s p95
+  - placement.mismatch_rate: fraction of pods that requested an AZ but scheduled to different AZ <= 0.5% p95
+  - cross_account_route_failures: any BGP/route flaps or rejected attachments < 1 per week
+- Alerts:
+  - P1: placement.mismatch_rate > 5% sustained for 10m -> page infra-sre on-call
+  - P2: node.label.propagation_latency > 120s p95 for 15m -> slack #infra-paging and email owners
+  - P3: Terraform plan includes destructive changes to gpu subnets -> notify owner_team and hold CI promotion until approved
+
+Short runbook: common failures and remediation
+- Symptom: pods with nodeSelector AZ=us-east-1a remain Pending.
+  - Check 1: kubectl get nodes -l node.k8s.redwood/az=us-east-1a. If no nodes, verify EC2 instances exist in subnets created by module.
+  - Check 2: Review instance-bootstrap logs (/var/log/cloud-init.log) for labeling errors and IAM denied messages.
+  - Remediation: Restart bootstrap agent on instance or re-run label command; if IAM denied, rotate instance profile and redeploy.
+- Symptom: cross-account traffic to S3 failing from GPU nodes.
+  - Check 1: Confirm route tables include NAT gateway or VPC endpoint and security groups allow outbound 443.
+  - Check 2: Inspect CloudTrail (AWS) or VPC Flow Logs for denied connections.
+  - Remediation: Add VPC endpoints for S3 or update NAT configuration; coordinate with networking team if shared transit gateway involved.
+
+Operational run tasks and playbook snippets
+- Daily: verify placement.mismatch_rate < 0.5% for each region.
+- Weekly: rotate small subset of node credentials (IAM instance profile) and validate bootstrap labels.
+- Incident drill: simulated AZ outage run quarterly. Steps:
+  1. Mark AZ as degraded in routing plane.
+  2. Confirm workload rescheduling completes within 5 minutes under test load.
+  3. Review logs and update module tests if mismatch or failures seen.
+
+Ownership and contacts
+- Module owners: infra/compute-team (primary: Asha Patel)
+- Network owner: infra/networking (primary: Lin Chen)
+- On-call for placement issues: infra-sre rotation (pager duty alias: infra-sre@s.redwood.ai)
+
+References and further reading
+- Internal: /confluence/eng-infra/terraform-and-iac/gpu-provisioning-immutable-state-and-disaster-recovery
+- Internal: /confluence/eng-infra/cloud-accounts-and-networking/gpu-network-topology-and-tenant-isolation-patterns
+- External: Kubernetes scheduler docs (affinity & taints), cloud provider docs on Shared VPC and Transit Gateway.
+
+Appendix: minimal troubleshooting commands
+- List nodes by AZ:
+  kubectl get nodes --selector='node.k8s.redwood/az' -o wide
+- Re-label a node:
+  kubectl label node ip-10-0-1-23 node.k8s.redwood/az=us-west-2b --overwrite
+- Drain a node (safe cordon + drain):
+  kubectl cordon ip-10-0-1-23 && kubectl drain ip-10-0-1-23 --ignore-daemonsets --delete-local-data --force
+
+Notes and future work
+- Evaluate integrating Kubernetes topology-aware-scheduling plugin for rack-level placement improvements.
+- Prototype a cross-account KV cache sharing path that prefers same AZ placement to reduce cross-AZ traffic.
+
+Document history
+- 2024-10-15: initial draft by Asha Patel.
+- 2024-12-05: added AWS Transit Gateway guidance and refined IAM least-privilege patterns.
+- 2025-02-10: updated canary rollout sequence; added monitoring thresholds and runbook steps.
+
+End of document

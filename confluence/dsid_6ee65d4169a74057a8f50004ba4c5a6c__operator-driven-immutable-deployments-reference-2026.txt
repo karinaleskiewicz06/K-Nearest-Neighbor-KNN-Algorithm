@@ -1,0 +1,168 @@
+Operator-driven immutable deployments — reference patterns for private installs
+
+Overview
+
+This page describes the operator-driven immutable deployment pattern we recommend for Redwood private deployments (VPC and on-prem). It focuses on a controller/operator that performs atomic, reproducible delivery of runtime components as immutable artifacts (signed images + declarative CRDs) and provides safe roll-forward/rollback semantics, multi-tenant isolation hooks, and a warm-standby fallback path for critical customer-facing control plane functions.
+
+Goals and constraints
+- Enable repeatable, auditable installs and upgrades with minimal manual steps for field engineers.
+- Prefer immutable artifacts (container images, signed packages) to in-place binary changes.
+- Provide safe rollback and fast failover when upgrades regress latency, resource usage, or correctness.
+- Minimize blast radius: support tenant-scoped rollout and operator-level canary controls.
+- Work within private deploy constraints: limited outbound connectivity, air-gapped zones, and strict KMS/HSM key usage.
+
+When to use this pattern
+- Customer wants predictable upgrade semantics and strict image signing verification.
+- Deployment target is air-gapped or VPC-only with operator-based lifecycle management.
+- Teams require deterministic rollback without relying on cloud provider snapshot primitives.
+
+High-level architecture (text diagram)
+- Customer cluster(s) (Kubernetes 1.25+)
+  - Redwood Operator (namespaced or cluster-scoped)
+  - Immutable runtime artifacts stored in internal registry (harbor/registry mirror)
+  - Control-plane components deployed as VersionedRuntime CRs
+  - Service mesh sidecars (optional) and network policy for tenant isolation
+  - KV cache migration job and state snapshotter (for stateful components)
+
+Architecture responsibilities
+- Redwood Operator:
+  - Validates CRs, verifies artifact signatures, orchestrates blue/green-like swaps by creating parallel ReplicaSets and switching traffic via ClusterIP / Service endpoints or Ingress rules.
+  - Runs preflight checks and smoke tests from the operator pod (local test harness).
+  - Publishes rollout events and metrics to the local telemetry sink (or pushes to customer-approved endpoint).
+- VersionedRuntime CR:
+  - Encodes desired artifact (image:tag), config hashes, KV snapshot references, and rollout policy.
+- Snapshotter component:
+  - Produces point-in-time KV and local FS snapshots used for rollback. Snapshots are signed and retained per retention policy.
+
+Prerequisites (table)
+| Item | Minimum / Recommended | Notes |
+|---|---:|---|
+| Kubernetes | 1.25 / 1.27 | RBAC enabled, PodSecurityPolicy or PSP alternatives configured |
+| Container registry | mirror reachable by cluster | Signed images (cosign) required for operator verify |
+| Operator RBAC | cluster-admin / delegated | See RBAC section below for least-privilege template |
+| KMS | Customer-managed KMS recommended | HSM-compatible key usage for signing and snapshot encryption |
+
+CRD: VersionedRuntime (summary)
+- apiVersion: redwood.ai/v1alpha1
+- kind: VersionedRuntime
+- metadata: name: runtime-<tenant>-v2
+- spec:
+  - image: registry.internal/redwood/runtime:2.1.0
+  - configHash: sha256:...
+  - rolloutPolicy: {strategy: "operator-immutable", canaryPercent: 5, maxUnavailable: 1}
+  - snapshotRef: s3://snapshots/tenant-x/2026-07-20
+  - verification: {cosignSig: "sha256:...", kmsKeyId: "projects/.../keys/..."}
+
+Operator lifecycle: responsibilities and failure modes
+- Install: operator is installed via Helm chart (signed package). The install is immutable; operator upgrades happen by installing a new controller image and reconciling CRs.
+- Reconcile loop: if a VersionedRuntime CR differs from the observed state, operator will:
+  1) Verify signatures and config hashes.
+  2) Stage new ReplicaSet/Deployment with isolated nodeSelector/taints for canary workloads.
+  3) Run preflight smoke tests (container health, prefix cache warmup, basic inference call).
+  4) Switch service endpoint to the new ReplicaSet when smoke tests pass.
+  5) Trigger snapshot expiry and retention pruning.
+- Failure modes:
+  - Preflight fails: operator aborts rollout and emits detailed events.
+  - Post-swap latency regression: operator optionally re-routes traffic back to previous ReplicaSet and marks the new image as quarantined.
+  - Snapshot incompatibility: operator refuses to apply CR until snapshot being referenced matches expected version.
+
+Step-by-step deployment and upgrade procedure (field guide)
+1) Preflight & staging (offline preparation)
+   - Ensure registry mirror has the image and cosign signature.
+   - Push signed snapshot artifacts to customer's snapshot store.
+   - Run local smoke harness: ./bin/preflight-check --image registry.internal/... --snapshot s3://...
+2) Create VersionedRuntime CR with rolloutPolicy: canaryPercent=5, maxUnavailable=1.
+   - kubectl apply -f versionedruntime-tenant-a-v2.yaml
+3) Operator stages canary on dedicated nodes and runs smoke tests (automated). Monitor events: kubectl describe versionedruntime runtime-tenant-a-v2
+4) If canary passes for configured observation window (default: 10m), operator increases traffic per policy, otherwise it triggers automatic rollback.
+5) Full rollout: operator waits for all ReplicaSets to become Ready and then prunes older ReplicaSets according to retention.
+
+Rollback and recovery
+- Automatic rollback triggers:
+  - Failed liveness/readiness within warm window, or
+  - 99th percentile latency exceeds configured threshold (see Observability section), or
+  - Functional regression detected by regression-suite lambda run.
+- Manual rollback steps:
+  1) kubectl annotate versionedruntime/runtime-tenant-a-v2 redwood.revert-requested=true
+  2) Operator re-applies previous ReplicaSet + snapshotRef and re-routes traffic.
+  3) Verify via smoke tests and customer acceptance tests.
+- Snapshot-based rollback: operator will restore KV snapshots into a parallel namespace before traffic cutover when stateful components exist. This prevents destructive in-place restores.
+
+Day-2 operations and maintenance
+- Observability hooks: operator exposes Prometheus metrics and events: 
+  - redwood_operator_rollouts_total{status}
+  - redwood_operator_rollout_duration_seconds
+  - redwood_operator_preflight_failures_total
+- Alerting recommendations:
+  - P1: preflight_failures_total > 0 for 15m after a rollout starts.
+  - P1: 99th latency increase > 2x baseline for 5m after cutover.
+  - P2: snapshot retention behind expected schedule by 30%.
+- Capacity considerations:
+  - Canary workloads should be scheduled on isolated nodes with smaller GPU count to detect memory/caching regressions earlier.
+
+Security and compliance
+- Image verification: cosign mandatory. Operator refuses to run unsigned artifacts.
+- Snapshot encryption: AES-256 with customer-managed KMS; snapshotRef must include kmsKeyId.
+- RBAC: provide a least-privilege manifest (example below) that grants operator permissions only to manage VersionedRuntime, Jobs for snapshotting, and Service endpoints.
+- Audit trail: operator writes an immutable rollout event with signed attestations to the local audit log (optionally shipped to customer SIEM).
+
+Example RBAC snippet (least-privilege psuedo-manifest)
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRole
+  metadata: name: redwood-operator-role
+  rules:
+    - apiGroups: ["redwood.ai"]
+      resources: ["versionedruntimes", "versionedruntimes/status"]
+      verbs: ["get", "list", "watch", "update", "patch", "create"]
+    - apiGroups: [""]
+      resources: ["services", "pods", "configmaps"]
+      verbs: ["get", "list", "create", "update"]
+
+Troubleshooting checklist (fast paths)
+- Operator not reconciling: check operator pod logs, verify RBAC errors, ensure controller image is healthy.
+- Canary fails on cold-start OOM: reduce canary replica memory or use smaller batch size; run a preflight with reduced concurrency.
+- Snapshot restore fails: validate snapshot checksum and KMS permissions.
+
+Operational SLOs and thresholds (recommended defaults)
+- Rollout success rate >= 99.5% over 30d window.
+- Mean time to rollback <= 10m for automatic rollbacks.
+- Snapshot restore test success >= 99% monthly.
+
+Appendix A — compatibility matrix
+| Component | Minimal supported | Notes |
+|---|---:|---|
+| Operator | 1.2.0 | features: immutable-rollout, cosign-verify |
+| Control plane components | 2.0.0 | must support snapshot migrate API v1 |
+
+Appendix B — example VersionedRuntime YAML (simplified)
+apiVersion: redwood.ai/v1alpha1
+kind: VersionedRuntime
+metadata:
+  name: runtime-tenant-a-v2
+spec:
+  image: registry.internal/redwood/runtime:2.1.0
+  configHash: "sha256:abc123..."
+  rolloutPolicy:
+    strategy: "operator-immutable"
+    canaryPercent: 5
+    maxUnavailable: 1
+  snapshotRef: s3://snap-archive/tenant-a/2026-07-20
+  verification:
+    cosignSig: "sha256:..."
+    kmsKeyId: "customer-kms-key-123"
+
+Ownership and contacts
+- Primary owner: eng-private-deployments/teams/runtime (oncall: runtime-oncall@redwood.ai)
+- Runbook author: Marisol Chen (marisol@redwood.ai)
+- Support escalation: customer-success/private-deploys@redwood.ai
+
+Related templates and artifacts
+- Helm chart: charts/redwood-operator (signed)
+- Preflight harness: tools/preflight-check v0.9+
+
+Change history
+- 2026-02-10: Draft created by Marisol Chen.
+- 2026-05-12: Added snapshot encryption requirements and RBAC least-privilege example.
+- 2026-08-03: Finalized SLOs and troubleshooting checklist; published.
+
+End of document"

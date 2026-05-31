@@ -1,0 +1,136 @@
+Hybrid sample + replay profiling playbook (workload reconstruction)
+
+Summary:
+This playbook describes our hybrid profiling approach: low-overhead statistical sampling in production combined with controlled full-trace capture (replay-ready) for targeted sessions. The goal is to reconstruct representative requests (inputs, model variant, KV cache state) for offline replay, root-cause subtle performance regressions, and validate mitigations in a staging replay cluster.
+
+Context and motivation:
+- Continuous sampling answers "what's happening" at scale with minimal overhead (0.5–1% CPU/RU).
+- Full-trace capture (trace-on-demand) captures exact execution paths (kernels invoked, kernel timings, batch composition, KV cache hits) for a small subset of sessions to enable deterministic replay and perf validation.
+- We combine both approaches to reduce signal-to-noise, limit storage costs, and produce actionable repros for runtime/kernel scheduling regressions.
+
+When to use this playbook:
+1. Tail-latency regressions that don't surface in microbenchmarks.
+2. Kernel scheduling anomalies (priority inversion, starvation) suspected from sampled traces.
+3. Regression triage after a rollout (canary or gradual) where sampled metrics indicate increasing variance.
+
+Owner and SLAs:
+- Playbook owner: eng-serving-runtime profiling team (primary: Asha Menon).
+- Response SLA for initiating a replay capture after an alert: 2 business days.
+- Repro attempt and initial report: 5 business days.
+
+High-level steps (overview):
+1. Analyze continuous sample telemetry and identify candidate sessions.
+2. If available, attach matching trace-on-demand session(s). If not, enable trace-on-demand for the relevant traffic slice for a limited window.
+3. Export inputs and KV cache deltas to the replay bucket.
+4. Reconstruct request in replay environment and run deterministic workload.
+5. Compare kernel timeline and resource occupancy between production sample and replay.
+6. Iterate with kernel scheduling or batching config changes; rerun replay.
+
+Detailed procedures:
+A. Selecting candidate sessions from samples:
+1. Query the profiler sampling index for windows where P99 latency deviates > 20% from baseline for the model and route.
+2. Filter sessions by: model_version, route_tag, tenant_id, and sequence_length bucket.
+3. For each session, compute a "replay_score" = weight(latency) + weight(kernel_variance) + weight(kvcache_miss_rate). Use thresholds: scores > 0.7 mark as high-priority.
+
+B. Enabling trace-on-demand safely:
+- Window: 5–15 minutes for initial capture.
+- Rate cap: max 1 trace/min per node; global cap 50 traces per hour across cluster.
+- Use route-level sampling policy: tag routes to limit to affected customer/experiment.
+- Commands:
+  - Enable:
+    TOGGLE_CMD=$(redwoodctl profiling trace enable --route my-route --window 10m --cap 50)
+  - Disable:
+    redwoodctl profiling trace disable --route my-route
+
+C. What to capture in a trace (mandatory fields):
+- request_id, model_version, prompt_hash, tokenized_input (safe-hashed), full kernel invocation timeline (per-kernel name, start_ns, duration_ns), batch_id, batch_composition (other request IDs in same batch), GPU index, device memory map, KV cache delta (keys evicted/inserted) as changelog, and environment tags (node, runtime-build).
+
+Storage and retention policy (table):
+| artifact | storage path | retention | rationale |
+| --- | --- | --- | --- |
+| sampled-metrics (aggregates) | s3://profiling/samples/yyyy/ | 90 days | rollups for alerting and SLO backfills |
+| trace-on-demand raw | s3://profiling/traces/yyyy/ | 30 days | full replays are costly; short TTL |
+| replay-recons | s3://profiling/replays/yyyy/ | 180 days | preserve repros tied to releases |
+| kvcache-deltas | s3://profiling/kvcache-deltas/yyyy/ | 90 days | needed to reconstruct warmstart state |
+
+Replay environment setup checklist:
+1. Match runtime binary and kernel versions: use artifact tag from trace (runtime_build: tag).
+2. Provision GPU nodes with identical or superset topology. For known NUMA-sensitive regressions, match node SKU and affinity masks.
+3. Configure model weights path and quantization profile as recorded.
+4. Seed KV cache from kvcache-deltas: apply changelog in order to an empty cache.
+5. Configure batch scheduler to accept the recorded batch composition and arrival timings (use synthetic inter-arrival to reproduce burst/coalescing).
+
+Reconstruction commands (examples):
+- Export traces for replay run:
+  redwoodctl profiling export --trace-id 1234abcd --out /tmp/replay_bundle.tar.gz
+- Initialize replay environment:
+  replayctl init --bundle /tmp/replay_bundle.tar.gz --runtime-tag release-2026-01-15
+- Apply KV cache deltas:
+  replayctl kvcache apply --bundle /tmp/replay_bundle.tar.gz --target replay-node-1
+
+Deterministic replay run (example):
+  replayctl run --trace-id 1234abcd --repeat 3 --compare-baseline /tmp/prod_timeline.json --output /tmp/replay_result.json
+
+Validation and artifacts to collect from replay runs:
+- Kernel timeline (per-step) and per-kernel duration distribution.
+- GPU occupancy and SM utilization trace.
+- CPU-to-GPU transfer timings (host staging times).
+- Batch composition mismatch report (if scheduler coalesced requests differently).
+- KV cache hit/miss timeline before and after warmstart.
+
+Alert thresholds and triage heuristics:
+- If replay kernel timeline matches production within 5% but latency differs > 15% -> investigate host-level interference (noisy neighbor) and network jitter.
+- If kernel variance differs > 20% -> likely scheduling non-determinism or different concurrency mix in production. Check batch-size distribution over 1 hour window.
+- If KV cache miss delta explains > 30% of token processing time -> treat as cache warmup issue and consider extending cache TTL for route.
+
+Mitigations and runbook actions (ordered):
+1. Validate runtime and kernel versions are identical. If mismatch, recreate replay with correct binary.
+2. Re-run replay on node with isolated CPU/GPU (pinning) to rule out host noise.
+3. Toggle kernel scheduling knobs: kernel_credit_limit, preemption_window_ms, eager_batching_enable. Use incremental changes and single-variable experiments.
+4. If scheduling changes affect latency positively in replay, run small canary rollout with those knobs for 1% traffic and monitor sampled P95/P99.
+
+Safe rollback guidance:
+- Any kernel-level knob change must include an automatic rollback policy: revert if P99 increases > 10% or error rate increases > 0.5% within 30 minutes.
+
+Example profiler config (YAML):
+-----BEGIN CONFIG-----
+profiling:
+  sampling:
+    default_rate: 0.005  # 0.5% of requests
+    stratified_by: [model_version, sequence_length_bucket, route_tag]
+  trace_on_demand:
+    enabled: false
+    global_cap_per_hour: 50
+    per_node_rate_limit: 1/min
+  artifacts:
+    traces_bucket: s3://profiling/traces/{{YYYY}}/{{MM}}/{{DD}}
+    replay_bucket: s3://profiling/replays/
+-----END CONFIG-----
+
+Security and privacy notes:
+- Never store full prompt text for customer requests. Store tokenized inputs with reversible hashing disabled; keep a prompt_hash and only store cleartext for synthetic/internal test traces.
+- Access to replay artifacts is restricted to eng-serving-runtime and incident response SSO groups. All exports are logged to audit.
+
+Telemetry keys and dashboards to consult:
+- profiler.sampled.latency.p99 (by model_version, route_tag)
+- profiler.trace.count (successful captures)
+- profiler.kvcache.hit_rate
+- runtime.kernel.duration.per_kernel (heatmap)
+- replay.compare.delta_ms (post-replay comparison)
+
+Postmortem and documentation updates:
+- If a replay produced a fixable action, attach the replay_result.json and a short remediation summary to the incident ticket and update the related kernel ADR if the fix changes scheduling guarantees.
+
+Appendix: common troubleshooting nuggets
+- If replay shows identical kernel durations but production is higher, instrument node-level cgroups & host IO (disk/NIC) — often a transient IO spike can amplify token latencies.
+- For quantization-induced variance, compare matrix-multiplication microbenchmarks between prod and replay nodes; numerical noise can change control flow in rare models.
+
+Contacts:
+- Primary profiling lead: asha.menon@redwood.ai
+- Runtime kernel SME: diego.ramirez@redwood.ai
+- On-call SRE for replay infra: infra-oncall@redwood.ai
+
+Change log:
+- 2026-02-10: Created initial draft.
+- 2026-02-18: Added retention table and replay commands (review feedback).
+- 2026-02-28: Finalized thresholds and published.

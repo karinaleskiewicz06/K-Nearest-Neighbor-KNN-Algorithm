@@ -1,0 +1,132 @@
+Throughput Stability and Rolling Eviction Playbook for Private Deploys
+
+Summary:
+This playbook describes operational procedures, safe defaults, metrics, and tooling for preserving throughput stability in private deployments when node/pod memory pressure, GPU contention, or sudden workload spikes require controlled rolling eviction or load-shedding. It focuses on minimizing request tail-latency regressions, avoiding noisy neighbor amplification, and preserving ML quality by protecting hot model shards and KV cache contents during transitions.
+
+Intent and scope:
+- Applies to Redwood Private deployments (VPC and on-prem) running the inference serving runtime (GPUs and attached KV cache)
+- Covers: detection, controlled eviction, traffic shaping, cache-tier preservation, warm-start considerations, rollback and recovery, and post-event analysis
+- Not covered: low-level kernel development; refer to runtime-architecture for kernel and scheduling details
+
+Key definitions:
+1) Rolling eviction: a coordinated, staged removal (or pausing) of workloads from nodes or GPUs to relieve resource pressure while maintaining service availability.
+2) Hot-shard: model weights or KV cache segments with high recent access rate (>80th percentile token access).
+3) Throughput stability window: configured time window (default 5m) used to smooth throughput signals and avoid oscillation.
+
+Service-level objectives (SLOs) targeted during evictions:
+- P99 generation latency: maintain <= 2.5x baseline for no more than 3 minutes during rolling eviction
+- Error rate: < 0.5% increase above baseline over a 10m window
+- Successful request ratio: > 99.0% (excluding client-side backpressure responses)
+
+Instrumentation and alerts (recommended):
+- Prometheus alerts (examples):
+  - ALERT:PrivateHighGpuMemPressure
+    expr: avg_over_time(gpu_mem_used_bytes / gpu_mem_total_bytes[2m]) > 0.85 for 3m
+    labels: severity=high, phase=detect
+  - ALERT:EvictionInProgress
+    expr: increase(runtime_eviction_actions_total[1m]) > 0
+    labels: severity=info, phase=notify
+  - ALERT:RequestTailIncreaseDuringEviction
+    expr: (histogram_quantile(0.99, sum(rate(request_duration_seconds_bucket[1m])))) / baseline_p99 > 2.5
+    labels: severity=critical, phase=escalate
+- Dashboards: include per-cluster heatmap for hot-shards, KV cache hit-rate by shard, GPU utilization by CUDA device, and rolling-eviction state timeline
+
+Eviction policy priorities (high level):
+1) Graceful pause of low-priority batch workloads (batch windows > 500ms latency)
+2) Prefer draining non-hot shards first; preserve hot-shards on least-loaded GPUs
+3) Reduce concurrency per model instance before evicting whole instance (per-instance request limiter)
+4) If memory pressure persists, evict oldest idle instances and then low-traffic instances in controlled batches
+
+Preconditions before starting rolling-eviction:
+- Confirm cluster alert for memory or GPU contention and validate with >2 data sources (Prometheus + node exporter logs or nvml telemetry)
+- Notify stakeholders via oncall channel: #private-deploy-ops and create an incident record
+- Ensure warm pool exists: at least 10% of capacity pre-warmed for critical models (configurable by customer profile)
+
+Operational runbook: step-by-step
+1) Detect and classify the event (0m–3m)
+   - Check alerts: PrivateHighGpuMemPressure or sustained high host swap
+   - Query heatmap: identify hot-shards and top-3 models causing growth in KV footprint
+   - Determine impact surface: number of tenants affected, percent of capacity used, and any customer SLA tags
+2) Enter controlled-mode and notify (3m–5m)
+   - Set cluster to controlled-eviction-mode: runtime flag runtime.eviction.mode=controlled
+   - Reduce global routing concurrency by 20% with traffic controller (example: rctl adjust concurrency --percent 80)
+   - Create an eviction window: size 3 nodes or 5 GPUs per batch (tunable by cluster size)
+   - Post status to incident bridge and update incident doc
+3) Execute eviction batches (5m–25m depending on cluster size)
+   - For each batch:
+     a) Identify candidate instances using scoring rules (see scoring table below)
+     b) Reduce instance concurrency: runtime.admin/instance/<id>/set-concurrency 1
+     c) Wait stabilization interval (default 30s) and monitor P95/P99 and error rate
+     d) If metrics stable, cordon instance and gracefully terminate via runtime evacuation API
+     e) If P99 spikes > 2.5x baseline, roll back last action and increase stabilization interval by 30s
+   - Repeat until pressure drops below threshold (gpu_mem_used/gpu_total < 0.80 over 2m)
+4) Post-eviction warm-up and validation (5m after final batch)
+   - Warm critical model replicas from warm pool into evicted nodes to restore capacity
+   - Rehydrate KV cache critical shards preferentially using prefetch tool (kv-prefetch --shard <id> --priority high)
+   - Validate cache hit-rate and tail latency for 10 minutes
+5) Recover and close incident
+   - Remove controlled-eviction-mode flag
+   - Step down temporary concurrency controls
+   - Document timeline, decisions, and any customer impact in postmortem template
+
+Eviction candidate scoring (table form)
+- Represented below as CSV lines; fields: instance_id, tenant_priority, last_access_min, hot_shard_fraction, avg_qps, eviction_score
+"instance-013,low,120,0.05,0.3,12"
+"instance-021,medium,10,0.45,5.0,44"
+"instance-042,critical,3,0.85,25.0,90"
+Scoring notes:
+- eviction_score = weighted sum: 0.5*(1 - tenant_priority_norm) + 0.2*(last_access_norm) + 0.2*(1 - hot_shard_fraction) + 0.1*(1 - qps_norm)
+- Tenant priority: critical>medium>low (mapped to 1.0/0.6/0.2)
+
+Cache and KV considerations:
+- Tiered retention windows: hot (last 30m), warm (30m–6h), cold (>6h). Protect hot-tier shards during eviction unless unavoidable
+- Use selective eviction: when evicting an instance, prefer eviction that preserves >80% of hot-tier coverage across the cluster
+- Prefetch strategy: favor model token prefixes most responsible for recent queries (top-10 prefixes by token count)
+
+Traffic shaping and client signalling:
+- Implement 429-based soft backpressure for non-critical routes with exponential backoff hints in Retry-After header
+- Use graceful short-circuits for very large requests: if estimated token-generation time > configured threshold (default 15s), return 503 with user-facing guidance and queue a lightweight acceptance token for retry
+
+Rollbacks and abort conditions:
+- Abort eviction if any of the following occur:
+  - sustained P99 > 4x baseline for 5m
+  - error-rate jump > 2% absolute for 10m
+  - KV cache hot-tier loss > 30% leading to quality regressions (monitored via eval metrics)
+- Rollback procedure:
+  1) Cancel current batch and revive last-terminated instance(s) using runtime.eviction.revive API
+  2) Rehydrate KV cache from cluster-wide snapshots (kv-restore --shard <id> --from latest)
+  3) Re-instate previous traffic concurrency values and observe for 15m
+
+Automation and safe defaults (recommended configuration):
+- Default rolling batch size: min(ceil(cluster_gpu_count * 0.05), 5)
+- Stabilization interval: 30s (increase to 60s if cluster critical models > 5)
+- Eviction mode: controlled by default; forced manual only for hardware emergencies
+
+CLI and example commands (operator-facing):
+- Check memory pressure: rctl cluster describe --filter "gpu_mem_used/gpu_mem_total > 0.80"
+- List hot shards: rctl kv shards top --hours 1 --limit 20
+- Start controlled eviction: rctl eviction start --mode controlled --batch-size 3 --stabilization 30s --notes "auto-detected high memory"
+- Revive instances (rollback): rctl eviction revive --instance instance-021 --reason rollback
+
+Ownership and oncall handoff:
+- Primary owner: Private Deployments SRE (team: eng-sre)
+- Secondary owner: Serving Runtime oncall
+- Escalation path: oncall -> runtime lead -> infra lead -> CTO for critical customer-impact incidents
+
+Post-incident review checklist:
+1) Attach timeline and alerts exported from Prometheus (10m granularity)
+2) Annotate which shards were evicted and why
+3) Share any customer-facing messages and verify with CS that impact was correctly categorized
+4) Identify automation candidates (e.g., pre-warming threshold tuning, auto-scaling heuristic changes)
+
+Appendix: tuning matrix (quick reference)
+- Symptom: Frequent short-lived evictions with high oscillation → Increase throughput stability window to 10m, reduce batch size by 50%
+- Symptom: Slow cache rehydration causing quality drop → Increase warm-pool size from 10% to 25% for affected tenant profiles
+- Symptom: Single tenant causing repeated evictions → Apply per-tenant soft quotas and consider tenant-level throttling (rctl tenant quota set)
+
+Related references:
+- runtime-architecture – model hot-swap and cache lifecycle
+- day2-security-maintenance-handbook – security checks to perform after instance reboots
+- private-deploy-onboarding-and-failover-runbook – customer onboarding runbook
+
+End of document.

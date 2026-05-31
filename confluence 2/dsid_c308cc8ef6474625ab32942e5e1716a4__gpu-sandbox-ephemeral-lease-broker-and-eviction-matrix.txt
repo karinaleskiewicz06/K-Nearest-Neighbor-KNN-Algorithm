@@ -1,0 +1,151 @@
+GPU sandbox ephemeral lease broker and eviction matrix
+
+Overview
+
+Purpose: This doc describes the design and operational runbook for the GPU Sandbox Ephemeral Lease Broker (GELB) — a thin service + IaC pattern that issues short-lived GPU leases to developer teams, enforces fair-share quotas, and performs deterministic eviction based on an explicit eviction matrix. The goal is to enable low-latency experiment access while protecting production capacity and predictable Dedicated pools.
+
+Scope: This applies to self-serve developer sandboxes (ephemeral nodes), short-lived eval jobs, and internal experimentation lanes that use fractional or whole GPUs from the shared GPU pool. It does NOT apply to Dedicated customer pools or Reserved capacity.
+
+Key goals
+- Fast provisioning: < 90s allocation from request to SSH/Job access for common flow.
+- Predictable reclaim: Eviction decision within 30s of policy trigger for preemption-sensitive lanes.
+- Fair-share enforcement: per-tenant daily credit and concurrency caps enforced via sidecar + quota broker.
+- Auditable: all allocations, renewals, and evictions logged to audit-log-gateway with request IDs.
+
+High-level architecture
+- GELB service: Kubernetes Deployment (replicas=3) in infra-gpu-ops namespace. Responsible for allocation decisions, TTLs, and lease metadata (in Postgres leasedb).
+- Quota store: Redis (primary) with persistent fallback to leasedb. Stores fast counters used in admission checks.
+- Allocator agent: runs as a controller in tenant namespaces to reconcile node leases and apply eviction taints.
+- Eviction service: small stateless worker that computes eviction scores and enqueues remediation (drain, migrate, terminate).
+- Terraform modules: terraform/modules/gpu-sandbox-lease and terraform/modules/gpu-network-egress used by self-serve onboarding pipeline.
+
+Service names & ownership
+- service: gelb (k8s deployment) — owner: infra-gpu-team
+- db: leasedb (postgres-prod-analytics) — owner: infra-data
+- cache: gelb-redis — owner: infra-gpu-team
+- exporter: gelb-metrics (Prometheus) — owner: eng-observability
+
+SLOs & thresholds
+- Allocation latency SLO: 90th percentile <= 90s measured from request API to "lease.active" event.
+- Eviction latency SLO: 95th percentile <= 30s from policy trigger to taint-applied.
+- Fair-share enforcement correctness: 99.9% of allocation decisions must adhere to quota constraints; infra alerts if mismatch.
+
+Eviction matrix (priority, reason, remediation)
+This matrix determines which lease(s) to evict when capacity contention occurs. Each entry has tie-breakers described.
+
+1) Production SLA breach (priority P0)
+- Reason: Host or Dedicated tenant SLO impacted (latency, error-rate).
+- Remediation: Immediately select sandbox leases on same node with evictionScore = highestRuntimeImpact. Taunt + drain; migrate long-running jobs to preemptible nodes if possible; force-terminate after graceful period 20s.
+
+2) Dedicated capacity reclaim (priority P1)
+- Reason: Reserved capacity commit demands math: commit factor > 0.9 and insufficient free GPUs.
+- Remediation: Pick leases with lowest dailyCreditsRemaining, prefer ephemeral lower-cost instances (fractional GPUs). Grace period = 60s.
+
+3) Credit overrun (priority P2)
+- Reason: Tenant exceeded daily credit or concurrency caps.
+- Remediation: Select tenant leases in FIFO order of allocation time; notify user with 2-minute warning via Slack and email; automatic eviction after 120s unless user renews using the CLI renew command.
+
+4) Node maintenance (priority P3)
+- Reason: Voluntary maintenance drain request.
+- Remediation: Mark taint=no-sandbox and cordon node; schedule graceful drain for sandbox pods for up to 5m; if pods have checkpointing support (checkpoint=true label), migrate; otherwise give 3m and terminate.
+
+5) Spot preemption (priority P4)
+- Reason: Cloud preemption notice from provider.
+- Remediation: Follow provider SIGTERM window: send in-band 30s preemption notification to workloads; allow preemption-aware jobs to checkpoint. Evict non-checkpointing leases after 25s.
+
+Tie-breakers when multiple candidates match
+- Prefer eviction of leases with the lowest user-specified priority label (user-priority: low|medium|high).
+- Prefer the lease with the smallest remaining TTL.
+- Prefer fractional-GPU allocations over whole-GPU allocations.
+- If still tied pick the oldest allocation.
+
+Admission & renewal flows (API examples)
+1) Request (CLI)
+- CLI: redwood-gelb request --pool shared-sandboxes --gpus 0.5 --ttl 2h --priority low
+- Example response: {"lease_id":"ls_abc123", "node":"gpu-sbx-12","ssh":"ssh -i ~/.ssh/id_rsa ubuntu@gpu-sbx-12.redwood.internal", "expires_at":"2025-11-02T09:32:00Z"}
+
+2) Renew (CLI)
+- CLI: redwood-gelb renew --lease ls_abc123 --extend 1h
+- Server will run quick quota check. Renew is allowed if dailyCreditsRemaining > cost(extend-hours).
+
+3) Force renew (approval flow)
+- For high-priority experiments, team lead can request an override via /gelb/override API with ticket id and approver. Logs appended to lease comment.
+
+Terraform module example (usage snippet)
+- terraform/modules/gpu-sandbox-lease main variables: tenant_id, requested_gpus, egress_policy, allow_checkpointing
+- Example usage snippet:
+
+module "tenant_sandbox" {
+  source = "github.com/redwood/terraform//modules/gpu-sandbox-lease"
+  tenant_id = "team-alpha"
+  requested_gpus = 0.5
+  egress_policy = "restricted-to-peering"
+  allow_checkpointing = true
+}
+
+Ci/CD pipeline & gating
+- Pipeline: buildkite-gelb -> unit tests -> integration (local k3s) -> image-promotion to staging -> canary rollout to infra-gpu-ops/staging -> gradual rollout to production following 10/30/60% window over 4 hours.
+- Gate: Any change to eviction logic must include deterministic eviction unit tests (simulate 1000 concurrent leases) and a canary job that runs real allocations in a non-prod GPU pool.
+
+Observability & alerts
+- Metrics emitted: gelb.allocations_total, gelb.evictions_total, gelb.allocation_latency_seconds (histogram), gelb.eviction_latency_seconds, gelb.renew_failures_total.
+- Dashboards: infra/gpu/gelb-allocations and infra/gpu/gelb-eviction-latency.
+- Key alerts:
+  - Allocation latency p95 > 120s for 2m -> P1 page
+  - Eviction latency p95 > 60s for 1m -> P1 page
+  - Quota enforcement mismatch > 0.1% over 5m -> P0 page (investigate immediately)
+
+Runbook: handling a saturated shared GPU pool
+1) Triage (owner on-call: infra-gpu-oncall)
+  - Check dashboard: capacity, allocations by tenant, eviction rate.
+  - Identify if saturation cause is spike (eval job) or leak (orphaned allocations).
+2) Mitigation steps (fast path)
+  - Increase soft TTL reclaim aggressiveness: kubectl patch configmap/gelb-config -n infra-gpu-ops --type merge -p '{"data":{"ttl_reclaim_scale":"1.5"}}'
+  - If a single tenant is noisy, enable immediate eviction: POST /gelb/admin/evict?tenant=tenant-id&force=true
+  - Temporarily mark pool read-only: apply label pool=drain to shared-pool nodes.
+3) Recovery & postmortem
+  - After saturation clears, revert config and run the leakage detection job: redwood-gelb audit --check-orphans --since 72h
+  - Create postmortem if SLA breach or sustained elevated evictions > 10% for 1 hour. Follow oncall incident template: /confluence/oncall-and-incident-response/postmortem-template.
+
+Operational notes & best practices
+- Tags & labels required on all leases: tenant_id, owner_email, purpose, allow_checkpointing(true|false), user_priority.
+- Encourage users to use checkpointing libraries for long experiments. Leases with allow_checkpointing=true are preserved during node maintenance if space allows.
+- Avoid granting > 4h TTL for whole GPU allocations without explicit approval.
+
+Security & networking
+- Egress: sandbox nodes must use sandbox-egress-iam role and egress NAT via per-tenant NAT gateway when egress_policy == restricted-to-peering. See terraform/modules/gpu-network-egress for config examples.
+- SSH access: ephemeral ssh keys are stored in vault and rotated on renew/extend events. Keys expire with lease TTL.
+
+Appendix: example YAML of admission-webhook policy (condensed)
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: gelb-admission
+webhooks:
+  - name: gelb.redwood.internal
+    rules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+    clientConfig:
+      service:
+        name: gelb-svc
+        namespace: infra-gpu-ops
+        path: "/validate"
+
+Contacts & escalation
+- Primary owner: infra-gpu-team Slack: #infra-gpu Oncall: infra-gpu-oncall pagerduty
+- Observability: eng-observability Slack: #observability Pager: observability-oncall
+- Database: infra-data Slack: #infra-data
+
+Related pages & modules
+- terraform/modules/gpu-sandbox-lease
+- terraform/modules/gpu-network-egress
+- /confluence/eng-infra/runbooks/preflight-gpu-deployment-validation-and-rollback-playbook
+
+Change log
+- 2024-02-15: Initial draft (Jared Moreno)
+- 2024-06-03: Added eviction tie-breakers and Terraform snippets (Priya Natarajan)
+- 2025-11-02: Updated SLOs and reduced default grace periods; added provider preemption flow (Mei Chen)
+

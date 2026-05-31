@@ -1,0 +1,154 @@
+Throttle Evidence Orchestrator Playbook
+
+Overview
+
+This playbook documents the Throttle Evidence Orchestrator (TEO): an operational pattern and supporting tooling that (1) centralizes telemetry signals used to trigger token/tenant throttles, (2) automates evidence capture for SLO/error-budget incidents, and (3) applies governance and audit trails for throttle decisions. TEO is intended for on-call SREs, capacity engineers, and product owners responsible for inference-gateway and multi-tenant routing.
+
+Goals
+- Provide deterministic, auditable throttle decisions tied to SLOs and error budgets.
+- Minimize false-positive throttling while preserving platform availability.
+- Ensure each throttle action creates a curated evidence bundle for post-incident review.
+
+Scope and non-goals
+- In scope: inference-gateway, capacity-orchestrator, quota-db, telemetry-pipeline, tenant-priority-lane, metrics-collector.
+- Out of scope: model training pipelines, billing reconciliation (billing team owns final chargebacks).
+
+Key concepts
+- Throttle signal: a consolidated decision input computed from telemetry (latency quantiles, error rates, queue depth, GPU memory pressure, model warm-pool miss rate).
+- Evidence bundle: time-bounded snapshot (metrics, traces, top N logs, tenant request sample, throttle policy applied).
+- Throttle policy: JSON document that maps signal severity to actions (soft queueing, percentage-based tenant throttle, regional failover).
+- Governance record: immutable audit entry stored in audit-log-service (see Audit Log schema below).
+
+SLOs and error budget mapping (examples)
+| service | SLO (p99) | Error budget (monthly) | Critical signals |
+| inference-gateway | <= 1.5s | 0.5% | p99 latency, request error-rate, long-tail queue depth |
+| embeddings-service | <= 350ms | 0.25% | p95 latency, batch-retry count, OOM events |
+
+Note: The TEO computes risk as a weighted combination of normalized signal deltas (latency, errors, headroom). If monthly burn > 40% and 5-min surge > 3x baseline, TEO elevates to level-2 actions.
+
+Telemetry signals and thresholds
+- Latency: p99 over 60s window > x * baseline (default x=1.6) -> severity +1
+- Error rate: 5-min rolling error-rate > 0.3% absolute increase -> severity +2
+- Queue depth: queue_time_99 > 500ms -> severity +1
+- Warm-pool-miss: > 8% sustained for 10m -> severity +1
+- GPU memory pressure: > 85% -> severity +2
+
+Telemetry sources (owned by engineering):
+- metrics: prometheus (metric names: gateway_request_duration_seconds_bucket, tenant_queue_time_seconds)
+- traces: jaeger (services: inference-gateway, model-worker)
+- logs: Loki centralized logs (labels: service, tenant_id, trace_id)
+- events: capacity-orchestrator events (kafka topic: capacity.events)
+
+Evidence bundle schema (stored as tar.gz in evidence-bucket, referenced in audit log)
+- metadata.json (fields: throttle_id, start_ts, end_ts, reason, decision_vector, owner, sla_links)
+- metrics.csv (snapshot for 5m before/after)
+- traces.json (sampled spans, up to 50)
+- logs.txt (top 500 lines filtered by tenant_id)
+- config.json (throttle policy in effect)
+
+Audit log schema (audit-log-service)
+- entry_id: string
+- throttle_id: string
+- triggered_by: TEO | manual | external-autoscaler
+- decision: allow | soft-queue | throttle-percent | regional-failover
+- reason_codes: list
+- evidence_url: s3://...
+- runbook_link: confluence://...
+
+Decision matrix (simplified)
+1) Severity 1 (low): apply soft-queue on a subset of low-priority tenants (10% of tokens). Notify owner via #sre-throttle.
+2) Severity 2 (moderate): throttle non-critical tenants by 20% request rate, increase model-serving parallelism limit for critical tenants. Create evidence bundle automatically.
+3) Severity 3 (high): apply regional failover for affected models, preempt best-effort jobs, escalate to oncall-sre and ENG lead. Create incident and attach evidence bundle.
+
+Runbook: Emergency throttle procedure (SRE on-call)
+1. Observe alert: TEO alert -> ticket created in PagerDuty.
+2. Verify signals: run the "teo-inspect" script to fetch recent telemetry and pre-computed decision vector. Example:
+   - CLI: ./bin/teo-inspect --throttle-id <id> --window 5m
+   - SQL example to fetch tenant error-rate:
+     SELECT tenant_id, count(*) AS errors, count(*)/NULLIF(total,0) AS error_rate
+     FROM events.requests
+     WHERE timestamp >= now() - interval '5 minutes'
+     GROUP BY tenant_id ORDER BY error_rate DESC LIMIT 10;
+3. Confirm decision: check audit-log-service entry and evidence bundle link. If evidence bundle missing, manually assemble using evidence-collector (see scripts/evidence-collector.sh).
+4. Apply quick mitigation (if required): POST to throttle-api with minimal rollback TTL 30m. Example payload:
+   {
+     "policy_id":"auto-telemetry-2026-07",
+     "actions":[{"type":"throttle","percent":20,"target":"tenant-group:best-effort"}],
+     "expires_at":"2026-09-08T15:00:00Z"
+   }
+5. Communicate: update PD incident and post summary to #sre-throttle and the affected product slack channel.
+6. Post-incident: ensure evidence bundle is attached and run the standard incident review checklist (below).
+
+Automated rollback safeguards
+- All automated throttle actions include a TTL (default 30m) and require human confirmation before extension to >2h.
+- Escalation policy: if throttle persists beyond TTL and SLO burn continues, oncall must open a SevX and escalate to capacity team.
+
+Operational tooling and scripts
+- teo-controller: k8s controller that subscribes to telemetry-pipeline, computes decision vectors, and writes to audit-log-service.
+- evidence-collector: serverless function that aggregates metrics/traces/logs and writes evidence bundles.
+- throttle-api: internal REST API that enforces policy via gateway config and returns async operation id.
+- teo-inspect CLI: diagnostic tool used by oncall.
+
+Configuration example (throttle policy JSON)
+{
+  "policy_id": "auto-telemetry-2026-07",
+  "match": { "tenant_priority": ["best-effort"] },
+  "actions": [ { "type": "throttle", "percent": 20 }, { "type": "soft_queue", "max_queue_ms": 250 } ],
+  "ttl_minutes": 30,
+  "rollback_condition": { "p99_latency": {"window":"5m","threshold_ms":1200,"direction":"decrease"} }
+}
+
+Capacity planning guidance
+- Reserve headroom: for each model class reserve 25% headroom in capacity-orchestrator for sudden tail events.
+- Mixed-tenancy lane quotas: maintain 3 lanes (critical, standard, best-effort) with adjustable capacity weights.
+- Monthly capacity review cadence: product + capacity + SRE meet weekly during ramp windows; quarterly run a capacity-forecast stress simulation using synthetic-canary harness.
+
+Reliability initiative backlog (prioritized)
+1. Dynamic batching by tenant (Q3 2026): reduce miss-rate and absorb bursts.
+2. Warm-pool prefetch tuning (Q4 2026): reduce warm-pool-miss signal.
+3. Graceful eviction policy for preemptible inference jobs (Q1 2027).
+4. Evidence automation improvements: reduce bundle assembly time to <90s.
+
+Incident review and evidence standards
+- Required artifacts for any throttling incident: evidence bundle, audit-log entry, PD incident link, timeline (minute-resolution), and remediation RCA.
+- Post-incident template:
+  - Summary (one paragraph)
+  - Impact (tenants affected, P50/P95/P99 changes, error budget burn)
+  - Timeline (UTC timestamps)
+  - Decision rationale (why throttle vs. other mitigations)
+  - Root cause and contributing factors
+  - Action items (owner, due date, severity weight)
+- Severity scoring: include throttle decisions in the incident severity algorithm (weight +2 if manual throttle of >50% applied).
+
+Metrics to track (dashboards)
+- TEO decisions per week (by severity)
+- Average TTL of automated throttles
+- % incidents with complete evidence bundles within 5m
+- Correlation matrix: throttle events vs. SLO burn, capacity allocation changes, and tenant churn
+
+Ownership and escalation map
+- TEO controller ownership: eng-platform/team-runtime (primary), eng-sre (secondary)
+- Evidence collector: eng-sre-tooling
+- PagerDuty rotations: oncall-sre primary, capacity-engineer secondary
+- Exec escalation: VP Eng (if >10% paying customers impacted for >2h)
+
+Related artifacts and links
+- Audit log receiver: https://internal.redwood/audit-log-service
+- Throttle API swagger: https://internal.redwood/api/throttle/v1/docs
+- Telemetry pipeline docs: /confluence/eng-platform/dashboards-and-alerts/telemetry-pipeline-architecture
+
+Appendix A: Example teo-inspect output (truncated)
+---
+throttle_id: teo-2026-07-24321
+decision_vector: ["latency:+2","error_rate:+1","gpu_pressure:0"]
+applied_actions: [{"type":"throttle","percent":20,"target":"tenant-group:best-effort"}]
+evidence_url: s3://evidence-bucket/teo/teo-2026-07-24321.tar.gz
+---
+
+Appendix B: Checklist for playbook changes
+1. Update policy JSON schema in /repos/infra/policies/throttle-schema.yaml
+2. Add unit tests in teo-controller (coverage > 85%)
+3. Notify stakeholders via #sre-change-control and schedule a 1-hour runbook rehearsal with oncall team
+4. Ship to staging and validate using synthetic-canary (failure modes: warm-pool-miss, model OOM, multi-tenant spike)
+
+This playbook will be reviewed quarterly and after any Sev2+ incident that used automated throttles. For questions or proposed changes, contact the owner team: eng-sre-tooling (sre-tooling@redwood.ai).

@@ -1,0 +1,128 @@
+gRPC idle connection and stream-reset mitigation playbook
+
+Summary:
+
+This playbook documents detection, immediate mitigation, and long-term fixes for customer-impacting gRPC idle connections and unplanned stream resets observed in Redwood’s ingress and proxy layers. It is intended for Customer Success engineers, SRE on-call, and Integration engineers supporting enterprise/Dedicated tenants.
+
+Why this matters:
+- gRPC stream resets and long-lived idle connections can manifest as partial failures (error responses, silent truncation) and increased tail latency for downstream model inference requests.
+- Enterprise tenants on Dedicated or Private deployments are particularly vulnerable when corporate firewalls, client SDKs, or load balancers interfere with HTTP/2/TCP keepalive semantics.
+
+Scope and applicable services:
+- Affected services: ingress-gateway (tenant-facing), adaptive-proxy (per-tenant routing), model-scheduler (when requests are fanout), and websocket-ingest adapters for mixed-mode clients.
+- Applies to Hosted API customers with long-lived websocket/gRPC streams and Dedicated or Private tenants behind customer-managed firewall/NAT.
+
+Symptoms to watch for (observable signals):
+1) Elevated gRPC stream reset rate (grpc_server_stream_reset_total) > 0.5% of total requests over 5m window.
+2) Increasing number of HTTP/2 GOAWAY frames from upstream proxies.
+3) Synthetic journey failures in conversational-synthetic-checks where client receives CANCELLED or UNAVAILABLE mid-stream.
+4) Client-side SDK errors: io.grpc.StatusRuntimeException: INTERNAL/UNAVAILABLE, or connection closed without response.
+
+Detection and alerting (recommended rules):
+- Alert: grpc_stream_reset_ratio_high
+  - Trigger when: (sum(grpc_server_stream_reset_total)[5m]) / (sum(grpc_server_handled_total)[5m]) > 0.005 for 3 consecutive windows
+  - Severity: P2
+- Alert: http2_goaway_spike
+  - Trigger when: increase in http2_goaway_frames_total by > 50% / 5m and absolute > 10
+  - Severity: P3
+- Synthetic: conversational-long-lived-stream-failure
+  - Trigger when: end-to-end synthetic session fails to complete 3/5 attempts
+
+Quick triage checklist (first 10 minutes):
+1) Confirm alert: open Prometheus/Grafana dashboard and note graphing windows (5m, 15m).
+2) Identify impacted tenants by joining bridge and inspecting logs for tenant_id in ingress logs:
+   - kubectl logs -n redwood ingress-gateway-xxxx --tail 200 | rg "stream_reset|GOAWAY" | head
+3) Query reset types: is the reset from client (RST_STREAM), upstream proxy, or server?
+   - PromQL example: sum by (reset_reason) (increase(grpc_server_stream_reset_total[5m]))
+4) Check client network pattern: are resets coincident with spikes in TCP retransmits or connection churn from a narrow set of IPs?
+
+Immediate mitigation steps (order matters):
+1) Enable aggressive keepalive and shorter max connection idle on affected ingress instance group (rolling configuration):
+   - config suggestion (defaults and recommended):
+     - grpc_keepalive_time: 60s (client) / 30s (ingress->upstream)
+     - grpc_keepalive_timeout: 10s
+     - http2_max_connection_idle: 5m -> 2m (if customer network is aggressive)
+2) Apply per-tenant request-level retry/fallback policy in adaptive-proxy for transient resets: 1 retry for idempotent calls (note: do NOT retry streaming write requests)
+3) If resets are correlated with a specific upstream model-hosting pool, temporarily remove that pool from the load pool and reroute traffic to compatible fallback model (use canary fallback policy):
+   - CLI: redwoodctl route update --tenant <TENANT> --remove-pool pool-42 --fallback-model model-v2-quantized
+4) For Dedicated/Private tenants behind customer NATs, ask the customer to verify TCP idle timeouts and suggest changing intermediate device idle timeouts to >= 10 minutes or enable HTTP/2 keepalives. Provide sample customer guidance in the troubleshooting email template below.
+
+Config table (common knobs and suggested values):
+- grpc_keepalive_time: ingress default 90s, recommended 30s for flaky networks
+- grpc_keepalive_timeout: default 20s, recommended 10s
+- http2_max_concurrent_streams: default 1000, recommended leave unless stream exhaustion is observed
+- http2_max_connection_idle: default 10m, recommended reduce to 2m only when upstreams aggressively close idle connections
+- stream_reset_alert_threshold: 0.5% over 5m -> create PagerDuty trigger at 1%
+
+Sample Envoy filter snippet (apply carefully in staging first):
+```yaml
+filters:
+  - name: envoy.filters.http.router
+    typed_config: {}
+http2_protocol_options:
+  max_concurrent_streams: 2000
+  initial_stream_window_size: 65536
+  initial_connection_window_size: 1048576
+```
+
+When to perform a rolling restart vs config patch:
+- Config patch (no pod restart) is preferred for keepalive and Envoy route-level changes.
+- Rolling restart is necessary if kernel-level TCP options or TLS libraries are updated. Perform restarts one AZ at a time.
+
+Customer communication template (for CS outreach):
+Subject: Action required: transient gRPC resets observed for <TENANT_NAME>
+Body: We observed intermittent gRPC stream resets impacting long-running sessions. Engineering has applied short-term routing mitigations. To avoid further interruptions, please confirm whether your network or firewall enforces TCP idle timeouts below 10 minutes. If so, we recommend enabling HTTP/2 keepalives or increasing idle timeouts. We can provide sample configuration for common load balancers (F5, AWS NLB, Azure Application Gateway).
+
+Operational verification checklist (post-mitigation):
+1) No service-level alerts for grpc_stream_reset_ratio_high for 30 minutes.
+2) Synthetic conversational checks pass 5/5 attempts for the tenant.
+3) No increase in downstream model request latency > 95th percentile baseline.
+4) Confirm tenant reports improved UX or absence of duplicate errors.
+
+Long-term remediation plan (owner: eng-serving-runtime):
+- Q2: Add RTT-aware keepalive tuning that adapts per-client IP/prefix.
+- Q3: Implement end-to-end stream-resume support for safe reconnection of idempotent streams.
+- Q4: Enhance telemetry to correlate TCP-level events with gRPC reset reason codes and include provenance in traces.
+
+Testing and rollout guidance:
+1) Reproduce in staging with a client that simulates NAT idle timeouts using tc/netem to drop connections after Xs.
+2) Validate no regression in high-throughput workloads (10k concurrent streams) and run chaos monkey test for random mid-stream connection closures.
+3) Gradually roll config changes to non-production clusters, then to a single tenant in dedicated staging, then to low-risk tenants in production.
+
+Escalation matrix and contacts (times are PST):
+- First responder: Customer Success on-call (CS-Ops Slack) — 24x7
+- SRE escalation (P1): eng-sre on-call (PagerDuty) — escalate after 15 min if mitigations not resolving
+- Runtime engineering (P0): eng-serving-runtime tech lead Marco Santoro (marco@redwood.ai) — page if resets persist after 1 hour and customer impact is critical
+
+Post-incident follow-up (within 72 hours):
+1) Complete incident timeline (who changed what when) and include relevant logs and traces.
+2) Run onboarding verification for affected tenant(s): run synthetic suite and collect full payload traces for at least 24 hours.
+3) Update docs: add tenant network checklist to enterprise-onboarding packet and include example configurations for common enterprise gateways.
+4) Schedule an RCA review with stakeholders and record action items with owners and due dates.
+
+Appendix A — PromQL examples:
+- Stream reset ratio (5m):
+  sum(increase(grpc_server_stream_reset_total[5m])) / sum(increase(grpc_server_handled_total[5m]))
+- GOAWAY per minute:
+  increase(http2_goaway_frames_total[5m]) / 5
+
+Appendix B — Troubleshooting commands and log queries:
+- Tail ingress logs with stream reset reason:
+  kubectl logs -n redwood ingress-gateway-xxxx --since=15m | rg "RST_STREAM|GOAWAY|stream_reset"
+- Check kernel TCP retransmits on node:
+  ss -s; cat /proc/net/netstat | rg TcpExt
+
+Appendix C — Customer-facing configuration snippets (examples to hand to customers):
+- AWS NLB: enable TCP keepalive: set idle_timeout = 350 (recommended)
+- F5/LTM: set TCP profile idle timeout to > 600s and enable 'TCP half close' handling
+
+Document ownership and review cadence:
+- Owner: Jordan Lee (Customer Success)
+- Technical owner: Marco Santoro (eng-serving-runtime)
+- Review cadence: Quarterly or after any P1 related to gRPC resets
+
+Related pages and further reading:
+- Onboarding: enterprise-networking-and-firewalls-checklist
+- Observability: grpc-telemetry-and-tracing-guidelines
+
+End of playbook.

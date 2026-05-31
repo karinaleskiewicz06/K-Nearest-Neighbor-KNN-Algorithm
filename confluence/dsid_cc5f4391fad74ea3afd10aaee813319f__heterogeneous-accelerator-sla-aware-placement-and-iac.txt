@@ -1,0 +1,186 @@
+Heterogeneous Accelerator SLA-aware Placement and IaC Patterns
+
+Summary:
+This document describes patterns and concrete IaC interfaces for SLA-aware placement across heterogeneous accelerator fleets (GPU, TPU-like inference accelerators, and edge NPUs). It covers placement policy, network-awareness, preemption and fallback strategies, Terraform module contracts, CI/CD gating for module changes, and a recommended rollout/playbook for migrating workloads to a mixed-accelerator allocator. The goal is to reduce SLO violations caused by blind packing and network egress hotspots while keeping the IaC surface auditable and safely deployable by platform teams.
+
+Table of contents
+1) Background and objectives
+2) Terminology and actors
+3) Placement & allocation policy (high-level)
+4) Terraform module API (recommended interface)
+5) Network-aware constraints and VPC considerations
+6) CI/CD and testing matrix for module changes
+7) Runbook: outage-safe rollouts and migration steps
+8) Observability, SLOs, and alerting
+9) Ownership and contribution process
+10) Appendix: examples and snippets
+
+1) Background and objectives
+- Problem statement: our fleet has grown heterogenous as we onboard cost-optimized inference accelerators (int8 NPUs) and experimental TPUs alongside standard CUDA GPUs. Current allocation logic focuses on single-resource binpacking which causes two recurring issues: (a) cross-zone network egress pressure when colocating hotspot tenants, and (b) SLA regressions when workloads are scheduled onto accelerators with mismatch in memory/latency profile.
+- Objectives:
+  - Provide a declarative IaC contract for teams to request "accelerator tiers" (gpu-standard, gpu-highmem, infra-tpu, edge-npu) rather than bare instance families.
+  - Ensure the allocator is SLO-aware (latency P95, tail CPU/host overhead) and network-aware (egress tokens/edge proximity).
+  - Offer clear Terraform module boundary and CI gating so infra changes are reversible and auditable.
+
+2) Terminology and actors
+- Accelerator tier: logical group mapping to allowed instance families + runtime optimizations (e.g., gpu-highmem -> A100-80GB, gpu-standard -> A10x).
+- Placement policy: policy that decides which zone/pool/accelerator to allocate for a given request.
+- Tenant: a billing/ACL construct representing a customer's workloads.
+- Platform allocator: service that schedules requests to heterogeneous pools.
+- Owners: infra (allocator service + IaC modules), platform SRE (alerts, runbooks), and customer-facing tenant owners.
+
+3) Placement & allocation policy (high-level)
+- Inputs considered by allocator: accelerator tier preference list, hard constraints (memory, PCIe type, required kernel/driver), soft constraints (max egress per-zone, tenant affinity, allowed preemption).
+- Policy rules (recommended):
+  1) Respect hard constraints first; use soft constraints as scoring modifiers.
+  2) For latency-sensitive SLOs (P95 < 50ms for inference), prefer intra-region placement with < 10ms network RTT and host tail CPU < 20%.
+  3) For cost-sensitive batch jobs, prefer low-cost pools with preemption allowed.
+  4) Avoid colocating more than N_high_network_tenants per-AZ where N_high_network_tenants = floor(agg_egress_capacity / tenant_egress_90th).
+  5) When selected accelerator is unavailable, fallback order: pinned variant -> compatible quantized variant -> remote-region variant (with egress cap) -> enqueue for warm-pool provisioning.
+- Preemption model: define preemption tiers (critical, standard, best-effort). Platform allocator should expose a preemption flag in allocation API and a TTL for graceful drain (recommended 120s for GPU inference, 300s for long-exec workloads).
+
+4) Terraform module API (recommended interface)
+- Rationale: keep module surface small and explicit; avoid embedding policy logic inside modules. Modules should define pools and expose metadata consumed by the allocator control-plane.
+
+- Example module signature (HCL) comment snippet:
+```
+module "accelerator_pool" {
+  source = "git::ssh://git@repo.internal/infra-terraform//modules/accelerator-pool"
+
+  pool_name         = "pool-infra-tpu-usw2"
+  accelerator_tier  = "infra-tpu"
+  region            = "us-west-2"
+  availability_zones = ["us-west-2a", "us-west-2b"]
+  node_count_min    = 4
+  node_count_max    = 40
+  preemptible       = true
+  egress_bandwidth_mbps = 10000
+  tenant_affinity_label = "platform-critical"
+  tags = {
+    team = "infra-platform"
+  }
+}
+```
+- Outputs that the module MUST emit (flat strings or lists consumed by control plane):
+  - pool_id (string)
+  - advertised_tier (string)
+  - max_concurrent_allocs (number as string)
+  - network_egress_capacity_mbps (string)
+  - host_instance_profiles (comma-separated string)
+
+- Best practices for modules:
+  - Keep pool lifecycle decoupled from tenant bindings; avoid creating tenant-level IAM/quotas inside pool modules.
+  - Use feature flags (TF var) to opt-in to preemptible pools.
+  - Emit explicit telemetry tags to allow auto-discovery by allocator (e.g., telemetry:accelerator_tier).
+
+5) Network-aware constraints and VPC considerations
+- Avoid cross-account egress amplification: when a pool spans accounts, ensure egress gateways (NAT/GWLB) have per-account shapers and tag-based cost accounting.
+- Placement scoring should include a network reachability penalty: +50 score if cross-AZ egress is required, +200 if cross-region.
+- Recommended VPC module fields for accelerator pools:
+  - private_subnet_prefixes (list)
+  - egress_gateway_id (string)
+- Egress protection: configure per-pool token-bucket policers at the egress gateway. Default egress limits per-pool: 10 Gbps for regional inference pools, 1 Gbps for edge pools.
+
+6) CI/CD and testing matrix for module changes
+- Goal: changes to accelerator pool modules should never result in immediate placement regressions.
+- Required CI stages for any PR touching modules/accelerator-pool/*:
+  1) Static checks: tfsec, tflint, fmt verify.
+  2) Unit plan: run terraform plan with a fake account using minimal vars.
+  3) Integration plan: run plan against a non-production staging account that mirrors production AZ layout. Ensure no destructive changes to live pools unless the PR flips an explicit opt-in var.
+  4) Allocator contract tests: a synthetic allocator-runner should validate the pool emits expected outputs and that the allocator can schedule a set of canonical workloads (latency-sensitive, batch, spot).
+  5) Canary apply: for non-breaking changes, a gated canary apply to a single AZ pool with automated rollback on mismatch.
+- Merge policy: require 2 infra approvers and a passing allocator-contract test. For changes that alter egress or preemption policy, require SRE review + owner_team signoff.
+
+7) Runbook: outage-safe rollouts and migration steps
+- Preflight checklist (before apply):
+  - Confirm target pool has monitoring configured (see section 8).
+  - Run allocator simulation with % of production traffic (use traffic-replay harness).
+  - Inform customers with pinned workloads; schedule a maintenance window for migrations that require host draining.
+- Safe rollout procedure (step-by-step):
+  1) Create new pool module instance with intended config (do not delete old pool).
+  2) Wait for new pool health checks to report healthy for 10 minutes (health: kernel/drivers, NVLink if applicable, telemetry probe).
+  3) Register new pool in allocator metadata via control-plane API as a cold pool (no allocations).
+  4) Run contract tests: schedule 100 synthetic latency inference requests and verify P95 within target.
+  5) Move a small percentage (5-10%) of low-risk tenant traffic to new pool for 1 hour and monitor SLOs.
+  6) If green, progressively shift traffic (25% -> 50% -> 100%) with 30-minute observation windows.
+  7) Decommission old pool after draining and confirming no lingering disks or podstate.
+- Emergency rollback: immediately re-register old pool and reassign allocations; use allocator affinity to pin critical workloads back and increase preemption of the new pool.
+
+8) Observability, SLOs, and alerting
+- Minimal metrics to emit per-pool:
+  - alloc_attempts_total (count)
+  - alloc_failures_by_reason (labelled count: capacity, constraints, network)
+  - avg_alloc_latency_ms
+  - host_cpu_tail_95
+  - egress_utilization_mbps
+  - preemption_events_total
+- Recommended SLOs (per-workload class):
+  - Inference-latency workload: P95 < 50ms (regional), error_rate < 0.1%
+  - Batch-training: availability > 99% over 30d window
+  - Edge-inference: avg_network_rtt < 30ms, P99 latency < 200ms
+- Alerts and thresholds (examples):
+  - ALERT: High preemption rate: preemption_events_total > 5/min over 5m window -> paging to platform-sre.
+  - ALERT: Egress saturation: egress_utilization_mbps > 85% for 2m -> oncall + network team.
+  - ALERT: Alloc failure due to constraints: if alloc_failures_by_reason{reason="capacity"} > 10/min -> capacity planning channel.
+
+9) Ownership and contribution process
+- Module ownership: infra/terraform-team owns modules/accelerator-pool repo.
+- Allocator ownership: infra/allocator-team owns the control-plane service and the contract tests.
+- Process to propose changes: create PR in modules repo + auxiliary PR in allocator's contract-tests referencing the module PR. Use cross-repo CI to validate.
+
+10) Appendix: examples and snippets
+- Kubernetes node affinity snippet for tiered scheduling:
+```
+nodeSelector:
+  accelerator_tier: "gpu-highmem"
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 50
+      podAffinityTerm:
+        labelSelector:
+          matchExpressions:
+          - key: workload-class
+            operator: In
+            values:
+            - "latency-sensitive"
+        topologyKey: "kubernetes.io/hostname"
+```
+- Sample CI job (GitHub Actions-like pseudo YAML)
+```
+name: PR-Terraform-Accelerator
+on: [pull_request]
+jobs:
+  static:
+    steps:
+      - run: tflint
+      - run: tfsec
+  contract-test:
+    needs: static
+    steps:
+      - run: ./scripts/run-allocator-contract-tests --pool=pr-temp --tier=gpu-standard
+  canary-plan:
+    needs: contract-test
+    steps:
+      - run: ./scripts/canary-plan-apply --az=us-west-2a
+```
+- Example allocator fallback mapping table:
+| Requested tier | Fallback order |
+|----------------|----------------|
+| gpu-highmem    | gpu-standard -> infra-quantized -> remote-gpu-highmem |
+| infra-tpu      | infra-tpu-compat -> remote-infra-tpu -> enqueue-warm-pool |
+| edge-npu       | edge-npu-similar -> region-inference-pool (egress capped) |
+
+Related reading and links:
+- Link: eng-infra/gpu-fleet-and-capacity/gpu-placement-slo-driven-provisioning-playbook
+- Link: eng-infra/terraform-and-iac/gpu-provisioning-immutable-state-and-disaster-recovery
+
+Contact and escalation
+- Primary owner: infra/terraform-team (Slack: #infra-terraform)
+- SRE oncall: platform-sre oncall rotation (PagerDuty)
+- For module changes that touch egress or preemption: tag @network-team and @platform-sre in PR description.
+
+Revision history
+- 2025-10-02: created by Aisha Patel (initial draft)
+- 2025-12-10: added preemption TTL recommendations after internal experiment (reviewers: Miguel Santos)
+- 2026-02-15: finalized Terraform module outputs and CI gating policy; switched default egress caps for region inference pools

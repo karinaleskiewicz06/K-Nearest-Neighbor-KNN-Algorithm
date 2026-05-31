@@ -1,0 +1,168 @@
+GPU QoS Reservoir and Tenant Priority Allocator
+
+Summary:
+
+This document defines the GPU QoS Reservoir and Tenant Priority Allocator (QRTPA): a cross-region/multi-cloud allocation control plane that enforces per-tenant quality-of-service (QoS) targets while enabling economic burst capacity. QRTPA is intended for Redwood’s Dedicated and Private deployments and is optional for Hosted where isolation is less strict.
+
+Goals and scope:
+
+- Provide firm guarantees for on-contract tenants (reserved capacity) while allowing elastic burst usage for non-reserved workloads.
+- Minimize application-visible latency regressions during capacity pressure via graceful preemption policies and fallbacks.
+- Support multi-cloud placement decisions with affinity hints and failover.
+- Expose a Terraform module and a small control-plane microservice to coordinate allocation decisions and audit logs.
+
+Audience:
+- Infra engineers operating GPU fleets
+- Platform SREs and capacity planners
+- Product and sales teams that manage tenant SLAs
+
+High-level design:
+
+1) Components:
+- Reservoir Manager (service): tracks global burst tokens (reservoir) per cluster pool and per region.
+- Tenant Profile Store (KVS): stores tenant SLAs, reserved units, priority, and preemption policy.
+- Allocator API (gRPC + REST): decision interface used by the scheduling layer and autoscaler.
+- Enforcement hooks (kube-scheduler plugin / VM agent): implements soft/hard preemption and transfer to fallback model variants.
+- Auditor (job): writes allocation decisions and preemption events to audit-log S3/GCS and exposes query endpoints.
+
+2) Key concepts and invariants:
+- Reserved Capacity: guaranteed GPU units assigned to a tenant (monthly/annual purchase).
+- Burst Reservoir: short-term pool of tokens representing GPU-seconds available for transient spike usage. Tokens replenish at a configured rate per cluster.
+- Priority Levels: integer scale 0..10. Reserved customers default to >=6. Trial/free-tier is 0–2.
+- Soft Preemption: lower-priority jobs are signaled to checkpoint / reduce concurrency; they have a configurable grace window (default 90s).
+- Hard Preemption: immediate eviction; only applied for priority difference >=5 or when hard-safeguard thresholds reached.
+
+Configuration table (example):
+
+| setting | description | example |
+|---|---|---|
+| reservoir_replenish_rate | tokens/sec added to the pool per cluster | 20 |
+| reservoir_max_tokens | maximum tokens storable | 86400 |
+| hard_preempt_threshold_pct | cluster GPU utilization percent to trigger hard preemption | 95 |
+| soft_preempt_grace_s | grace period before eviction during soft preemption | 90 |
+| tenant_priority | tenant priority integer | 8 |
+| reserved_gpu_units | units guaranteed for tenant | 64 |
+
+Terraform / IaC interface (module summary):
+
+Usage notes:
+- The module deploys the Reservoir Manager CRD, configmap templates, and an IAM/service-account per-region.
+- It is designed to integrate with existing gpu-node pools; it does not create compute nodes itself.
+
+Example variables (YAML snippet):
+
+module "gpu_qos_reservoir" {
+  source = "git::ssh://git@internal.redwood.ai/infra/terraform-modules.git//gpu/qos-reservoir"
+  cluster_name = "gpu-prod-us-west-2"
+  reservoir_replenish_rate = 20
+  reservoir_max_tokens = 86400
+  audit_log_bucket = "s3://redwood-gpu-audit-prod"
+  default_soft_grace_s = 90
+}
+
+Operational SLOs and thresholds:
+
+- Allocation decision latency: 99th percentile < 45ms for Allocator API.
+- Preemption success rate (after soft-grace): >= 99% within 2 minutes of decision.
+- Audit-log lag: < 30s for write-through; batch export < 10m.
+- Preemption churn: < 2% of running jobs per cluster per hour.
+
+Metrics to instrument (suggested Prometheus names):
+- qr_reservoir_tokens_total{cluster,region} (gauge)
+- qr_alloc_decision_latency_seconds (histogram)
+- qr_preempt_events_total{outcome,reason,tenant} (counter)
+- qr_soft_preempt_signals_total (counter)
+- qr_hard_evictions_total (counter)
+- qr_audit_export_lag_seconds (gauge)
+
+Dashboard suggestions:
+- Cluster overview: reservoir tokens, GPU utilization, preemption rate, pending allocation queue length.
+- Tenant QoS view: reserved vs used GPUs, burst consumption over time, preemption incidents.
+
+Multi-cloud placement and affinity rules:
+
+- Each tenant profile includes affinity tags: [region_preference], [latency_budget_ms], [data_residency_constraint].
+- The Allocator computes a placement score factoring: available tokens, reserved capacity, cross-region egress cost, and data residency.
+- Placement fallback order: local reserved pool -> local reservoir -> peer-region reserved -> peer-region reservoir -> preemptible spot pools.
+
+Failure modes and mitigation (runbook excerpts):
+
+1) Symptom: Reservoir tokens rapidly deplete and preemption spikes increase.
+Immediate action:
+1. Verify metrics: qr_reservoir_tokens_total and qr_preempt_events_total.
+2. Temporarily raise soft_preempt_grace_s to 300s to reduce churn: kubectl patch configmap qr-config -n infra --type merge -p '{"data":{"soft_preempt_grace_s":"300"}}'
+3. Trigger capacity burst: request emergency spot burst via cloud provisioning playbook (link referenced below).
+4. Notify on-call: pg-infra-sre@groups.redwood.ai.
+Postmortem checks:
+- Which tenants consumed >50% of reservoir in 10m windows?
+- Were any misconfigured tenant priorities?
+
+2) Symptom: Allocator API 99th latency spikes > 200ms.
+Immediate action:
+1. Check service pods and threadpool contention. Scale controller replicas: kubectl scale deployment/qr-allocator -n infra --replicas=3
+2. Fallback: enable local cache mode (config flag: allocator_cache_enabled=true) to serve decisions for 30s TTL.
+
+3) Symptom: Auditor export failing, audit lag grows > 10m.
+Immediate action:
+1. Identify S3/GCS permission errors in pod logs; rotate IAM keys if needed.
+2. Switch to local durable queue: kubectl patch deployment/qr-auditor -n infra --type merge -p '{"spec":{"template":{"spec":{"containers":[{"name":"qr-auditor","env":[{"name":"AUDIT_MODE","value":"local-queue"}]}]}}}}'
+
+Rollout checklist (for module upgrade or policy change):
+
+1. Developer/staging validation:
+- Deploy module into a staging cluster with synthetic tenants.
+- Run synthetic spike tests (see scripts/synthetic-burst-test.sh) verifying preemption behavior and audit logs.
+2. Canary in a small production pool:
+- Target one non-critical cluster.
+- Monitor allocation latency and reservoir stability for 72 hours.
+3. Gradual expansion:
+- Increase rollout by doubling cluster count every 24h while watching preemption churn < 1.5%.
+4. Full rollout and retrospective.
+
+Terraform migration notes:
+- The module uses a stateful CRD; upgrades must preserve existing CR objects. Always run terraform plan and inspect changes to aws_s3_bucket or IAM bindings.
+- Back up the Tenant Profile Store before applying changes: kubectl get tenants -A -o yaml > backup/tenants-$(date +%F).yaml
+
+Ownership and escalation:
+
+- Primary owner: infra-gpu@redwood.ai (team: infra engineering GPU-fleet)
+- Secondary: platform-sre@redwood.ai
+- Pager: infra-oncall rotation (see oncall-and-incident-response docs).
+
+CLI snippets and operational utilities:
+
+- Allocate a transient burst token for tenant T123 from CLI (admin only):
+redwoodctl qr grant-burst --tenant T123 --tokens 1200 --reason "test-burst"
+
+- Revoke a granted burst token:
+redwoodctl qr revoke-burst --grant-id abc123 --force
+
+- Query allocation decisions for tenant over last 1h:
+redwoodctl qr query-decisions --tenant T123 --window 1h --output json | jq '.'
+
+Security and audit considerations:
+- All allocation decisions are signed and recorded. The Auditor produces append-only logs with checksums.
+- Tenant profile changes require approvals from Billing or Security for reserved capacity changes > 10% of cluster.
+
+Open design questions (RFCs):
+- Should we allow cross-tenant credit-sharing for internal teams under a marketplace model?
+- Tradeoffs between longer soft_preempt_grace_s (reduces churn) vs. increased latency for high-priority tenants when resources are scarce.
+
+References and related pages:
+- See gpu-fleet-scaling-metrics-and-oncall-runbook for cluster scaling integration.
+- See gpu-provisioning-immutable-state-and-disaster-recovery for emergency node provisioning steps.
+
+Appendix A: synthetic-burst-test.sh (example)
+
+#!/usr/bin/env bash
+# Simulates burst behavior for QRTPA
+for i in {1..60}; do
+  redwoodctl qr grant-burst --tenant test-tenant --tokens 100 --reason "load-test" || true
+  sleep 10
+done
+
+Appendix B: change log
+- 2024-09-20: Draft created by Aisha Patel.
+- 2024-11-03: Added Terraform module usage notes (Liam Chen).
+- 2025-02-14: Expanded runbook with auditor fallback and multi-cloud placement heuristics (Mariana Gomez).
+

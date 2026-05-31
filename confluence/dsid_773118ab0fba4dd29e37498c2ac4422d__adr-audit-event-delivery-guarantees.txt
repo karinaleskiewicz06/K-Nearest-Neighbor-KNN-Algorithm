@@ -1,0 +1,188 @@
+ADR: Audit Event Delivery Guarantees (Ingestion, Buffering, and Outage Behavior)
+
+## Status
+Published (effective for schema v1 rollout).
+
+## Summary
+This ADR defines Redwood Inference’s delivery semantics for audit events and how producers must behave during audit pipeline degradation or outages.
+
+We choose **at-least-once delivery from the audit ingestion service onward** (durable queue → storage/export), and **best-effort delivery from producers to ingestion** with **bounded buffering and retry**. This prioritizes platform availability (admin actions must not routinely fail) while still providing strong audit reliability, clear signals when delivery is degraded, and a consistent customer guidance story (including how to de-duplicate in SIEMs).
+
+## Context
+Redwood is standardizing audit logs across Hosted, Dedicated, and Private. Customers (especially regulated/enterprise) require:
+- Consistent auditability of sensitive actions.
+- Reasonable delivery latency to their SIEM.
+- Predictable behavior under failure (no silent drop without detection).
+
+Constraints and realities:
+- Audit pipelines can degrade (regional outages, backpressure, exporter downtime).
+- Some producers are latency-sensitive synchronous request paths (API Gateway, Control Plane) and must not introduce high tail latency.
+- Some producers are “operator tooling” paths (Private installer/upgrade) where longer retries and local spooling are feasible.
+- At-least-once semantics inevitably introduce duplicates; we must provide an **idempotency/deduplication story**.
+
+## Definitions (for this ADR)
+- **Producer**: Any service/tool emitting audit events (API Gateway, Control Plane services, Console backend/admin actions, policy engine, Private installer).
+- **Ingestion service** (“audit-ingest”): Receives audit events from producers, validates schema, adds server-side metadata, and writes to a durable queue.
+- **Durable queue**: Managed Kafka/PubSub equivalent in Hosted/Dedicated; pluggable in Private (customer-managed or bundled).
+- **Audit storage**: Redwood-managed storage for retrieval/export (Hosted/Dedicated) or customer-managed in Private depending on configuration.
+- **Exporter**: Pushes events to external SIEM targets (Splunk HEC, Azure Sentinel, Datadog, etc.).
+
+## Decision drivers
+1. **Do not break admin workflows** by making audit sink availability a hard dependency in the general case.
+2. **Detectability**: if audit delivery is degraded, Redwood and customers must be able to detect it quickly.
+3. **Consistency across deployment modes** (Hosted/Dedicated/Private parity).
+4. **SIEM compatibility**: flattened JSON, stable identifiers, duplicates possible.
+5. **Operational simplicity**: clear retry and buffering rules; avoid per-service bespoke logic.
+
+## Considered options
+### Option A — End-to-end exactly-once
+Pros: clean semantics, minimal duplication.
+Cons: high complexity (distributed transactions/idempotency everywhere), performance cost, brittle failure modes; not realistic across all producers and Private environments.
+
+### Option B — End-to-end at-least-once with blocking (fail closed when ingestion unavailable)
+Pros: strong audit guarantee.
+Cons: makes audit pipeline a hard dependency; creates major availability risk and potential customer-facing outages for unrelated admin actions.
+
+### Option C — Producer best-effort to ingestion + at-least-once after ingestion (chosen)
+Pros: preserves platform availability; still yields strong reliability with buffering/retry and durable queue; easier to operate; duplicates handled via event_id.
+Cons: in a total ingestion outage beyond buffering limits, some events may be dropped (but must be signaled and measurable).
+
+## Decision
+### 1) Delivery semantics
+**1.1 Producer → ingestion: best-effort with bounded buffering + retry**
+- Producers MUST attempt to deliver audit events asynchronously and MUST NOT routinely block user/admin requests on audit delivery.
+- Producers MUST implement bounded buffering and retry (see “Producer requirements”).
+- If buffering is exhausted or the outage exceeds retry policy, producers MAY drop events, but MUST emit internal telemetry indicating drops and MUST surface degradation signals as defined below.
+
+**1.2 Ingestion → durable queue → storage/export: at-least-once**
+- Once the ingestion service acknowledges an event (HTTP 2xx / gRPC OK), Redwood guarantees **at-least-once** delivery into the durable queue.
+- Downstream consumers (storage and exporters) MUST be resilient and operate with at-least-once semantics. Duplicates are expected.
+
+**1.3 Customer-facing statement**
+- Redwood provides **at-least-once delivery** after ingestion acknowledgment and **best-effort delivery** from producers, with explicit detection/alerting when degraded.
+- Redwood does **not** claim exactly-once.
+
+### 2) Required identifiers and deduplication
+- Every audit event MUST include a globally unique `event_id` (ULID preferred; UUIDv7 acceptable) generated at the producer.
+- Ingestion MUST treat `event_id` as the idempotency key for a bounded window.
+  - Hosted/Dedicated: ingestion performs best-effort dedupe for repeated `event_id` within **24 hours**.
+  - Private: dedupe is best-effort and configuration-dependent; guidance must recommend SIEM-side dedupe on `event_id`.
+- Exporters MUST forward `event_id` unchanged.
+
+### 3) Producer requirements (library-level defaults)
+All producers MUST use the shared audit library defaults unless an explicit exception is approved.
+
+**3.1 Retry policy**
+- Exponential backoff with full jitter.
+- Initial backoff: 250ms
+- Max backoff: 10s
+- Max attempts: 12 (approx. 2–5 minutes depending on jitter)
+- Retry only on retryable classes: timeouts, connection errors, 429, 502/503/504.
+- Do NOT retry on schema validation errors (4xx) except 429.
+
+**3.2 Buffering policy**
+- Default: in-memory queue per process.
+- Default capacity: 10,000 events or 10 MB, whichever comes first.
+- Drop behavior when full: **drop oldest** (to preserve recency for investigations) and increment `audit_events_dropped_total`.
+- Producers MUST emit metrics for:
+  - `audit_events_enqueued_total`
+  - `audit_events_sent_total`
+  - `audit_events_failed_total`
+  - `audit_events_dropped_total`
+  - `audit_queue_depth`
+  - `audit_delivery_degraded` (0/1)
+
+**3.3 Synchronous-path latency budget**
+- Producer code MUST not add more than **5ms p99** on synchronous request paths.
+- Audit emission should be non-blocking; when unavoidable (rare), it must be behind a short deadline (<= 50ms) and must fail open.
+
+**3.4 Private installer special case (disk spool allowed)
+**
+- The Private installer/upgrade tooling MAY use a local disk spool (encrypted at rest when feasible) to tolerate longer outages during maintenance windows.
+- Disk spool is bounded (default 250 MB) and rotated; if full, follows drop-oldest and emits explicit operator warnings.
+
+### 4) Outage and degradation behavior
+We standardize behavior for “audit pipeline degraded” across surfaces.
+
+**4.1 Hosted/Dedicated services**
+When ingestion is unreachable or returning persistent retryable errors:
+- Continue processing admin actions (fail open) by default.
+- Set `audit_delivery_degraded=1` metric.
+- Add response header on admin endpoints where appropriate:
+  - `X-Redwood-Audit-Delivery: degraded`
+- Log an internal structured error (non-audit) with rate limiting.
+
+**4.2 Console UI**
+- If the Console backend detects `audit_delivery_degraded=1` for the tenant/region, show a non-blocking banner:
+  - “Audit log delivery is currently degraded. Actions are still applied. Some audit events may be delayed.”
+- Console actions that mutate sensitive config MUST still emit audit attempts; UI must not attempt to “retry on behalf of audit.”
+
+**4.3 Private deployments**
+- If the configured sink/export target is unavailable, the platform MUST:
+  - Continue applying changes by default.
+  - Surface degradation in operator-visible logs.
+  - Provide `redwoodctl private status` indicators for audit pipeline health (when available).
+
+**4.4 Fail-closed is not the default**
+- We do not fail closed on audit delivery for general admin actions.
+- Any request to fail closed for a specific action category must go through Security + SRE review and be documented as an exception (with customer impact analysis).
+
+### 5) Monitoring, SLOs, and alerting (minimum viable)
+- We measure delivery at the ingestion service boundary:
+  - **Ingestion acceptance latency** (producer → ingestion ack)
+  - **Queue write success rate**
+  - **Exporter lag** and **drop/duplicate indicators**
+
+Baseline SLO target (enterprise tiers; subject to tuning):
+- 99.9% of accepted events available to exporters within **5 minutes**.
+- Drop rate (post-acceptance) < **0.01%** rolling 30 days.
+
+Alerting:
+- Page SRE on sustained:
+  - ingestion backlog > 10 minutes, or
+  - exporter drop rate above threshold, or
+  - `audit_delivery_degraded` > 0 for > 10 minutes in a region.
+
+(See runbook: Audit Log Pipeline Incident Runbook.)
+
+## Consequences
+### Positive
+- Keeps admin/control-plane workflows available even during audit sink incidents.
+- Provides clear, consistent semantics to customers and internal auditors.
+- Standardizes retry/buffering so teams don’t reinvent (and misconfigure) delivery logic.
+
+### Negative / trade-offs
+- Duplicate events are expected; customers must dedupe by `event_id`.
+- In extreme outages beyond buffering limits, some producer-originated events may be dropped (but must be measurable and trigger alerts).
+- “Best-effort producer to ingestion” means that “100% coverage of sensitive actions” refers to **instrumentation coverage**, not a cryptographic guarantee of delivery under all failures.
+
+## Implementation notes
+- Shared audit library MUST:
+  - Generate `event_id` if missing.
+  - Enforce timeouts and non-blocking behavior.
+  - Provide a standard async delivery worker with buffering and retry.
+  - Emit the required metrics.
+- Ingestion MUST:
+  - Validate schema version and required fields.
+  - Stamp server receive time.
+  - Best-effort dedupe on `event_id`.
+- Exporters MUST:
+  - Preserve `event_id`, `schema_version`, and correlation fields.
+  - Batch with retry/backoff; expose duplicate rate metrics where possible.
+
+## Rollout plan
+1. Land shared audit library defaults and metrics.
+2. Update ingestion to enforce ack semantics and queue durability.
+3. Roll out producers service-by-service; ensure each service exports `audit_delivery_degraded`.
+4. Enable dashboards/alerts and run game-day for ingestion outage.
+5. Publish customer-facing guidance on dedupe and expected semantics (Support + Solutions).
+
+## Open questions
+- Should we introduce a small “fail-closed” allowlist for ultra-high-risk actions (e.g., disabling audit export, breaking-glass RBAC changes) in specific regulated Private environments?
+- Should Private bundle a default local durable queue (so producers aren’t directly coupled to exporter availability)?
+
+## References
+- Audit Event Schema + Taxonomy ADR (structure and required identifiers)
+- Audit Log Events Logging Standard (naming, required context, and cardinality controls)
+- Audit Log Pipeline Incident Runbook (mitigation and comms)
+- SLO/alert tickets: ENG-4829, ENG-4835

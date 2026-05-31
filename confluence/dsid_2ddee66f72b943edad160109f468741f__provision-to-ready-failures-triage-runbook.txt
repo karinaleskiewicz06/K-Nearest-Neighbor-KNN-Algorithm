@@ -1,0 +1,401 @@
+Runbook: Provision-to-Ready failures triage (GPU fleet)
+
+## Purpose
+This runbook describes how to triage and remediate failures in the **Provision-to-Ready** automation for GPU nodes (Dedicated and shared capacity). It focuses on:
+- Quickly identifying *where* a node is stuck (Provisioning vs Validating)
+- Finding authoritative failure reasons (Fleet Readiness Service + validation artifacts)
+- Applying safe remediation steps (retry validation, drain, quarantine, reimage)
+- Escalation paths and when to stop the line
+
+## Audience
+- Infra/Fleet on-call
+- SRE on-call (paging + alert tuning)
+- Platform Control Plane on-call (readiness state/API issues)
+
+## Definitions (canonical)
+Readiness state machine (see ADR-017):
+- **Allocated**: capacity allocated, node not yet being processed by orchestrator
+- **Provisioning**: instance boot + bootstrap + cluster join
+- **Validating**: pre/post-flight checks executing and reporting results
+- **Ready**: passed required gates; eligible to join serving pools
+- **Quarantined**: removed from automation; requires operator action (or auto-remediation)
+
+Key components:
+- **Provisioning Orchestrator**: drives step execution + retries/backoff
+- **Node Validation Agent (DaemonSet)**: runs checks on the node and reports results
+- **Fleet Readiness Service (control plane)**: source of truth for current readiness state + artifacts
+- **Perf Canary**: lightweight inference/perf smoke test run post-provision
+
+---
+
+## Safety principles (do these first)
+1) **Do not manually add nodes to serving pools**. Readiness gates exist for a reason.
+2) **Prefer reversible actions** in this order:
+   - Retry validation / retry step (low blast radius)
+   - Drain + re-run join/validation (medium)
+   - Quarantine (safe containment)
+   - Reimage (destructive; may hide root cause)
+3) **Avoid SSH**. Use approved breakglass (SSM) only if:
+   - validation artifacts are missing/incomplete, *and*
+   - you need a single additional signal to decide quarantine vs reimage.
+4) **If multiple nodes fail the same step in a short window**, assume a systemic issue (image channel, orchestrator change, cloud/network event). Stop rollout and escalate.
+
+---
+
+## Quick triage checklist (10 minutes)
+### Step 0 — Identify blast radius
+- Is this one node, one pool, one region/GPU type, or global?
+- Did this start after a rollout (image promotion, feature flag enablement, Terraform apply)?
+
+### Step 1 — Get the authoritative status + failure reason
+Use the Fleet Readiness Service first.
+- Internal UI: Fleet Ops Console → Pool → Nodes → filter by **state != Ready**
+- API/CLI (examples):
+  - `readinessctl get node <node_id> --include-artifacts`
+  - `readinessctl get pool <pool_id> --summary`
+
+Look for:
+- `state`: Allocated / Provisioning / Validating / Quarantined
+- `failed_step`: e.g., `kubelet_join`, `driver_parity`, `nccl_smoke`, `perf_canary`
+- `failure_reason`: short string safe for dashboards
+- `artifacts`: links to logs bundles (Loki), agent output, canary logs, orchestrator trace
+
+### Step 2 — Check dashboards (fastest signal)
+Open Grafana dashboard: **Provision-to-Ready → Step breakdown**.
+Focus panels:
+- Time-to-ready P50/P95 by region + GPU type
+- Failure rate by step name
+- Quarantine counts (by reason)
+- Validation flake rate (NCCL, perf canary)
+
+### Step 3 — Decide path
+- **Single node + hardware-ish symptom** → quarantine or reimage
+- **Many nodes same failure** → stop the line + escalate; do not reimage everything blindly
+
+---
+
+## Standard remediation actions (approved)
+### A) Retry validation (preferred first response)
+Use when:
+- Failure looks transient (network jitter, artifact upload timeout, known flake step)
+- Node is otherwise healthy and joined to cluster
+
+Action:
+- `readinessctl retry-validation <node_id> --reason "transient failure triage"`
+
+Notes:
+- Respect orchestrator backoff; avoid repeated manual retries (can amplify load).
+- If retry succeeds, annotate incident/ticket with root cause hypothesis and whether thresholds/timeouts should be tuned.
+
+### B) Drain node (containment before destructive actions)
+Use when:
+- Node has joined cluster but is misbehaving (kubelet unstable, device plugin crashloop)
+- You need to safely remove any workloads before deeper actions
+
+Action:
+- `kubectl cordon <node_name>`
+- `kubectl drain <node_name> --ignore-daemonsets --delete-emptydir-data --force`
+
+Notes:
+- Draining should not affect Dedicated production pools if readiness gating prevented joining; still do it if any workloads landed unexpectedly.
+
+### C) Quarantine node (safest containment)
+Use when:
+- Repeated validation failures (>= max attempts) per policy
+- Signs of hardware instability (Xid/ECC) or inconsistent GPU enumeration
+- You suspect a node-specific issue and want to prevent automation thrash
+
+Action:
+- `readinessctl quarantine <node_id> --reason "<short reason>" --details "<ticket/incident link>"`
+
+Expected behavior:
+- Node marked **Quarantined** in readiness service
+- Node excluded from pool admission
+- Operator can later `unquarantine` after reimage or cloud replacement
+
+### D) Reimage (destructive; use with justification)
+Use when:
+- Image mismatch/corruption is the most likely cause
+- Provisioning bootstrap failed early and artifacts indicate incomplete install
+
+Action:
+- `fleetctl reimage <node_id> --image-channel <candidate|stable> --reason "<short reason>"`
+
+Guardrails:
+- If >3 nodes in the same pool require reimage for the same reason in <1 hour, escalate (likely systemic).
+
+---
+
+## Where to look (by data source)
+### Fleet Readiness Service
+Use for:
+- current state + authoritative failure reason
+- validation result summary and artifact pointers
+
+Common gotcha:
+- If state is stale or missing step data, check agent heartbeat and control-plane errors (see “Control plane/API issues”).
+
+### Logs
+- Provisioning Orchestrator logs (service): `provisioning-orchestrator`
+- Validation Agent logs (node DaemonSet): `node-validation-agent`
+- Perf canary logs: `perf-canary`
+
+Example Loki queries (adapt to your environment):
+- `{service="provisioning-orchestrator"} |= "node_id=<node_id>"`
+- `{app="node-validation-agent"} |= "node=<node_name>"`
+- `{app="perf-canary"} |= "pool_id=<pool_id>"`
+
+### Tracing
+- Look for the end-to-end trace: `provision_to_ready` root span
+- Key span tags: `region`, `gpu_type`, `pool_id`, `step`, `result`
+
+### Kubernetes signals
+- `kubectl describe node <node_name>`
+- `kubectl get pods -n kube-system -o wide | grep -E "nvidia|device-plugin|containerd"`
+
+---
+
+## Common failure modes (signatures → likely causes → remediation)
+
+### 1) Node stuck in Allocated (no progress)
+**Symptoms**
+- State remains **Allocated** beyond normal window
+- No orchestrator spans/logs for node
+
+**Likely causes**
+- Orchestrator queue/backpressure
+- Missing Terraform outputs/tags required to pick up the node
+- Feature flag disabled for region/pool
+
+**What to check**
+- Orchestrator dashboard: queue depth, worker errors
+- Node tags: `pool_id`, `image_channel`, `region`, `gpu_type` present and correct
+- Feature flag: staged rollout constraints (region + GPU type)
+
+**Remediation**
+- If tags missing: fix Terraform/IaC and re-apply; do not hand-edit tags.
+- If orchestrator unhealthy: escalate to Infra/Fleet + SRE; pause rollout.
+
+---
+
+### 2) Provisioning failure: kubelet join / node never becomes Ready in Kubernetes
+**Common error signatures**
+- `kubelet` errors: `failed to run Kubelet: ...` / `x509: certificate signed by unknown authority`
+- Node appears but remains `NotReady`
+
+**Likely causes**
+- Bootstrap credential/CA mismatch
+- Kubelet flags drift from baseline
+- Time sync issues (clock skew)
+
+**What to check**
+- Readiness failed_step: `kubelet_join` or `bootstrap`
+- Node events: `kubectl describe node <node_name>` (look for cert or CNI failures)
+- Validation agent preflight: `time_sync`, `kubelet_config_baseline`
+
+**Remediation**
+- If certificate/CA mismatch across multiple nodes: stop rollout; escalate to Platform Control Plane.
+- Single node: quarantine and reimage.
+
+---
+
+### 3) Driver/CUDA/NCCL parity failure (image/toolkit mismatch)
+**Common error signatures**
+- Validation: `driver_parity` failed
+- `nvidia-smi` fails or shows unexpected driver version
+- Agent output: expected vs actual driver/CUDA minor version mismatch
+
+**Likely causes**
+- Wrong image channel pinned for pool
+- Partial driver install on first boot
+- Golden image promotion regression
+
+**What to check**
+- Readiness artifacts: `driver_parity` output; image version + channel
+- Recent image promotions (candidate → stable)
+- Other nodes in same batch: are they failing with the same expected/actual mismatch?
+
+**Remediation**
+- If many nodes fail: rollback image channel to last known good stable; escalate to Release Engineering + Infra.
+- If single node: reimage (same channel) once; if repeat, quarantine.
+
+---
+
+### 4) GPU health check failure (ECC / Xid / missing GPUs)
+**Common error signatures**
+- Validation: `gpu_health` failed
+- Agent reports: ECC error threshold exceeded, Xid codes, GPU count mismatch
+- `nvidia-smi` shows GPUs missing or in error state
+
+**Likely causes**
+- Hardware instability
+- Firmware/driver bug (if correlated across a batch)
+
+**What to check**
+- Artifact includes Xid/ECC summary and timestamps
+- Correlation: same GPU SKU + same rack/AZ + same launch time
+
+**Remediation**
+- Single node: quarantine (preferred) and request cloud replacement per fleet procedure.
+- Batch-wide: stop rollout; escalate; consider disabling the new image channel if it coincides.
+
+---
+
+### 5) NCCL smoke test failure (fabric issues / flake)
+**Common error signatures**
+- Validation: `nccl_smoke` failed
+- Logs: `NCCL WARN`, `unhandled system error`, `connection timed out`
+- High flake rate without other symptoms
+
+**Likely causes**
+- Transient network congestion/jitter
+- Incorrect NIC/Mellanox settings for the instance type
+- Timeout too aggressive for new region/AZ
+
+**What to check**
+- Dashboard: NCCL failure heatmap by region/AZ
+- Recent changes: NCCL timeout/backoff tuning PRs
+
+**Remediation**
+- First: retry validation once (do not spam retries)
+- If repeat on same node: quarantine
+- If repeated across many nodes: pause rollout; escalate to Infra networking + SRE; consider adjusting thresholds/timeouts (ticket follow-up)
+
+---
+
+### 6) Storage / disk layout validation failure
+**Common error signatures**
+- Validation: `disk_layout` / `storage_iops` failed
+- Agent: insufficient free space, wrong mount options, poor IOPS
+
+**Likely causes**
+- Instance launched with wrong volume type/size
+- Baseline drift in image or cloud-init
+
+**What to check**
+- Terraform config for the pool (volume type/size)
+- Node baseline standard (expected mount points and options)
+
+**Remediation**
+- If Terraform misconfig: fix IaC and re-provision; do not attempt manual disk surgery.
+- Single node anomaly: reimage; if still failing, quarantine.
+
+---
+
+### 7) Perf canary failure (runtime smoke test)
+**Common error signatures**
+- Validation: `perf_canary` failed
+- Canary logs: model load failure, OOM, latency > threshold
+
+**Likely causes**
+- Runtime/library regression in image
+- GPU clocks/power settings off baseline
+- Misconfigured container runtime / cgroups
+
+**What to check**
+- Canary artifact: failure type (load vs runtime vs latency)
+- Compare against prior stable image version
+
+**Remediation**
+- If widespread after image promotion: rollback image channel and stop rollout.
+- If isolated: retry once; then quarantine and reimage.
+
+---
+
+### 8) Nodes stuck in Validating (no completion)
+**Common error signatures**
+- State: **Validating** for > expected duration
+- No new validation events; agent heartbeat may be missing
+
+**Likely causes**
+- Validation agent DaemonSet not running (RBAC, scheduling, image pull)
+- Artifact upload blocked (egress, permissions)
+- Orchestrator waiting on a result that will never arrive
+
+**What to check**
+- `kubectl -n fleet-validation get pods -o wide | grep <node_name>` (namespace may differ)
+- Agent logs: look for `permission denied`, `timeout`, `failed to upload artifacts`
+- Readiness service: last heartbeat timestamp
+
+**Remediation**
+- If agent missing across many nodes: rollback the agent DaemonSet release; escalate to Release Eng.
+- If single node: drain + retry validation; if still stuck, quarantine.
+
+---
+
+## Control plane / API issues (Fleet Readiness Service)
+Escalate to Platform Control Plane when:
+- State transitions appear incorrect (e.g., Ready without validations)
+- Nodes cannot be mutated due to authz errors
+- Artifacts are missing for all nodes (systemic)
+
+What to capture for escalation:
+- node_id(s), pool_id, region, gpu_type
+- expected state vs actual
+- timestamps of last successful state change
+- relevant errors from readiness service logs (request IDs)
+
+---
+
+## When to page vs ticket
+Follow the SLO/error budget policy.
+
+Page (urgent) if any of the below:
+- Provision-to-ready success rate drops sharply (multi-node impact) in a production region
+- P95 time-to-ready breaches the paging threshold for the current rollout phase
+- Quarantine count spikes and causes capacity shortfall for a Dedicated customer pool
+
+File a ticket (non-urgent) if:
+- Single-node quarantine without capacity impact
+- One-off flake recovered by a single retry
+- Dashboard noise/cardinality issues without user impact
+
+---
+
+## Stop-the-line criteria (rollout)
+Immediately pause staged rollout / disable feature flag for the target region/GPU type if:
+- >20% of nodes in a batch fail the same validation step
+- Any failure indicates a possible unsafe readiness gate bypass
+- Evidence of image-level regression after a candidate→stable promotion
+
+Communicate in:
+- #eng-infra (primary)
+- #eng-sre (paging context)
+- #eng-platform (if control plane implicated)
+- Release train channel per current rollout plan
+
+---
+
+## Post-incident hygiene (required)
+After mitigation:
+1) Update the relevant Linear ticket with:
+   - failure step + root cause hypothesis
+   - remediation chosen (retry/drain/quarantine/reimage/rollback)
+   - links to dashboard panel + logs/artifacts
+2) If thresholds/timeouts were adjusted ad-hoc, file a follow-up to make it explicit and reviewed.
+3) If quarantine policy was triggered unexpectedly, add a note to the quarantine policy doc and propose tuning with data.
+
+---
+
+## Appendix A — Normal timing expectations (rule of thumb)
+These vary by region/GPU type, but as a quick heuristic during rollout:
+- Provisioning (boot + join): typically minutes
+- Validating (gates + canary): typically minutes
+- Any single node >30 minutes without progress warrants investigation
+
+Refer to the Provision-to-Ready dashboards for current baselines and targets.
+
+---
+
+## Appendix B — Minimal data to include when asking for help
+Copy/paste template:
+- pool_id:
+- node_id / node_name:
+- region + gpu_type:
+- current state:
+- failed_step + failure_reason:
+- first_seen (timestamp):
+- blast radius (# nodes impacted):
+- dashboard link:
+- logs/artifacts link:
+- actions taken (retry/drain/quarantine/reimage):

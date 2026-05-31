@@ -1,0 +1,167 @@
+GPU eviction impact matrix and rollback checklist
+
+Summary
+
+This runbook defines a concise impact matrix for GPU eviction events, prescriptive mitigation actions, and a step-by-step rollback checklist for code/config changes that increase vulnerability to evictions. It is intended for oncall engineers, capacity owners, and CI/CD owners who need to quickly assess severity and execute safe rollbacks or mitigations.
+
+Scope
+
+- Applies to all Redwood-hosted GPU pools (ephemeral spot/spot-like, reserved burst, and dedicated perpetual).
+- Covers evictions due to preemption, host OOM, kernel panics, thermal events, and network-induced detachment.
+- Assumes presence of standard telemetry: node_exporter, gpu_exporter, eviction-event logs (evictor-operator), and capacity-sentry metrics.
+
+Ownership and SLAs
+
+- Primary oncall: infra-sre (pager: infra-sre@redwood.ai)
+- Secondary: gpu-fleet oncall
+- SLOs to consider during incidents: availability >= 99.9% for Dedicated pools; tail latency 95th < 250ms for interactive tenants.
+
+Eviction impact matrix (quick reference)
+
+Columns: Cause | Likely scope | Impact classification | Immediate indicators | Fast mitigation
+
+1) Preemption (cloud spot) | Affects ephemeral pools and any tenant using spot-backed nodes | High for batch, Medium for interactive | High rate of `node_preempt_events_total`, sudden spike in evictor-operator logs, spot-notification webhook | - Enable spot-fallback-autoscaler to move to warm-pool; - Increase allowed burst budget; - Activate fast requeue (batch)
+
+2) Host OOM / Driver crash | Single host or host-stripe | High for pinned sessions running large models | Kernel OOPS logs on host, dmesg GPU reset lines, kubelet NodeCondition: NotReady | - Isolate host, cordon and drain; - Evict long-running pinned sessions; - Reboot host and preserve recent logs to S3
+
+3) Thermal / Power trip | Region or rack-level | Medium to High depending on packing | Thermal telemetry, host power-cycle events, increased hardware errors | - Throttle cluster-level scheduling (reduce packing factor); - Move high-heat workloads to different pools; - Drain degraded rack nodes
+
+4) Network detachment (egress link/NAT failure) | Affects multi-tenant egress-dependent workloads | Medium | Node shows pod networking flaps, high connection timeouts, NAT gateway alerts | - Shift tenants to alternative egress path; - Use egress-lease manager to reassign egress; - Temporarily block heavy egress jobs
+
+5) Software regression (kernel/gpu driver rollout, quant kernel change) | Could be broad if rollout is global | Critical if rollout affects stable kernel paths | Telemetry: increase in per-node crash counts post-rollout, CI/CD release tag visible in node metadata | - Immediate rollback to previous driver/kernel image; - Pause rollout; - Re-run canary tests on warm pools
+
+Impact categories and escalation matrix
+
+- P0 (Critical): >5% of Dedicated capacity impacted OR critical customer SLA breach. Pager + Executive notification.
+- P1 (High): >10% of ephemeral pools degraded OR interactive tail latency SLO breached for >10 minutes. Pager.
+- P2 (Medium): Isolated hosts or small tenant impact. Slack alert to owner.
+
+Instrumentation to check first (commands / queries)
+
+- kubectl: kubectl get nodes -l node-role.kubernetes.io/gpu=true -o wide
+- Eviction event tail: kubectl -n infra logs deploy/evictor-operator --since=15m | grep Evict
+- Prometheus (examples):
+  - Preemption rate: sum(rate(node_preempt_events_total[5m])) by (region) > 0
+  - OOMs: increase in rate of node_oom_kill_count[10m]
+  - GPU reset detection: sum(rate(gpu_reset_count[5m])) by (node)
+- Recent node metadata (image tag): kubectl get nodes -o=jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.labels.image-tag}{"\n"}{end}'
+
+Mitigation playbook (step-by-step)
+
+1) Triage (first 5 minutes)
+  a) Confirm scope: run the instrumentation queries above. Record affected clusters/nodes and time window.
+  b) Identify probable cause from matrix and recent changes (deployments, kernel rollouts, Terraform changes).
+  c) Assign incident owner and note business impact (customers affected, SLOs).
+
+2) Short-term safety actions (5–30 minutes)  a) If preemption: enable spot-fallback-autoscaler and increase warm-pool size by +20% if budget allows.
+  b) If host-level crash: cordon affected nodes and drain with graceful-period=30s for interactive; force-evict long-running batch jobs.
+  c) If driver/kernel suspicious: pause image promotion pipeline (CI/CD) and mark the release as 'paused' in release service.
+
+3) Stabilize (30–120 minutes)
+  a) Re-hydrate KV caches for long-running chat sessions where possible.
+  b) Rebalance tenants across racks to avoid thermal re-trigger.
+  c) Start a rolling power-cycle sequence only after collecting logs and kernel dumps.
+
+4) Post-incident (after stabilization)
+  a) Capture core dumps and upload to artifact store with ticket ID.
+  b) Run root-cause-analysis (RCA) and create a postmortem in /confluence/eng-infra/postmortems.
+  c) Schedule follow-up actions (software revert, IaC patch, capacity change).
+
+Rollback checklist for infrastructure and runtime changes
+
+Use this checklist when a change (Terraform, kernel, runtime image, quantized kernel) is suspected or confirmed to increase eviction risk. Do not proceed to a rollback without a measured readiness check.
+
+Pre-checks (before rollback)
+1) Verify incident scope and that rollback targets the suspected change.
+2) Ensure you have an accessible previous artifact (AMI/Image tag, driver package, TF state snapshot).
+3) Communicate to stakeholders and open an incident ticket.
+
+Rollback execution steps (example: kernel/driver image rollback)
+1) Pause related CI/CD pipelines: gh workflow run cancel --workflow="gpu-image-promotion" --reason "Eviction incident"
+2) Promote previous image tag to node pool:
+   - Terraform example (apply using operator-safe flags):
+     terraform workspace select prod-gpu
+     terraform plan -var 'gpu_image_tag=release-20260210' -out=tfplan.rollback
+     terraform apply -parallelism=10 -auto-approve tfplan.rollback
+3) Cordon nodes with bad image and drain: kubectl cordon <node>; kubectl drain <node> --ignore-daemonsets --delete-local-data --grace-period=30
+4) Verify new nodes join with previous tag: kubectl get nodes -l image-tag=release-20260210
+5) Monitor eviction rate and tail latency for 15 minutes. If metrics don't improve, escalate to P0 protocol.
+
+Rollback execution steps (example: Terraform change that reduced warm pool)
+1) Revert Terraform module change from PR that introduced the regression. Use the previous state snapshot if automated: tfstate snapshots are under s3://redwood-iac-backups/gpu-warm-pool/
+2) Apply with a low blast radius: terraform apply -target=module.warm_pool -var 'size=50'
+3) Ensure capacity-sentry reports capacity deficit cleared: curl -s http://capacity-sentry.internal/api/v1/pools/summary | jq .
+
+Safety gates and post-rollback validation
+
+- Do not re-enable global rollouts for driver/kernel images until canary pool has held for 4 hours with no increase in gpu_reset_count.
+- Run the CI/CD canary test suite (gpu-e2e-canary) against warm-pool before resuming.
+- Confirm SLOs for affected tenants are back within thresholds for 30 minutes before marking incident resolved.
+
+Automation snippets and useful scripts
+
+1) PromQL snippet for a compact dashboard (copy/paste):
+   - Eviction heatmap per region: topk(10, sum by (region) (rate(node_preempt_events_total[1m])))
+   - Rapid crash detector: increase(gpu_reset_count[5m]) > 5
+
+2) terraform partial apply wrapper (bash):
+   #!/usr/bin/env bash
+   set -euo pipefail
+   WORKSPACE=${1:-prod-gpu}
+   TF_VARS=${2:-"gpu_image_tag=release-20260210"}
+   terraform workspace select "$WORKSPACE"
+   terraform plan -var "$TF_VARS" -out=/tmp/tfplan.rollback
+   terraform apply -parallelism=8 /tmp/tfplan.rollback
+
+3) kubectl one-liner to force-evict noisy pods > 10 minute run:
+   kubectl get pods -n tenant-namespace --field-selector=status.phase=Running -o json | jq -r '.items[] | select(.status.startTime < "2026-01-01T00:00:00Z") | .metadata.name' | xargs -r -n1 kubectl delete pod -n tenant-namespace --grace-period=5
+
+Runbook playbook examples (decision tree excerpt)
+
+- If preemption spike AND warm-pool utilization < 70%: increase warm-pool by 10% and monitor.
+- If driver crashes correlate with a specific release label: pause rollout, rollback image tag, and run regression on quantified workloads.
+- If thermal indicators present but no software change: reduce packing factor and move heavy workloads to dedicated racks.
+
+Communication templates
+
+- Slack (incident-alert): "[INCIDENT] GPU eviction spike detected in us-west-2 ephemeral pools. Owner: @infra-sre. Impact: batch retries increasing by 23%. Taking short-term action: increasing warm-pool by +20%. Will update in 15m."
+- Customer-facing status blurb: "We are investigating increased evictions impacting GPU-backed inference. Mitigation is in progress; we expect stabilization within 60–90 minutes. We will follow up with a postmortem."
+
+Postmortem checklist (when incident is resolved)
+
+1) Collect: logs, core dumps, TF plan/apply diffs, CI/CD release IDs, SLO metric graphs.
+2) Timeline: capture events and actions with timestamps.
+3) Root cause: attribute to software/infra/config/hardware.
+4) Action items: engineering owner, priority, and due date.
+
+Appendix: Example Terraform module guard (policy snippet)
+
+- Check prevents warm-pool size being reduced below safety threshold in prod:
+
+resource "aws_ssm_parameter" "gpu_warm_pool_min" {
+  name  = "/gpu/constraints/warm_pool_min_size"
+  type  = "String"
+  value = "30"
+}
+
+# In module.warm_pool variables: min_size = tonumber(data.aws_ssm_parameter.gpu_warm_pool_min.value)
+
+When to skip a rollback
+
+- If rolling back would cause a larger capacity gap (e.g., rolling back to an image that lacks a security patch currently required for compliance), prefer capacity hedging (increase warm-pool / burst) and open an exception with security.
+
+Related documents and links
+
+- Capacity Sentry overview: /confluence/eng-infra/gpu-fleet-and-capacity/gpu-capacity-safety-budgeting-whitepaper-2025.json
+- Evictor operator design: /confluence/eng-infra/terraform-and-iac/spot-drainer-terraform-operator-spec.json
+
+Revision history
+
+- 2025-08-19: Created by Ava Thompson (initial draft)
+- 2025-11-02: Added thermal and network detachment sections (reviewer: Diego Martinez)
+- 2026-03-01: Clarified rollback Terraform examples and added safety gates (reviewer: Priya Kapoor)
+
+Contact
+
+- Infra SRE oncall: infra-sre@redwood.ai
+- GPU fleet owner: gpu-fleet@redwood.ai

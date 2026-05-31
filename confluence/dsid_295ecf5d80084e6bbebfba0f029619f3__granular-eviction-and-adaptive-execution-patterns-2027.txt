@@ -1,0 +1,159 @@
+Granular eviction and adaptive execution patterns for mixed inference workloads
+
+Summary
+
+This document describes the design, operational controls, and runbook for the Granular Eviction and Adaptive Execution Patterns (GEAEP) subsystem in the Redwood serving runtime. GEAEP is a set of runtime techniques that: (1) reduce unnecessary KV-cache evictions, (2) enable per-request execution path selection (fast path vs. accuracy path), and (3) smooth contention across heterogeneous kernel families in the GPU pool. The guidance here is intended for runtime engineers, SREs handling inference incidents, and product teams evaluating cost/latency tradeoffs.
+
+Why this doc exists
+
+- Prior problems addressed: eviction storms during traffic spikes, oscillation between quantized and full-precision kernels, and sudden tail-latency increases for mixed short/long sequences.
+- Goals: lower tail latency for short-prefix requests, reduce unnecessary recompute, expose safe knobs for cost-vs-accuracy routing, and provide clear operational steps for triage and rollback.
+
+Design principles
+
+1) Local, demand-driven granularity: evictions and prefetches are controlled per-shard and per-session rather than globally. This avoids thrashing when a single tenant (or bursty bot) requests long sequences.
+2) Execution adaptivity: requests carry an execution-hint header that lets the scheduler choose a lightweight kernel (quantized, truncated context, prefix-cached) or the accuracy path (full-precision, full-KV materialization). Default policy is conservative (favor accuracy) unless overridden by explicit cost profile or model-variant rules.
+3) Cost-safety guards: automated budget limits and soft-fallbacks prevent runaway cost when adaptivity picks expensive paths.
+
+Key concepts and terminology
+
+- shard-eviction-window: configurable time window used to compute per-shard eviction score.
+- per-request execution-hint: request metadata field (execution_hint) with values: fast_path | balanced | accuracy_path.
+- eviction-stabilizer: smoothing function that delays eviction decisions when churn is detected.
+- kernel-ladder: ordered family of kernels (e.g. q4_8_fast, q8_0_balanced, fp16_full) that the dispatcher may move through for a request.
+
+Configuration reference (example YAML)
+
+runtime_geaep:
+  enabled: true
+  shard_eviction_window_sec: 60
+  eviction_score_threshold: 0.12
+  eviction_stabilizer_alpha: 0.6
+  execution_hint_defaults:
+    short_prefix: fast_path
+    long_prefix: balanced
+  kernel_ladder:
+    - q4_8_fast
+    - q8_0_balanced
+    - fp16_full
+  cost_safety_budget_tokens_per_min: 20000
+  per_tenant_hard_cap_tokens_per_min: 100000
+
+Explanation of important keys
+
+- eviction_score_threshold: a normalized value [0,1]; shards with score > threshold become candidates for eviction. We tune this to balance memory pressure against recompute cost.
+- eviction_stabilizer_alpha: smoothing parameter for exponential moving average used by the stabilizer. Higher = more inertia.
+- cost_safety_budget_tokens_per_min: safety budget applied to adaptivity decisions; once exhausted, adaptivity falls back to balanced or fast_path depending on flags.
+
+Observability and metrics
+
+Instrument the following metrics (already emitted by ri-runtime v3.8+):
+- runtime.geaep.eviction_rate.per_shard (gauge, evictions/min)
+- runtime.geaep.eviction_candidates (gauge)
+- runtime.geaep.prefetch_hits (counter)
+- runtime.geaep.execution_path.count{path=fast_path|balanced|accuracy_path} (counter)
+- runtime.geaep.kernel_switches.count (counter)
+- runtime.kvcache.recompute.tokens_cost (counter)
+- runtime.geaep.adaptivity_budget_remaining (gauge)
+
+Alerting thresholds (suggested)
+
+- P0: runtime.geaep.eviction_rate.per_shard > 0.5 for more than 2 minutes AND 99th_latency.service > 800ms for a modeled short-prefix route -> Pager.
+- P1: runtime.geaep.adaptivity_budget_remaining < 10% for 5 minutes -> Page to oncall if impacting cost or SLOs.
+- P2: kernel_switches.count rate increases > 5x baseline over 10 minutes with increased tail latencies -> Slack alert to #serving-runtime.
+
+Operational runbook: common incidents
+
+1) Eviction storm (symptoms: sudden spikes in eviction_rate and 99p latency for short requests)
+
+- Owner: serving-runtime oncall.
+- Immediate checks:
+  1. rictl metrics get runtime.geaep.eviction_rate.per_shard --since 15m --top 5
+  2. rictl trace find --tag="eviction" --since 10m | head -n 50
+  3. Check per-tenant traffic with rictl tenant stats --top 10
+
+- Mitigation steps (fast):
+  A. Enable eviction-stabilizer in read-only override: rictl config set runtime_geaep.eviction_stabilizer_override=true --duration=15m
+  B. Lower eviction aggressiveness: rictl config set runtime_geaep.eviction_score_threshold=0.20
+  C. If issue persists, pin affected shard(s) to no-evict: rictl shard annotate <shard_id> no-evict=true --reason="eviction_storm_mitigate"
+
+- Recovery check: after changes, monitor eviction_rate and short-prefix 99p latency for 10 minutes. If rates drop and latency stabilizes, keep stabilizer enabled and schedule a retrospective.
+
+2) Kernel oscillation (symptoms: frequent kernel_switches, rising GPU queue length, throughput drop)
+
+- Owner: serving-runtime + kernel-team.
+- Immediate checks:
+  1. runtime.geaep.kernel_switches.count --since 30m by kernel_family
+  2. GPU dispatcher queue lengths and occupancy: grafana:GPU/dispatcher/queue_length
+  3. Last deploys: ci-cd job checks to see if a kernel rollout coincided with the start time.
+
+- Mitigation steps:
+  A. Limit kernel ladder to two levels for the most-affected tenants: rictl config set runtime_geaep.kernel_ladder_override.<tenant_id>='["q8_0_balanced","fp16_full"]' --duration=1h
+  B. Throttle adaptivity scoring for the tenant: rictl config set runtime_geaep.adaptivity_alpha_override.<tenant_id>=0.2
+  C. If the oscillation started after a kernel rollout, rollback the kernel plugin: rictl kernel rollback <kernel_plugin_name> --to-version <previous-version>
+
+- Recovery check: kernel_switches should fall to baseline and GPU queue length return to normal within 15–30 minutes.
+
+3) Budget exhaustion (symptoms: adaptivity_budget_remaining hits 0 and many requests fall back unexpectedly)
+
+- Owner: serving-runtime + product cost ops.
+- Immediate checks:
+  1. runtime.geaep.adaptivity_budget_remaining and per-tenant consumption.
+  2. Which routes consumed most tokens: rictl profiling route-consumption --since 1h --top 20
+
+- Mitigation steps:
+  A. Temporarily increase cost_safety_budget_tokens_per_min for the affected region: rictl config set runtime_geaep.cost_safety_budget_tokens_per_min=30000 --region=us-west-2
+  B. If spending spike is unexpected, identify and throttle offending route(s) via per-route quotas in the control plane.
+
+Design validation and benchmarking notes
+
+We validated GEAEP on the mixed-workload simulator (see benchmarking suite 'mixed_short_long_2026') with these noteworthy outcomes:
+- Short-prefix 99p latency decreased 18–26% when using per-request execution_hint defaulting to fast_path for sequences < 64 tokens.
+- Overall token cost increased 4–6% in the balanced test; but with cost-safety budgets enabled, the increase was bounded to under 6%.
+- Under synthetic eviction storms, the stabilizer reduced shard-level evictions by 70% at peak.
+
+Configuration rollout checklist
+
+1. Feature flag: geaep.v1 enabled in staging only.
+2. Canary: two nodes in us-west-2 with production traffic shadowed (no adaptivity writes). Run for 48 hours.
+3. Gradual ramp: 5% -> 25% -> 50% -> 100% over 7 days, with SLO gate: short-prefix 99p < 350ms and adaptivity budget utilization < 80%.
+4. Post-rollout: schedule 2-week observation period and capture baseline metrics for the next kernel rollout.
+
+Testing and validation tools
+
+- rictl simulate --profile=mixed_short_long --seed=42 --duration=2h --out=./geaep-sim-2027-02
+- runtime-bench run --scenario geaep-adaptivity-compare --concurrency 128 --seq-dist short:0.7,long:0.3
+- scripts/validate_eviction_stability.py (documentation in repo/runtime/tools/validation.md)
+
+Implementation notes for engineers
+
+- Execution-hint is exposed as an HTTP header X-RI-Execution-Hint and as SDK metadata field execution_hint on the Python/Node SDKs. SDKs will default to balanced when model length is unknown.
+- Kernel ladder decisions are made in two stages: (a) soft decision (dispatcher hint) and (b) hard enforcement (kernel plugin selection) at kernel-launch. Both emits traces: trace.tag=">geaep:soft_decision" and ">geaep:kernel_launch".
+- Prefetch logic uses a low-priority background queue and will not prefetch across tenant hard-cap boundaries.
+
+Ownership and review cadence
+
+- Author/Primary owner: Aisha Patel (serving-runtime).
+- Secondary owner: Jonah Kim (kernel infra).
+- Quarterly review: every release cycle (quarterly) the GEAEP config defaults must be reviewed as part of runtime release checklist.
+
+Related artifacts and links
+
+- Simulation results: s3://redwood-inference/benchmarks/geaep/mixed_short_long/2027-02-01/results.csv
+- Tooling: repo/runtime/tools/geaep (contains validators and scrubbers)
+- Telemetry dashboard: grafana://dashboards/GEAEP-Overview
+
+Appendix: quick commands
+
+- View top eviction shards: rictl metrics get runtime.geaep.eviction_rate.per_shard --since 30m --top 10
+- Temporarily pin shard to no-evict: rictl shard annotate <shard_id> no-evict=true --duration=30m --reason "triage"
+- Adjust threshold: rictl config set runtime_geaep.eviction_score_threshold=0.20 --duration=10m
+- Force a kernel ladder override for a tenant: rictl config set runtime_geaep.kernel_ladder_override.<tenant_id>='["q8_0_balanced","fp16_full"]' --duration=1h
+
+If you are a product or solutions engineer reading this and want guidance for choosing the default execution_hint for a customer workload, open a PR on repo/runtime/configs/geaep-defaults.yaml and tag @PriyaSingh for review.
+
+ChangeLog
+
+- 2026-11-15: Initial draft by Aisha Patel.
+- 2026-12-07: Added budget and alert recommendations after first staging run (reviewers: Jonah Kim).
+- 2027-02-03: Clarified kernel ladder enforcement and added rollout checklist (published).

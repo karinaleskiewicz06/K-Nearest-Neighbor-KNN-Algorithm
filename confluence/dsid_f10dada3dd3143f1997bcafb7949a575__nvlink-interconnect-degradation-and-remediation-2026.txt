@@ -1,0 +1,125 @@
+NVLink interconnect degradation and remediation playbook
+
+Summary:
+This page describes symptoms, detection signals, triage steps, and remediation actions for NVLink / GPU interconnect degradation observed in the runtime fleet. NVLink issues typically present as increased tail latency and elevated per-request GPU-to-GPU copy times for sharded models or multi-GPU kernels. The goal of this playbook is to provide a repeatable oncall and engineering triage path, automated mitigations where safe, and guidance for permanent fixes or vendor escalation.
+
+Scope and impact:
+- Affects multi-GPU model shards, cross-GPU KV cache fills, and kernels that perform peer-to-peer communication (e.g., sharded attention, distributed KV cache updates).
+- Typical customer impact: 99.9th percentile generation latency spikes (5x–20x), increased error rates due to kernel timeouts (grpc errors, TPU-like watchdog resets), and occasional node-level GPU panic requiring node restart.
+- Known affected subsystems: gpu-dispatcher, shard-orchestrator, kvcache-sync-job, and the runtime kernel layer.
+
+When to use this playbook:
+1. Alert fires: "nvlink_transfer_time_p95 > 10ms for 5m" or "gpu_p2p_error_rate > 0"
+2. Tail latency regressions correlated with multi-GPU allocations in Grafana panel 'Model Shard Latency by Node'
+3. Post-deploy increase in intra-node memcpy or nvlink error counters in node exporter
+
+Detection signals (ranked):
+1. Telemetry (high confidence):
+   - PromQL: sum(rate(nvlink_transfer_time_sum[5m])) / sum(rate(nvlink_transfer_time_count[5m])) > 0.01 // mean > 10ms
+   - PromQL alert: increase(gpu_nvlink_link_error_total[10m]) > 0
+   - Perf counters: PCIe DMA stall events and increased memcpy latency in per-kernel telemetry
+2. Runtime traces:
+   - Trace span 'p2p-copy' duration spike on request trace
+   - Traces show 'wait-for-peer' subspan dominated in GPU scheduler traces
+3. Node metrics:
+   - nvlink_utilization / nvlink_throughput drop while local GPU utilization remains high
+
+Immediate oncall triage (0–15 minutes):
+1. Confirm alert context and scope:
+   - Determine affected node(s) and model(s) using 'alert.labels.node' and 'alert.annotations.models'.
+   - Run quick queries: 
+     - kubectl -n runtime get pods -o wide --field-selector spec.nodeName=<node>
+     - prometheus query: topk(10, rate(nvlink_transfer_time_sum[1m]) / rate(nvlink_transfer_time_count[1m]))
+2. If the issue is isolated to a single node and no kernel panics: divert new multi-GPU allocations off the node.
+   - Command: curl -X POST https://internal-scheduler/api/v1/drain-node -d '{"node":"<node>","reason":"nvlink_degradation"}'
+3. If kernel panics / GPU watchdog resets observed: escalate to SRE and set short maintenance window for node reboot.
+   - Oncall runbook: run 'sudo nv_peer_sync_check.sh' (see diagnostics below) before reboot; collect logs to /tmp/nvlink-diagnostics-<timestamp>.tar.gz
+
+Automated mitigations (safe defaults):
+- Auto-fallback policy (configured in dispatcher): when nvlink_transfer_time_p95 > 10ms for a node for 3m, do not schedule multi-GPU shards to the node; allow single-GPU fallbacks. See 'fallback-routing-config' below.
+- KV cache sync throttle: reduce kvcache-sync parallelism from 64 -> 8 for nodes with nvlink anomalies. Controlled by the 'kvcache.sync_parallelism_per_node' feature flag.
+
+Deep triage (15–90 minutes):
+1. Reproduce telemetry in isolation: run a synthetic cross-GPU memcpy microbenchmark against the node:
+   - test tool: /opt/runtime/tools/p2p_transfer_test --size 256MB --iters 200 --target-node <node>
+   - Expected baseline: p2p latency median < 2ms, p95 < 5ms. If p95 > 10ms, then NVLink degradation confirmed.
+2. Collect GPU and NVLink counters:
+   - nvidia-smi dmon -s u -d 1 -o DUMP > /tmp/gpu-dmon-<ts>.log
+   - nvlink error counters (via nvidia-smi nvlink) or vendor tool: nvlink-smi --show-errors > /tmp/nvlink-errors-<ts>.log
+3. Kernel-level profiling: capture a short runtime profile (10–30s) with tracing enabled:
+   - curl -X POST http://localhost:15000/api/v1/trace/start -d '{"duration_s":30, "include":"p2p-copy,kernel-launch"}'
+   - Save trace: /tmp/trace-nvlink-<ts>.json and open in TraceUI. Look for long queues at 'gpu-mem-copy' spans.
+4. Check OS-level messages: dmesg, kernel logs may show peer-to-peer DMA errors or nvlink faults.
+   - sudo journalctl -u nvidia-node-manager -n 500 | grep -i nvlink
+
+Diagnostics scripts and snippets:
+- nv_peer_sync_check.sh (runs basic nvlink and p2p checks):
+  #!/bin/bash
+  node=$1
+  timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+  nvidia-smi nvlink --query-gpu=all > /tmp/nvlink-summary-${timestamp}.txt
+  nvidia-smi dmon -s u -d 1 -c 10 > /tmp/gpu-dmon-${timestamp}.log
+  /opt/runtime/tools/p2p_transfer_test --size 32MB --iters 50 --target-node ${node} > /tmp/p2p-test-${timestamp}.log
+  tar -czf /tmp/nvlink-diagnostics-${timestamp}.tar.gz /tmp/nvlink-summary-${timestamp}.txt /tmp/gpu-dmon-${timestamp}.log /tmp/p2p-test-${timestamp}.log
+  echo "/tmp/nvlink-diagnostics-${timestamp}.tar.gz"
+
+Recommended alert definitions (Prometheus):
+- Alert: NVLink_P2P_Latency_High
+  expr: histogram_quantile(0.95, sum(rate(nvlink_transfer_time_bucket[5m])) by (le,node)) > 0.01
+  for: 5m
+  labels: { severity: page, subsystem: runtime }
+  annotations: { runbook: "/confluence/eng-serving-runtime/known-issues/nvlink-interconnect-degradation-and-remediation-2026" }
+
+Fallback routing config (example YAML):
+- name: fallback-routing-config
+  version: 2
+  rules:
+    - when: nvlink_transfer_time_p95 > 0.01 and nvlink_error_rate > 0
+      action: avoid_multi_gpu_on_node
+      ttl: 15m
+      owner: runtime-scheduler-team
+
+Operational thresholds and SLO impact guidance:
+- If a single node exhibits nvlink p95 > 10ms for > 10 minutes, mark node as 'degraded' and avoid new multi-GPU allocations.
+- If >= 3 nodes in a single AZ show degradation for 15m, open an incident (sev2).
+- SLO impact: a single degraded node hosting large model shards can increase per-request cost by 30% and tail latency by up to 10x for affected customers.
+
+Permanent remediation checklist (owner: hardware-ops / infra-eng):
+1. Validate hardware: reseat NVLink bridges, check physical connectors, and run vendor diagnostics.
+2. Firmware: ensure GPUs have vendor-recommended firmware revision (vendor_firmware >= 2025.12.1).
+3. OS driver: verify NVIDIA driver >= 535.x where known nvlink fixes exist.
+4. Replace unit: if nvlink errors persist after reseat + firmware + driver, schedule GPU or node replacement with priority 'P1 hardware' queue.
+
+Escalation matrix:
+- Oncall SRE (first): notify via #sre-runtime and tag runtime-oncall (pager if sev1).
+- Hardware ops: if nvlink error counters persist after reboot/resync, create ECC ticket with vendor and include diagnostics tarball.
+- Product/Customer Success: if major customers are affected, inform assigned CSM and prepare a customer-facing incident summary.
+
+Post-incident analysis and permanent mitigations (RCA template):
+1. Timeline of detection, mitigations, and service impact.
+2. Root cause hypothesis (hardware / firmware / OS driver / workload pattern).
+3. Evidence: telemetry graphs, diagnostics tarball, vendor response.
+4. Action items with owners and ETA (firmware rollouts, alert tuning, scheduler constraints).
+
+Appendix: Useful queries and dashboards
+- Grafana panels: 'NVLink topology and errors', 'Model shard p2p latency by node', 'KVCache cross-gpu sync latency'.
+- PromQL quicklist:
+  - nvlink_error_total: increase(gpu_nvlink_link_error_total[10m])
+  - nvlink_p95: histogram_quantile(0.95, sum(rate(nvlink_transfer_time_bucket[5m])) by (le,node))
+  - p2p_wait_traces: sum(rate(runtime_p2p_wait_seconds_count[5m])) by (node) / sum(rate(runtime_p2p_wait_seconds_sum[5m])) by (node)
+
+Contacts and ownership:
+- Primary: runtime-infra (pager: pagerduty runtime-infra)
+- Secondary: gpu-hardware-ops (slack: @gpu-hw-ops)
+- Documentation owner: Lina Park (lina.park@redwood.ai)
+
+Change history:
+- 2026-02-14 (Lina Park): initial draft
+- 2026-06-07 (Marcus Chen): added automated fallback policy and alert examples
+- 2026-11-03 (Aisha Bello): updated firmware and driver recommended versions, clarified diagnostic commands
+
+Notes and references:
+- Vendor NVLink troubleshooting guide (internal link stored in hardware-ops drive)
+- See related runbooks: 'gpu-affinity-and-eviction-strategies', 'gpu-memory-fragmentation-diagnostics-playbook' for mitigation overlap.
+
+End of document.

@@ -1,0 +1,161 @@
+GPU immutable launch bundle and Terraform policy-scan playbook
+
+Overview
+
+This playbook documents the end-to-end process to produce an immutable GPU runtime launch bundle (OCI image + baked TF modules + manifest), validate it with automated policy scans, and release it via a staged CI/CD pipeline. The goal is to provide a reproducible, auditable artifact that can be deployed to hosted, dedicated, and private clusters with minimal drift and clear rollback semantics.
+
+Scope
+- Producing immutable launch bundles for inference nodes and warm-pools.
+- Enforcing Terraform policy checks (OPA/Rego + tfsec) and image SBOM verification in CI.
+- Canary/staged promotion to canary -> regional -> global.
+- Fast rollback and emergency patch paths.
+
+Non-goals
+- Low-level GPU kernel tuning (covered in eng-serving-runtime/kernel-and-scheduling).
+- Tenant-specific pricing policies.
+
+Definitions and artifacts
+- Launch bundle: OCI image (gpu-runtime:v{semver}), a hashed Terraform module tarball (tf-modules-{sha256}.tar.gz), and a JSON manifest tying image/module hashes to a release id.
+- Release ID: redwood-launch-YYYYMMDD-NN (example: redwood-launch-20250110-02).
+- Policy scan: combination of tfsec, OPA/Rego checks for org policies, and SCA/SBOM verification for container images.
+
+Ownership and contacts
+- Pipeline owner: eng-infra/ci-cd (primary: Maya Patel).
+- IaC ownership: eng-infra/terraform-and-iac (primary: Diego Alvarez).
+- Fleet/SRE oncall: eng-sre (pager: #sre-gpu).
+- Security reviewers: security-and-compliance (Priya Raman).
+
+SLOs and thresholds for launch validation
+- CI green rate: 100% policy checks and unit tests.
+- Image SBOM completeness: >= 95% dependency resolution.
+- Tf module plan drift: no resource changes allowed for immutable modules (plan exit code != 0 on detected drift).
+- Canary latency regression: 95th percentile token-latency must not increase by > 10% vs baseline.
+- Canary error-rate: < 0.5% increased 5xx across 1h window.
+
+Preconditions (checks before creating a bundle)
+1. All feature branches merged to release branch (release/*).
+2. All infra module versions pinned in module manifest (modules.json).
+3. No active critical incidents for GPU fleet (check #sre-gpu).
+
+Release pipeline (high level)
+1) Build phase (CI runner: buildkite-gpu-builders)
+   - Step 1. Checkout release branch at tag.
+   - Step 2. Build OCI image using buildkite buildkite-gpu-image pipeline. Image must be signed with cosign and uploaded to registry (registry.redwood-infr/gpu-runtime:v{semver}).
+   - Step 3. Produce SBOM (syft) and attach to image.
+   - Example commands:
+     - docker build -t registry.redwood-infr/gpu-runtime:v1.4.0 .
+     - cosign sign --key ksm://projects/redwood/cosign/ci registry.redwood-infr/gpu-runtime:v1.4.0
+     - syft registry.redwood-infr/gpu-runtime:v1.4.0 -o json > sbom-v1.4.0.json
+
+2) IaC packaging
+   - Archive the exact set of TF modules used by runtime into tf-modules-{sha256}.tar.gz and push to artifact-store (s3://redwood-iac-bundles/).
+   - Modules must include a modules-lock.json with provider and version pins.
+   - Generate manifest.json with image/hash/module references and GPG-sign the manifest.
+
+3) Policy & security scans (gating)
+   - Run tfsec against the extracted TF modules (tfsec --config .tfsec.yaml).
+   - Run rego policies (opa test ./policies -v) for org constraints: no public S3, KMS required, egres-slicing enabled, egress-proxy required for private deployments.
+   - Verify SBOM: ensure no critical CVEs with exploitable severity (policy: CVSS >= 9.0 -> fail).
+   - Container image scanning: trivy --severity HIGH,CRITICAL registry.redwood-infr/gpu-runtime:v{semver}. Fail on CRITICAL.
+
+4) Integration tests (GPU-enabled runners)
+   - Run nightly synthetic load tests (locust) in a dedicated canary account that mirrors customer tenancy.
+   - KV-cache replay smoke tests using a 5k-token prefix set. Pass condition: cache hit-rate >= 85% and p95 latency within SLO.
+
+5) Staged promotion
+   - Promote to canary pool in region-us-west-2 (10% of traffic, routing via router-service canary-tag).
+   - Observe for 2 hours with automated monitors (prometheus alert: canary-latency-regression, canary-5xx-spike).
+   - If green, promote to regional (30%) for 12 hours, then global for full rollout.
+
+Validation matrix (example)
+| Check | Tool | Accept criteria | Remediation on failure | Owner |
+|---|---:|---|---|---|
+| TF policy | OPA + tfsec | 0 policy rejects | Fix policy violations in module, re-run packaging | eng-infra/terraform-and-iac |
+| Image CVEs | trivy | No CRITICAL CVEs | Patch base image or update dependency, rebuild | eng-infra/ci-cd |
+| SBOM completeness | syft | >95% resolved | Investigate reproducible build inputs | eng-infra/ci-cd |
+| Canary latency | prom | p95 <= baseline * 1.10 | Rollback canary, file perf investigation | eng-sre |
+| KV cache hit-rate | smoke harness | >=85% | Re-evaluate warm-pool seeding strategy | eng-serving-runtime |
+
+Release playbook (operational steps)
+- Normal release (green checks): follow staged promotion sequence and update release registry (internal: releases.redwood-infra). Notify #release-notifications and update release-notes page.
+- Soft-failure in stage: pause promotion, open release incident (tag: release-blocker), assign eng-sre and module owner.
+- Hard failure or critical user impact: immediate rollback to previous release id (known-good) via orchestration service: orchestrator rollback --release <release-id> --force.
+
+Rollback procedure (quick steps)
+1. Identify release-id to rollback to (check release registry).
+2. Run orchestration rollback (CLI example):
+   - rwd-orch rollback --target release=redwood-launch-20250102-05 --scope region=us-west-2 --reason "canary latency spike"
+3. Verify rollback finished and confirm canary metrics have returned to baseline for 30 minutes.
+4. Postmortem: owners file a 72-hour incident review if rollback due to correctness/regressions.
+
+CI gates and automation rules (detailed)
+- Gate A: Build signing. Image must be cosign-signed by CI key and key rotation status validated.
+- Gate B: Policy scan. tfsec + opa must exit 0.
+- Gate C: Integration tests. Must run on GPU runners with a minimum of 4 concurrent users in the synthetic harness.
+- Gate D: Manual approval for cross-account/private deployments (approval from eng-infra/priv-deploy).
+
+Terraform policy examples (Rego snippets)
+- Deny public S3 buckets (rego excerpt):
+  package redwood.iac.denials
+
+  deny[msg] {
+    resource := input.resources[_]
+    resource.type == "aws_s3_bucket"
+    resource.config.acl == "public-read"
+    msg = sprintf("s3 bucket %v is public", [resource.name])
+  }
+
+- Require KMS on EBS encryption:
+  package redwood.iac.requirements
+
+  violation[msg] {
+    res := input.resources[_]
+    res.type == "aws_ebs_volume"
+    not res.config.kms_key_id
+    msg = sprintf("ebs volume %v missing KMS", [res.name])
+  }
+
+CI/CD pipeline snippet (buildkite YAML excerpt)
+- steps:
+  - label: ":docker: build gpu-runtime"
+    command: "scripts/build_and_sign.sh {{build.version}}"
+    agents: [queue=gpu-builders]
+    plugins: [docker#v3.5.0]
+  - label: ":lock: policy scan"
+    command: "./ci/policy_scan.sh modules.tar.gz sbom.json"
+  - wait
+  - label: ":rocket: promote to canary"
+    command: "./ci/promote.sh --stage canary"
+    concurrency: 1
+    concurrency_group: "release-{{build.version}}"
+
+Operational runbooks (troubleshooting snippets)
+- If cosign signature missing: check KMS cosign key permissions and CI runner logs. Use: cosign verify --key ksm://projects/redwood/cosign/ci registry.redwood-infr/gpu-runtime:v{semver}
+- If tfsec fails with ECR public access: ensure module pins do not reference remote modules with unapproved provenance. Use modules-lock.json to pin.
+- If canary latency spikes: scale canary pool to double capacity (orchestrator scale --pool canary --replicas +100%), enable fallback routing to model-variant (router-service set-fallback) and initiate KV-cache warm seeding from snapshot.
+
+Chaos and canary drills (quarterly)
+- Run a controlled canary rollback drill every quarter using the release orchestration dry-run mode: rwd-orch rollback --dry-run --release <release-id>. Document findings in the release-retrospective page.
+
+Telemetry and dashboards to monitor
+- dashboards/release/canary_overview (Grafana) — p95 latency, 5xx rate, dps (requests/sec), cache-hit-rate
+- alerts: canary-latency-regression (p95 > baseline*1.10 for 15m), canary-error-spike (>0.5% 5xx increase over 10m), policy-scan-failure (CI job failure alert)
+
+Appendix: example manifest.json (single-line sample)
+{
+  "release_id": "redwood-launch-20250110-02",
+  "image": "registry.redwood-infr/gpu-runtime:v1.4.0",
+  "image_sha256": "sha256:...",
+  "tf_modules": "s3://redwood-iac-bundles/tf-modules-abc123.tar.gz",
+  "manifest_signature": "GPG:..."
+}
+
+Notes and links
+- Related playbooks: eng-infra/runbooks/gpu-warm-pool-replenishment-and-iac-sync.json
+- Policy repository: git@github.com:redwood-infra/iac-policies.git
+- Release registry: https://releases.redwood-infra.internal/
+
+Change log
+- 2024-08-12: Initial draft by Maya Patel.
+- 2024-11-03: Added SBOM gating and trivy policy (security review).
+- 2025-01-17: Promoted to published; added rollback CLI examples and canary thresholds (eng-sre review).

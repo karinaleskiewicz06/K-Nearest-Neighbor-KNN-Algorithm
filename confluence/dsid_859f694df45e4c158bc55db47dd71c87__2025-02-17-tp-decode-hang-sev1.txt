@@ -1,0 +1,173 @@
+Postmortem: 2025-02-17 Sev1 — Tensor-parallel decode hang causing Dedicated timeouts
+
+## Executive summary
+On 2025-02-17, a Dedicated customer experienced elevated request timeouts and streaming stalls due to a tensor-parallel (TP) decode hang in the serving runtime on A100-80GB multi-GPU replicas.
+
+A subset of TP replicas entered a state where one or more ranks stopped making forward progress in the decode loop while other ranks continued to enqueue work, resulting in blocked NCCL collectives and wedged decode steps. This manifested as requests that never completed (hangs), triggering downstream timeouts and cascading retries.
+
+Immediate mitigations (replica drain/recycle and temporary concurrency caps) restored service while we collected logs and narrowed the most likely failure mode. This incident materially accelerated the “Multi-GPU (TP) stability fixes” program (ENG-4821).
+
+## Customer impact
+**Primary impacted customer:** Acme AI (Dedicated, A100-80GB, TP=4 per replica)
+
+**User-visible symptoms**
+- Streaming responses intermittently stalled mid-generation (no new tokens) until client timeout.
+- Non-streaming requests exceeded timeout thresholds (30–60s) and failed.
+- Elevated tail latency (p99) and sporadic 5xx due to request timeouts.
+
+**Impact window (PT)**
+- Start: 2025-02-17 09:12 PT
+- End (stabilized): 2025-02-17 10:15 PT
+- Total: ~63 minutes of elevated error rate / severe latency for a portion of traffic.
+
+**Estimated metrics (Acme AI Dedicated cluster)**
+- Peak request timeout rate: ~6–10% (route-dependent)
+- p99 latency: increased from ~2.8s to >30s during peak stall periods
+- Affected replicas: 3/12 replicas repeatedly wedged and recycled
+
+**SLA / commercial**
+- Incident was treated as Sev1 due to enterprise Dedicated impact and sustained timeout rate.
+- Customer Success coordinated hourly updates and agreed on temporary mitigations pending runtime 1.19 rollout.
+
+## Internal impact
+- On-call pages: SRE (primary), Serving Runtime (kernel + scheduling)
+- Operational load: repeated replica drains and manual concurrency tuning; elevated support volume (SUP-48321, SUP-48344)
+
+## Detection
+**How we detected**
+- Primary alert: Dedicated request timeout SLO breach (symptom-based).
+- Secondary signals observed during triage:
+  - GPUs on affected replicas showed low utilization despite high queue depth.
+  - Incomplete streaming spans in tracing (requests stuck in decode stage).
+
+**Detection gap**
+- We lacked a direct “TP forward progress” signal (per-rank heartbeat / collective counters). As a result, alerting triggered only after customer-visible timeouts accumulated.
+- We did not have an automated classification for “compute vs comms vs scheduler starvation,” increasing time-to-triage.
+
+## Timeline (PT)
+> Note: times are approximate and reconstructed from Slack incident thread, Dedicated logs, and paging records.
+
+- **09:12** — Dedicated timeout SLO alert fires for Acme AI. SRE on-call begins investigation.
+- **09:16** — Customer Success reports active customer escalation: “streaming stalls / requests hanging.” Incident channel opened.
+- **09:20** — SRE observes 3 replicas with rising queue depth and flat GPU utilization; initial hypothesis: replica-level wedging.
+- **09:24** — Mitigation #1: drain/recycle the worst replica set; timeouts drop briefly, then return as another replica wedges.
+- **09:29** — Serving Runtime engaged (Noah Patel, Hiro Tanaka, Sofia Ivanova). Hypothesis expands to TP collective stall.
+- **09:36** — Mitigation #2: reduce concurrency caps for the affected deployment (temporary guardrail). Timeout rate begins trending down.
+- **09:44** — Enable a limited debug window (extra NCCL/runtime debug logging) for a single canary replica to capture evidence without broad perf impact.
+- **09:52** — Runtime engineer confirms common signature: decode loop stuck awaiting a collective; no NCCL hard error surfaced; requests remain in-flight indefinitely.
+- **10:03** — Additional replica drains; confirm the combination of lower concurrency + recycling stabilizes traffic.
+- **10:15** — Incident declared stabilized. Begin deeper analysis and customer follow-up with mitigations and ETA.
+- **Same day (afternoon)** — Create/triage ENG-4821 and child issues; assign owners for instrumentation, scheduler guardrails, and watchdog.
+
+## What happened (technical)
+The affected Dedicated deployment uses TP across 4 GPUs per replica. Under sustained mixed load (prefill + decode with streaming) and bursty concurrency, certain replicas entered a state where decode iterations stopped progressing.
+
+The observed behavior is consistent with a “silent stall” where:
+- One rank stops reaching a required collective (or reaches it on a different stream/order), while other ranks continue and block.
+- The runtime did not have a watchdog to abort/tear down the replica when forward progress halted.
+- Scheduler behavior under heavy prefill could starve the next collective-aligned step, increasing the probability of ordering divergence.
+
+During the incident, wedged replicas did not crash and did not emit a surfaced NCCL error. They remained partially alive (accepting work) until manual drain/recycle.
+
+## Root cause
+**Root cause (most likely, based on evidence and subsequent reproduction work):**
+A TP decode hang triggered by an ordering/synchronization bug at the kernel/comms boundary during streaming workloads.
+
+Specifically:
+- A cancellation/streaming edge path could leave a rank in a different state with respect to the next required collective.
+- In the absence of strict stream/event synchronization around NCCL collectives, collectives could be issued or waited on inconsistently across ranks under concurrency.
+- Scheduler fairness issues under mixed prefill/decode increased the chance that some ranks “fell behind” in collective-aligned steps.
+
+This aligns with later work items and fixes tracked in:
+- **ENG-4825** (NCCL stream/event sync hardening)
+- **ENG-4824** (scheduler guardrail to prevent collective starvation)
+- **ENG-4826** (watchdog + safe abort/drain semantics)
+
+## Contributing factors
+- **Mixed workload stressor:** Bursty concurrency with long prompts + streaming decode increases synchronization pressure.
+- **Lack of abort semantics:** No bounded-time mechanism to stop a replica from accepting more work once a TP stall begins.
+- **Insufficient observability:** No per-rank heartbeat / collective counters to pinpoint where progress stopped.
+- **Operational defaults:** Concurrency/batch defaults were too aggressive for TP stability on this workload profile (mitigated by temporary caps).
+
+## Where we got lucky
+- The stall was replica-scoped (not cluster-wide) and manual draining could restore capacity.
+- The customer had sufficient headroom to tolerate temporary concurrency caps without a full outage.
+
+## Immediate mitigations applied
+1) **Drain/recycle wedged replicas**
+- Result: restored service quickly but did not prevent recurrence.
+
+2) **Temporary concurrency caps (Dedicated deployment-level guardrail)**
+- Result: reduced recurrence rate while we collected logs and prepared fixes.
+
+3) **Short debug-logging window for evidence collection**
+- Goal: capture NCCL/runtime signals without broadly increasing overhead.
+
+## Corrective actions
+### Already completed (immediate follow-ups)
+- Added internal guidance for SRE/Support on rapid mitigation (drain + caps) while fixes ship.
+- Linked customer tickets and incident artifacts to the TP stability initiative.
+
+### Action items (tracked)
+| ID | Action | Owner | Tracking | Target |
+|---|--------|-------|----------|--------|
+| A1 | Add TP heartbeat metrics (per-rank) + stall reason codes; wire to dashboards/alerts | Omar El-Sayed / Aisha Bello | ENG-4823 | 2025-03-07 |
+| A2 | Scheduler guardrail to prevent collective starvation under prefill-heavy batches | Sofia Ivanova | ENG-4824 | 2025-03-14 |
+| A3 | Enforce stream/event synchronization around NCCL collectives; document CUDA graphs constraints | Hiro Tanaka / Grace Kim | ENG-4825 | 2025-03-14 |
+| A4 | Implement TP watchdog timeout + safe abort/drain path; define customer-facing error code semantics | Noah Patel / Rafael Mendes | ENG-4826 + ADR-0127 | 2025-03-21 |
+| A5 | Add TP stress scenarios to perf-canary (long context + bursty concurrency) with gating thresholds | Marcus Reed / Rina Kobayashi | ENG-4828 | 2025-03-28 |
+| A6 | Release plan for runtime 1.19: Dedicated-first rollout, rollback criteria, comms checklist | Connor O'Brien / Paula Mendes | ENG-4829 | 2025-03-31 |
+
+## Detection & observability improvements
+**What we are adding**
+- **TP per-rank heartbeat**: periodic “I am alive and progressing” signal tagged by replica, rank, model, and stage.
+- **In-flight collective counters**: surfaced in traces/logs to correlate hangs with specific collective IDs/steps.
+- **Stall reason classification**: compute vs comms vs scheduler starvation vs memory/KV pressure.
+
+**Alerting changes**
+- Page on sustained heartbeat gaps per replica (with suppression/aggregation to avoid alert storms).
+- Add dashboards that correlate:
+  - heartbeat gaps
+  - request timeout rate
+  - replica drains/restarts
+  - NCCL warnings/errors (when present)
+
+## Operational / runbook changes
+- Update runbook with a first-5-min triage checklist:
+  1) Identify affected replicas (queue depth + heartbeat gaps)
+  2) Drain wedged replicas
+  3) Apply temporary concurrency/batch guardrails
+  4) Enable limited debug window if needed
+  5) Escalate to runtime with captured artifacts
+
+(See: **Confluence: eng-serving-runtime/runbooks/runtime-tp-hang-mitigation**)
+
+## Customer communications
+- Customer Success provided:
+  - Immediate acknowledgement and mitigation steps during the incident
+  - Follow-up summary within 24 hours
+  - Rollout plan for runtime 1.19 (Dedicated-first), including a canary window and success criteria
+
+## Lessons learned
+**What went well**
+- SRE and Runtime engaged quickly; draining was effective at restoring capacity.
+- Concurrency caps provided a low-risk stabilizer while root cause was investigated.
+
+**What didn’t go well**
+- We detected too late (symptom-based alerting) and could not rapidly determine “where” the TP pipeline was stuck.
+- Lack of bounded-time abort behavior turned stalls into prolonged request hangs rather than fast failures with retries/fallback.
+
+**What we will change**
+- Treat TP “forward progress” as a first-class SLO signal.
+- Ship watchdog + abort semantics with safe draining and clear error surfacing.
+- Add regression coverage (perf-canary + repro harness) to prevent recurrence.
+
+## Appendix
+### Key artifacts
+- Slack incident thread: incidents/1740165551-sev1-dedicated-timeouts-suspected-tp-hang
+- Support tickets: SUP-48321, SUP-48344
+- Known issue page: eng-serving-runtime/known-issues/tensor-parallel-hangs-under-load
+
+### Definitions
+- **TP (Tensor Parallelism):** Split model tensors across multiple GPUs per replica; requires tightly coordinated collectives during forward pass.
+- **Decode hang:** Generation loop stops progressing; requests remain in-flight without completion until a timeout or manual intervention.

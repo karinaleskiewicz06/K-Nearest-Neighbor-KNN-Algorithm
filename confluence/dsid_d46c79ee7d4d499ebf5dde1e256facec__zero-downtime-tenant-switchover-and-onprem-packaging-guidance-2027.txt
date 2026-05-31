@@ -1,0 +1,154 @@
+Zero-downtime tenant switchover and on‑prem packaging guidance
+
+Summary:
+This playbook describes a tested, repeatable process to perform zero-downtime tenant switchover across a private deployment (VPC or on‑prem) while also covering the packaging constraints and preflight checks required to support the approach. It combines: (1) a blue/green runtime switchover pattern, (2) on‑prem packaging requirements for immutable images and attestation, and (3) operator runbooks for validation, rollback and day‑2 operations.
+
+Scope and audience:
+- Scope: Redwood private deployments (VPC-connected control plane, or fully air‑gapped on‑prem bundles). Covers: runtime nodes, control plane components, tenant routing, KV cache warmup, model binary rollout, and packaging for secure boot/attestation.
+- Audience: Field engineers, SREs, and Private Deploy PMs executing upgrades or tenant migrations that require minimal service disruption.
+
+Goals and guarantees:
+- Target: < 1% of requests experiencing latency degradation above SLO during switch, and no more than 5s tail latency increase for 99th percentile.
+- Safety: ability to abort and fully rollback to previous state in < 10 minutes for a single tenant switchover.
+- Observability: per-tenant tracing and token-level cost/latency breakdown must be available during the window.
+
+High-level architecture (textual diagram):
+- redwood-control-plane (API, model registry, rollout manager)
+- redwood-proxy (tenant-aware edge, in-cluster ingress)
+- redwood-runtime-blue / redwood-runtime-green (GPU pools serving model shards)
+- redwood-kvcache (prefix/KV cache layer shared across nodes; per-tenant logical partitions)
+- redwood-telemetry-agent (exporter for cost/latency per route)
+- Optional: sidecar-attestor (on‑prem -- signs image boot attestations)
+
+Prerequisites / customer requirements (minimums):
+- Network:
+  - Egress: TCP 443 to Redwood control plane endpoints (if delegated). For fully air‑gapped, ensure admin access to local control plane endpoints and package signing HSM.
+  - Intra-cluster: 8443 (control plane), 9100 (node-exporter), 50051 (runtime gRPC), 8080 (proxy health).
+- Hardware: at least two disjoint runtime pools (N1 and N2) each with capacity to serve peak qps for targeted tenant during switch. GPU sizing consistent with model memory and runtime quantization profile.
+- Security: KMS reachable for key rotation or local HSM for private key operations; image signing keypair present on packaging host.
+- Packaging: images signed and stored in accessible registry; for air‑gapped installs, signed tarball with detached signature and a signing-chain metadata file.
+
+Packaging guidelines (on‑prem and air‑gapped):
+1. Immutable images:
+  - Build image per release that contains pinned runtime binary and model binary manifest. No in-place model downloads at boot time allowed.
+  - Docker labels: org.redwood.build_id, org.redwood.release_date, org.redwood.signature_sha256.
+2. Signed bundles for air‑gapped installs:
+  - Create bundle: tar.gz {images.tar, manifests.yaml, attestations.sig, package-metadata.json}
+  - Sign using infra‑specific signing key; include certificate chain.
+  - Verification: sidecar-attestor verify --bundle bundle.tar.gz --certs /etc/redwood/certs.pem
+3. Ephemeral boot and rollback images:
+  - Provide two immutable boot images per node (current and candidate). Bootloader selects candidate for green pool. A signed pointer file (active-image.json) determines which image to run.
+4. Configuration snippet (sample manifest entry):
+  - "release": "2027-02-01",
+  - "images": ["redwood/runtime:2027-02-01-signed"],
+  - "attestation": "sha256:abcd...",
+  - "model-manifest": "v1.3.7"
+
+Blue/Green tenant switchover pattern (step-by-step):
+1) Planning and pre-checks (T-48h to T-1h):
+  - Confirm capacity: ensure green pool has >= 1.2x estimated throughput for tenant under test.
+  - Validate model parity: model-manifest in green must match functional tests in canary suite.
+  - KV cache warm target: estimate prefix hit-rate and reserve warmup budget (see warmup procedures).
+  - Communication: post channel notification to stakeholders; open change ticket with risk and rollback plan.
+2) Prepare green environment (T-30m):
+  - Deploy redwood-runtime-green nodes with new package. Do not advertise to proxy yet.
+  - Run smoke tests: health-check endpoints /health and /ready should be green for 3 consecutive checks (30s interval).
+  - Pre-warm caches: execute synthetic prefix replay (see cache warmup commands) to seed redwood-kvcache for that tenant.
+3) Traffic canary (T-15m):
+  - Use routing-weight control in redwood-proxy to send 2% traffic for tenant to green. Monitor error rates and latency for 5m.
+  - Key metrics: 5xx rate, 95/99 P50/P95/P99 latency delta, token cost per request.
+4) Progressive ramp (T-10m to T+X):
+  - If metrics stable, increase weight to 10% -> 25% -> 50% at 5–10 minute intervals.
+  - At each ramp step, run quick verification test set (functional and hallucination checks) against sampled responses.
+5) Final cutover (T+X):
+  - Set proxy weight to 100% for tenant to green. Drain old runtime pool gradually with graceful sessions draining (30s connection drain, 5m request drain).
+  - Final validation: ensure no increase in 5xx and SLO violations remain within target.
+6) Decommission or keep blue as fallback:
+  - Option A (immediate decommission): keep blue for 2 hours in standby, then retire if stable.
+  - Option B (rollback readiness): keep blue active but isolated for 24 hours, ready to reintroduce in < 10 minutes.
+
+Warmup and KV cache migration notes:
+- Use recorded prefix traces where available to seed the kvcache on green. Command: redwood-kvtool warmup --tenant TENANT_ID --trace-file traces/tenant-123.trace --concurrency 8
+- If warmup budget is limited, prefer synthetic high-frequency short prefixes rather than full long sequences to increase hit-rate quickly.
+- Stateful persistent shards (if enabled) must be snapshotted and mounted read-only into green nodes before traffic.
+
+Validation checklist (automated + manual):
+- Automated:
+  - Canary test suite pass (functional, auth, rate-limit, and signature validation)
+  - Per-route latency and error metrics within thresholds for 30m after cutover
+  - Token usage and cost per request within ±10% of baseline
+- Manual:
+  - Customer-specific smoke tests executed (customer acceptance tests)
+  - Representative prompted samples sanity check for hallucination/regression
+
+Rollback procedure (single-tenant rollback within window):
+1) Trigger condition examples: 5xx rate > 0.5% absolute increase or P99 latency increase > 2x baseline for > 10 minutes.
+2) Steps:
+  - Set redwood-proxy route weight back to 100% blue.
+  - Wait for green to drain (status from /proxy/drain-status shows 0 active sessions).
+  - Mark incident: record start/stop times and artifacts (logs, traces).
+  - Do a post-rollback health verification and notify stakeholders.
+3) Post-rollback analysis: collect diff traces between blue and green for 30 minutes and open regression ticket if necessary.
+
+Upgrade sequencing rules (multi-tenant / full-cluster):
+- Control plane minor upgrades: can be performed first if backward compatible with runtime. Perform control plane in small batches across zones.
+- Runtime major upgrades: use blue/green per runtime pool. Never upgrade more than one runtime pool that shares the same persistent KV volumes concurrently.
+- Model catalog changes: upload model blobs to registry first, then publish manifest; avoid in-place model replacement.
+
+Operational automation and safety gates:
+- Automated gates triggered by metrics: 5xx > 0.2% for a tenant or P99 latency +25% triggers immediate pause on weight increase.
+- Canary guard rails: require 15m stable window at each ramp step.
+- Rollout window enforcement: non-business hours recommended for high-risk tenants unless business requires daytime.
+
+Day‑2 operations after switchover:
+- Telemetry: ensure redwood-telemetry-agent exports per-tenant traces to the metrics cluster; verify sampling rate correct for long-tail debugging.
+- Cost reconciliation: run token usage reconciliation job for target tenant to detect regressions in token consumption.
+- Capacity adjustments: if green shows different CPU/GPU utilization profile, adjust autoscale thresholds and cache sizes.
+
+Runbook excerpts (commands and snippets):
+- Check proxy route weights:
+  curl -sS -H 'Authorization: Bearer $ADMIN_TOKEN' https://proxy-admin.internal/api/routes/tenants/TENANT_ID | jq '.weight'
+- Set weight to 10%:
+  curl -X POST -H 'Authorization: Bearer $ADMIN_TOKEN' -d '{"weight":10}' https://proxy-admin.internal/api/routes/tenants/TENANT_ID/weight
+- Warmup example:
+  redwood-kvtool warmup --tenant TENANT_ID --trace-file traces/sample.trace --rate 200 --concurrency 8 --target 60m
+- Verify node readiness:
+  kubectl -n redwood get pods -l app=redwood-runtime-green -o jsonpath='{.items[*].status.containerStatuses[*].ready}'
+
+Rollback matrix (text table):
+- Cause: model regression (semantic) -> Action: route back to blue, collect side-by-side samples, open eval ticket
+- Cause: memory pressure on green -> Action: reduce weight, scale pool, or rollback
+- Cause: kvcache cold start causing latency -> Action: pause ramp, run aggressive warmup, or rollback
+
+Communication and stakeholder plan:
+- Before window: notify CS and account team (T-24h).
+- During canary: live channel updates every ramp step.
+- On rollback: immediate incident page and customer-facing communication draft prepared by CS.
+
+Ownership and escalation:
+- Primary owner: Private Deploy Field Engineering (oncall rotation)
+- Secondary owner: Runtime SRE
+- Escalation path: Field Eng -> Runtime Lead -> Head of SRE -> CEO if P0 customer impact
+
+Post‑mortem and learning capture:
+- Require a short post-mortem when rollback occurs or when any SLO breach persists > 30m. Capture: timeline, root cause, mitigating actions, and CI tests added.
+
+Appendix A — Packaging validation checklist:
+- Image signed and signature verified on host
+- Bootloader active-image.json matches candidate image
+- Attestation chain validated by sidecar-attestor binary
+- Model manifest checksum validated against registry
+
+Appendix B — Quick risk table:
+- Risk: Network partition between control plane and runtime -> Mitigation: pre-seed model artifact and signed bundle for local verification
+- Risk: Fake image deployed -> Mitigation: require 2 distinct signatures (build system + field key) and runtime verify both
+
+References and related pages:
+- See related internal references for full reference architectures and air‑gap packaging playbooks.
+
+Document history:
+- 2027-01-10: Drafted by Aisha Patel
+- 2027-02-02: Reviewed and validated with Field Eng (Marco Ruiz)
+- 2027-02-21: Published after tabletop exercises and automated canary tests
+
+Contact: aisha.patel@redwood.ai for questions and scheduling tabletop drills.

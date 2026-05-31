@@ -1,0 +1,198 @@
+Execution provenance, replay, and hash specification
+
+Overview
+
+This document defines the execution provenance format, canonical hash scheme, and replay artifact requirements used by Redwood Inference runtime for deterministic reproduction of inference executions. It standardizes what data to capture at request ingress, kernel selection, KV-cache decision, routing, and final token emission to enable: post-incident forensics, fidelity regression repro, and deterministic replay in the sandbox.
+
+Goals
+
+- Make a minimal, fixed set of fields that allow deterministic replays at the same or compatible runtime version.
+- Ensure artifact size is bounded and classified so privacy-sensitive payloads can be redacted before long-term storage.
+- Provide a reproducible hashing strategy to detect non-deterministic divergence between production and replayed runs.
+
+Scope and non-goals
+
+- Scope: inference request path from API gateway -> runtime-coordinator -> kernel-router -> GPU shard(s) -> response assembly. Includes model variant metadata, kernel hints, and runtime decisions.
+- Non-goal: this is not a full telemetry retention policy; refer to observability for retention windows and PII rules.
+
+Specification: execution provenance artifact
+
+An execution artifact (E-Artifact) is a newline-delimited JSON (NDJSON) file with three reserved top-level records in order: METADATA, DECISIONS, EVENTS. Additional records (LOG / TRACE / PAYLOAD) are optional and flagged. Each line is a single JSON object with primitive values only. Nested objects are flattened with dot notation in keys (see examples).
+
+Required records (order matters):
+
+1) METADATA record (type: "metadata")
+- artifact_version: text (current: "v1")
+- runtime_version: semantic version string (e.g., "2.14.0")
+- model_id: catalog identifier (e.g., "redwood/open-13b-v2")
+- model_variant: text (e.g., "int8-fast")
+- request_id: global request UUID (X-Request-Id)
+- timestamp_utc: ISO8601
+- ingress_cluster: region/cluster id
+- route_name: API route name
+- fidelity_profile: label used by fidelity-orchestrator (e.g., "balanced")
+
+Example METADATA line:
+{
+  "type": "metadata",
+  "artifact_version": "v1",
+  "runtime_version": "2.14.0",
+  "model_id": "redwood/open-13b-v2",
+  "model_variant": "int8-fast",
+  "request_id": "b6b7e2f2-8a72-4f1a-9c7b-1a2d3e4f5a6b",
+  "timestamp_utc": "2026-01-10T15:34:21Z",
+  "ingress_cluster": "us-west-2-prod-1",
+  "route_name": "/v1/generate",
+  "fidelity_profile": "cost-optimized"
+}
+
+2) DECISIONS record (type: "decisions")
+- kernel_selection: text (kernel id chosen)
+- kernel_flags: comma-separated short flags (e.g., "prefetch,kvcache")
+- kvcache_hit_bitmap: base64-encoded bitset (optional)
+- scheduler_cohort: text (cohort id used by job scheduler)
+- routing_path: pipe-separated list of nodes/shards (e.g., "coord-3|shard-12|shard-15")
+- batch_size_at_dispatch: integer
+- quantization_profile: text
+- fallback_invoked: boolean string ("true"|"false")
+- fallback_reason: text (if fallback_invoked)
+
+Example DECISIONS line:
+{
+  "type": "decisions",
+  "kernel_selection": "kvm-attn-v2-16",
+  "kernel_flags": "kv-prefetch,continuous-batch",
+  "scheduler_cohort": "cohort-22",
+  "routing_path": "coord-3|shard-12",
+  "batch_size_at_dispatch": "8",
+  "quantization_profile": "q4_0",
+  "fallback_invoked": "false"
+}
+
+3) EVENTS record(s) (type: "event")
+- Sequence of deterministic events with monotonic event_index starting at 0.
+- event_type: one of {ingress, kernel_enter, kernel_exit, kv_write, kv_read, token_emit, error}
+- event_index: integer
+- elapsed_ms: integer (ms since METADATA.timestamp_utc)
+- note: short text (max 256 chars)
+- checksum_hint: short hex string (optional, used during correlation)
+
+Example event line:
+{
+  "type": "event",
+  "event_type": "kernel_enter",
+  "event_index": "3",
+  "elapsed_ms": "37",
+  "note": "dispatched to shard-12"
+}
+
+Optional record types (flagged via "type"):
+
+- payload (type: "payload"): request prompt and redaction mask. If present, store only after automated PII redaction; payloads > 8KB must be stripped and replaced with a reference to secure blob store.
+- trace (type: "trace"): block of stack frames/execution markers for kernel; base64 compressed.
+- log (type: "log"): supplemental runtime logs, one-per-line semantics.
+
+Hashing and divergence detection
+
+Purpose: determine if replay diverges from production execution due to runtime non-determinism or model-level changes.
+
+Canonical hash construction (SHA256):
+- Inputs concatenated in this exact order (UTF-8): METADATA.request_id + "|" + runtime_version + "|" + model_id + "|" + model_variant + "|" + decisions.kernel_selection + "|" + serialized-events-hash
+- serialized-events-hash = SHA256 of the concatenation of event lines exactly as persisted (preserve order and whitespace).
+- Final hash (execution_hash) = SHA256 hex of the entire concatenated string.
+
+Store the final execution_hash in the METADATA record under key execution_hash. Replays compute their own execution_hash and compare. Differences are classified as:
+- MATCH: identical hash -> deterministic replay success
+- KERNEL_DIFF: kernel_selection differs (indicates routing or scheduler change)
+- EVENT_MISMATCH: same kernel but serialized-events-hash differs (indicates non-determinism or missing telemetry)
+- METADATA_MISMATCH: any other metadata field mismatch (e.g., model_variant change)
+
+Replay workflow (operational runbook)
+
+Prerequisites: sandbox runtime matching runtime_version (within same minor), model artifact available, kernel plugin versions compatible.
+
+Steps:
+1) Fetch E-Artifact by request_id from archive or hot-store.
+2) Validate METADATA.execution_hash present.
+3) Start replay in isolated sandbox with environment variables: RUNTIME_REPLAY_MODE=1, REPLAY_REQUEST_ID=<request_id>.
+
+CLI example to start a replay job via runtime-coordinator-controller (rcctl):
+
+# start a replay with the archived artifact attached
+rcctl start-replay --artifact-id b6b7e2f2-8a72-4f1a-9c7b-1a2d3e4f5a6b --sandbox-profile small --env "RUNTIME_REPLAY_MODE=1"
+
+4) On completion the sandbox computes execution_hash and writes a small replay-summary JSON to /artifacts/<request_id>/replay-summary.json containing: request_id, original_execution_hash, replay_execution_hash, status (MATCH/KERNEL_DIFF/EVENT_MISMATCH/METADATA_MISMATCH), divergence_hint.
+
+Replay triage matrix (quick decisions)
+
+- MATCH -> close forensics ticket as reproducible; attach summary and annotated trace.
+- KERNEL_DIFF -> escalate to kernel-scheduling owners: include DECISIONS record, compare scheduler_cohort and kernel_flags.
+- EVENT_MISMATCH -> run delta-trace analysis: compare event_index sequences and run "event-aligner" tool (see tools section).
+- METADATA_MISMATCH -> check rollout history; likely model or runtime upgrade caused mismatch.
+
+Retention and privacy guidance
+
+- E-Artifacts for high-severity incidents: retain for 180 days. Other artifacts: 30 days by default.
+- Sensitive fields: payload.prompt and payload.user_text must be redacted before long-term storage unless a legal hold is present. Use the redaction tool:
+
+# redact and upload to secure archive
+redact-and-archive --input artifact.ndjson --pii-policy p0 --output s3://secure-archive/provenance/ --tag incident-1234
+
+Tooling and utilities
+
+- event-aligner: CLI tool to diff two EVENTS streams and present minimal edit script. Usage: event-aligner --original orig.ndjson --replay replay.ndjson --out diff.html
+- hash-inspector: prints the canonical concatenation used to compute execution_hash for auditing.
+- repro-runner: helper utility that spins a sandbox with model artifacts pinned.
+
+Diagnostic fields and common failure modes
+
+Table: common divergence indicators
+
+| symptom | likely root cause | first action |
+|---|---|---|
+| kernel_selection mismatch | scheduler policy change or kernel deprecation | check scheduler rollout timeline, kernel-compat table |
+| missing events or truncated artifact | transport/archiver dropped lines | run archive validation and re-ingest from hot-store |
+| checksum_hint mismatches on token_emit events | non-deterministic token sampling | validate sampling RNG seed and temperature config |
+| kvcache_hit_bitmap differences | cache eviction or timing | compare kv cache warmup windows and eviction logs |
+
+Versioning and compatibility rules
+
+- artifact_version evolves (v1 -> v2) whenever any required record schema changes. Replays must refuse artifacts with artifact_version > supported_max.
+- runtime minor upgrades (2.14.x -> 2.15.0) are allowed if kernel plugin compatibility matrix flags "replay-safe". Major version mismatch requires model-owner approval.
+
+Housekeeping and ownership
+
+- Owning team: eng-serving-runtime (runtime-observability subteam). Primary contacts: Priya Rao (runtime-observability), Samir Gupta (scheduler), Leah Ortiz (forensics).
+- SLA for requested replay artifact retrieval: 24 business hours for P1/P0 incidents, 5 business days for routine requests.
+
+Appendices
+
+A. Minimal example E-Artifact (NDJSON):
+
+{"type":"metadata","artifact_version":"v1","runtime_version":"2.14.0","model_id":"redwood/open-13b-v2","model_variant":"int8-fast","request_id":"b6b7e2f2-8a72-4f1a-9c7b-1a2d3e4f5a6b","timestamp_utc":"2026-01-10T15:34:21Z","ingress_cluster":"us-west-2-prod-1","route_name":"/v1/generate","execution_hash":"<sha256-hex>"}
+{"type":"decisions","kernel_selection":"kvm-attn-v2-16","kernel_flags":"kv-prefetch","scheduler_cohort":"cohort-22","routing_path":"coord-3|shard-12","batch_size_at_dispatch":"8"}
+{"type":"event","event_type":"ingress","event_index":"0","elapsed_ms":"0","note":"received at api-gateway"}
+{"type":"event","event_type":"kernel_enter","event_index":"1","elapsed_ms":"18","note":"dispatched to shard-12"}
+{"type":"event","event_type":"token_emit","event_index":"6","elapsed_ms":"320","note":"emitted token: 0x4f"}
+
+B. Quick checklist for oncall when a replay request is opened:
+1) Confirm artifact retrieval path and manifest checksum.
+2) Ensure sandbox runtime matches runtime_version (minor ok).
+3) Trigger repro-runner with explicit --seed if replay uses sampling.
+4) Save replay-summary and attach to incident.
+5) If divergence, tag the incident with divergence class and notify owners.
+
+C. References and related standards
+- telemetry-data-model-and-tracebook (see team-wiki)
+- runtime-decision-replay-and-slo-forensics-manual (operational patterns)
+- data-management/pii-redaction-policy
+
+Document change log
+
+- 2025-03-12 (Marcos Lin): created initial draft v1 of spec.
+- 2025-09-01 (Priya Rao): added retention and redaction rules.
+- 2026-02-14 (Samir Gupta): clarified canonical hash algorithm and added replay triage matrix.
+
+Contact and escalation
+
+For urgent questions about failing replays or missing artifacts, page: #runtime-observability on Slack and email runtime-observability@redwood.ai.

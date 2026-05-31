@@ -1,0 +1,319 @@
+Redwood Private: Backup and Restore Strategy (Upgrade + Rollback)
+
+## Overview
+This document defines the backup and restore strategy used by **Redwood Private (VPC + on-prem/air-gapped)** during upgrades and rollbacks. The goal is to make upgrades **safe-by-default** by taking a deterministic, auditable backup prior to any irreversible step (notably DB schema migrations), and by providing an operator-friendly restore path when rollback is required.
+
+This strategy is implemented by the **redwood-private-installer** (backup orchestration + state persistence) and supported by Helm hook ordering (pre-upgrade jobs, timeouts, and rollback-safe behavior).
+
+### Goals
+- Ensure there is a **known-good restore point** prior to upgrade execution.
+- Support both **VPC (cloud)** and **on-prem/air-gapped** deployments with consistent semantics.
+- Provide multiple backup mechanisms to match storage backends: **EBS snapshots**, **CSI VolumeSnapshots**, and **logical DB dumps**.
+- Enforce **encryption and auditability** requirements suitable for regulated customers.
+- Provide a clear **restore verification checklist** to confirm the environment is safe to return to service.
+
+### Non-goals
+- This is not a full DR/geo-replication design. It focuses on **upgrade/rollback safety** and recovering a single environment to a pre-upgrade state.
+- We do not attempt to back up or restore all ephemeral caches (e.g., model KV/prefix caches) beyond best-effort cleanup.
+
+---
+
+## Invariants and assumptions
+The following are required for a “supported” backup/restore posture:
+- A backup must be created and verified **immediately prior to upgrade execution** (within the same maintenance window).
+- Backups must be **encrypted at rest** using an approved key management method.
+- The installer must persist an **Upgrade State Record** linking:
+  - the upgrade plan ID
+  - target version
+  - backup artifact IDs (snapshot IDs and/or dump object URIs)
+  - verification results
+  - timestamps
+- Restore must be possible without pulling new artifacts from the internet (for air-gapped, all required artifacts must already be present in the offline bundle/mirror).
+
+---
+
+## What we back up
+Backups are split into **control-plane state**, **Kubernetes object intent**, and **operator/installer state**. We explicitly avoid capturing raw secret material unless the customer selects a secret backend that requires it (see “Secrets and secret backends”).
+
+### Backup scope (by component)
+| Component | Why | Backup method | Required | Notes |
+|---|---|---|---|---|
+| Control-plane PostgreSQL DB (redwood-control-plane) | Schema migrations are the most common irreversible upgrade step | (Preferred) Volume snapshot of DB PV; (Fallback) logical `pg_dump` | Yes | Snapshot preferred for speed/consistency; dump used for storage backends without snapshots or when PV snapshot fails prechecks |
+| Installer state + upgrade state record | Deterministic rollback/restore and audit trail | Copy installer state directory and generated plan/summary to backup destination | Yes | Contains plan ID, step status, artifact checksums, snapshot IDs, and versions |
+| Helm release metadata + values | Reproducibility; rollback to known chart configuration | Export `helm get values`, `helm get manifest`, `helm history` | Yes | Stored as text artifacts; does not include decrypted secrets |
+| Redwood Private configuration (non-secret) | Restore intended configuration | Export Redwood config CRs/ConfigMaps in allowed namespaces | Yes | Stored as YAML; we exclude large transient objects |
+| In-cluster signing keys / TLS materials | Only if customer stores TLS keys inside Kubernetes secrets and opts in | Optional (discouraged) | No | Strongly recommend external secret manager/HSM/KMS-backed storage |
+| Audit trail of upgrade | Compliance evidence | Export last N hours of upgrade-related audit events + installer logs | Yes (enterprise) | Also included in support bundle; see “Audit evidence” |
+
+### Kubernetes objects included/excluded
+Included (scoped to Redwood namespaces, e.g. `redwood-system`, `redwood-control-plane`, `redwood-data-plane`):
+- ConfigMaps and non-secret CRs that represent **desired state**
+- Helm release manifests/values as rendered artifacts
+- Custom Resources for Redwood components (where applicable)
+
+Excluded by default:
+- `Secret` resources (see below)
+- Large ephemeral resources (jobs with logs, transient caches)
+- Customer application namespaces outside Redwood-owned namespaces
+
+---
+
+## Secrets and secret backends
+### Default stance
+Backups must be structured so that **secret values are not copied** unless explicitly required. Most Private customers use one of:
+- Cloud KMS + external secret store (VPC)
+- Vault / HSM / enterprise secret manager (on-prem)
+
+### What we store instead of secrets
+- **References** to secret locations (e.g., secret name, external secret path, key alias/ARN, or Vault path), plus validation that those references were reachable during prechecks.
+- Kubernetes secret metadata (names/labels) when needed to ensure restore can recreate object stubs.
+
+### If secrets must be included (exception)
+If a customer chooses to store TLS private keys or other required secrets exclusively as Kubernetes secrets and does not have an external secret manager, the operator may enable `--include-k8s-secrets` for backup. This is:
+- **Restricted** (requires explicit approval in change management for regulated customers)
+- Encrypted and access-controlled (see encryption section)
+
+---
+
+## Supported backup mechanisms
+The installer selects the best available mechanism based on environment detection and prechecks.
+
+### 1) EBS snapshots (AWS VPC)
+Used when:
+- StorageClass is backed by EBS
+- Snapshot APIs are available and permitted
+
+Behavior:
+- Create EBS snapshots for the DB PV and any other stateful PVs designated as “upgrade-critical”
+- Record snapshot IDs in the Upgrade State Record
+- Tag snapshots with:
+  - `redwood:env_id`, `redwood:cluster_id`, `redwood:private_version`, `redwood:upgrade_plan_id`, `redwood:created_by=installer`
+
+### 2) CSI VolumeSnapshots (portable, incl. on-prem)
+Used when:
+- Kubernetes VolumeSnapshot CRDs are installed
+- The CSI driver supports snapshots and the snapshot controller is healthy
+
+Behavior:
+- Create `VolumeSnapshot` objects
+- Wait for `readyToUse=true` with a bounded timeout
+- Record snapshot object names + underlying snapshot handle in the Upgrade State Record
+
+### 3) Logical PostgreSQL backups (fallback)
+Used when:
+- Snapshot mechanisms are unavailable or fail prechecks
+- Customer requires a portable DB export
+
+Implementation:
+- Run a Kubernetes Job that performs:
+  - `pg_dump --format=custom --no-owner --no-privileges`
+  - Optional `pg_dumpall --globals-only` when roles are managed locally
+- Upload artifact to destination (S3/object store/file system)
+
+Caveats:
+- Slower for large DBs; may increase maintenance window
+- Restore requires compatible PostgreSQL major version (installer enforces version gate)
+
+---
+
+## Backup destinations
+### VPC (cloud) recommended destinations
+- S3 bucket (customer-managed), with bucket policies limiting access to installer IAM role
+- S3 Object Lock (optional) for tamper-evidence (regulated workloads)
+
+### On-prem / air-gapped recommended destinations
+- Customer-managed object store (S3-compatible) inside the restricted network
+- NFS/SMB file share with restricted ACLs
+- Local disk only for staging; not recommended as sole backup destination
+
+The installer writes a “backup manifest” artifact to the destination, alongside logs and exported YAML.
+
+---
+
+## Encryption and key management
+### Requirements
+All backup artifacts must be encrypted at rest using one of:
+- Cloud KMS (AWS KMS in VPC deployments)
+- Customer-managed keys in an approved HSM/Vault solution (on-prem)
+- Envelope encryption (AES-256) with a KEK managed by KMS/HSM
+
+### AWS VPC expectations
+- S3 backups must use SSE-KMS with a customer-approved CMK:
+  - `x-amz-server-side-encryption: aws:kms`
+  - `x-amz-server-side-encryption-aws-kms-key-id: <key-arn>`
+- EBS snapshots inherit encryption from the source volume when possible; otherwise the installer requires an explicit KMS key.
+
+### On-prem expectations
+- If using an S3-compatible object store, backups must be encrypted either:
+  - server-side using the object store’s KMS/HSM integration, or
+  - client-side by the installer using envelope encryption
+- Keys must never be stored in plaintext on disk. Installer supports loading encryption configuration from:
+  - environment variables injected via Kubernetes Secret (reference-only), or
+  - a local secure config file protected by OS-level permissions (last resort)
+
+### Access controls
+- Backups must be readable only by:
+  - the installer/operator identity
+  - a designated break-glass recovery role
+- Backup destinations must be **separate from the cluster** where feasible (to protect against cluster-scoped compromise).
+
+---
+
+## Retention and lifecycle
+### Default retention
+- Minimum retention for upgrade safety: **7 days**
+- Recommended retention for enterprise: **30 days**
+
+### Snapshot retention
+- EBS/CSI snapshots: default keep **3** most recent pre-upgrade snapshots (configurable)
+- Logical dumps: default keep **3** most recent dumps per environment
+
+### Cleanup policy
+- Cleanup is performed by the installer only when explicitly enabled:
+  - `--enable-backup-gc`
+- For regulated customers, cleanup is typically delegated to bucket lifecycle policies and/or snapshot retention tooling to meet internal evidence requirements.
+
+---
+
+## Restore workflow (operator-facing)
+Restore is intended to be deterministic and “plan-driven”: operators restore **the backup associated with a specific upgrade plan ID**.
+
+### Restore entry points
+- **Rollback during upgrade**: triggered when upgrade fails or when operator chooses to rollback within the maintenance window.
+- **Post-upgrade incident restore**: triggered after an upgrade completes but later requires restoring the pre-upgrade state.
+
+### High-level steps
+1. **Stop/scale down Redwood workloads** (data plane first, then control plane) to prevent writes during restore.
+2. **Restore control-plane DB**:
+   - If snapshot-based: restore PV from snapshot and reattach
+   - If logical: run `pg_restore` job and verify DB health
+3. **Re-apply known-good Kubernetes intent**:
+   - Use Helm history/values captured in the backup
+   - Pin chart/app versions as recorded in the Upgrade State Record
+4. **Bring up control plane** and wait for readiness gates.
+5. **Bring up data plane** and validate service health.
+
+### Example installer commands (illustrative)
+- Create backup (pre-upgrade):
+  - `redwood-private backup create --reason pre-upgrade --destination s3://<bucket>/<prefix> --kms-key <arn>`
+- Verify backup:
+  - `redwood-private backup verify --backup-id <id>`
+- Restore from backup:
+  - `redwood-private restore --backup-id <id> --confirm-impact`
+
+Note: Command names/flags are subject to change; refer to the current installer `--help` output for the installed version.
+
+---
+
+## Restore verification checklist
+A restore is considered successful only after completing the checks below.
+
+### Control plane verification
+- [ ] PostgreSQL is reachable from control-plane pods and passes readiness checks
+- [ ] DB schema version matches the expected pre-upgrade version recorded in the backup manifest
+- [ ] Control plane API health endpoint returns OK (internal): `GET /healthz`
+- [ ] No crash loops in control-plane namespaces for 15 minutes
+- [ ] Audit log shows `restore_started` and `restore_completed` events (enterprise environments)
+
+### Data plane verification
+- [ ] Data plane controllers are reconciled (no pending rollouts)
+- [ ] Canary inference request succeeds against a known small model with a fixed prompt
+- [ ] Token streaming works (if enabled)
+- [ ] Error rate and latency return to within normal band for the environment (baseline defined by SRE per customer)
+
+### Platform invariants
+- [ ] RBAC/OIDC connectivity intact (no auth regressions)
+- [ ] TLS certificates valid and served correctly
+- [ ] No version skew beyond supported range (N-1 ↔ N control plane/data plane constraints)
+
+If any item fails, do not reopen traffic; follow the runbook escalation path.
+
+---
+
+## Backup verification steps (pre-upgrade)
+Before an upgrade proceeds past prechecks, the installer must verify:
+- Snapshot jobs completed and snapshot objects are `readyToUse=true`
+- Destination is readable and writable with expected encryption settings
+- Backup manifest is written and includes:
+  - cluster/environment identifiers
+  - current Private version and target version
+  - snapshot IDs and/or dump object URIs
+  - checksums for exported text artifacts
+- DB consistency checks (lightweight):
+  - ability to run `SELECT 1`
+  - migration lock status is clear (no long-running migration locks)
+
+---
+
+## Failure modes and operator guidance
+### Common failures
+- **Insufficient storage headroom** for snapshot/dump staging
+  - Remediation: expand PV or destination capacity; rerun backup
+- **Snapshot controller/CRDs missing** (on-prem)
+  - Remediation: install VolumeSnapshot CRDs and controller; or use logical dump
+- **KMS permissions denied** (VPC)
+  - Remediation: validate IAM role access to CMK and S3 bucket policy
+- **Logical dump too slow** for maintenance window
+  - Remediation: switch to snapshot; reduce DB size; schedule longer window
+
+### Guardrails
+- If backup creation or verification fails, the upgrade is **blocked**.
+- If restore verification fails, the environment remains in “maintenance mode” until operator resolution.
+
+---
+
+## Audit evidence (enterprise/compliance)
+For environments with compliance requirements, the following evidence artifacts must be retained alongside the backup:
+- Upgrade plan summary (plan ID, steps, versions)
+- Precheck report (pass/fail + remediation pointers)
+- Backup manifest (IDs, checksums, encryption mode)
+- Restore/rollback logs (if invoked)
+- Audit log events (minimum fields):
+  - `event_type` (upgrade_started, prechecks_failed, backup_completed, rollback_invoked, restore_completed)
+  - `actor` (operator identity)
+  - `env_id` / `cluster_id`
+  - `upgrade_plan_id`
+  - `from_version` / `to_version`
+  - `backup_id`
+  - timestamps
+
+Retention for audit evidence should follow the customer’s policy; Redwood recommends aligning evidence retention to the organization’s change-management retention (commonly 90–365 days).
+
+---
+
+## Appendix A: Backup manifest (example format)
+The installer writes a human-readable manifest file alongside artifacts:
+
+- File: `backup-manifest.txt`
+- Example fields:
+  - `backup_id: bkp-2025-06-20T02:14:33Z-7f3a`
+  - `env_id: priv-prod-us-east-1-042`
+  - `cluster_id: eks-...`
+  - `private_version: 1.18.3`
+  - `upgrade_plan_id: upgplan-1.19.0-20250620-0210Z`
+  - `snapshot_type: ebs`
+  - `db_snapshot_ids: snap-0123..., snap-0456...`
+  - `helm_values_sha256: ...`
+  - `export_bundle_uri: s3://bucket/prefix/bkp-.../exports.tgz`
+  - `encryption: sse-kms arn:aws:kms:...`
+  - `verification: PASS`
+
+---
+
+## Appendix B: Sizing guidance
+- Snapshot-based backups typically complete in minutes to tens of minutes (storage dependent).
+- Logical dumps scale with DB size; assume roughly **20–60 GB/hour** effective throughput depending on CPU/network and compression.
+
+Operators should ensure:
+- Destination has at least **2×** expected DB size available for dump-based backups (temporary + final artifact).
+
+---
+
+## Owners
+- Primary owner: **Infrastructure Engineering (Private Deployments)**
+- Backup/restore implementation owners:
+  - Installer orchestration: Release Engineering + Infra
+  - Storage backend support (CSI/EBS): Infra
+  - Audit signals/dashboards: Observability/SRE
+
+For changes to backup scope, encryption defaults, or retention behavior, request review from Security Engineering and SRE leadership per Private change-management policy.

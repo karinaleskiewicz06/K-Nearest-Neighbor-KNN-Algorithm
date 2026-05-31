@@ -1,0 +1,134 @@
+ADR: Client-driven adaptivity and cost shaping
+
+Summary
+
+This ADR records the decision to support a lightweight, well-scoped client-driven adaptivity layer in the Redwood inference API: a typed, opt-in set of request hints that let callers express latency sensitivity, cost preferences, and quality tolerances. The runtime will use these hints to select routing, batching, quantization policies, and fallback variants to meet customer-level objectives while preserving system stability and cost predictability.
+
+Problem statement
+
+Many production applications have conflicting requirements: user-facing flows require low tail-latency, high-cost tolerance for short bursts; background jobs prefer lower unit cost with higher latency; internal batch workloads accept quantized model variants for cost savings. Today, we rely on coarse service tiers and tenant-level routing which forces operators to create many dedicated variants or manually tune request shaping. This is operationally expensive and leads to either excessive cost or unmet latency SLAs.
+
+Decision
+
+We will add a first-class, backward-compatible hints envelope to the public request schema and a corresponding runtime contract that: 
+- Accepts client hints (priority, max_cost_microdollars, latency_budget_ms, quality_tier, early_exit_ok) as optional, typed fields.
+- Treats hints as guidance (not strict guarantees) unless the customer has an SLA/reserved capacity that mandates firm behavior.
+- Exposes telemetry for decisioning (estimated_cost, chosen_variant, hint_applied) and ensures service-level guardrails (global budget, tenant fairness) take precedence over individual hints.
+
+Motivation and trade-offs
+
+Goals:
+- Give clients control to express intent so runtime policies can optimize at request granularity.
+- Avoid proliferating endpoints and model variants.
+- Make cost/latency trade-offs observable and debuggable.
+
+Trade-offs:
+- Complexity: Adds decisioning logic in the routing layer. Mitigation: keep hint set intentionally small and immutable for the first release.
+- Incorrect hints: Clients may send overly aggressive hints that stress the fleet. Mitigation: apply global caps and emit metrics + throttles.
+- Backward compatibility: Default behavior remains unchanged when hints are omitted.
+
+Design
+
+API contract (high-level)
+- New optional field in request envelope: `client_hints` with typed fields.
+- Hints are semantic; runtime maps them to policies (e.g., prefer-dedicated-pool, prefer-quantized, max-batch-delay).
+
+Example request snippet (JSON):
+{
+  "input": "Summarize the following document...",
+  "client_hints": {
+    "priority": "interactive",           // interactive | background | bulk
+    "latency_budget_ms": 120,            // integer milliseconds
+    "max_cost_microdollars": 5000,       // micro-dollars per request
+    "quality_tier": "standard",         // standard | high | economize
+    "early_exit_ok": true                // allow early-exit heuristics
+  }
+}
+
+Mapping to runtime actions (examples)
+- priority=interactive + latency_budget_ms<=120 -> prefer low-queue, low-batch pools, earlier preemption for background work.
+- quality_tier=economize -> prefer INT8/4 quantized variants or shorter context window if available.
+- max_cost_microdollars set -> apply conservative batching and prefer cheaper model variants until estimated_cost<=budget.
+
+Runtime contract and guardrails
+- Hints are advisory. The routing orchestration evaluates: capacity, tenant fairness score, global budget window, and per-tenant reserved capacity. If hint conflicts with higher-priority constraints, runtime logs a `hint_rejected` telemetry event and falls back to the dominant policy.
+- For reserved-capacity customers with SLAs, hints that would violate an SLA must be rejected with a 4xx and descriptive error.
+
+SLOs and telemetry
+
+We will add these metrics (emitted per-request and aggregated):
+- request.hint_present (bool)
+- request.hint_used (bool)
+- request.estimated_cost_microdollars (gauge)
+- request.actual_cost_microdollars (gauge)
+- routing.chosen_variant (tagged)
+- routing.rejection_reason (tagged)
+- hint_rejection_rate (percent of hinted requests rejected due to constraints)
+
+Primary SLOs and alert thresholds:
+- Hint rejection rate (global) < 2% over 1h window; alert P1 if >5% for 10m.
+- 99th percentile latency for `priority=interactive` requests remains within 1.3x baseline 99p for same traffic profile.
+- Observability coverage: >= 95% of requests with client_hints must have corresponding `hint_used` or `hint_rejected` events within 10s.
+
+Operational runbook (summary)
+
+1) Detection:
+- Alert triggers on elevated hint_rejection_rate, unexpected cost increases, or increased tail-latency for interactive hints.
+
+2) Immediate actions:
+- Toggle feature flag `client-hints-v1` to disable hint-driven decisions (runtime reverts to legacy routing).
+- Throttle hint processing globally via a soft cap if rejection rate causes cascading failures.
+
+3) Mitigation:
+- Identify offending tenants by correlating request.hint_present with tenant_id and escalate to customer success if repeated abuse.
+- Increase dedicated capacity or temporarily divert interactive hinted traffic to fallback pools.
+
+Rollout plan
+
+Phase 1 (canary, internal tenants):
+- Implement API contract as opt-in behind `client-hints-v1` feature flag.
+- Enable for 5 internal services and 1 small external beta customer. Monitor telemetry for 2 weeks.
+
+Phase 2 (wider beta):
+- Expand to 10% of external traffic with telemetry gating. Create dashboard showing hint adoption and rejection.
+
+Phase 3 (general availability):
+- Enable by default for all tenants, but with client_hints processed only when explicit opt-in flag in tenant config is set (for conservative rollout).
+
+Ownership and governance
+
+- Runtime routing: serving-runtime team (primary)
+- API surface and docs: eng-developer-experience (primary)
+- Observability and alerts: eng-platform (support)
+- Product policy (cost guardrails and SLA interaction): product team (advisory)
+
+Alternatives considered
+
+1) No client hints: keep current per-tenant and endpoint approach. Rejected because it forces proliferation of endpoints and reduces per-request adaptivity.
+
+2) Full policy language: allow clients to submit expressive policies (capabilities, priorities, preemption rules). Rejected for v1 because it exponentially increases complexity and opens safety/abuse vectors.
+
+3) Dedicated CLI/sidecar for per-tenant shaping: keep core API unchanged but provide a sidecar for advanced customers. Rejected for the general case because it fragments the developer experience and increases operations overhead.
+
+Risks and mitigations
+
+- Abuse and unexpected cost spikes: global rate caps, per-tenant budget windows, and telemetry to detect anomalies.
+- Observability blind spots: require instrumentation as part of rollout and make hint telemetry mandatory for any tenant processing hints.
+- Backwards compatibility: keep defaults unchanged and fail open/closed depending on tenant SLA to avoid breaking clients.
+
+Appendix: Error semantics and sample responses
+
+- If a hint is rejected due to capacity or policy, response includes: {"error": "hint_rejected", "reason": "tenant_budget_exceeded"} (HTTP 200 with structured body for partial acceptance) or HTTP 4xx when hint conflicts with customer SLA.
+
+Sample curl (beta):
+curl -X POST https://api.redwood.run/v1/generate -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{
+  "input":"Translate to French: ...",
+  "client_hints": {"priority":"interactive","latency_budget_ms":100} 
+}'
+
+Appendix B: Minimal server-side pseudocode (description)
+- When request arrives: validate hints schema -> compute estimated_cost for candidate variants -> consult tenant budget and global capacity -> pick variant that best satisfies hint and constraints -> emit telemetry (hint_present, hint_used, estimated_cost) -> dispatch.
+
+We intend this ADR to be the canonical source for v1 of client-driven hints. Implementation details (schema shape, numeric units, metric names) will be finalized in the accompanying API playbook and a short spec maintained by eng-developer-experience.
+
+Owner: Lina Chen (serving-runtime)

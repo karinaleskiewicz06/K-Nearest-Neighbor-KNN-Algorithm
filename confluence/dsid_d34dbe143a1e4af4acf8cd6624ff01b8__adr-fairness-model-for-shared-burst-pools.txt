@@ -1,0 +1,238 @@
+ADR: Fairness model for shared burst pools (Dedicated Burst Capacity)
+
+## Status
+Published (approved for implementation).
+
+## Summary
+We need a fairness model for *shared, Redwood-managed burst pools* used by Dedicated customers to temporarily exceed baseline reserved GPU capacity.
+
+This ADR compares fairness approaches (WFQ, token buckets, priority tiers) and selects an implementation that:
+- Prevents noisy-neighbor outcomes and reduces tail latency amplification for non-burst workloads.
+- Produces deterministic, supportable admission decisions (same input → same decision) even under telemetry lag.
+- Is measurable: we can quantify whether the fairness model is working via explicit metrics and guardrails.
+
+## Context
+Dedicated Burst Capacity allows a tenant (customer) to request additional capacity beyond their reserved baseline by borrowing from a shared burst pool (scoped to a region + hardware class, e.g., us-east/H100).
+
+Key constraints:
+- Baseline Dedicated capacity is not shared; only the incremental *burst portion* is.
+- Burst pools must protect:
+  1) Other Dedicated tenants using the same pool (including other bursters)
+  2) Platform-wide SLOs and fleet safety limits
+- Admission must be quick (p50 < 5ms in-controller) and safe under degraded telemetry conditions.
+- The system must provide clear denial reasons to customers and Support.
+
+Non-goals for the initial implementation:
+- Spot-market style bidding / trading reservations.
+- Cross-region bursting.
+- Fully preemptive scheduling on GPU nodes (we do not preempt running model server processes per request).
+
+## Decision drivers
+1) **Measurable fairness**: ability to compute “share of pool granted vs entitled” per tenant/tier over time.
+2) **Determinism**: avoids flapping decisions that lead to retry storms and hard-to-explain outcomes.
+3) **Simplicity & operability**: few knobs; predictable behavior; easy to simulate in load tests.
+4) **Anti-starvation**: ensure that small burst requests are not perpetually denied by one large tenant.
+5) **Tail-latency protection**: keep queue depth and saturation in check; degrade gracefully when pool is hot.
+
+## Considered options
+### Option A: Weighted Fair Queuing (WFQ) / Deficit Round Robin (DRR) at admission time
+**Description:** Maintain per-tenant queues (or virtual finish times) and admit according to WFQ/DRR weights.
+
+**Pros**
+- Strong fairness properties in networking contexts.
+- Can provide explicit weighted shares.
+
+**Cons / risks**
+- Requires maintaining queue state per tenant and per pool at high cardinality.
+- Admission decisions become dependent on controller-local ordering; determinism across replicas becomes difficult without a shared ordered log.
+- Harder to reason about under retries and client-driven concurrency (admit order may diverge).
+- We do not have a single central queue per pool; routing paths are distributed.
+
+**Conclusion:** Not selected for v1.
+
+### Option B: Pure token bucket per tenant (rate limiting) with static caps
+**Description:** Each tenant has a token bucket representing burst “budget” (e.g., burst GPU-seconds/s) with refill rate and burst size. Admit if tokens available.
+
+**Pros**
+- Simple, deterministic, low overhead.
+- Easy to implement and test.
+- Naturally produces explainable denials (“you exceeded your burst rate”).
+
+**Cons / risks**
+- Does not directly respond to pool-level contention. If every tenant is within its own budget, the pool can still overload.
+- Does not guarantee fair sharing when the pool is saturated; whoever requests first may win.
+- Can be too rigid for enterprise expectations (priority tiers).
+
+**Conclusion:** Useful building block, but insufficient alone.
+
+### Option C: Priority tiers only (gold/silver/standard), no per-tenant fairness
+**Description:** Admit burst requests by tier; higher tier always wins until global caps hit.
+
+**Pros**
+- Simple product story.
+- Easy to enforce “enterprise priority.”
+
+**Cons / risks**
+- Starvation risk for lower tiers during sustained saturation.
+- Hard to measure and defend “fairness” within the same tier.
+- Can create unpredictable customer experiences and elevated Support burden.
+
+**Conclusion:** Not selected as a standalone solution.
+
+### Option D (Selected): Tiered weighted token buckets + pool-level safety gates (with optional WFQ-style smoothing)
+**Description:** Use hierarchical/tiered token buckets for fairness and enforce pool-level contention gates to prevent overload.
+
+Core pieces:
+1) **Tier weights** (e.g., gold > silver > standard) expressed as refill rates and/or maximum share.
+2) **Per-tenant token bucket** within a tier to enforce fairness within that tier.
+3) **Pool-level gates** (saturation, queue depth, telemetry lag, global fleet safety) to protect neighbors and SLOs.
+4) **Deterministic decision function**: decision computed from a bounded set of inputs (tenant config + recent telemetry snapshot + current counters).
+
+**Why this works:**
+- Token buckets provide deterministic, explainable, rate-based fairness.
+- Tiering supports packaging without making the scheduler fully preemptive.
+- Pool-level gates ensure we never grant “fairly” into a meltdown.
+
+## Decision
+Adopt **Option D**: implement fairness as **tiered weighted token buckets** for burst admission, combined with **pool-level safety gates** and **anti-starvation constraints**.
+
+This is the default and required fairness mechanism for all shared burst pools in v1.
+
+## Detailed design
+### Definitions
+- **Baseline capacity**: tenant’s reserved Dedicated allocation (not part of burst pool fairness).
+- **Burst request**: request that exceeds baseline capacity and must borrow from pool.
+- **Burst unit for fairness accounting (v1)**: GPU-seconds (or GPU-milliseconds) attributed to the tenant’s incremental usage above baseline.
+- **Tier**: configured priority class (standard, silver, gold). Tier impacts refill rates and maximum share.
+
+### Hierarchical token bucket model
+We model each pool with:
+1) A **pool bucket** limiting total burst consumption (bounded by pool capacity and safety margin).
+2) A **tier bucket** per tier (optional in v1, recommended; enables explicit tier shares).
+3) A **tenant bucket** per tenant within tier.
+
+Admission requires tokens from:
+- pool bucket AND
+- tenant bucket (and tier bucket if enabled)
+
+If any bucket lacks tokens, deny (or queue, per ADR “admission control semantics”).
+
+### Parameters (v1 defaults; configurable per pool)
+All values below are expressed as guidance; exact numbers are set in pool config and can vary by region/hardware class.
+
+1) **Max burst ratio (per tenant)**
+- max_burst_ratio = 2.0 (tenant can burst up to 2x baseline capacity), subject to pool availability.
+
+2) **Tenant token bucket**
+- refill_rate: derived from baseline and tier weight.
+- burst_size: allows short spikes (seconds to tens of seconds) without instant denial.
+- cooldown_window: prevents oscillation when a tenant repeatedly hits cap.
+
+3) **Tier weights**
+- standard: 1.0
+- silver: 1.5
+- gold: 2.0
+
+4) **Pool safety margin**
+- reserve 10–20% of burst pool capacity as headroom to avoid tail latency blowups.
+
+### Admission decision inputs (for determinism)
+The admission controller decision MUST depend only on:
+- Tenant config: tier, enablement, max_burst_ratio, explicit burst caps
+- Pool config: capacity, safety margin, per-tier weights, max utilization, circuit breaker thresholds
+- Telemetry snapshot: pool utilization, queue depth, p95/p99 latency deltas for non-burst tenants, telemetry freshness
+- Controller counters: token balances and last refill timestamps
+
+To avoid replica divergence:
+- Token bucket refill uses monotonic time and quantized refill intervals (e.g., 100ms ticks).
+- Decision is made against a single telemetry snapshot per request (timestamped).
+- When telemetry freshness is outside the acceptable window, we fail closed to conservative gating (see Failure modes).
+
+### Anti-starvation rules
+To avoid starvation of smaller tenants within a tier:
+- Tenant buckets include a minimum refill floor for enabled tenants (bounded by pool safety) so that low-volume tenants can occasionally burst even when a large tenant is continuously requesting.
+- Enforce a maximum continuous-admission window per tenant under sustained saturation (implemented as a soft cap that increases deny probability/forces queueing).
+
+### Denial reason mapping (supportability)
+The admission controller returns a single primary denial reason code, stable over time:
+- BURST_DISABLED
+- TENANT_BURST_CAP_REACHED
+- TENANT_COOLDOWN_ACTIVE
+- POOL_SATURATED
+- POOL_FLEET_SAFETY_CAP
+- TIER_BUDGET_EXCEEDED
+- TELEMETRY_STALE_FAILCLOSED
+- CONTROLLER_OVERLOADED
+
+These reason codes are expected to be surfaced in routing/gateway logs and customer-visible reporting.
+
+## Measurable guardrails and success criteria
+We will measure fairness and neighbor protection via:
+
+1) **Per-tier share adherence**
+- Metric: granted_burst_gpu_seconds_by_tier / total_granted_burst_gpu_seconds
+- Goal: within ±10% of configured tier weights during sustained saturation (over 15m windows).
+
+2) **Within-tier fairness**
+- Metric: Jain’s fairness index over tenants’ granted_burst_gpu_seconds (computed per tier, per pool, per 15m window).
+- Goal: ≥ 0.85 in load tests; ≥ 0.75 in production (allowing real-world burstiness).
+
+3) **Starvation rate**
+- Metric: percentage of enabled tenants with > N consecutive denials while pool has non-zero grants.
+- Goal: < 1% for N=50 within 15m windows.
+
+4) **Neighbor impact (non-burst protection)**
+- Metrics:
+  - nonburst_p95_latency_delta (vs baseline period)
+  - tail_amplification_ratio (p99/p50)
+  - error_rate for non-burst tenants
+- Goal: No sustained regression beyond SLO gates; triggers automatic reduction/disable of burst when exceeded.
+
+5) **Determinism / stability**
+- Metric: retry_admit_flip_rate (same request idempotency key sees admit/deny flip within a short window)
+- Goal: near-zero except during config changes.
+
+## Failure modes and fallback behavior
+1) **Telemetry lag / stale telemetry**
+- Behavior: fail closed for pool-level gates (deny or queue with conservative limits), return TELEMETRY_STALE_FAILCLOSED.
+- Rationale: better to deny burst than to risk fleet-wide tail latency.
+
+2) **Controller overload**
+- Behavior: shed load, return CONTROLLER_OVERLOADED; routing should apply exponential backoff and/or fallback per admission semantics ADR.
+
+3) **Hot pool / tail latency regression**
+- Behavior: trigger pool circuit breaker (deny new burst admissions), allow existing bursts to drain, surface POOL_SATURATED or POOL_FLEET_SAFETY_CAP.
+
+4) **Tier misconfiguration**
+- Behavior: defaults to standard tier weight; audit log required for tier changes.
+
+## Consequences
+### Positive
+- Deterministic and supportable: denial reasons map directly to one of a small number of gates/buckets.
+- Measurable fairness with explicit KPIs and dashboards.
+- Supports packaging (tiers) without requiring complex distributed queuing.
+
+### Negative / trade-offs
+- Token bucket fairness is time-based and may not perfectly approximate instantaneous fairness under extremely bursty workloads.
+- Requires careful calibration of token units (GPU-seconds) and refill rates to match real consumption.
+- Some customers may expect “gold always wins”; we explicitly avoid absolute starvation of lower tiers.
+
+## Rollout plan
+1) Implement token bucket fairness in admission controller with standard tier only (no tier buckets), validate determinism.
+2) Enable tier weights for limited beta tenants; validate share adherence and anti-starvation metrics.
+3) Add tier buckets (if needed) for stricter tier share enforcement under saturation.
+4) GA: enforce fairness model for all shared pools; disallow per-tenant bespoke scheduling logic.
+
+Rollout guard: error-budget / SLO gate can automatically reduce or disable burst in a region/hardware class if non-burst latency regresses beyond configured thresholds.
+
+## Security and audit
+- Tier changes, burst enable/disable, and cap updates MUST be audit logged.
+- Support tooling can view decision explanations with redaction (no cross-tenant identifiers beyond hashed tenant id).
+
+## Open questions
+1) Should we standardize fairness accounting on GPU-seconds only, or incorporate token-level throughput as a secondary constraint (model-dependent)?
+2) Do we need separate tier weights per pool (region/hardware class) for procurement-driven constraints?
+3) What is the long-term stance on “enterprise override” during incidents (manual priority boosts), and how do we bound blast radius?
+
+## Appendix: Why we did not choose pure WFQ
+We do not have a single serialized queue per pool; routing is distributed and admission happens concurrently. Implementing WFQ with strong determinism would require additional shared state, ordering guarantees, or a central coordinator—adding latency, complexity, and failure modes. Token buckets provide a safer, more deterministic first implementation while still enabling measurable fairness and tiering.

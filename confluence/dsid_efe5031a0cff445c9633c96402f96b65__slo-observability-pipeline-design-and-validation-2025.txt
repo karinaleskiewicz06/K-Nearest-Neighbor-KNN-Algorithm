@@ -1,0 +1,127 @@
+SLO observability pipeline design and validation
+
+Summary:
+This document defines a canonical design and validation workflow for the SLO observability pipeline used by Redwood Inference SRE. It covers metric selection, collection guarantees, aggregation/rollups, validation and backfill procedures, automated error-budget actions, and runbook primitives for SLO burn incidents. The goal is to ensure SLOs are measurable, auditable, and actionable across hosted, dedicated, and private deployments.
+
+Purpose and scope:
+- Purpose: Provide an end-to-end pattern for converting raw telemetry into trusted SLO state and automated operational responses.
+- Scope: All production services that expose external-facing customer APIs (text generation, embeddings, chat) and internal platform surfaces that carry user-visible traffic (control plane routes). Does not cover purely experimental or internal feature branches.
+
+Key terms:
+- SLI: Service Level Indicator, the raw metric (ex: successful_response_ratio).
+- SLO: Service Level Objective, target on an SLI (ex: 99.95% availability over 30d).
+- Error budget: 1 - SLO.
+- Burn: sustained error-budget consumption above policy threshold.
+- Rollup window: the aggregation interval used for SLO reporting (default 1m -> 5m rollup).
+
+Design principles (non‑negotiable):
+1) Deterministic aggregation: every request must map to at most one SLI event with an immutable timestamp and context tags (service, cluster, region, model_variant, route_id, customer_tier).
+2) Single source of truth: SLI ingestion must originate from the service emitter and flow through a validated pipeline into the metrics system (Prometheus/Thanos) and the SLO store (Cortex-backed SLO service).
+3) Observability parity: SLO-relevant metrics must be present in both real-time alerting (Prometheus) and long-term retrospective stores (Parquet on object storage).
+4) Testability & replayability: all ingested raw events are checkpointed for 72 hours to enable replays for validation/backfill.
+5) Ownership & audit trail: each SLO has a single owner team and an audit log of changes (who, when, why).
+
+Required telemetry and labels (table):
+- name | type | required labels | retention
+- request_count | counter | service, route_id, model_variant, region, outcome, status_code | 13 months
+- request_latency_ms | histogram | service, route_id, model_variant, region, quantile_tag | 13 months
+- kv_cache_hit | counter | service, model_variant, region | 6 months
+- upstream_fallback | counter | service, route_id, fallback_reason | 1 year
+
+SLI definitions (examples with PromQL):
+1) Availability SLI (success ratio):
+- definition: ratio of successful responses to total requests with customer-visible status codes
+- PromQL example:
+  sum(rate(request_count{service="api-public", outcome=~"success|partial_success"}[5m])) / sum(rate(request_count{service="api-public"}[5m]))
+2) Latency SLI (p95 tail):
+- definition: fraction of requests with latency <= 500ms on production tier routes
+- PromQL (using histogram_quantile):
+  histogram_quantile(0.95, sum(rate(request_latency_ms_bucket{service="api-public", route_id=~"/v1/.*"}[5m])) by (le)) <= 500
+3) Correctness SLI (rerank/semantic scoring):
+- definition: automated evaluation success rate for structured outputs on daily sample sets (see "daily-evals" job)
+
+SLO targets and windows (examples):
+- api-public availability: target 99.95% over 30d, 99.9% over 7d (secondary)
+- embeddings-latency: 95% of requests <= 200ms over 14d
+- control-plane-ops: 99.99% availability over 30d
+Note: Each SLO must include a rationale paragraph in the SLO metadata explaining customer impact and cost tradeoffs.
+
+Error budget policy and automated actions:
+- Soft thresholds (informational): 10% of monthly error budget consumed -> notify owner via Slack SLO channel, generate weekly burn report.
+- Hard thresholds (automated mitigation): 25% of monthly error budget consumed -> reduce non-essential background jobs (auto-pause batch refresh), scale down low-priority replication, and enable degraded-mode routing to warm standby models.
+- Emergency threshold: 50% of monthly error budget consumed in 24h -> trigger runbook SRV-BURN-01 and open an incident/P1.
+- Reconciliation: all automated mitigations must be logged in the SLO audit trail with an auto-generated runbook decision entry.
+
+Validation & backfill workflow (step-by-step):
+1) Pre-deploy checks (CI): unit tests for emitters, schema validation for metric labels, and a synthetic traffic job that asserts metric emission at canary load.
+2) Canary validation (first 48h): compare canary and baseline SLI rates (delta < 0.05%). If deviation > 0.2% open a preflight review.
+3) Backfill/replay steps when gaps detected:
+   a) Identify gap window from checkpointed raw events.
+   b) Replay events into a validation namespace and compute SLI.
+   c) If replay SLI differs from production SLO by > 0.1% for availability or > 2% for latency quantiles, escalate to SRE and platform-observability.
+   d) Once fixed, record a backfill job and annotate the SLO with the correction.
+4) Post-deploy audit (30d): scheduled SLO-quality report comparing metric drift, cardinality growth, and rollup accuracy.
+
+Runbook primitives (short snippets):
+- SLO-BURN-ALERT (P2)
+  1) Pager fires when 25% monthly budget consumed AND 14d budget slope > 0.5%/day.
+  2) Triage: confirm signal (run PromQL queries, check for client-side retry storms).
+  3) Immediate mitigations: route to lower-cost model_variant, enable prefix KV cache bypass, disable non-critical telemetry.
+  4) If mitigations reduce burn rate to <10%/day, move to monitoring state; otherwise escalate to on-call P1.
+
+- SLO-BACKFILL (Runbook)
+  1) Owner tags the SLO and requests replay from the checkpoint store.
+  2) Validation lead runs replay in staging namespace, generating a JSON report (schema below).
+  3) If consistent, merge backfill and update SLO notes.
+
+Alert rule YAML example (PrometheusAlertmanager-style):
+- alert: SLO_MonthlyBudgetBurnHigh
+  expr: (1 - (sum(rate(request_count{service="api-public", outcome=~"success|partial_success"}[30d])) / sum(rate(request_count{service="api-public"}[30d])))) > 0.0025
+  for: 30m
+  labels:
+    severity: warning
+    runbook: SRV-BURN-01
+  annotations:
+    summary: "SLO monthly burn > 25% for api-public"
+
+Metric quality gates (automated checks executed nightly):
+- cardinality growth < 15% week-over-week per service
+- required labels present on 99.9% of samples
+- histogram bucket completeness (no missing buckets for last 7 days)
+- replay parity: replayed SLI within 0.1% of live SLI for availability metrics
+
+Operational tooling integrations (recommended):
+- Checkpoint store: S3 bucket with lifecycle 90d for raw events, archived Parquet for 13 months.
+- Replay engine: containerized job (replayctl) that accepts window and SLO id and writes to validation Prometheus namespace.
+- SLO dashboard: Cortex-based SLO store surfaced in Redwood Console with token-level filters.
+- Automation: a lightweight runner (runbook-exec) to apply the automated mitigation actions via infra API.
+
+Ownership, audits and change control:
+- Every SLO must live in the SLO registry and include: owner, escalation channel, rationale, and approval history.
+- Changes to SLO thresholds require: owner sign-off + SRE peer review + a 72h monitoring window post-change.
+- Audit record sample: "2025-01-21 | Maya Patel | raised availability target for api-public from 99.9->99.95 | reason: enterprise SLA increase"
+
+On-call playbook excerpt (when called from PagerDuty):
+1) Acknowledge and capture initial facts: affected routes, burn rate, recent deploys, and capacity signals.
+2) Run the triage notebook (link in SLO dashboard) that executes canonical PromQL queries and summarizes upstream errors, client retry patterns, and capacity headroom.
+3) If evidence points to capacity saturation, coordinate with capacity on-call to run quick scale (see capacity rapid scale checklist).
+4) Notify product & customer success if an incident is declared (include estimated customer impact and mitigation timeline).
+
+Rollout checklist for the observability pipeline (preflight):
+- emitter library updated and released
+- CI metric schema checks pass
+- checkpointing to S3 enabled for the service
+- canary traffic tests green for 48h
+- SLO created in registry with owner and rationale
+- automated mitigations reviewed and simulated in staging
+
+Appendix: example JSON report schema for replay validation (single-line fields):
+- replay_id, slo_id, start_ts, end_ts, baseline_availability, replay_availability, diff_pct, action_taken
+
+Related references:
+- SLO escalation and capacity triggers (internal page)
+- Error budget orchestration playbook (internal page)
+
+Document maintenance:
+- Owner: engineering (SRE); review cadence: quarterly or after any major SLO incident.
+- Last review: 2025-02-03 (Maya Patel).

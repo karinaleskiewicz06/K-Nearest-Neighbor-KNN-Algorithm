@@ -1,0 +1,183 @@
+ADR: Standard request metadata envelope and hierarchical throttling
+
+Summary
+-------
+This ADR records the decision to standardize a compact request metadata envelope across Redwood's public and internal inference APIs and to adopt a hierarchical throttling model enforced at three tiers (global, tenant, model/route). The envelope and throttling policy will enable deterministic routing, consistent observability, and cost-aware quality controls for hosted, dedicated, and private deployments.
+
+Context and problem statement
+-----------------------------
+Existing behavior at Redwood is inconsistent: different services expect different header keys and shapes for routing metadata, and enforcement for throttling is split across gateway, runtime, and ad-hoc service logic. This leads to failures in cross-region routing, opaque cost attribution, and surprises during model rollouts (e.g., noisy tenants exhausting shared pool capacity). We need a single, compact, forward-compatible envelope and a clear, enforceable throttling scheme that: 
+- Preserves low-latency for critical requests,
+- Enables predictable cost accounting per-tenant/model,
+- Supports graceful degradation (fallbacks) when a tier is saturated,
+- Works across Hosted API, Dedicated, and Private modes.
+
+Decision
+--------
+We will: 
+1) Adopt a standardized request metadata envelope (JSON body + headers) called "redwood-envelope" that all public SDKs and internal services will populate.
+2) Enforce hierarchical throttling at three levels: Global (per-region), Tenant (per-customer/organization), and Route/Model (per-model or per-feature route).
+3) Implement enforcement and metrics at the gateway (fast reject and shaping) and at the serving runtime (final enforcement and soft-burst accounting).
+4) Instrument detailed metrics and structured logs for each enforcement decision to surface cost and quality tradeoffs.
+
+Required envelope fields (backwards-compatible)
+----------------------------------------------
+We choose a minimal set to avoid extra serialization overhead while being future-proof. All fields are optional except request_id and client_id; missing optional fields default to server-side policy values.
+
+Example JSON payload (body-level envelope for large/batched requests):
+
+{"request_envelope": {
+  "request_id": "uuid-v4-1234",            // string, required; used for tracing and dedupe
+  "client_id": "team-42",                  // string, required; billing/tenant key
+  "priority": "normal",                    // enum: low | normal | high | realtime
+  "route_hint": "chat.v2",                 // string: logical route or feature name
+  "model_preference": ["redwood/gpt-3-small-quant"], // ordered list of name/variants
+  "max_tokens": 1024,                        // integer, optional enforcement hint
+  "preserve_kv_cache": true,                // boolean hint for caching policy
+  "slo_tier": "business",                  // enum: free | standard | business | enterprise
+  "meta": {"env": "prod", "region": "us-west-2"} // free-form map for private deployments
+}}
+
+Header-level compact form (for small requests / streaming):
+X-Redwood-Req: client_id=team-42;req_id=uuid-v4-1234;pri=normal;route=chat.v2;slo=business
+
+Parsing rules and compatibility
+- Gateways and SDKs MUST accept both body envelope and header envelope. If both present, body envelope takes precedence.
+- Unknown fields in meta MUST be ignored to remain forward-compatible.
+- SDKs MUST provide a small helper to serialize the header-engineered form to reduce network overhead for streaming.
+
+Hierarchical throttling model
+---------------------------
+Enforcement tiers and default backstop policies (numbers are defaults and subject to per-tenant overrides via Dedicated/Private contracts):
+
+1) Global (per-region)
+   - Purpose: Protect regional capacity and provide immediate feedback for large spikes.
+   - Default limits: 20,000 tokens/sec aggregate; 5,000 concurrent in-flight streams.
+   - Action on breach: fast 429 with Retry-After header; route to passive fallback region if configured.
+
+2) Tenant (per client_id)
+   - Purpose: Isolate noisy neighbors and enable predictable billing buckets.
+   - Default limits: 120 tokens/sec, 20 concurrent streams, burst token bucket of 400 tokens.
+   - Action on breach: throttling to configured rate; if sustained (>60s), apply soft quota admission that returns lower-cost model variant if available.
+
+3) Route/Model (per route_hint or model_identifier)
+   - Purpose: Protect expensive models and preserve SLOs for critical routes.
+   - Default limits: model-specific; e.g., large-llama-70b: 200 tokens/sec globally, 15 concurrent per-tenant.
+   - Action on breach: queue requests up to a short window (default 250ms), then attempt fallback to cached response or cheaper model variant; if unavailable, return 503 with structured reason.
+
+Enforcement placement and sequencing
+-----------------------------------
+- Ingress API Gateway (Envoy): primary fast-reject; maintains lightweight per-key counters using local caches + periodic sync with central rate-limiter. Good for low-latency rejects.
+- Serving runtime sidecar (per-host): authoritative throttling and accounting, performs soft-burst reconciliation, and records token accounting to central billing pipeline.
+- Control plane service (redwood-throttle): central policy store and aggregator that emits adaptive rate suggestions based on capacity and model latency.
+
+Observability and metrics (required)
+-----------------------------------
+Each enforcement point MUST emit the following metrics with tags/dimensions {region, client_id, route_hint, model, enforcement_tier, action}:
+- redwood.throttle.tokens_consumed (counter, tokens)
+- redwood.throttle.requests_rejected (counter)
+- redwood.throttle.requests_queued (counter)
+- redwood.throttle.latency_ms (histogram)
+- redwood.throttle.fallbacks (counter)
+
+Structured log line example (JSON log):
+{"ts":"2025-06-02T15:40:12Z","service":"ingress-gateway","event":"throttle_reject","client_id":"team-42","request_id":"uuid-v4-1234","tier":"tenant","reason":"burst_limit","retry_after":3}
+
+Dashboards and alerts
+- Charts: tokens_consumed P50/P95/P99 by tenant; rejected rate trend by route; fallback rate and latency impact.
+- Alert: Tenant reject rate > 0.5% sustained for 10m -> paging SRE and account exec if enterprise tenant.
+- Alert: Global concurrent streams > 90% capacity -> page infra SRE.
+
+API semantics and developer ergonomics
+------------------------------------
+- SDKs will expose a minimal API to set envelope fields and will automatically populate request_id and client_id from credentials.
+- A new header X-Redwood-Fallback: allow|disallow will let callers opt-out of automatic fallbacks to cheaper models. Default: allow.
+- The platform will provide a deterministic routing policy: models listed in model_preference are tried in order; if none available and X-Redwood-Fallback=allow, runtime can select a compatible model variant.
+
+Implementation plan and rollout (high-level)
+-------------------------------------------
+1) Spec & SDK changes (2 sprints)
+   - Publish open spec for envelope and header tokens. Update JS/Python/Go SDKs with helpers.
+2) Gateway enforcement (3 sprints)
+   - Implement Envoy filter to parse header envelope, fast-reject, and push metrics.
+3) Runtime sidecar enforcement (3 sprints)
+   - Add authoritative enforcement and token accounting; handle soft fallbacks.
+4) Control plane & billing integration (2 sprints)
+   - Central policy, per-tenant config UI, and billing ingestion for tokens_consumed.
+5) Canary rollout (8 weeks)
+   - Start with internal teams, then opt-in enterprise customers, then default for new customers. Monitor errors, fallback rates, and latencies.
+
+Compatibility and migration notes
+--------------------------------
+- Backwards compatibility: Gateways will accept legacy headers and map them to the envelope where possible.
+- SDK migration: SDKs will provide automated shim layer that translates existing per-field headers into the envelope for a transitional period (~6 months).
+- For Dedicated or Private deployments, the control plane UI will allow tenants to upload custom per-tenant overrides (e.g. higher concurrency).
+
+Rationale and alternatives considered
+------------------------------------
+Considered:
+- Centralized token bucket service: rejected because of additional RTT for every request and single point of failure; kept as future enhancement for cross-region coordination.
+- Per-request heavy metadata: rejected to avoid extra per-token cost and serialization overhead.
+- Client-side throttling library: helpful but insufficient (clients may be misbehaving); server-side enforcement required.
+
+Consequences and risks
+----------------------
+- Positive: predictable billing attribution, consistent routing, improved reliability during noisy spikes.
+- Risk: misconfigured tenant limits could cause customer-visible 429s; mitigated by soft-fallbacks and canarying.
+- Operational overhead: new metrics + dashboards increase SRE load; we commit to an initial 90-day monitoring window and runbook.
+
+Ownership and contacts
+----------------------
+- Spec and SDKs: eng-developer-experience (owner: Sofia Ruiz).
+- Gateway enforcement: eng-platform (owner: Kenji Nakamura).
+- Runtime enforcement: eng-serving-runtime (owner: Arjun Patel).
+- Observability & billing: eng-sre and finance (owner: Priya Desai).
+
+Related docs and references
+--------------------------
+- /confluence/architecture-and-standards/api-standards/request-size-and-rate-guidelines-2024
+- /confluence/eng-serving-runtime/runtime-architecture/sidecar-patterns-2024
+- RFC: model-fallback-policy-2025 (internal id: RFC-2025-11)
+
+Implementation snippet (pseudo-code for ingress filter):
+1. Parse X-Redwood-Req header or request_envelope from body
+2. Resolve client_id -> tenant_policy (cache)
+3. Check local counters for Global and Tenant; if breach -> return 429 with Retry-After
+4. Tag request with resolved policy and forward to runtime
+
+Pseudocode example:
+function handleRequest(req) {
+  envelope = parseEnvelope(req)
+  policy = lookupPolicy(envelope.client_id)
+  if (!globalBucket.consume(envelope.estimated_tokens)) return reject(429)
+  if (!tenantBucket(policy).consume(envelope.estimated_tokens)) return rejectOrFallback(policy, envelope)
+  req.headers['x-rd-policy-id'] = policy.id
+  forward(req)
+}
+
+Rollout runbook highlights (short)
+- Canary segment: 5% internal + 2 trusted enterprise tenants.
+- KPIs to monitor in first 72h: 429 rate, fallback rate, p95 latency delta, billing token count variance.
+- Escalation: if p95 latency increases > 30% within canary, rollback gateway filter and revert SDK changes.
+
+Future work
+-----------
+- Evaluate a centralized cross-region coordinator for burst allocation.
+- Expose tenant-level throttling dashboards to customers in Console.
+- Synthesize a per-customer cost predictor using observed token consumption patterns.
+
+Appendix: sample tenant policy table (default values)
+---------------------------------------------------
+| tenant_tier | tokens/sec | concurrency | burst | fallback_allowed | comment |
+| free        | 30         | 3           | 60    | true             | best-effort, high-latency allowed |
+| standard    | 120        | 20          | 400   | true             | default for self-serve customers |
+| business    | 600        | 80          | 2000  | true             | SLAs apply |
+| enterprise  | custom     | custom      | custom| configurable     | negotiated in contract |
+
+Document change history
+-----------------------
+- 2025-03-10: Draft created by Maya Chen.
+- 2025-04-18: Added metrics and enforcement placement after eng-platform review.
+- 2025-06-02: Finalized defaults and rollout plan after canary tests.
+
+End of document

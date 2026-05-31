@@ -1,0 +1,150 @@
+Interactive latency triage runbook for GPU inference
+
+Summary
+-------
+This runbook is an interactive, step-by-step triage and mitigation guide for oncall engineers responding to sudden latency regressions affecting GPU-backed inference paths (hosted, dedicated, or private). It combines immediate mitigations, exploratory queries, and safe rollback steps that touch the serving runtime, routing, caching, and IaC layers. Use this document during live incidents and for post-incident sim exercises.
+
+Scope
+-----
+- Applies to inference requests that route to GPU-backed pools (real-time generation, chat, reranking, embeddings).
+- Covers production-facing latency SLO breaches (p95/p99 increases, tail latency spikes) and upstream causes (model, kernel, routing, KV/cache).
+- Excludes: training clusters, offline batch jobs.
+
+Owner and escalation
+--------------------
+- Primary oncall: Inference-SRE team
+- Secondary: GPU-fleet (infra)
+- Pager escalation path: Inference-SRE -> Runtime (serving-runtime team) -> Kernel / CUDA owners -> Platform (networking/Terraform)
+- Pager contact list (Slack channels): #oncall-inference, #gpu-fleet, #runtime-kernels
+
+SLOs and thresholds (quick reference)
+------------------------------------
+- Production p95 latency: 120ms (soft), p99: 350ms (critical)
+- Auto-page triggers:
+  1. p99 > 500ms for > 2min OR
+  2. Error rate > 0.5% for > 5min OR
+  3. Token-level throughput drop > 30% with queue growth
+
+Detection and triage checklist (first 10 minutes)
+------------------------------------------------
+1. Confirm alert - collect: alert name, window, affected routes/models, deployment tag/hash.
+2. Validate scope:
+   - Query recent routing breakout: `SELECT model, region, count(*) as rps, avg(latency_ms), p95, p99 FROM inference.routing_metrics WHERE time>now()-5m GROUP BY model, region;`
+   - Check model-specific anomaly: high tail latency across multiple regions suggests model/runtime issue; single-region suggests infra/network.
+3. Check telemetry dashboards (links in Appendix): p50/p95/p99 per-route, request queue length, kv-cache hit ratio, batch sizes, GPU utilization, PCIe errors, node-level CPU steal.
+4. If error spikes accompany latency, capture recent error classes and stack traces from logs.
+
+Immediate mitigations (order matters)
+-----------------------------------
+- If queue length is growing and p99 > 2x SLO: enable short-term rate limit on affected route (Console -> Route -> Throttle: set to 80% of steady-state RPS).
+- If one model variant shows tail-only regressions: switch traffic to previous model version (rollout -> rollback to pinned version). Keep canary traffic enabled at 1% to gather evidence.
+- If GPU nodes show OOM/driver/NIC errors: cordon affected nodes and drain; enable warm-pool expansion for ephemeral replacements.
+- If KV cache hit ratio drops precipitously: temporarily disable prefix caching to reduce cache-miss amplification and fallback to fresh context generation (see KV cache rollback block).
+- If batching has collapsed (batch size ~1): force a burst-friendly batching policy by toggling `batching_profile=latency-stable` via the runtime API.
+
+Safe experiment rollback actions (10–30 minutes)
+------------------------------------------------
+- Model rollback (preferred when model variant implicated):
+  1. Identify last successful deployment tag: `rlsctl list --model <model> --env prod --limit 5`.
+  2. Promote previous tag to 100% traffic or create weighted split (99/1) for monitoring.
+  3. Observe p95/p99 for 5m windows before full promotion.
+- Kernel or GPU driver rollback is high risk; only perform with platform and kernel owners. Prefer evacuating nodes running new kernel and rolling back images via the node-image CD pipeline.
+- Routing policy rollback: revert recent `smart-routing` or `cost-routing` changes in the Console or via gitops. Use `cd-ops rollback <route-id>` to revert.
+
+Deep investigation (if immediate mitigations not sufficient)
+-----------------------------------------------------------
+- Correlate latency to signals:
+  - per-token time breakdown (tokenization, first-token, generation, streaming flush)
+  - KV cache hit/miss timeline
+  - Batching distribution histogram (observe tail bins)
+  - GPU kernel occupancy / SM utilization / tensor core metrics
+- Use these queries/examples:
+  - PromQL: `histogram_quantile(0.99, sum(rate(inference_latency_bucket{route=~".*"}[5m])) by (le, route))`
+  - KV cache: `sum(rate(kv_cache_miss_total[5m])) by (pool, region)`
+  - Batch distribution: `sum by (pool, bucket) (rate(batch_size_bucket[5m]))`
+- Log search (ELK): `service:inference AND model:<model> AND @timestamp:[now-10m TO now] AND ("kv miss" OR "batch size=1" OR "cuda error")`
+- Node-level: `kubectl top pod -n inference -l pool=<pool>`; check `dmesg` for PCIe / driver errors on nodes with observed anomalies.
+
+KV cache reconstruction & safe warmup steps
+------------------------------------------
+1. If KV cache was accidentally invalidated or evicted: do NOT mass-warm on entire fleet. Use staged warmup:
+   - Select a single small pilot tenant or synthetic traffic stream.
+   - Run `kv-warm --model <model> --pool <pool> --prefixes-file small-prefixes.txt --rate 10rps` to seed hot prefixes.
+   - Monitor cache hit rate and tail latency.
+2. If warmup causes CPU/GPU saturation, throttle warmup process or reduce concurrency.
+3. For persistent cache corruption, follow the `kv-cache-consensus` recovery checklist in the Appendix.
+
+Batching & runtime tuning checklist
+----------------------------------
+- Check recent config commits to batching_profile, batching_window_ms and batch_size_max.
+- If tiny batches dominate, look for: sudden drop in RPS, queue desynchronization, or a recent change to `batching_window_ms` in Git.
+- Temporary mitigation: set `batching_window_ms` to the lower safe bound (e.g., 10ms -> 20ms) to allow better batching without violating prompt-level latency SLOs. Use runtime API: `curl -s -X POST https://runtime-admin/api/v1/profiles/<pool>/apply -d '{"batching_window_ms":20}'`
+
+GPU node and kernel issues (quick checks)
+----------------------------------------
+- Check driver and kernel errors: `journalctl -u nvidia-driver -n 200` and `dmesg | grep -i pcie` on suspect nodes.
+- GPU ECC/PCIe errors: if increasing, cordon node immediately and create a support ticket with hardware vendor.
+- Firmware/kernel rollouts: if started in last 24h, consider rolling back the kernel image via the image promotion CD job.
+
+IaC / Terraform rollback checklist (when infra change is suspected)
+------------------------------------------------------------------
+1. Identify recent Terraform changes: check `git log -- path=infra/gpu* -n 20` and `terraform state list` for affected resources.
+2. If a module change reduced pool capacity or changed instance types: plan a rollback in a non-blocking manner: `git checkout <previous-commit> && terraform plan -out rollback.plan && terraform apply rollback.plan --auto-approve` triggered by Infra SRE.
+3. Use operator: ensure capacity expansion (warm-pool) and preemptive placements are re-enabled if previously disabled.
+
+CI/CD fast-checks (if suspect deployment introduced regression)
+------------------------------------------------------------
+- Check recent merges to serving-runtime and model-serving repos within last 60 minutes: `gh pr list --repo=redwood/serving-runtime --state=merged --since=1h`
+- If a canary was promoted, reduce traffic to canary and re-run the canary test harness (local synthetic traffic) before reverting fully.
+- Recommended quick test: run the local `latency-smoke` container in the same region for 10m at production traffic profile to reproduce tail.
+
+Communication template (incident channel)
+----------------------------------------
+- Channel topic: [INCIDENT] Inference latency — <brief cause if known> — <region>
+- Post initial update within 10m: scope, users impacted, immediate mitigations, next update ETA 15m.
+- Use status page if customer-impacting: include affected endpoints, expected mitigation, and ETA for next update.
+
+Post-incident and learning steps
+-------------------------------
+1. Create a lightweight postmortem with timeline, root cause, mitigations taken, and actions.
+2. Add synthetic test(s) to the CI canary that would have detected the regression (example: a p99-focused synthetic traffic run with variable sequence lengths).
+3. If KV/cache, batching, or kernel was involved, add a regression-eval and automated alert (tied to this document) to detect similar patterns.
+
+Runbook simulation lab (recommended quarterly)
+---------------------------------------------
+- Objective: validate the runbook and detect gaps by simulating a realistic latency regression across a small testbed.
+- Steps:
+  1. Provision a 3-node GPU testbed with the latest runtime image using the `integration/team-lab` terraform workspace.
+  2. Deploy a canary model and run `synthetic-gen` with a p99-focused workload for 15–20m, e.g. `synthetic-gen --model canary-chat --seq-dist heavy-tail --rps 100 --duration 20m`.
+  3. Introduce a controlled KV eviction on one node: `sudo systemctl stop kv-cache-backend` and observe global fallback behavior.
+  4. Execute the warmup script in a staged manner and confirm cache rehits and latency recovery.
+  5. Record findings and update this runbook.
+
+Appendix: useful commands and queries
+------------------------------------
+- Runtime API: `GET /api/v1/pools/<pool>/metrics`, `POST /api/v1/profiles/<pool>/apply`
+- PromQL examples:
+  - p99 per route: `histogram_quantile(0.99, sum(rate(inference_latency_bucket{env=\"prod\"}[5m])) by (le, route))`
+  - KV miss rate: `sum(rate(kv_cache_miss_total{env=\"prod\"}[2m])) by (pool)`
+- kubectl: `kubectl -n inference get pods -l pool=<pool> -o wide`
+- Terraform quick revert snippet:
+  ```bash
+  git checkout <old-commit>
+  terraform init -reconfigure
+  terraform plan -out rollback.plan
+  terraform apply rollback.plan
+  ```
+- Warmup example (toy): `kv-warm --model vicuna-7b --pool uk-west-1 --prefixes-file small.txt --rate 5rps`
+
+Runbook maintenance
+-------------------
+- Author is responsible for annual review or after any incident where this runbook was used.
+- Maintain the lab scripts in `gitlab.com/redwood/infra/sim-labs` and mark the runbook version in the top section.
+
+Contact and further reading
+---------------------------
+- Runtime architecture overview: /confluence/eng-infra/serving-runtime/runtime-architecture.json
+- KV cache consensus and recovery: /confluence/eng-infra/runbooks/kv-cache-consensus-and-warmup-coordination-runbook.json
+- Canary gating and CI runs: /confluence/eng-infra/ci-cd-and-build/gpu-ci-canary-burst-backstop-and-ci-safety-harness.json
+
+End of document.

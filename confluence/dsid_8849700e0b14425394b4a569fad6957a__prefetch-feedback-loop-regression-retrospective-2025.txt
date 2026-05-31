@@ -1,0 +1,138 @@
+Prefetch feedback-loop regression retrospective
+
+Summary
+-------
+This retrospective analyzes a production regression that began 2025-11-18 and lasted eight days before automated rollback and operator intervention fully restored expected behavior. The regression manifested as elevated tail-latency and increased miss-rate for LLM KV prefix cache reads for small seqlen workloads, primarily impacting real-time chat endpoints (route: /v1/chat/stream).
+
+Goals of this doc:
+- Capture timeline and impact metrics.
+- Explain root-cause with causal evidence.
+- Document detection rules and mitigations applied.
+- Propose preventative changes, tests, and owner assignments.
+
+Timeline (high level)
+--------------------
+1) 2025-11-18 03:12 UTC — First automated alert: token-latency SLI for /v1/chat/stream breached 99th percentile > 1.5s (SLO target: 99p < 1.0s).
+2) 2025-11-18 03:20 UTC — Operators observed rising KV cache miss-rate from 4% baseline to 28% (service: kv-prefetcher).
+3) 2025-11-18 04:05 UTC — Canary rollout for a new prefetch heuristic (feature flag: prefetch_v2) had reached 15% overall traffic.
+4) 2025-11-19 — Attempts to tune allocator and increase prefetch concurrency caused brief improvements but also produced eviction storms.
+5) 2025-11-21 14:32 UTC — Automated rollback to prefetch_v1 completed.
+6) 2025-11-22 — Post-rollback monitoring showed residual eviction jitter; final fixes to cache watermarks and operator throttles completed.
+
+Impact summary
+--------------
+- Affected cohort: 9% of production tenants (mainly PLG chat flows with median request length 64 tokens).
+- User-visible latency: 99p token latency increased from 0.9s to 1.8s for affected tenants.
+- Cost: approx +12% GPU token compute due to additional model re-generation from cache misses (est. $18k incremental for incident window).
+- Pages/ops: 6 on-call shifts across three teams (platform, serving-runtime, eng-sre).
+
+Key observability signals (queries) used during investigation
+-----------------------------------------------------------
+- KV cache miss-rate (per model, per region):
+  sum(rate(kv_cache_misses_total[5m])) / sum(rate(kv_cache_requests_total[5m]))
+- Operator eviction events (5m window):
+  increase(kv_evictions_total[5m]) > 0
+- 99th token latency for streaming route:
+  histogram_quantile(0.99, sum(rate(request_duration_seconds_bucket{route="/v1/chat/stream"}[5m])) by (le))
+- Prefetch queue length by pod:
+  max(prefetch_queue_length) by (pod)
+
+Root-cause analysis
+-------------------
+We performed a phased analysis combining telemetry, canary diffs, and code review. The chain of causation we validated:
+
+1) Behavioral change in prefetch_v2: the new heuristic increased speculative prefetch breadth for short-context requests to attempt better cache-hit coverage. This raised concurrent prefetch tasks per request from median 2 -> 6.
+2) KV cache watermark math bug: a 32-bit integer truncation in the new watermarks computation caused watermarks to appear higher than actual available capacity, delaying evictions until memory pressure was critical.
+3) Eviction storms: when memory pressure finally triggered, the delayed eviction path forced many large shard-level evictions. That caused temporary read failures and serialization stalls in the prefix cache read path, increasing miss-rate and tail-latency.
+4) Feedback amplification: the higher miss-rate led clients to re-request prefixes and fall back to slower full token generation paths, increasing load and causing more prefetch tasks and further pressure (positive feedback loop).
+
+Evidence checklist (what we observed)
+- Canary vs baseline: canary prefetch_v2 at 15% had miss-rate 3x baseline and 99p latency +0.9s.
+- Heap/memory traces: pods with prefetch_v2 reported delayed GC and higher RSS peaks prior to eviction logs.
+- Code diff: watermarks function used int32 arithmetic in an allocator loop where expected values exceeded 2^31-1 for certain shard aggregates.
+- Repro: Local replay harness reproduces miss-rate increase when prefetch concurrency simulated at real traffic levels (see appendix for replay command).
+
+Mitigations applied during incident (chronological)
+------------------------------------------------
+1) 2025-11-18 05:00 UTC — Scoped rollback: reduced canary traffic to 2% and disabled speculative prefetch breadth expansion (feature flag set to conservative).
+2) 2025-11-18 07:45 UTC — Emergency operator step: manually lowered shard watermarks to force earlier evictions (operator runbook: prefetch-eviction-manual).
+3) 2025-11-19 10:20 UTC — Autoscaler throttle added to prefetch queue to cap per-pod prefetch worker count at 8.
+4) 2025-11-21 14:32 UTC — Full rollback: prefetch_v1 promoted and prefetch_v2 rolled back fleet-wide.
+
+Permanent corrective actions and timeline
+---------------------------------------
+We agreed the following backlog items and owners. Priority assignments indicated: P0 (week), P1 (30 days), P2 (quarter).
+
+- P0: Fix allocator integer truncation and add unit tests (owner: eng-serving-runtime — Priya Nair)
+- P0: Add canary test that simulates high concurrency small-seqlen traffic in replay harness (owner: eng-platform QA — Marcus Lee)
+- P0: Short-term: change default prefetch breadth for short seqlen to previous heuristic (owner: product/platform — Elena García)
+- P1: Introduce an eviction early-warning metric (eviction_pressure_score) and dashboard tile (owner: eng-sre)
+- P1: Add operator CTA to abort canary if kv_cache_miss_rate > 10% within 30 minutes (owner: oncall tooling)
+- P2: Capacity-simulation job that verifies prefetch + cache interactions at scale as part of CI gate (owner: eng-infra)
+
+Action-items table
+------------------
+| id | action | owner | priority | due |
+|----|--------|-------|----------|-----|
+| A1 | Fix 32-bit truncation and add unit/regression tests | Priya Nair | P0 | 2025-11-19 |
+| A2 | Replay test for canary profile + automation pass/fail | Marcus Lee | P0 | 2025-11-26 |
+| A3 | Dashboard: eviction_pressure_score and alert | Daniel Ho (eng-sre) | P1 | 2025-12-10 |
+| A4 | Prefetch feature flag safety gate in rollout system | Elena García | P0 | 2025-11-25 |
+| A5 | Runbook: automatic canary abort on miss-rate > X | Eng-Platform / Oncall Tools | P1 | 2025-12-05 |
+
+Detection and alerting improvements (playbook changes)
+-----------------------------------------------------
+- New derived SLI: "kv_eviction_pressure_score"
+  - Definition: weighted combination of increase(kv_evictions_total[5m]), rss_growth_rate, and prefetch_queue_length.
+  - Alert threshold (SEV-2 candidate): kv_eviction_pressure_score > 0.65 for 10 minutes.
+- Canary rollout safety gate: fail canary if canary_kv_miss_rate / baseline_kv_miss_rate > 2.0 for 15 minutes.
+- Dashboard tiles to add: per-model miss-rate heatmap, eviction_pressure_score trend, canary vs baseline latency diff.
+
+Operator runbook excerpt: immediate steps for suspected prefetch regression
+---------------------------------------------------------------------
+1) Identify whether a canary rollout is in progress: kubectl get rollout feature/prefetch_v2 --namespace=platform
+2) If canary > 5% traffic, immediately reduce to 1% and pause rollout.
+3) Query miss-rate: run monitoring query above; if miss-rate > 10% for 15m, escalate to eng-serving-runtime owner.
+4) Apply emergency watermark correction (only if evictions > 0 and memory RSS > 80%): run internal script /opt/platform/bin/eviction_force.sh --shard <id> --delta -0.15
+5) If manual changes not effective within 30m, rollback the feature flag to previous version.
+
+Post-incident verification criteria
+---------------------------------
+The incident is considered contained when all of these are true for 48 hours:
+- kv_cache_miss_rate <= 5% for all models and regions.
+- 99p token latency for /v1/chat/stream within SLO (<=1.0s).
+- Eviction events reduced to baseline (no sustained >2x baseline for 24h).
+
+Longer-term roadmap items (informed by this retrospective)
+--------------------------------------------------------
+- Platform roadmap Q1 2026: prioritize CI-grade workload replay and operator-in-the-loop canary automation.
+- Q2 2026: integrate prefetch simulation into capacity forecasting engine to estimate unit-cost impact of heuristic changes.
+
+Lessons learned and principles reinforced
+---------------------------------------
+- Canary safety gates must include cross-system metrics (prefetch behavior + downstream cache health), not just route latency.
+- Small arithmetic/overflow bugs in allocation math can produce outsized production effects; integer-size assumptions must be codified in design docs and tested.
+- Operators need concise, executable CTAs (scripts + runbook steps) for rapid remediation; we added cheatsheets to the operator-runbook repo.
+
+Appendix
+--------
+Reproduction command (replay harness):
+```
+# replay traffic using canary profile (token lengths ~ 40-80)
+./replay-harness --profile canary_small_seqlen --inject-prefetch-concurrency 6 --duration 30m --report=./reports/canary-run.json
+```
+Relevant diffs (high level):
+- prefetch/heuristics.go: speculativeBreadth changed from func(old) -> new function scaling by request.sigConfidence; introduced new concurrency path.
+- allocator/watermarks.go: used int32 for aggregateShardCount; fixed to int64 and added overflow checks.
+
+Contact/owners for follow-up
+---------------------------
+- Incident lead: Elena García (eng-platform) — elena.garcia@redwood.com
+- Runtime owner: Priya Nair (eng-serving-runtime) — priya.nair@redwood.com
+- SRE tooling: Daniel Ho (eng-sre) — daniel.ho@redwood.com
+
+Related docs and artifacts
+-------------------------
+- /confluence/eng-platform/runbooks/prefetch-eviction-manual
+- CI replay run (artifact): s3://redwood-ci-artifacts/prefetch/replay/2025-11-18-canary.json
+- Postmortem board: https://boards.internal.redwood.com/incident/INC-2025-11-18-prefetch

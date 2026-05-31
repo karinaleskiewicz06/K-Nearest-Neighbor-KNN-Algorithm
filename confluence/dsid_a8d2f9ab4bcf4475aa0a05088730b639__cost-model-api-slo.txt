@@ -1,0 +1,197 @@
+Cost Model API — SLOs, SLIs, and Error Budgets
+
+## Purpose
+This document defines the Service Level Objectives (SLOs), Service Level Indicators (SLIs), and error budget policy for the **Cost Model API** (service name: `cost-model-api`). It covers:
+- Availability and latency targets for production traffic
+- A correctness/drift SLI to ensure cost outputs remain finance-usable and product-consistent
+- Alerting and escalation policy
+
+The Cost Model API is a shared dependency for **Redwood Console** cost dashboards and **Redwood Optimize** ROI/what-if projections. The SLOs below are designed to keep Console usable on hot paths while providing guardrails for cost drift that can impact customer trust and finance reporting.
+
+## Service summary
+**What it does:** Computes standardized cost primitives and breakdowns (prefill/decode, cache attribution, batch efficiency, overhead allocation) and supports what-if projections.
+
+**Primary endpoints (v1):**
+- `POST /internal/cost-model/v1/estimate`
+- `POST /internal/cost-model/v1/breakdown`
+- `POST /internal/cost-model/v1/what-if`
+
+**Primary callers:**
+- Console backend aggregations (interactive dashboards; latency-sensitive)
+- Optimize backend (batch jobs and interactive flows; less latency-sensitive, but correctness-sensitive)
+
+**Critical dependencies (for SLI interpretation):**
+- Telemetry store/pipeline (token accounting, KV cache stats, batch efficiency metrics)
+- Model catalog (model + quantization profile metadata)
+- Policy/tenancy service (authn/z, org/project scoping)
+
+## SLOs (production)
+**SLO window:** rolling **28 days**, evaluated continuously.
+
+### SLO table
+| Category | SLI | SLO target | Applies to | Notes |
+|---|---|---:|---|---|
+| Availability | Successful request rate | **99.90%** | `estimate`, `breakdown` | Excludes caller timeouts < client configured timeout; includes 4xx/5xx per definition below |
+| Latency | Request latency (p95) | **<= 250 ms** | `estimate`, `breakdown` | Measured at service boundary; excludes async queueing before the service |
+| Latency | Request latency (p95) | **<= 800 ms** | `what-if` | Heavier compute; bounded by policy guardrails |
+| Correctness / Drift | Weekly cost drift index | **<= 3.0%** | Aggregate by (deployment_mode, region, hardware_sku) | Not a per-request correctness guarantee; it is a stability guardrail |
+
+**Why these targets:**
+- Console cost views must remain interactive; p95 of 250 ms supports acceptable dashboard performance when combined with Console caching and pagination/bounds guidance.
+- What-if computations can be heavier but must remain bounded to prevent user-visible timeouts and to protect the cluster.
+- A drift SLI provides a measurable signal for “are we still telling the truth about cost?” without requiring perfect reconciliation with invoice/RevRec systems.
+
+## SLI definitions
+### 1) Availability SLI: successful request rate
+**SLI name:** `cost_model_api_success_rate`
+
+**Definition:**
+- Numerator: count of requests to `estimate` + `breakdown` that return HTTP **2xx**.
+- Denominator: count of requests to `estimate` + `breakdown` that return HTTP **2xx/4xx/5xx**, excluding requests rejected due to platform-wide auth outages (see “Exclusions”).
+
+**Error classification (for SLO accounting):**
+- **Counts as failure:**
+  - Any **5xx**
+  - **429** if due to service-side throttling misconfiguration or resource exhaustion (not caller abuse)
+  - **408** / server-side request timeouts
+- **Does not count against SLO (still tracked):**
+  - **4xx** due to invalid caller input that violates published bounds/contract (e.g., payload too large, invalid schema version, tenant mismatch)
+  - **401/403** due to caller misconfiguration (bad token/scopes)
+
+**Exclusions:**
+- If the upstream auth provider has a declared incident and cost-model is functioning but cannot validate tokens, those 5xx responses are tracked as “dependency failures” and are excluded from the availability SLO calculation for post-incident reporting. They still page if they impact customers (see escalation).
+
+### 2) Latency SLI: request duration
+**SLI name:** `cost_model_api_latency_ms`
+
+**Measurement:** server-side duration from first byte received to last byte written (includes internal dependency calls).
+
+**Slices tracked (non-SLO, but used for diagnosis):**
+- by endpoint (`estimate` / `breakdown` / `what-if`)
+- by schema version (`x-redwood-cost-schema: v1.*`)
+- by deployment mode (`hosted` / `dedicated` / `private`) when present in request
+
+**Notes:**
+- Latency SLOs apply only to requests within documented bounds (payload size, requested breakdown cardinality, what-if parameter ranges). Requests above bounds should be rejected with 4xx and not counted.
+
+### 3) Correctness SLI: cost drift index
+**SLI name:** `cost_model_cost_drift_index`
+
+**Goal:** Detect systematic divergence between **predicted/request-attributed costs** and **observed spend** (or its best available proxy) early enough to prevent prolonged misreporting in Console and misleading ROI estimates in Optimize.
+
+**Definition (weekly, per slice):**
+For each slice `S` (default: `(deployment_mode, region, hardware_sku)`), compute:
+- `predicted_cost_usd(S)` = sum of cost-model predicted costs for requests in slice `S` (from telemetry/cost-model outputs stored for analysis)
+- `observed_cost_usd(S)` = observed GPU cost proxy for slice `S` over the same window
+- `drift(S)` = `abs(predicted_cost_usd(S) - observed_cost_usd(S)) / max(observed_cost_usd(S), 1)`
+
+Then compute a weighted index across slices:
+- `drift_index = sum_over_S( drift(S) * weight(S) )`
+- `weight(S) = observed_cost_usd(S) / sum_over_S(observed_cost_usd(S))`
+
+**SLO target:** `drift_index <= 3.0%` over a rolling 7-day window, evaluated daily.
+
+**Observed cost proxy:**
+- Hosted + Dedicated: cluster-level GPU-hour cost from finance-approved rate card *measured GPU-hours* (preferred) or scheduler-reported GPU allocation if measured hours are delayed.
+- Private: drift index is computed only where Redwood has sufficient observability; otherwise marked “N/A” and excluded from index (tracked separately).
+
+**Exclusions / guardrails (to reduce false positives):**
+- Windows with telemetry lag > 2 hours (as measured by telemetry freshness metric) are excluded from SLO evaluation and flagged as “data incomplete.”
+- Major capacity rebalancing events (e.g., region evacuation) can temporarily alter observed cost attribution; SRE may annotate and exclude a single day with approval from Finance stakeholder (Laura Bennett) and Service/API lead (Ethan Park).
+
+**Interpretation:**
+- Drift does **not** imply a single bug; it can be caused by telemetry gaps, rate card changes, runtime instrumentation changes (prefill/decode split), or overhead allocation policy changes.
+- Drift SLI is a **stability and trust** metric. It is intentionally aggregated; per-tenant and per-model slices are tracked for diagnosis but are not part of the SLO to avoid high-cardinality volatility.
+
+## Error budgets
+### Budget calculations (28-day window)
+- Availability SLO 99.90% => error budget **0.10%**
+  - Total budgeted error time-equivalent: ~**43.2 minutes** of complete outage per 30 days (approximate), or equivalent partial failure rate.
+
+### Budget policy
+- **> 75% budget remaining:** normal operations
+- **25–75% budget remaining:** warn state
+  - Freeze non-critical releases to `cost-model-api` unless they reduce risk or are required for incident mitigation.
+  - Require explicit rollout plans and fast rollback for changes impacting telemetry contracts or schema.
+- **< 25% budget remaining:** constrained state
+  - Only reliability work, incident fixes, or changes approved by SRE + service owner.
+
+**Correctness/drift “budget” handling:**
+Drift does not map cleanly to minutes. We treat drift as a release gating signal:
+- If drift_index > 3% for **2 consecutive days**, enter warn state.
+- If drift_index > 5% for **any day** or > 3% for **5 out of 7 days**, enter constrained state and trigger an incident review.
+
+## Alerting
+Alerting is defined in the dashboards doc; this section captures paging intent.
+
+### Paging alerts (on-call)
+1) **Availability paging:**
+- Trigger: success rate for `estimate`+`breakdown` < **99.0%** over **10 minutes** AND request volume > minimum threshold
+- Action: page **Cost Model API primary on-call**
+
+2) **Latency paging (Console endpoints):**
+- Trigger: p95 latency > **500 ms** for `estimate` or `breakdown` over **15 minutes**
+- Action: page primary on-call
+
+3) **Drift paging:**
+- Trigger: drift_index > **5.0%** on daily evaluation OR drift_index > **3.0%** for **2 consecutive days**
+- Action: page primary on-call + notify `#finance` + `#eng-platform`
+
+### Ticket alerts (non-paging)
+- Elevated 4xx (contract violations) indicating caller regression
+- Increased schema version negotiation failures
+- Telemetry freshness degradation (if not already covered by telemetry on-call)
+
+## Escalation policy
+### Ownership and rotations
+- **Primary on-call:** Eng SRE (Cost Model API rotation), backed by Platform Control Plane on-call
+- **Service owner:** Ethan Park (Service/API lead)
+- **SRE reliability lead:** Rafael Mendes
+- **Finance stakeholder (drift incidents):** Laura Bennett
+
+### Escalation steps
+1) **Triage (0–15 min):**
+- Confirm if impact is localized (single endpoint/region) or global.
+- Check dashboards: error rate, p95 latency, dependency errors, telemetry freshness.
+- Apply safe mitigations: enable cached responses (where supported), tighten request bounds via config, or shed load for `what-if` first.
+
+2) **Mitigation (15–45 min):**
+- If dependency issue: engage dependency on-call and implement fallback behavior (e.g., serve “partial breakdown” with explicit `incomplete_reason` header if supported by current version).
+- If regression: rollback latest release or disable feature flag for new schema behavior.
+
+3) **Escalate (45+ min or severe impact):**
+- Page service owner (Ethan Park) for architectural decisions (e.g., temporary endpoint disablement).
+- For drift incidents: notify Finance stakeholder (Laura Bennett) and Console product owner (Marissa Cole) to coordinate customer-facing messaging if needed.
+
+### Severity guidance
+- **SEV-1:** Console cost pages broadly unusable OR drift > 5% with known customer exposure.
+- **SEV-2:** Elevated latency/errors with partial degradation OR drift > 3% for 2+ days with unclear impact.
+- **SEV-3:** Localized issues; workarounds available; no major customer impact.
+
+## Change management and SLO exceptions
+- Any change that modifies telemetry inputs (token accounting, cache metrics, batch efficiency) must:
+  - include an updated compatibility test/golden fixture where applicable
+  - be announced in `#eng-platform` and `#eng-runtime` before rollout
+  - have a rollback plan (feature flag or deploy rollback)
+
+- Any change to overhead allocation policy or rate card assumptions must:
+  - be reviewed by Finance (Laura Bennett or Rishi Malhotra)
+  - be reflected in ADRs or the unit economics alignment doc
+  - include a planned “drift recalibration” window where drift alarms are temporarily annotated (not disabled)
+
+## Reporting
+- Weekly SLO summary is posted to `#eng-sre` and `#eng-platform`:
+  - success rate, latency p50/p95, top errors
+  - drift_index and top contributing slices
+  - notable annotations (telemetry lag, rate card changes, rollouts)
+
+## Appendix
+### Key definitions
+- **Predicted cost:** The cost-model output attributed to requests (including configured overhead allocation category output).
+- **Observed cost:** Finance-approved proxy of actual spend at the slice level; not an invoice total.
+- **Drift:** Absolute relative difference between predicted and observed costs over a window.
+
+### Operational links
+- Dashboards: see `Cost Model API Observability`
+- Runbook: see `Cost Model API Incident Runbook`
+- API standards: see `Cost Model API Guidelines` (bounds, pagination, determinism expectations)

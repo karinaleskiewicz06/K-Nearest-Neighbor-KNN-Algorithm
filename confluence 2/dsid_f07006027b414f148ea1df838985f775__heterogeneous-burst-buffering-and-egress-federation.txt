@@ -1,0 +1,150 @@
+Heterogeneous burst buffering and egress federation playbook
+
+Overview
+-------
+This playbook describes a coordinated approach for handling short-duration traffic spikes across heterogeneous GPU pools (on-demand, spot/preemptible, and rented burst capacity) while preserving tenant egress SLAs and minimizing cross-account egress cost leakage. The target audience is infra engineers, SREs, and platform product owners who operate GPU fleets and associated networking/IaC.
+
+Goals
+-----
+- Maintain 99.95% token-serving availability for high-tier tenants during short (<=30 min) bursts.
+- Limit cross-account egress cost impact to <= 10% of normal hourly baseline during bursts.
+- Provide Terraform modules and CI/CD checks to automate burst enrollment, circuit-breakers, and safe rollback.
+- Ensure clear runbook steps for oncall to route, throttle, and reprovision without manual IAM changes.
+
+Scope and non-goals
+-------------------
+- Scope: GPU pools (heterogeneous hardware), multi-region routing policies, egress gating, IaC surfaces (Terraform modules), and CI/CD gating for burst-capacity promotion.
+- Non-goals: scheduling algorithm research, model-level quantization profiles, long-lived capacity contracts (>24h).
+
+Key concepts
+------------
+- Burst buffer: Temporary capacity (heterogeneous instances) pooled and advertised via a control-plane feature flag for fast allocation.
+- Federated egress: Short-lived cross-account or partner-peered egress paths used to carry burst traffic when local egress is saturated.
+- Cost reservoir: A tracked budget per org to pay for burst egress; automatically caps federation when exhausted.
+
+Ownership and contacts
+----------------------
+- Capacity lead: Priya Kulkarni (eng-infra)
+- Network lead: Liam Chen (eng-infra/cloud-networking)
+- SRE oncall: pager duty rotation (team: eng-sre)
+- Terraform module owner: Marta González (infra-iac)
+
+SLOs and thresholds
+--------------------
+| Metric | Target | Alert threshold | Pager threshold |
+|---|---:|---:|---:|
+| Token-serving availability (high-tier) | 99.95% per 30m window | 99.8% | 99.5% |
+| Egress bandwidth saturation (region) | N/A | >=85% sustained 5m | >=95% sustained 2m |
+| Cross-account egress spend variance | <=10% of baseline/h | >15% | >25% |
+
+Architecture summary
+--------------------
+1. Control plane exposes a BurstEnrollment resource (Terraform + API) that provisions:
+   - ephemeral instance pool claims (heterogeneous flavors; tagged with burst-claim-id)
+   - egress policy attachments (short-lived routes or bandwidth-reserved tunnels)
+   - cost-reservoir token and limit in billing service
+2. Smart router uses policy matrix (tenant-tier, latency-sensitivity, cost-reservoir) to route requests to local pool, fall back to burst-pool, or federated-egress paths.
+3. Continuous monitors (Prometheus) feed dashboards and circuit breakers: rate-based token leaks and egress spend windows.
+
+Terraform/IaC module interface (summary)
+--------------------------------------
+Table: module inputs and expected values
+| Input | Type | Example | Required | Notes |
+| burst_id | string | "burst-2025-01-10-nyc" | yes | unique id for auditing and cleanup |
+| regions | list | ["us-east-1", "us-west-2"] | yes | preferred regions ordered by latency |
+| flavors | list | ["a100-40g","h100-80g","t4-16g"] | yes | allowed hetero instance profiles |
+| max_spend_usd | number(string) | "5000" | yes | cost reservoir for burst; string for compatibility |
+| egress_policy | string | "federated-vpn" | no | options: nat-egress, federated-vpn, partner-peering |
+| ttl_minutes | number(string) | "30" | yes | automatic teardown |
+
+Example Terraform usage (snippet)
+```hcl
+module "burst_pool" {
+  source      = "git::ssh://git@repo/redwood-iac//modules/burst-pool"
+  burst_id    = "burst-2025-01-10-nyc"
+  regions     = ["us-east-1"]
+  flavors     = ["h100-80g","t4-16g"]
+  max_spend_usd = "2500"
+  egress_policy  = "federated-vpn"
+  ttl_minutes    = "30"
+}
+```
+
+CI/CD and gating
+----------------
+- PR checks for burst modules require: unit tests, cost-reservoir validation, and a dry-run plan output.
+- Merge to main triggers: terraform plan in staging tenant account and a canary apply that attaches a synthetic monitoring job to verify egress rules.
+- Promotion policy: successful canary + 10m stable synthetic traffic -> full apply. Failures automatically destroy burst resources.
+
+Runbook: active surge <30 minutes (oncall)
+----------------------------------------
+1. Triage: Confirm SLO breach alert and check region-level egress and instance utilization (dashboards). If token-serving availability < alert threshold, proceed.
+2. Evaluate cost reservoir: Query billing service (CLI below) to see remaining burst budget. If > 20% remaining, allow federation; else limit to local-only.
+   - CLI: redwood-billing reservoir get --id burst-2025-01-10-nyc --format json
+3. Trigger controlled enrollment (if not already):
+   - API: curl -X POST https://control-plane.internal/api/v1/bursts -d '{"burst_id":"<id>","regions":["us-east-1"],"ttl_minutes":30}' -H 'Authorization: Bearer $TOKEN'
+   - Or use IaC: `terraform apply -target=module.burst_pool` in the burst branch.
+4. Watch monitors: Confirm ephemeral instances come Ready and egress routes attach. Monitor 1) token-serving availability, 2) egress spend, 3) latency p50/p95.
+5. If cross-account egress exceeds 15% variance: 1) throttle federated-egress via control-plane UI, 2) ramp local throttles (per-tenant rate-limits) by 25% increments, 3) notify billing and owner.
+6. After surge: allow automatic TTL expiry or manually trigger teardown: `redwood-infra burst destroy --id <burst_id>` and run post-burst cleanup checklist.
+
+Runbook: long tail or reckless spend
+-----------------------------------
+- If cost-reservoir exhausts but egress remains high for >10m, immediately flip egress_gating to "restrict-federation" and start a billing incident. Pager notify: capacity lead + finance oncall.
+
+Testing and canaries
+-------------------
+- Unit tests: module validation for malformed flavors, negative TTLs, and missing region lists.
+- Integration: simulate 3m synthetic burst at 120% baseline traffic against canary region with federated-egress enabled. Verify cost-reservoir decrement and circuit-breaker trip at configured thresholds.
+- Chaos: schedule a daily 2x synthetic spike to maintain warm pool readiness on non-critical tenants (configurable).
+
+Dashboards and alerts (recommended)
+----------------------------------
+| Dashboard | Panels | Important alerts |
+| Fleet burst overview | instance readiness, allocated flavors, queued requests | instance-provision-failure (2m), pool-empty (1m) |
+| Egress federation | egress bytes by account, hourly spend delta | cross-account-spend > 15% |
+| Tenant impact | token serve availability by tenant tier | availability < 99.8% (30m) |
+
+IAM, security and compliance notes
+---------------------------------
+- Federated egress paths create temporary peering tunnels. Access is managed by ephemeral role assumption with limited scope: `burst-application-role` with time-limited STS credentials.
+- Terraform applies that create federated egress must be signed and require 2 approvers from cloud-networking and infra-iac teams.
+- Audit logging: every burst enrollment must emit an audit event to central audit-log with metadata (burst_id, regions, initiator, max_spend_usd).
+
+Operational play: escalation and postmortem triggers
+---------------------------------------------------
+Escalate immediately if:
+- Availability < 99.5% for high-tier for 15 consecutive minutes.
+- Cross-account egress > 25% of baseline -> finance+security must be paged.
+Postmortem required if:
+- Burst event cost > $50k or systemic failure where >1 region lost >50% capacity.
+
+Cleanup and cost reconciliation checklist
+--------------------------------------
+1. Verify burst resources destroyed via control plane.
+2. Run `terraform destroy -target=module.burst_pool` and confirm no residual PVs or ENIs.
+3. Reconcile cost-reservoir ledger: `redwood-billing reconcile --burst-id <id>` and tag invoices.
+4. Produce event summary: owners, duration, peak bandwidth, total spend, lessons learned. Attach to the incident ticket.
+
+Appendix: useful commands and snippets
+------------------------------------
+- Query pool status: `redwood-infra pool status --id <burst_id> --region us-east-1`
+- Force disable federation: `redwood-network egress set --policy restrict-federation --burst-id <id>`
+- Billing quick-check (example): `redwood-billing ledger tail --burst-id <id> --last 60m`
+
+Change history
+--------------
+- 2024-11-05: Initial draft (Priya Kulkarni)
+- 2024-12-12: Added CI/CD gating and Terraform inputs (Marta González)
+- 2025-01-10: Finalized SLO thresholds and runbook escalation (Liam Chen)
+
+Related reading
+---------------
+- GPU scaling decision framework and burst policy (internal)
+- Federated egress security patterns (cloud-networking)
+- Terraform module: burst-pool (repo: git@repo/redwood-iac)
+
+Notes and open questions
+------------------------
+- Should we provide tenant-level opt-in for chaotic warmups? (Product question for platform team)
+- Evaluate longer TTLs (60–120m) for enterprise customers with committed budgets.

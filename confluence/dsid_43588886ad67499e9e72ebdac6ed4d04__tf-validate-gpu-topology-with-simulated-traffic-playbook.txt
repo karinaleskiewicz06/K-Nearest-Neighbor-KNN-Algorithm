@@ -1,0 +1,175 @@
+Terraform validation harness for GPU topology changes with simulated traffic
+
+Summary
+
+This playbook documents the recommended Terraform validation harness used to safely change GPU pool topology (instance types, AZ placement, placement groups, taints/tolerations) by running an automated, CI-driven simulation of representative inference traffic against a temporary environment. The goal is to detect capacity, latency, and egress regressions before Terraform changes reach production gates.
+
+Scope
+
+- Applies to Terraform changes that modify: GPU pool sizes, instance flavors, network egress routes, subnets, placement groups, or tenant QoS tags.
+- Intended for use in the main infrastructure CI pipeline (Buildkite) and also as a manual preflight for large migration windows.
+
+Why we run simulated traffic during TF validation
+
+Terraform plan/validate and policy-as-code checks catch many problems (iam, security, drift). However, changes that affect topology can cause emergent behavior only visible under realistic load: KV cache warmup time, network egress hot spots, host-level forks, instance scheduling differences, or kernel-level performance regressions for quantized kernels. Running a short, deterministic traffic simulation in an isolated environment reduces risk and gives measurable pass/fail criteria tied to SLOs.
+
+Ownership and roles
+
+- Owner: infra/gpu-platform (pager: #infra-gpu on Slack)
+- CI pipeline owner: infra-ci-team
+- Reviewer(s): Perf team for benchmark definitions; Security for service identity changes.
+
+Prerequisites
+
+1) Feature branch containing Terraform changes targeting the gpu-allocator module.
+2) CI credentials: a service account with limited create/delete rights in the sandbox AWS/GCP account. The account must be constrained to the sandbox project and tagged appropriately.
+3) Canary image bundles must be published to the build artifact registry (image tag ref used by the simulation harness).
+4) Telemetry exporters enabled in the test environment: metrics (Prometheus push/gateway), traces (Jaeger), and logs (ELK/Cloud Logging).
+
+High-level flow
+
+1. Developer opens PR with Terraform changes.
+2. CI runs terraform fmt/validate, policy checks (OPA/Conftest).
+3. CI creates a short-lived sandbox environment by applying a curated Terraform overlay (isolated VPC, dedicated subnets, ephemeral GPU nodes).
+4. Once infra is healthy and node agents report ready, CI deploys the simulation harness and a minimal control plane (service discovery + routing).
+5. CI kicks off a deterministic workload generator (see workload profiles below) for 6–20 minutes.
+6. Telemetry is collected and evaluated against thresholds. If thresholds are exceeded, the run is marked failed and the TF change is blocked.
+
+Workload profiles (examples)
+
+- baseline-infer: 200 rps, short prompts (avg 48 tokens), 95th latency expected < 150ms, KV hit ratio 35%
+- bursty-chat: 50 rps with Poisson bursts up to 400rps for 30s windows, avg seq length 256, tail P99 < 2.2s
+- long-context-eval: 8 rps, sequence length 2048, measures KV growth and memory pressure
+
+Configuration table (thresholds used by CI guard)
+
+| metric | acceptable threshold | failure condition |
+|---|---:|---|
+| 95th response latency (baseline-infer) | < 150 ms | > 180 ms for 3+ sample windows |
+| P99 latency (bursty-chat) | < 2.2 s | > 3.0 s for > 10% of samples |
+| GPU util (avg across pool) | 25% - 85% | sustained > 95% for 2+ minutes or < 5% for 3+ mins |
+| KV cache miss rate | < 20% | > 40% |
+| Packet drops (instance NIC) | < 0.1% | > 1% |
+| Egress errors (5xx from proxy) | < 0.5% | > 2% |
+
+Note: CI evaluates both absolute thresholds and delta-from-baseline (the baseline is the last green canonical run for the same infra-module version). An increase > 20% relative to baseline triggers an investigator review even if absolute thresholds are still within limits.
+
+Terraform overlay pattern
+
+We use a small overlay module that reuses the same tf-modules as production but isolates resources: unique VPC, namespacing tags, and a shortened lifetime. Example usage within the pipeline:
+
+```bash
+# pipeline step (pseudocode)
+export TF_VAR_prefix=ci-sim-${BUILDKITE_BUILD_NUMBER}
+terraform init -backend-config="bucket=ci-terraform-state" \
+  -backend-config="key=ci/${BUILDKITE_BUILD_NUMBER}/tfstate"
+terraform apply -auto-approve -var-file=overlays/sim.vars.tfvars
+```
+
+Policy gates (pre-apply and post-apply)
+
+- Pre-apply: OPA checks for forbidden instance types, missing tenant tags, and network exposure.
+- Post-apply: Smoke tests (SSH to nodes, kube node ready, NVidia driver loaded), and an automated kernel/cuda version detector that fails if the new image/container runtime loses required drivers.
+
+Simulation harness implementation notes
+
+- Harness is a containerized service (go/python) that drives traffic using a combination of k6 for synthetic HTTP loads and a lightweight client that exercises the actual inference path (auth, routing, streaming).
+- Test orchestration is implemented as a Buildkite step that: deploys harness, configures the target load profile, and pulls telemetry snapshots into a verification step.
+- Harness supports deterministic replay from a recorded trace to ensure reproducibility across runs.
+
+CI pipeline example (Buildkite YAML excerpt)
+
+```yaml
+steps:
+  - label: ":terraform: TF validate + OPA"
+    command: scripts/tf-validate.sh
+  - wait: ~
+  - label: ":rocket: Create sandbox infra"
+    command: scripts/tf-apply-sim.sh
+    timeout_in_minutes: 30
+  - label: ":zap: Run sim traffic"
+    command: scripts/run-sim.sh --profile baseline-infer
+    timeout_in_minutes: 20
+  - label: ":mag: Verify telemetry & teardown"
+    command: scripts/verify-and-destroy.sh
+    timeout_in_minutes: 10
+    parallelism: 1
+```
+
+Pass/fail decision logic
+
+- If any absolute threshold fails => fail the CI job, keep state for investigation (do not automatically destroy until reviewed unless configured).
+- If delta-from-baseline > 20% => mark job for manual review by perf/infra owner.
+- If smoke checks fail => immediate fail, skip simulation, and tear down if teardown policy allows.
+
+Failure investigation checklist (quick triage)
+
+1. Capture CPU/GPU profiles from the nodes (nvidia-smi stats, pid memory).
+2. Check kernel and driver versions: mismatch with expected (see /ops/gpu-driver-manifest) is common root cause.
+3. Inspect network telemetry (observability dashboard: egress QPS heatmap, ENI metrics).
+4. Validate Terraform diff: did the change reduce pool size or modify AZ distribution?
+5. If a regression is reproducible locally, escalate to runtime/kernel team.
+
+Rollback and state cleanup policy
+
+- By default the sandbox environment is set to auto-destroy on success or failure after a configurable hold window (default 30 minutes).
+- For failing runs flagged for investigation, terraform state is preserved under a build-specific key and the infra owner is paged.
+
+Operational runbook snippets
+
+- Manually re-run a simulation against a historical TF plan:
+  1. Check out the PR branch and download the terraform state snapshot associated with the build.
+  2. Recreate the sandbox (scripts/tf-apply-sim.sh --preserve-state).
+  3. Run the harness with the recorded trace that previously failed: scripts/run-sim.sh --replay trace-id.
+
+- If an infra change requires immediate production roll (emergency):
+  1. Ensure runbook owner signoff.
+  2. Apply change to a single small region using the same overlay but with production credentials.
+  3. Run a scaled-down sim for 10 minutes and monitor.
+  4. Roll forward only if no regression; otherwise revert using the last-known-good module version.
+
+Telemetry and artifacts retained per run
+
+- Prometheus snapshot (Promtool export) - retained 7 days
+- Trace dump (Jaeger) - retained 14 days
+- Terraform state snapshot - retained 30 days for failed runs; 7 days for successful runs
+- Benchmark artifacts (raw k6 output, harness logs) - retained 14 days
+
+Limitations and known caveats
+
+- Sandbox infra cannot perfectly mimic multi-tenant noisy neighbor patterns present in production; use the multi-tenant stress harness in conjunction with the sim for large migrations.
+- GPU kernel quantization regressions that only appear at very long context lengths (> 8k) may require specialized long-run tests outside the standard CI window.
+
+Related resources
+
+- gpu-driver-manifest (internal): canonical mapping of OS/kernel/CUDA/cuDNN combos
+- infra-ci/scripts: repo housing tf-apply-sim.sh and run-sim.sh examples
+- perf-team/benchmarks: canonical baseline traces and replay IDs
+
+Appendix: sample verification script (pseudo)
+
+```bash
+# verify-and-destroy.sh (high level)
+set -e
+BUCKET=s3://ci-telemetry
+build=$BUILDKITE_BUILD_NUMBER
+prom_snapshot=$(curl "http://prometheus/api/v1/snapshot?job=sim&build=${build}")
+python tools/evaluate_thresholds.py --snapshot "$prom_snapshot" --baseline latest_green || {
+  echo "Thresholds failed; preserving state for investigation"
+  # keep state around and notify owners
+  scripts/preserve-state.sh $build
+  exit 1
+}
+# success path
+scripts/tf-destroy.sh --state-key ci/${build}/tfstate
+```
+
+Contact and escalation
+
+For questions about the harness, contact infra/gpu-platform. When a scaffolded run fails and the issue appears to be a runtime or kernel problem, include perf@redwood and runtime-eng in the Slack thread and create an investigation ticket with the build id, snapshot links, and trace ids.
+
+Changelog
+
+- 2024-11-05: Initial draft (Priya Natarajan)
+- 2025-02-14: Added delta-from-baseline gating and retention policy updates (Marta Ruiz)
+

@@ -1,0 +1,161 @@
+SDK stream resumption and idempotency playbook
+
+Overview
+
+Purpose: This playbook documents recommended SDK patterns for robust streaming, resumable responses, and idempotent client behaviour when interacting with Redwood’s inference API. It is intended for DX owners of SDKs (JS, Python, Go), product engineers that consume streaming endpoints, and SREs who operate streaming infrastructure.
+
+Why this matters
+- Streaming endpoints improve perceived latency for long generative responses but expose clients to partial reads, transient network errors, and duplicate deliveries.
+- Proper resume and idempotency handling reduces user-visible failures, lowers retry amplification on the runtime, and helps maintain cost predictability.
+
+Scope and assumptions
+- Applies to text generation and chat streams (HTTP streaming/SSE, WebSocket, HTTP/2 server push).
+- Assumes backend emits incremental chunks with monotonically increasing offsets and optional resume tokens.
+- Does NOT cover raw WebRTC or proprietary binary protocols. For private deployments, customers may opt into modified headers; see the Appendix.
+
+Goals and SLOs
+- Client recovery: 95% of transient network interruptions should resume without a full request restart.
+- No duplicate final outputs for idempotent requests > 99.9% of the time when clients follow the playbook.
+- Bounded retry amplification: retries should not cause more than 2x additional work for the serving runtime under normal failure modes.
+
+Summary of patterns (high level)
+1) Prefer resume tokens from server. If unavailable, use deterministic chunk offsets + idempotency key.
+2) Use idempotency keys for semantic requests (create-completion, chat-completion) to prevent double billing/state changes.
+3) Shape requests client-side: throttle reconnects, backoff with jitter, and prefer resume over restart within a short window (recommended 2m).
+4) Emit detailed telemetry for resume events and duplicate-detection to help runtime/ops.
+
+Protocol-level recommendations
+- HTTP streaming (recommended): support `Connection: keep-alive`, incremental JSON-lines, and a final `done` sentinel. Each chunk should include `offset` and optional `resume_token`. Example chunk:
+
+```json
+{ "offset": 3450, "resume_token": "rTok_v1:abc123", "data": "and then the model continued..." }
+```
+
+- SSE: map event ids to `offset`. The SDK should use the last processed SSE id as resume position.
+- WebSocket: server sends periodic `checkpoint` frames with offset and resume_token.
+- Backwards compatibility: server may omit resume_token for older model/route versions; SDK must fall back to offset-only logic.
+
+Idempotency and request keys
+- Idempotency key semantics: a client-provided opaque string attached to write-like operations. Key TTL: runtime retains keys for 24 hours for deduplication.
+- Naming: header `X-Redwood-Idempotency-Key` or query parameter `idempotency_key`. SDKs should generate v4 UUIDs by default but allow injection from the application.
+- Behavior: when runtime receives a request with an idempotency key already seen, it returns the cached response metadata and distinct `x-redwood-previously-applied: true` header.
+
+Client-side resume flow (recommended)
+1) On open: record stream start time and set a `stream_session_id` (UUID).
+2) When chunk arrives: write data to app buffer and persist last `offset` + `resume_token` to ephemeral local store (in-memory + optional on-disk for long-running apps).
+3) On transient disconnect (socket close, HTTP 5xx, network error): attempt resume if resume_token exists. If not, attempt offset-based resume.
+4) Resume request: include original request body, same idempotency key, and a header `X-Redwood-Resume-From: <resume_token|offset>`. Use exponential backoff for reconnect attempts (base 200ms, factor 2, jitter up to 300ms) up to 8 attempts or 2 minutes, whichever comes first.
+5) If resume fails or server responds with incompatible error (409/Incompatible-Checkpoint): fallback to a restart with the application-visible warning and require application-driven confirm (for stateful operations).
+
+SDK implementation examples (short pseudocode)
+- JavaScript (fetch + ReadableStream):
+
+```javascript
+const idempotencyKey = opts.idempotencyKey || uuidv4();
+let lastResume = { offset: 0, token: null };
+let session = uuidv4();
+
+async function openStream(req) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Redwood-Idempotency-Key': idempotencyKey,
+      'X-Redwood-Session-Id': session
+    },
+    body: JSON.stringify(req)
+  });
+
+  for await (const chunk of res.body) {
+    const parsed = parseChunk(chunk);
+    if (parsed.resume_token) lastResume = { offset: parsed.offset, token: parsed.resume_token };
+    onData(parsed.data);
+  }
+}
+
+async function attemptResume() {
+  if (!lastResume.token && lastResume.offset === 0) return restart();
+  const resumeHeader = lastResume.token ? lastResume.token : lastResume.offset;
+  const res = await fetch(url + '?resume=true', {
+    method: 'POST',
+    headers: {
+      'X-Redwood-Idempotency-Key': idempotencyKey,
+      'X-Redwood-Resume-From': resumeHeader
+    },
+    body: JSON.stringify(originalRequest)
+  });
+  // handle chunks as before
+}
+```
+
+- Python (requests + streaming): similar semantics; SDK should expose `resume()` on stream objects and handle background reconnects.
+
+Telemetry and observability (SDK contract)
+Emit the following events for each stream session:
+- stream.open { session_id, route, model, idempotency_key }
+- stream.chunk.received { session_id, offset, bytes }
+- stream.resume.attempt { session_id, method: token|offset, attempt_n }
+- stream.resume.success | stream.resume.failure { session_id, reason }
+- stream.duplicate.detected { session_id, idempotency_key, server_response_id }
+- stream.restart.fallback { session_id, reason }
+
+Tag traces with session_id and idempotency_key. Counters to emit: resume_attempts, resume_successes, duplicate_responses, restart_count. Default sampling: 100% for resume events, 1% for raw chunk payloads.
+
+Testing and QA guidance
+- Add fuzz tests in SDK CI to simulate: mid-stream TCP resets, partial chunk truncation, out-of-order chunks, and duplicated chunks. Use the `api-error-injection` harness (see related_pages) to validate resume correctness.
+- Golden tests: assert that resumed stream yields the same concatenated final text as an uninterrupted streamed session.
+- Load-testing: ensure resume behaviour does not amplify QPS by more than 2x under 1% simulated network failures.
+
+Operational runbook (triage)
+Symptoms:
+- Clients report truncated responses that cannot be resumed.
+- Runtime high CPU/Tokens spikes post-network flapping (retry storms).
+
+Triage steps:
+1) Check telemetry: search for stream.resume.failure spikes and identify common failure reasons.
+2) Inspect recent release rollouts: did the runtime or model variant change the chunk schema? Look for `resume_token` schema changes in release notes.
+3) For a single customer: verify SDK version; older SDKs may not include new headers.
+4) If server logs show repeated restart without resume attempts, verify client headers and idempotency key propagation.
+
+Mitigation:
+- Short-term: enable server-side conservative restart (return 429 with Retry-After) to reduce duplicate processing and instruct SDK to pause exponential retries for 30s.
+- Mid-term: release SDK patch that gracefully handles missing token patterns and includes a compatibility header `X-Redwood-Resume-Compat: v1->v2` negotiation.
+
+Rollout and compatibility
+- When changing resume token format: ship runtime with a backward-compatible v1 token vector for 2 weeks and include a migration header `X-Redwood-Resume-Versions: v1,v2`.
+- SDKs should accept multiple token formats and prefer structured tokens `v2:<base64-json>` but fall back to opaque v1 strings.
+
+Ownership and contacts
+- SDK maintainers: eng-developer-experience SDK team (owner team).
+- Runtime changes: eng-serving-runtime kernel team.
+- On-call SRE: see eng-sre rota page.
+
+Appendix: Resume token schema (recommended v2)
+The server may issue a structured token. The SDK should accept both opaque strings and structured tokens. Example JSON payload encoded as base64 in `v2:` token: 
+
+```json
+{
+  "model": "redwood-2b",
+  "seq": 3450,
+  "kv_crc": "ab12f...",
+  "timestamp": "2026-02-14T15:00:12Z"
+}
+```
+
+Encoded token example: `v2:eyJtb2RlbCI6ICJyZWR3b29kLTIiLCAic2VxIjogMzQ1MCwgImt2X2NyYyI6ICJhYjEyZiJ9`
+
+If a resume attempt fails with 409 (checkpoint mismatch), SDK should surface a recoverable error to the application and include `resume_details` from the server payload to help the application decide whether to restart or re-request with a fresh idempotency key.
+
+Frequently asked questions
+Q: When should apps persist resume tokens to disk?
+A: Persist if streams are expected to survive client process restarts (e.g., long-running CLI jobs or daemonized services). For short-lived web requests, in-memory is sufficient.
+
+Q: Can I rely solely on idempotency keys and always restart?
+A: Restarting is safe for idempotent requests but increases latency and cost and may cause transient duplicate work. Prefer resume where available.
+
+Related docs
+- See the SDK telemetry contract page (link in related_pages) and the server-side streaming runbook for runtime-level mitigations.
+
+Change log
+- 2026-02-15: initial publish.
+- 2026-03-01: added JS pseudocode and telemetry counters.

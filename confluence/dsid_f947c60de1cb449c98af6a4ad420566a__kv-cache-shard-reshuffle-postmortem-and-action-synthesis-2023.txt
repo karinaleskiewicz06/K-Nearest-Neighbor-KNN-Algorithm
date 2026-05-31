@@ -1,0 +1,109 @@
+KV cache shard reshuffle — postmortem and action synthesis
+
+Summary:
+
+This document is a consolidated postmortem and action synthesis for the KV-cache shard reshuffle that caused token-latency degradation and elevated 99th-percentile tail latencies for several multitenant workloads on 2023-11-27. It captures the timeline, contributing factors, measurements, immediate mitigations, and the long-term program of work (owners, deadlines, and dashboard/alert changes) required to avoid recurrence.
+
+Impact (what happened):
+- Start: 2023-11-27 09:17 UTC — observed elevated token-p90/p99 on the inference path for models served from the west-us region.
+- Duration: ~3 hours of intermittent elevated tail latency with several short spikes to 1.2–1.8s token latency (baseline ~0.2–0.4s).
+- Affected surface: ~12 production tenants (varied impact), control plane KV-cache rebalances triggered increased synchronous KV fetches and forced de-duplication across shards.
+- Customer visible: A small subset of customers reported degraded chat responsiveness; automated health checks triggered incident page and paging for platform on-call.
+
+Owner: Eng Platform — Operator Reliability (primary), Serving Runtime (secondary).
+SLO impact: Estimated SLO burn at the platform layer: 0.9% SLO budget for tail latency across west-us models for the day. No SLA crediting was required but internal error budget thresholds were approached for a few tenants.
+
+Timeline (verified events, logs, and operator notes):
+1) 2023-11-27 09:12 UTC — automated preflight reported a degraded shard-imbalance metric (shard skew ratio > 1.6).
+2) 09:15 — Autoscaler/maintenance agent scheduled a reshuffle job to reassign 48 KV shards across the west-us pool to improve cache hit distribution.
+3) 09:17 — Platform telemetry: synchronous KV miss counts spiked by 6x; several worker processes entered contention while warming new hot shards.
+4) 09:25 — On-call noticed increased inference tail latency; initiated immediate mitigation steps (see below).
+5) 10:05 — Emergency rolling revert of the reshuffle started: held the shuffle progression and resumed only a small subset of shard moves.
+6) 11:45 — Rebalance completed with stabilization; p99 returned to baseline by 12:15 UTC.
+
+Measured diagnostics and supporting evidence:
+- Metric snapshots (comparison to baseline week):
+  - KV synchronous fetches: +540% at peak (09:18–09:30).
+  - Cache hit rate (global, west-us): dropped from 92.3% -> 55.4% during reshuffle window.
+  - Worker CPU queue length: median +30%, 95th +120%.
+  - Tail token latency (per-token p99): baseline 0.37s -> peak 1.74s.
+- Logs: operator-run logs show the maintenance agent issued parallel move operations without per-tenant slowdown throttles.
+- Traces: distributed traces correlate KV-miss spike with sustained database RPS increase to backing stores (redis clusters) indicating higher synchronous fallback reads.
+
+Root cause analysis (concise):
+1) Primary cause — Aggressive parallel shard moves by the automated rebalance agent without respecting warmup backoff: the agent executed N concurrent shard copy operations (N=16) with no token-smoothing window, causing a coordinated reduction in local prefix/KV cache hit rate across many nodes.
+2) Secondary cause — Lacking pre-move synthetic warmup: there was no pre-warm path to repopulate hot prefixes into the new shard locations before switching traffic. New nodes took traffic cold, incurring synchronous reads.
+3) Contributing factor — Alerting and throttles were tuned for capacity deficits, not for coordinated cache rebalances; there was no soft-fail circuit to pause reshuffles when tail latency rose.
+4) Operational process gap — Runbook guidance for shard rebalances did not require operator-approved staging or a canary batch size based on tenant heatmap.
+
+Immediate mitigations performed (operator timeline):
+- 09:25 UTC: Reduced concurrent move concurrency from 16 -> 2 via the maintenance agent override.
+- 09:30 UTC: Enabled a temporary in-memory prefix fallback on a subset of hot-serving nodes to avoid synchronous reads to redis for top-5 tenants.
+- 10:05 UTC: Rolled back uncommitted move batches and paused the reshuffle job; started phased resumption with canary batches (see runbook update below).
+
+Action items and long-term fixes (owners, priority, target date):
+1) Rewrite rebalance agent to support staged moves with pre-warm option (HIGH) — owner: eng-serving-runtime (Asha Patel), due: 2024-02-15.
+2) Implement per-tenant heatmap and canary batch sizing (MEDIUM) — owner: eng-platform/operator-reliability (Miguel Tan), due: 2024-01-31.
+3) Add a dynamic reshuffle circuit-breaker that pauses ongoing shard moves when tail latency or KV sync fetch rate exceeds thresholds (HIGH) — owner: eng-sre (Jordan Li), due: 2024-01-20.
+4) Create synthetic pre-warm jobs that replay recent hot prefixes to target shards before traffic cutover (HIGH) — owner: eng-serving-runtime (Data Platform liaison), due: 2024-02-28.
+5) Update runbooks and add a dedicated "Shard Movement Playbook" with checklist, operator approvals, and rollback commands (CRITICAL) — owner: eng-platform/runbooks (Lena Ortiz), due: 2024-01-08.
+6) Dashboard and alerting improvements (see next section) (MEDIUM) — owner: telemetry-team (Rachel Huang), due: 2024-01-10.
+7) Quarterly DR/gameday for cache reshuffle scenarios including synthetic load and cold-warm transitions (LOW) — owner: platform-ops (M. Tan), due: 2024-04-01.
+
+Dashboard & alert changes (concrete proposals):
+- New panel: "Shard Move Concurrency" (gauge) with alert if > 4 concurrent moves for > 2 minutes. Severity: P2.
+- Alert: "KV sync-fetch surge" when rate increases > 3x baseline AND p99 token latency > 1s for 5m. Severity: P1 and auto-paginate on-call.
+- SLO burnboard widget: per-tenant SLO contribution during rebalances (to quickly identify tenants approaching error budget).
+- Add synthetic warmup success/failure metric (boolean per batch) to monitor pre-warm coverage.
+
+Runbook updates (summary of changes to be merged):
+- New section: "Performing a Shard Movement" with the following required steps:
+  1) Review tenant heatmap and identify top-10 hot prefixes.
+  2) Schedule maintenance window with operator sign-off if > 10% expected cold-hit exposure.
+  3) Execute canary batch (<= 2 shards) with pre-warm enabled; validate cache-hit > 85% for top-3 tenants in 15m.
+  4) Increase concurrency only after canary success and p99 latency within 10% of baseline for 30m.
+  5) Rollback instructions and emergency throttle commands (copied CLI snippets below).
+- Runbook authoring note: Must include the CLI snippet for throttle: `maintenance-agent set-concurrency --job-id $JOB --concurrency 2` and rollback: `maintenance-agent abort-moves --job-id $JOB --force`
+
+Operational run commands (copyable):
+- Pause reshuffle: `maintenance-agent pause --job-id <id>`
+- Throttle concurrency: `maintenance-agent set-concurrency --job-id <id> --concurrency 2`
+- Begin canary prewarm: `maintenance-agent prewarm --target-shard <shard-id> --lookback 60m`
+
+Post-incident verification plan (tests & dashboards to validate fix):
+- A/B test on next scheduled rebalance: run with new pre-warm enabled on 5% of shards and measure cache hit delta and tail latency for 60m.
+- Run automated synthetic workload simulating top-50 prefixes against the pre-warm path; require > 85% cache hit on warmed shards.
+- Add chaos experiments in platform lab that emulate staggered node failures plus reshuffles.
+
+Follow-ups and owners (tracking table):
+- Weekly check-ins for engineering owners until all high-priority items are closed. Meeting: "KV Rebalance Safety Sync" — cadence: weekly, owner: Lena Ortiz.
+- Post-implementation audit due 2024-03-01: verify SLO behavior for a full month of scheduled reshuffles. Owner: eng-sre (Jordan Li).
+
+Lessons learned (operational & cultural):
+- Operational: Automated rebalancers must be conservative by default — favor small canary batches with explicit warmups over large parallel moves.
+- Telemetry: The missing composite alert (KV sync-fetch + tail latency) delayed escalation. Combine metrics into correlated alerts where appropriate.
+- Team practice: Runbooks must codify a human-in-the-loop checkpoint for any multi-node coordinated changes that affect cache locality.
+
+Appendix A — Key logs and queries used during incident (examples):
+- PromQL: `sum(rate(kv_sync_fetch_total[1m])) by (region)` — used to detect 6x surge.
+- Tracing search: `trace.service=\"inference\" AND trace.tag.shard_move=true AND duration>1000` — used to identify requests impacted by cold shards.
+- Redis RPS query: `avg_over_time(redis_commands_total[5m])` per instance to detect backing-store pressure.
+
+Appendix B — Quick CLI snippets for operators (for runbook copy/paste):
+- Pause/resume: `maintenance-agent pause --job-id 1234 && maintenance-agent resume --job-id 1234`
+- Force rollback: `maintenance-agent abort-moves --job-id 1234 --force --notify-team ops`
+- Canary run: `maintenance-agent run-canary --shard-list 12,13 --prewarm --verify-warm=15m`
+
+Related reading & references:
+- Runbook: /confluence/eng-platform/runbooks/kv-cache-drain-and-rebalance-runbook-2023
+- Design note: /confluence/eng-platform/systems-and-services/operator-feedback-playback-and-cost-debt-reconciliation-2026
+
+Document ownership and maintenance:
+- Primary doc owner: Lena Ortiz (eng-platform/runbooks).
+- Review cadence: Every 6 months or after any major rebalance/reshuffle incident.
+- Next review scheduled: 2024-07-15.
+
+Acknowledgements:
+Thanks to on-call responders (N. Park, M. Tan), telemetry (R. Huang), and serving runtime engineers (A. Patel, S. Gomez) for triage and data collection.
+
+End of document.

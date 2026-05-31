@@ -1,0 +1,171 @@
+GPU Thermal and Power-Aware Scheduling Guidelines
+
+Overview
+
+This document specifies operational standards and recommended configuration patterns for making scheduling decisions based on GPU thermal, power, and related platform health signals. The goal is to reduce unscheduled service disruption, extend hardware lifetime, and maintain predictable inference latency/cost tradeoffs for Redwood-hosted and Dedicated GPU fleets.
+
+Scope
+
+- Applies to all production GPU pools managed by the infra team: reserved clusters, burst pools, and Dedicated capacity.
+- Focuses on middleware and controller-level heuristics (schedulers, autoscalers, node agents); does not prescribe model-level changes.
+- Does not replace vendor firmware defaults or host-level safety controls; this document augments those controls with inference-aware behaviors.
+
+Motivation
+
+Observed failure modes:
+1. Abrupt kernel throttling triggered by thermal events leading to long-tail latency spikes.
+2. Synchronous reclaim/eviction on node-level power capping resulting in batch drops and failed requests.
+3. Overconsolidation of inference tenants on a subset of nodes increasing hot-spot thermal stress.
+
+Design principles
+
+- Safety first: never disable vendor-enforced thermal/power safeguards. Our scheduler must act conservatively to avoid creating unsafe conditions.
+- Predictability: prefer degradation modes that trade throughput for latency predictability (e.g., shed batch size, route to lower-capacity variant) rather than abrupt eviction.
+- Observability-driven: every decision must emit structured telemetry (reason, input signals, decision outcome, remedial action).
+- Tenant fairness: prioritize SLAs and tenant isolation policies during constrained conditions.
+
+Signals and telemetry (what to observe)
+
+Primary signals (recommended sampling frequency in parentheses):
+- GPU temperature (per-GPU sensor) (5s)
+- Board temperature (5s)
+- Power draw (W) (5s)
+- Power cap/kg limit events (evented)
+- ECC/PCIe error rate (1m)
+- GPU utilization (smoothed 10s)
+- Active kernel count / time-to-sleep (10s)
+- Node ambient temperature (1m)
+- Node-level thermal trip/driver events (evented)
+
+Derived signals:
+- Thermal trend (delta over 30s)
+- Sustained power margin (observed cap vs. expected draw)
+- Heat-accumulation index (weighted sum of temp * utilization over window)
+
+Decision taxonomy (ordered by preferability)
+
+1. Passive mitigation (non-disruptive):
+   - Reduce batch ceiling for new requests on affected GPUs.
+   - Increase request-level timeout budgets to allow slower kernels to finish when safe.
+   - Enable aggressive prefix/KV cache reuse to reduce compute.
+2. Proactive routing (mildly disruptive):
+   - Route new requests to sibling nodes or model variant with lower power profile (quantized/FP16).
+   - Activate capacity from warm spare pool.
+3. Staged eviction (disruptive, last resort):
+   - Evict non-critical low-priority workloads (best-effort jobs, background evals).
+   - Drain the GPU for scheduled maintenance if thermal hardware indicates impending sustained trips.
+
+Policy knobs and defaults
+
+A minimal set of configurable parameters (example defaults for 80GB A100-like fleet):
+
+Parameter | Description | Default
+--- | --- | ---
+thermal-warning-threshold-c | Per-GPU temperature to start mitigation | 78
+thermal-critical-threshold-c | Per-GPU temperature to force draining/eviction | 88
+power-draw-soft-cap-w | Soft power draw above which routing is considered | 300
+heat-accumulation-window-s | Window for heat accumulation index | 120
+heat-accumulation-threshold | Index above which proactive routing starts | 9000
+batch-ceiling-reduction-percent | Fraction to reduce batch size on soft alerts | 30
+routing-variant-fallback | Model variants ordered by preference for routing | ["fp16", "int8"]
+low-priority-eviction-list | Labels identifying workloads eligible for eviction | ["spot", "background-eval"]
+
+Implementation patterns
+
+1) Node agent responsibilities (daemon running on each host):
+- Collect and forward primary signals to clustering control plane (prometheus+pushgateway or direct gRPC stream).
+- Maintain short-term smoothed signals for local mitigation to avoid round-trip delays.
+- Expose an HTTP readiness & pressure endpoint used by the cluster scheduler: /node-pressure (JSON: {"pressure": "low|medium|high", "reason": "TEMP|POWER|ECC"}).
+
+2) Scheduler extension (control-plane):
+- Consume the node pressure endpoints and make per-pod placement decisions respecting tenant SLAs.
+- Evaluate routing policy: if pressure==medium, apply passive mitigations; if pressure==high, consult routing variant and spare-pool policy; if pressure==critical then initiate drain.
+- Record decisions in an event stream (kafka/topic: gpu-scheduler-decisions) with the following fields: timestamp, node_id, gpu_id, decision, reason, triggered_by_signal.
+
+3) Autoscaler integration:
+- The autoscaler should consider thermally constrained nodes as "less desirable" until recovery metrics indicate sustained cooling (30-60s beyond thresholds).
+
+Operational runbook (playbook for on-call)
+
+1. Detection
+   - Alert: GPU Thermal Pressure (policy: sustained per-GPU temp >= thermal-warning-threshold-c for 2 measurements).
+   - Pager to infra on-call when pressure escalates to sustained critical threshold (per-GPU temp >= thermal-critical-threshold-c).
+2. Triage steps
+   - Check node agent /metrics and /node-pressure endpoint. CLI: curl -s http://<node-ip>:9100/node-pressure
+   - Inspect recent kafka events: kafka-console-consumer --topic gpu-scheduler-decisions --from-beginning --max-messages 50
+   - Determine if the cause is ambient (data center HVAC), software (driver/panic loop), or workload-driven.
+3. Immediate mitigations (infra on-call)
+   - If ambient: coordinate with colo facilities to check CRAC/PDU/room sensors.
+   - If workload-driven: manually apply eviction to background-eval label and reroute traffic to warm spares by toggling scheduler.routing.force_spare=true for the cluster.
+   - If driver/firmware: follow hardware vendor escalation; mark node as quarantine in inventory and schedule maintenance.
+4. Post-incident
+   - Record incident summary in incident tracker. Associate decision events and node telemetry for later analysis.
+   - If repeated across nodes, open a reliability initiative to add smarter thermal-aware packing and capacity planning.
+
+Telemetry and SLOs
+
+- Emit an SLI: fraction of inference requests that experienced a thermal-induced mitigation (labels: mitigated=true|false). Target SLO: mitigated.requests.rate <= 0.5% per week for Dedicated pools.
+- SLI: median and 95th-store latency delta between mitigated and non-mitigated requests. Targets: 95th delta <= 20% for hosted API; for Dedicated, 95th delta <= 10% (customers can opt-in to strict power-friendly profiles).
+- Operational metric: mean time from thermal-warning to recovery < 180s.
+
+Compatibility and exceptions
+
+- Private deployments: provide an optional runtime (node-agent + scheduler webhook) that customers can enable. Default thresholds should be conservative and documented in customer onboarding.
+- Edge cases: legacy drivers that do not expose per-GPU power draw should rely on temperature-only heuristics and a higher degree of conservatism.
+
+Example policy JSON (scheduler control plane)
+
+{
+  "policy_version": "v1",
+  "defaults": {
+    "thermal_warning_c": 78,
+    "thermal_critical_c": 88,
+    "batch_reduction_pct": 30,
+    "routing_preference": ["fp16","int8"],
+    "low_priority_labels": ["spot","background-eval"]
+  }
+}
+
+Example Node Agent readiness endpoint (response)
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "pressure": "medium",
+  "reason": "TEMP",
+  "gpus": [
+    {"id": "gpu0", "temp_c": 80, "trend_c_30s": 2.1},
+    {"id": "gpu1", "temp_c": 74, "trend_c_30s": -0.4}
+  ]
+}
+
+Rollout plan
+
+1. Prototype (2 weeks): instrument a single cluster with node agent and scheduler extension in read-only mode (emit decisions but do not act).
+2. Canary (4 weeks): enable passive mitigations on one production shard; monitor mitigated SLI and latencies.
+3. Broader rollout (8 weeks): incrementally enable proactive routing for non-critical workloads across remaining clusters.
+4. Full enforcement (QA & enterprise comms): enable staged eviction for background workloads and add documentation to Dedicated customer onboarding.
+
+Ownership and maintenance
+
+- Primary owner: infra/gpu-team (on-call: infra-sre rotation).
+- Secondary owner: eng-serving-runtime (scheduler extension and model-variant routing).
+- Review cycle: review policy knobs quarterly or after any thermal incident affecting >3 nodes.
+
+References and further reading
+
+- Vendor thermal guidelines (internal link to vendor docs).
+- Related Redwood playbook: graceful-gpu-preemption-and-prewarming-guidelines-2026 (see related_pages).
+- Observability: link to observability SLI spec for hardware telemetry ingestion.
+
+Appendix: Safety checklist before enabling active mitigation in a cluster
+
+- Node agent deployed and healthy on 100% of nodes? (yes/no)
+- Event stream consumer (gpu-scheduler-decisions) subscribed and indexed?
+- Warm spare pool capacity verified for routing fallbacks?
+- Customer SLAs for affected tenants documented and exemptions configured?
+
+Contact
+
+For questions or exceptions, contact the GPU infra lead: sara.chen@redwood.ai or open a ticket in #infra-gpu.

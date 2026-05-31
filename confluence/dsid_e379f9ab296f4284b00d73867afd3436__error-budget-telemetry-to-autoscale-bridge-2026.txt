@@ -1,0 +1,210 @@
+Error-Budget Telemetry to Autoscale Bridge Runbook
+
+Overview
+
+This runbook defines the operational pattern and automated bridge that converts SLO and error-budget telemetry into safe capacity actions (autoscale, burst allocation, and controlled tenant throttling). The goal is to reduce manual triage time during progressive SLO burn while preserving customer experience and minimizing cost.
+
+Scope
+
+- Services: inference-gateway, prefix-cache, tokenizer-service, kv-cache, batch-scheduler
+- Environments: prod-us, prod-eu (same policy applied with regional knobs)
+- Owners: eng-sre (primary), eng-serving-runtime (secondary)
+
+When to use this document
+
+1. To design or review automation that reacts to error-budget consumption.
+2. To run the telemetry->autoscale bridge during an SLO ramp or incident that starts as high burn.
+3. To perform post-incident validation that automated scale decisions obeyed safety constraints.
+
+Key objectives
+
+- Turn error-budget signals into graded capacity or degradation actions instead of one-off throttles.
+- Ensure actions are reversible, observable, and auditable by SRE.
+- Maintain a human-in-the-loop escalation for unsafe or unexpected scaling decisions.
+
+SLOs, Signals and Derived KPIs
+
+Primary SLOs (examples)
+
+| Service | SLO (p99 latency) | Error budget (monthly) | Alert burn threshold |
+|---|---:|---:|---:|
+| inference-gateway | 250ms p99 | 99.9% | 10%/day
+| prefix-cache | 50ms p99 | 99.95% | 5%/day
+| batch-scheduler | 2s p99 | 99% | 20%/day
+
+Derived KPIs used by the bridge
+
+- EB_rolling_24h_percent: fraction of monthly error budget consumed in last 24h
+- p99_latency_headroom: (SLO_p99 - observed_p99) / SLO_p99 expressed as percent
+- effective_capacity_utilization: moving average of tokens/sec per GPU normalized by target throughput
+- queue_depth_score: weighted sum of request queue length and oldest_request_age
+
+Telemetry sources and owners
+
+- Metrics: Prometheus (eng-sre/prometheus-prod)
+  - inference_gw_p99_latency_seconds: histogram summary (owner: eng-serving-runtime)
+  - service_error_budget_consumption_ratio: precomputed SLO exporter (owner: eng-sre)
+  - tokens_per_gpu: runtime exporter (owner: eng-serving-runtime)
+- Traces: Jaeger (for tail-latency dives)
+- Logs: structured logs (request_id, tenant_id, model_id, route)
+
+Decision matrix (policy overview)
+
+| EB_24h | p99_headroom | utilization | Action | Safety checks | Intended outcome |
+|---:|---:|---:|---|---|---|
+| < 5% | > 10% | < 70% | no-op | N/A | stable
+| 5-15% | 5-10% | 70-85% | suggest scale +1 pool | check GPU spare capacity, cost cap | reduce burn
+| 15-40% | 0-5% | 80-95% | autoscale +burst (up to +30%) | eviction whitelist, eviction impact estimate | aggressive mitigation
+| > 40% | <0% | >95% | trigger controlled tenant throttle + paging to fallback models | human approval (15m SLA) | immediate budget protection
+
+Automated Bridge: high-level flow
+
+1. Continuous monitor: Collect EB_rolling_24h_percent and other KPIs every 60s.
+2. Evaluate policy rules (see Decision matrix) in order of severity.
+3. If rule indicates capacity adjustment: run safety checks (below).
+4. If safety checks pass and action is low-risk: execute automated action and log event.
+5. If safety checks fail or action is high-risk: create high-priority incident (automated), notify on-call, and enter human-in-the-loop flow.
+
+Safety checks (must pass before any automatic non-reversible action)
+
+- SpareCapacityCheck: available reserved GPUs in region >= requested delta + 1 (buffer).
+- CostGuard: projected 24h incremental cost <= region_cost_threshold (configurable per-customer and org).
+- BlacklistCheck: action must not evict tenants listed in the eviction_whitelist (e.g., enterprise SLA tenants).
+- CanaryCheck: run a brief (2-minute) canary on 1/10th of the scale delta to validate p99 improvement.
+- ObservabilityCheck: required telemetry streams must be fresh (<30s age).
+
+Concrete runbook: from EB burn detection to autoscale (+burst)
+
+1. Detection
+   a. Alert fires: alertname=HighErrorBudgetBurn, labels={service=inference-gateway, severity=warning}
+   b. Pager not paging yet if EB_rolling_24h_percent < 15%. Bridge begins evaluation automatically.
+2. Bridge evaluation
+   a. Fetch current metrics (last 60s window): EB_24h, p99_latency, tokens_per_gpu, queue_depth.
+   b. Run decision matrix. Suppose result: autoscale +burst up to +20%.
+3. Safety checks
+   a. SpareCapacityCheck: call /api/v1/fleet/available?region=prod-us -> returns 5 free GPUs; delta=4 -> pass.
+   b. CostGuard: estimate +$2,400/24h -> within cost cap of $5,000 -> pass.
+   c. CanaryCheck: schedule canary job: increase one node in canary pool and replay synthetic traffic for 2 minutes.
+4. Execution
+   a. If canary success (p99 improvement >= expected threshold), execute fleet autoscale API:
+
+   curl -X POST https://infra-api.redwood.internal/v1/fleet/scale \
+     -H 'Authorization: Bearer $SRE_RUN_BRIDGE' \
+     -H 'Content-Type: application/json' \
+     -d '{"region":"prod-us","pool":"inference-gpu-pool","delta":4,"mode":"burst","reason":"EB_24h=18%"}'
+
+   b. Tag the action with an audit_event_id returned by infra-api. Post to #sre-ops with details.
+5. Post-action validation (5m window)
+   a. Verify p99 drops, EB_24h percent curve flattens within 30 minutes.
+   b. If not, revert scale (scale down delta) and escalate to oncall.
+
+Human-in-the-loop: when to escalate immediately
+
+- Any action that would evict enterprise-whitelisted tenants.
+- CostGuard would exceed threshold.
+- Observability streams stale or missing.
+- Bridge detects contradiction (metrics implying hardware fault).
+
+Manual throttle procedure (controlled tenant throttling)
+
+1. Run impact assessment: `./tools/tenant-impact --tenant <id> --window 60m`
+2. Create a holding message via runtime config: `rdctl set global throttle.tenant.<id> 10rps --expires 1h --reason "EB protection"`
+3. Notify Customer Success with template: `cs-notify --tenant <id> --template eb_protection`
+
+Operational tooling integration
+
+- Prometheus alert rules (sample)
+
+  alert: HighErrorBudgetBurn
+  expr: increase(service_error_budget_consumption_ratio[24h]) > 0.12
+  for: 10m
+  labels:
+    severity: warning
+    team: eng-sre
+  annotations:
+    summary: "High 24h error budget burn for {{ $labels.service }}"
+    runbook: "/confluence/eng-sre/operational-tooling/error-budget-telemetry-to-autoscale-bridge-2026"
+
+- Bridge evaluation service config (example key values stored in Vault):
+
+  - evaluation_window: 60s
+  - canary_duration_seconds: 120
+  - burst_max_percent: 30
+  - cost_threshold_usd_24h: 5000
+  - human_approval_timeout_seconds: 900
+
+- Sample autoscaler YAML (for KEDA-like runner)
+
+  apiVersion: keda.sh/v1alpha1
+  kind: ScaledObject
+  metadata:
+    name: inference-gpu-burst
+  spec:
+    scaleTargetRef:
+      apiVersion: apps/v1
+      kind: Deployment
+      name: inference-gateway
+    pollingInterval: 15
+    cooldownPeriod: 300
+    minReplicaCount: 2
+    maxReplicaCount: 40
+    triggers:
+      - type: prometheus
+        metadata:
+          serverAddress: http://prometheus:9090
+          metricName: tokens_per_gpu
+          threshold: "800"
+
+Incident review expectations (for automated actions)
+
+- Tagging: Every automated action MUST include audit_event_id and policy_version in the action payload.
+- Evidence packet: When an alert escalates to incident, the bridge must attach:
+  - last 60m metrics for SLOs (CSV)
+  - action audit log (JSON)
+  - canary run results (pass/fail, traces)
+- Postmortem: If any automated action resulted in customer-visible degradation, a post-incident review must be opened within 48h and labeled `auto-action`.
+
+SRE runbook checklist (quick play)
+
+1. Verify alert and ownership: `promtool check rules` -> inspect alert details.
+2. Validate telemetry freshness: check `up` metrics for exporters.
+3. Confirm spare capacity via infra-api.
+4. If safe and low-risk, allow automated scale and monitor.
+5. If risky, escalate and follow manual throttle/eviction steps.
+
+Ownership and RACI
+
+- eng-sre: bridge service, alert rules, runbook owner (primary)
+- eng-serving-runtime: metrics exporters, canary workloads, autoscale execution integration (secondary)
+- customer-success: notification templates and whitelist maintenance (consulted)
+
+Appendices
+
+A. Quick PromQL snippets
+- EB rolling 24h percent:
+  sum(rate(service_error_budget_consumption_ratio[24h])) / sum(service_error_budget_total)
+- tokens per GPU (5m avg):
+  avg_over_time(tokens_per_gpu[5m])
+
+B. Example audit log entry (JSON blob stored as string in audit log)
+
+{"audit_event_id":"ae-20260212-0042","actor":"bridge-service","action":"scale","region":"prod-us","delta":4,"reason":"EB_24h=18%","policy_version":"v3.1"}
+
+C. Post-action verification checklist (to file to incident ticket)
+- p99 latency trend (15m, 30m, 60m)
+- EB consumption percent delta (pre/post 60m)
+- Cost delta estimate for last 24h
+
+Document maintenance
+
+- Owner: eng-sre runbooks team (Maya Chen)
+- Review cadence: quarterly or after any auto-action postmortem
+- Change process: file ADR for any policy change that adjusts burst_max_percent or changes human_approval_timeout_seconds
+
+Related links
+
+- Fleet API docs: /internal/fleet/api
+- SLO exporter design: /confluence/eng-sre/operational-tooling/slo-observability-fidelity-spec-2025
+- Incident postmortem template: /confluence/eng-sre/incident-review/postmortem-template
+
+End of document

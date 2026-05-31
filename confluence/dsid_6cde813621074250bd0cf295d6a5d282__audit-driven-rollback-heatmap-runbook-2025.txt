@@ -1,0 +1,130 @@
+Audit-driven rollback and latency-heatmap runbook
+
+Overview
+
+Purpose:
+This runbook defines the audit-driven rollback decision flow and the process for generating and interpreting a latency budget heatmap used to decide whether to perform an automated or manual rollback of runtime changes (model swaps, kernel upgrades, scheduler policy changes). The document is intended for oncall, SRE, runtime engineers, and release owners.
+
+Scope:
+- Applies to changes that affect serving runtime execution surface: model binary swaps, kernel/plugin rollouts, scheduler policy updates, and admission-controller changes.
+- Covers detection (signals), heatmap generation, rollback decision matrix, automated rollback triggers, manual rollback steps, verification, and post-action telemetry.
+
+Prerequisites
+- You must have the runway CLI and telemetry tools available: runwayctl, rt-query, heatmap-gen.
+- Access: runtime-admin or oncall role with permission to query audit-log and submit rollbacks.
+- Baseline SLOs: 95th latency <= 80ms for interactive tier; 99th tail <= 250ms for bulk tier; error-rate <= 0.5%.
+
+Key signals (observability inputs)
+- Latency quantiles: p50/p95/p99 per route and per model-variant.
+- Error signals: 5xx rate, model-exec-failures, kernel-timeouts.
+- Throughput and concurrency: RPS, active slots, kernel-queue-length.
+- Audit events: model_swap, kernel_release, scheduler_policy_apply (include change_id and actor).
+- Traces: end-to-end traces with kernel segment durations.
+- KV cache metrics: kvcache-hit-rate, kvcache-warmup-latency.
+
+Heatmap generation (quick guide)
+1) Query a 30-minute window anchored on change timestamp (T0 = audit event time). Example query:
+
+Command:
+runwayctl query metrics --from "T0-30m" --to "T0+30m" --metrics p50_latency,p95_latency,p99_latency,error_rate,kvcache_hit --group-by route,change_id > /tmp/heatmap-window.json
+
+2) Generate heatmap visualization artifacts (CSV and PNG):
+heatmap-gen /tmp/heatmap-window.json --group-by route,model_variant --output /tmp/T0-heatmap.csv --png /tmp/T0-heatmap.png
+
+3) Heatmap interpretation rubric (rows=routes, cols=time buckets):
+- Color scale: green (within baseline), amber (exceeds p95 by 1.5x), red (exceeds p95 by >= 3x or error-rate > 1%).
+- Look for contiguous red bands that coincide with the change_id.
+
+Rollback decision matrix
+| Condition observed | Confidence | Recommended action | Notes |
+|---|---:|---|---|
+| Isolated p95 spike on non-critical route, no error increase | Low | Monitor 10–30m | No immediate rollback; add temporary throttle if sustained. |
+| Wide p95/p99 increase across >20% routes or core routing path | High | Initiate automated or manual rollback | Check audit-log actor and change_id; prefer automatic rollback when evidence is clear. |
+| Error-rate > 1% and persistent for 5 minutes after change | High | Immediate rollback | Prioritize availability; communicate outage. |
+| KV cache cold-start latency spike without kernel anomalies | Medium | Gradual rollback or targeted cache warm-up | May be resolved by warming; avoid full rollback if warmup fixes in 10–15m. |
+
+Automated rollback triggers (safety gates)
+- Trigger A (automated): If (global p95 increases >= 2x baseline) AND (error-rate increases >= 0.5% absolute) AND (affected routes > 15%) within 3 minutes of change_id -> automated rollback.
+- Trigger B (restricted-automated): Kernel release where rollout percentage > 50% -> use rolling pause and canary check; if p95 of canary cohort > 1.8x baseline -> rollback the release and pause pipeline.
+- Human override: Oncall can cancel automated rollback by marking audit-event as "investigating" and creating an incident with severity.
+
+Safe rollback prerequisites (pre-check list)
+1) Confirm the change_id matches audit log event and lane (prod/dedicated/private).
+2) Verify rollback target (previous model hash, prior kernel image, previous scheduler policy) is available and marked as validated in release registry.
+3) Ensure capacity for rollback (e.g., old model fits on current GPU fleet).
+4) Notify downstream owners: product route owners, account ops (if customer-affecting), and SRE lead.
+
+Manual rollback steps (model swap example)
+1) Identify change_id: rt-query audit --event model_swap --since "T0-5m" --limit 50. Note new_variant and prev_variant hashes.
+2) Validate prev_variant is in release-registry: runwayctl release get --id <prev_variant>
+3) Initiate rollback in controlled fashion:
+   a) For Hosted API canary first: runwayctl rollout start --change-id <rollback-to-prev> --cohort canary --wait 120s --health-check p95<1.2x
+   b) If canary stable, start staged rollout: runwayctl rollout resume --stages 10%, 25%, 50%, 100% with 5–10 minute observation windows.
+4) If immediate full rollback required (severe outage): runwayctl rollback apply --target <prev_variant> --force --audit-reason "sre:latency_regression"
+
+Manual rollback steps (kernel/plugin rollback)
+1) Identify release and nodes: rt-query audit --event kernel_release --change-id <id> --expand nodes
+2) Pause scheduler plugin activation globally: runwayctl scheduler plugin pause --plugin <name> --audit <change_id>
+3) Roll back kernel image out-of-band via orchestration job: runwayctl infra kernel rollout --image <previous_image> --nodes <node-list> --parallel 10
+4) Observe trace segment durations and kernel-specific metrics for 15 minutes post-rollback.
+
+Verification checklist (post-rollback)
+- Latency: p95 back to <= 1.05x baseline across affected routes for 15 consecutive minutes.
+- Error-rate: back to baseline +/- 0.1%.
+- KV-cache: hit-rate returns to pre-change baseline within 10 minutes.
+- Audit: record rollback event with change_id, actor, and reason: runwayctl audit log --append "rollback: <change_id> reason=latency_regression"
+
+Escalation and communication templates
+- Pager message (initial):
+  - Subject: [P1] Runtime latency regression after change <change_id>
+  - Body: Brief summary, observed p95 and error spikes, automated rollback status (triggered/blocked), oncall owner and next steps.
+
+- Customer-facing (if customer observed):
+  - Short statement describing impact, mitigation (rollback initiated), and ETA for fix. Avoid technical kernel details.
+
+Diagnostics playbook (fast triage)
+1) Confirm scope: rt-query metrics --filter change_id=<id> --group-by route | summarize affected_routes
+2) Compare traces: rt-query traces --from T0-5m --to T0+10m --filter change_id=<id> --sample 50
+3) Kernel-level check: ssh to one impacted node -> sudo journalctl -u runtime-kernel | grep <change_id> and check for OOM, timeouts, or segmentation faults.
+4) Check admission controller logs for throttling signals: rt-query logs --service admission --from T0-10m --to T0+10m --grep "deny|throttle"
+
+Table: Quick thresholds reference
+| Metric | Baseline | Amber threshold | Red threshold | Action |
+|---|---:|---:|---:|---|
+| p95 latency (interactive) | <= 80ms | > 120ms | >= 240ms | Amber -> monitor; Red -> rollback |
+| p99 latency (bulk) | <= 250ms | > 375ms | >= 750ms | Amber -> staged mitigation; Red -> rollback |
+| Error-rate (5xx) | <= 0.5% | > 1% | >= 2% | Red -> rollback + incident |
+| KV cache hit-rate | >= 85% | 60–85% | < 60% | Coldstart remediation or rollback |
+
+Post-rollback tasks (owner manager)
+- Create incident with classification: latency-regression / kernel-release / model-swap.
+- Kick off perf-profiling ticket: profiling team to run focused experiments (cohort replay with and without change).
+- Coordinate a release-gate review: require additional canary stage and extended observation windows for next attempt.
+- Update deployment checklist: add rollout throttles or pre-warm steps that would have prevented incident.
+
+Safety notes and caveats
+- Do not roll back a change that was part of a security patch without approval from Security and Product — instead perform targeted mitigations while preserving the security patch if possible.
+- Automated rollback needs an explicit changelog entry created by CI/CD; otherwise the safety checks will refuse to act.
+- For Dedicated and Private environments, follow the environment-specific rollback authorization steps (see related_pages).
+
+Ownership and contacts
+- Primary oncall (runtime): runtime-oncall@redwood.ai
+- SRE lead: Arjun Patel (arjun@redwood.ai)
+- Release owner (deploy pipeline): Luis Ortega (luis@redwood.ai)
+- Profiling / experiments: Maya Chen (maya@redwood.ai)
+
+Appendix A — Example queries and snippets
+- List recent model swaps: rt-query audit --type model_swap --since 1h | jq '.[] | {time,change_id,actor,new_variant}'
+- Quick p95 per-route table: runwayctl metrics table --metric p95_latency --group-by route --from "T0-15m" --to "T0+15m"
+
+Appendix B — Change log for this runbook
+- 2025-03-12 (Maya Chen): Initial creation.
+- 2025-09-02 (Arjun Patel): Added automated rollback triggers and heatmap-gen workflow.
+- 2026-01-18 (Luis Ortega): Tightened thresholds for kernel rollbacks and added safety note for security patches.
+
+Related resources
+- Runtime rollout API spec: ../runtime-architecture/runtime-feature-flagging-experimentation-contract-2026.json
+- Canary orchestration patterns: ../runbooks/runtime-upgrade-validation-and-canary-matrix-2026.json
+- Profiling playbook: ../profiling-playbook/causal-latency-attribution-and-signal-enrichment-playbook-2027.json
+
+End of document

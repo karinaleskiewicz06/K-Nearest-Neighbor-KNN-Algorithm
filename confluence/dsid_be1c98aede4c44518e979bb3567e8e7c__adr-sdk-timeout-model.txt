@@ -1,0 +1,167 @@
+ADR: SDK Timeout Model (v1) — Overall + Connect/Read Timeouts
+
+## Status
+Published (v1).
+
+## Context
+Redwood is running a cross-language SDK parity initiative (Python, TypeScript, Go) to make behavior consistent and predictable in production. A major support driver has been inconsistent timeout semantics:
+- “Timeout not honored” reports (especially for streaming).
+- Differences between overall deadline vs connect/read timeouts across underlying HTTP clients.
+- Confusion about whether timeouts apply per attempt (when retries are enabled) or across the entire operation.
+
+We need a single, documented timeout model and defaults that:
+1) Behave similarly across languages.
+2) Map cleanly onto the underlying HTTP implementations.
+3) Avoid breaking changes where possible.
+4) Support both non-streaming and streaming use cases.
+
+## Decision
+We will standardize on a **dual-layer timeout model** across SDKs:
+
+1) **Overall timeout (request deadline):** `timeout_ms`
+   - Defines a hard deadline for a single HTTP attempt (non-streaming request or streaming connection lifetime).
+   - Implemented as a cancellation/deadline at the request level.
+
+2) **Granular timeouts (best-effort where supported):**
+   - `connect_timeout_ms` — maximum time to establish a TCP/TLS connection.
+   - `read_timeout_ms` — maximum idle time waiting for the next byte/chunk after the request is established.
+
+The SDKs MUST expose the same configuration names and document the same semantics. Where a platform (notably browser fetch) cannot enforce a granular timeout, the SDK must:
+- Still accept the option for parity.
+- Document that it is “best-effort” / “not supported in this runtime,” and enforce `timeout_ms` as the portable baseline.
+
+### Streaming semantics
+For streaming requests, timeouts are defined as:
+- `timeout_ms` = maximum total wall-clock time allowed for the stream to remain open.
+- `read_timeout_ms` = **idle timeout** between chunks/events. If no bytes/events are received for `read_timeout_ms`, the SDK aborts the stream and raises a typed timeout error.
+
+This explicitly addresses enterprise proxy/network behavior where connections can half-open and appear “stuck.”
+
+### Per-attempt vs total elapsed time (interaction with retries)
+Timeouts in this ADR apply **per attempt**.
+- Each retry attempt gets a fresh `timeout_ms` budget.
+- The retry system is responsible for bounding total elapsed time via its own controls (see the Retry Policy standard/ADR). The SDKs should recommend coordinating `timeout_ms` with retry limits to avoid unexpectedly long total runtime.
+
+## Defaults (v1)
+Defaults are chosen to balance “works out of the box” with production safety.
+
+### Default timeouts
+| Request type | timeout_ms (overall) | connect_timeout_ms | read_timeout_ms |
+|---|---:|---:|---:|
+| Non-streaming (default) | 60,000 | 10,000 | 60,000 |
+| Streaming (default) | 600,000 (10 min) | 10,000 | 60,000 (idle) |
+
+Notes:
+- For non-streaming, `read_timeout_ms` effectively behaves like an overall “response wait” limit; we keep it aligned with `timeout_ms` by default for simplicity.
+- For streaming, the 10-minute `timeout_ms` prevents unbounded resource usage by default while still supporting typical “long answer” generation. Customers can set `timeout_ms = 0` (or `None`, language-specific) to disable the overall stream limit, but **idle timeout remains enabled by default**.
+
+### Disabling timeouts
+- `timeout_ms`:
+  - Python: `None` disables overall request timeout.
+  - Go: `0` duration disables `http.Client.Timeout` (overall) but granular timeouts may still apply via transport.
+  - TypeScript:
+    - Node: `0` disables AbortController-based deadline.
+    - Browser: same, via AbortController.
+- `connect_timeout_ms` and `read_timeout_ms`:
+  - `0` (or `None`) disables that granular check where supported.
+
+## Public SDK API (standard names)
+All SDKs will expose a `timeouts` configuration block (or equivalent) with these fields:
+- `timeout_ms` (overall per attempt)
+- `connect_timeout_ms`
+- `read_timeout_ms`
+
+Language-specific mapping may provide alias names for backward compatibility, but documentation and examples must prefer the standard names.
+
+## Error handling requirements
+When a timeout triggers, SDKs must raise/return a typed error consistent with the cross-language error taxonomy:
+- `type`: `TimeoutError` (or language equivalent)
+- `request_id`: included if available (e.g., if headers were received)
+- `phase`: one of `connect`, `read`, `overall` (best-effort)
+- `timeout_ms`: the configured threshold that fired
+- `retryable`: true (timeouts are retryable by default; streaming retries remain conservative—see Retry ADR)
+
+## Implementation mapping by language
+This section defines how the timeout model maps to each SDK’s underlying HTTP stack.
+
+### Python SDK
+HTTP client: `httpx`.
+- `timeout_ms` (overall): implemented via request-level timeout (and/or `anyio.fail_after`) applied to the attempt.
+- `connect_timeout_ms`: mapped to `httpx.Timeout(connect=...)`.
+- `read_timeout_ms`: mapped to `httpx.Timeout(read=...)`.
+
+Streaming:
+- Use `read_timeout_ms` as the idle timeout between streamed chunks/events.
+- Ensure cancellation closes the response stream and underlying connection.
+
+Footgun to avoid:
+- In some implementations, streaming iteration can bypass the “overall” timeout if only set at client construction. The SDK must enforce per-request deadlines for streaming iterators.
+
+### Go SDK
+HTTP client: `net/http`.
+- `timeout_ms` (overall): mapped to `http.Client.Timeout` OR request context deadline for stricter control.
+  - Preferred: set request context deadline for per-attempt timeout. `http.Client.Timeout` may be used as a safety net, but context should be the source of truth.
+- `connect_timeout_ms`: mapped via `net.Dialer{Timeout: ...}` on the Transport.
+- `read_timeout_ms`:
+  - For non-streaming: map to `ResponseHeaderTimeout` (for initial response) plus per-read deadlines where feasible.
+  - For streaming idle timeout: enforce via periodic `SetReadDeadline` on the underlying connection when accessible; if not reliably accessible, enforce at the stream reader layer (timer that cancels the request context when idle).
+
+### TypeScript SDK
+HTTP client:
+- Browser: `fetch`.
+- Node: `fetch` (undici-backed in supported runtimes).
+
+Portable baseline:
+- `timeout_ms` (overall): implemented with `AbortController` + timer.
+
+Granular (best-effort):
+- `connect_timeout_ms`:
+  - Browser: not reliably supported; accept option but document as not enforced.
+  - Node/undici: where available, approximate with undici dispatcher settings. If the runtime does not allow safe per-request dispatcher overrides, treat as best-effort and document.
+- `read_timeout_ms`:
+  - Browser: not reliably supported at the socket level; for streaming, enforce idle timeout at the reader/event level (timer that aborts the controller if no bytes/events observed).
+  - Node: for streaming, same idle-timer approach (portable and reliable).
+
+## Alternatives considered
+1) **Overall timeout only**
+   - Pros: simple, portable.
+   - Cons: insufficient for diagnosing connect vs idle hangs; does not address “stuck stream” well without careful reader-layer enforcement.
+
+2) **Fully granular only (connect/read/write/pool) and no overall deadline**
+   - Pros: precise in languages that support it.
+   - Cons: not portable (browser/TS); too many knobs; customers want a single “deadline” option.
+
+3) **Total operation timeout across retries (one budget)**
+   - Pros: clearer upper bound for users.
+   - Cons: more complex; requires retry subsystem coordination; risk of surprising behavior when attempts are cut short.
+   - Decision: defer to retry standard (max elapsed time) rather than bundling into this v1 timeout ADR.
+
+## Consequences
+### Benefits
+- Consistent configuration across SDKs.
+- Predictable behavior for streaming “idle hang” scenarios.
+- Clearer support triage (connect vs read vs overall).
+
+### Costs / tradeoffs
+- TypeScript/browser cannot strictly enforce connect/read at the network layer; some semantics remain best-effort.
+- Go transport-level mapping is not 1:1; enforcement may use reader-layer timers.
+
+## Rollout plan
+1) Implement `timeouts` options and defaults behind a compatibility layer in each SDK.
+2) Add conformance tests for:
+   - Overall timeout triggers for non-streaming.
+   - Streaming idle timeout triggers and produces typed error.
+   - `timeout_ms` cancellation properly closes streaming iterators/readers.
+3) Update docs/quickstarts to use standard names.
+4) Deprecate legacy timeout option names with warnings for at least one minor release.
+
+## Acceptance criteria
+- All three SDKs expose `timeout_ms`, `connect_timeout_ms`, `read_timeout_ms` with the semantics described.
+- Default values match the table above.
+- Streaming idle timeout is enforced consistently across languages.
+- Timeout errors include `request_id` when available and include a `phase` field.
+- Conformance suite passes in CI for Python/TS/Go.
+
+## Appendix: Recommended customer guidance (for docs)
+- If you enable retries, set `timeout_ms` high enough for a single attempt, and keep retry attempts bounded (max attempts / max elapsed time) to avoid long total latency.
+- For streaming behind proxies, keep `read_timeout_ms` enabled to avoid hung reads; if you expect long “silent” periods, increase idle timeout rather than disabling.

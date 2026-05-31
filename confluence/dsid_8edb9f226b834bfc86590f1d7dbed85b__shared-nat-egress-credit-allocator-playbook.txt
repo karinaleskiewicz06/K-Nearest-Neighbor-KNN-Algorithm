@@ -1,0 +1,149 @@
+Multi-tenant Shared NAT & Egress Crediting Allocator — Design, IaC, and Runbook
+
+Summary
+-------
+This document describes the architecture, Terraform/IaC patterns, monitoring, and on-call runbook for a Multi-tenant Shared NAT + Egress Crediting Allocator (the Allocator). The Allocator provides fair, auditable egress crediting and NAT port assignment for tenant workloads that share a pool of NAT gateways (or egress appliances). It is intended for Redwood-hosted GPU and inference tenant workloads that must control egress spend while preserving tenant isolation and predictable QoS.
+
+Goals
+-----
+- Meter per-tenant egress at high cardinality (per account / environment / cluster) with sub-minute accuracy for billing and throttling.
+- Enforce predictable fairness by allocating reusable NAT port ranges and egress credit quotas per tenant.
+- Provide a Terraform module and CI/CD pattern for managing allocator pools across accounts/regions.
+- Offer an on-call runbook that reduces pager fatigue and supports safe rollback of crediting/policing rules.
+
+Non-goals
+---------
+- Replacing provider-level billing (this augments it for product-level chargebacks).
+- Deep packet inspection or payload-level policy.
+
+Architecture overview
+---------------------
+1) Control-plane service (Allocator API)
+   - Stateless HTTP service providing: allocate_port_range, refresh_quota, report-egress, reconcile-tenant-assignments.
+   - Backed by a single sharded Postgres (or Dynamo) table for assignments and credits.
+   - Exposes a read-only metrics stream for Prometheus and an audit log to S3/BigQuery.
+
+2) Data-plane (shared NAT appliances / managed gateway)
+   - NAT appliances (cloud-managed NAT gateway or self-hosted egress proxies) configured with multiple public IPs and port mapping.
+   - A sidecar agent (or iptables management daemon) that requests a port-range from Allocator and applies per-tenant SNAT rules.
+
+3) Accounting/charging pipeline
+   - Periodic batch job consumes audit logs and per-tenant report-egress events to create invoiceable line items and chargeback metrics.
+
+Key entities and invariants
+---------------------------
+- Tenant: (org_id, project_id, env) string.
+- PortRange: contiguous ephemeral TCP/UDP port block (e.g., 1000 ports).
+- CreditBucket: egress bytes reserved per tenant per billing-period.
+- Invariant: port assignment is unique per NAT IP + port range to avoid collisions.
+
+Operational SLOs and thresholds
+-------------------------------
+- Allocator API availability: 99.95% (global)
+- Allocation latency: 95th percentile < 300ms for allocate_port_range API call
+- Egress metering latency: events visible in Prometheus within 60s of occurrence
+- Billing accuracy: <0.5% drift versus provider egress billing for aggregated daily totals
+
+Prometheus metrics to publish
+----------------------------
+- allocator.allocations_total (labels: tenant, region, outcome)
+- allocator.allocation_latency_seconds_bucket (labels: tenant, region)
+- allocator.egress_report_bytes_total (labels: tenant, region, ip)
+- allocator.quota_exhausted_count (labels: tenant, region)
+- allocator.audit_events_published_total
+
+Terraform / IaC patterns (example)
+---------------------------------
+This section shows the recommended module layout and a compact example. The actual module shipped in our org follows the pattern below and lives in the terraform monorepo (module path: modules/egress-allocator).
+
+Table: Module inputs and defaults
+- name: module_input - description: default
+- name: region - Target region for NAT pool - default: us-west-2
+- name: nat_pool_size - Number of public IPs in pool - default: "4"
+- name: port_block_size - Ports reserved per tenant - default: "1024"
+- name: db_connection_string - Allocator DB - default: ""
+
+Example usage snippet (HCL)
+- module "egress_allocator" {
+-   source = "git::ssh://git@repo/modules/egress-allocator.git//cloud-account?ref=v1.3.0"
+-   region = "us-west-2"
+-   nat_pool_size = 8
+-   port_block_size = 2048
+- }
+
+CI/CD pattern and gates
+----------------------
+1. PRs to module require: unit tests, terratest integration (ephemeral infra), and a smoke deploy using a sandbox account.
+2. Promotion pipeline (canary -> staging -> prod) enforced with a feature flag for new allocator behavior.
+3. Runbook step must be referenced in the promotion merge commit message and checked off in CI before promotion.
+
+Reconciliation and data integrity checks (daily job)
+---------------------------------------------------
+- Verify no overlapping port ranges across all NAT public IPs.
+- Compare aggregated egress bytes by provider API vs our aggregated credit events; emit drift alert if >0.5%.
+- Validate that credit buckets with churn >20% get a rebalance recommendation.
+
+On-call runbook (Pager triggers and immediate response)
+-----------------------------------------------------
+Pager conditions (alerts and actions):
+1) allocator.api_5xx_rate > 1% sustained for 3m\   - Action: page oncall infra-engineer, acknowledge in alert system, increase allocator replicas (k8s HPA), check DB connectivity, fail open to conservative default port assignment if DB unreachable.
+2) allocation_latency_seconds (p95) > 300ms for 5m\   - Action: page infra oncall, check service heap/cpu, recent deploys, scale horizontally, sample trace for slow SQL queries.
+3) quota_exhausted_count spikes for a tenant by >100x baseline\   - Action: notify customer-success and rate-limit tenant via policy; open emergency ticket for billing team to reconcile credits.
+4) egress_drift_alert (daily) > 0.5%\   - Action: run reconciliation script (see Appendix), escalate to finance if persistent for 48 hours.
+
+Step-by-step: Recovering from allocator DB outage
+1) Identify: Pager shows allocator.api_5xx_rate alert.
+2) Quick mitigation: enable local ephemeral port-assignment fallback in sidecars (config flag: ALLOCATOR_FALLBACK=local_range).
+3) If DB is write-unavailable, configure Allocator to serve read-only and queue writes to a durable S3 buffer (feature toggle).
+4) After DB restore: drain buffer consumer job to apply queued events; run data integrity checks; reconcile drift.
+5) Postmortem: publish root cause, timeline, and the corrective IaC change if rollout exposed a deployment race.
+
+Safety & gradual rollout checklist
+--------------------------------
+- Canary rollout to 3 tenants with high egress but non-critical SLAs for 72h.
+- Monitor top-10 egress tenants for port collisions and latency.
+- Enable crediting in billing pipeline for canary tenants only.
+- After 72h with no anomalies, switch on broader promotion with 24h ramp steps.
+
+Ownership and responsibilities
+------------------------------
+- Allocator control-plane: eng-infra/networking (primary), with oncall rotation in infra-team.
+- NAT appliance configuration: cloud-accounts team (ownership of cloud account and VPC).
+- Billing pipeline: finance + eng-data for reconciliation jobs.
+- Terraform modules & CI: eng-infra/ci-cd team (module authors), with CD pipeline enforced in repo.
+
+Appendix A — Debugging commands and snippets
+-------------------------------------------
+- Check allocations for tenant (SQL): SELECT tenant, ip, port_start, port_end, assigned_at FROM allocations WHERE tenant = 'org-123' ORDER BY assigned_at DESC LIMIT 50;
+- Reconciliation helper (python psuedocode):
+-   requests.get("https://allocator/api/v1/reconcile?period=24h")
+
+Appendix B — Example sidecar config (yaml)
+- sidecar:
+-   allocator_endpoint: "https://allocator.internal:443"
+-   request_timeout: 2s
+-   port_block_size: 2048
+-   fallback_mode: "disabled"
+
+Appendix C — Audit and compliance notes
+- Audit logs: all allocate_port_range and refresh_quota API calls are written to s3://redwood-allocator-audit/{region}/YYYY/MM/DD with per-event signed checksums.
+- Retention: 365 days cold, 7 years for restricted tenants.
+
+Appendix D — Known limitations and future work
+- UDP-heavy workloads with unpredictable ephemeral port churn may require per-flow NAT session tracking; currently unsupported.
+- Plan to introduce token-bucket soft throttles to smooth bursty egress and avoid hard throttling.
+
+Change history
+--------------
+- 2025-09-12: Initial design and runbook (Priya Natarajan).
+- 2025-11-03: Added Terraform promotion gating and reconciliation job (Carlos Mendes).
+- 2026-02-15: Clarified DB outage fallback and retention policy (Ava Chen).
+
+Related diagrams and attachments
+--------------------------------
+- Diagram: allocator-sequence-diagram.drawio (stored in confluence attachments).
+- Terraform module source: git@repo:infra/modules/egress-allocator.git (internal).
+
+Questions / feedback
+--------------------
+For questions about rollout timeline or tenant mapping, ping @priya.natarajan or add comments on this page.

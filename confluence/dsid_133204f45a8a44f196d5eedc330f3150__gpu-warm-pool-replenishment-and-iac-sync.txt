@@ -1,0 +1,138 @@
+GPU warm-pool replenishment and IaC sync runbook
+
+Overview
+
+Purpose: This runbook describes the automated and manual procedures for replenishing GPU warm-pools (prewarmed instances/containers) while keeping Terraform/IaC and CI/CD promotion state in sync. It is intended for on-call infra engineers and SREs who operate Redwood's GPU warm-pool system across hosted and dedicated fleets.
+
+Scope: Applies to warm-pools used for low-latency inference lanes (latency SLO <= 150ms p95), canary promotion environments, and short-lived eval clusters. Does NOT cover long-lived dedicated tenant reservations (see dedicated-capacity runbooks).
+
+When to use this runbook
+
+- Triggered automatically by the warm-pool controller when pool_fill < target_fill for > 3 minutes.
+- Use manually when: capacity anomalies are observed, CI/CD promotions fail to create warmed images, or large traffic spikes require emergency warm-up.
+
+Key metrics and thresholds
+
+- pool_fill_ratio = running_warmed / configured_warm_target; alert threshold: < 0.7 for 3m.
+- boot_latency_ms (median, p95); target p95 < 12000ms for instance boot + container start.
+- promo_fail_rate (image promotion failures per hour); page if > 5/h.
+- preempt_rate (spot interruptions) > 0.1 per hour triggers investigation.
+
+Ownership and on-call routing
+
+- Primary owner: GPU Fleet team (eng-infra/gpu-fleet). Pager rotations: infra-oncall (primary) -> infra-sre (escalation).
+- Slack channels: #gpu-fleet, #infra-oncall. Pager duty runbook links: internal://pagerduty/gpu-fleet.
+
+Preconditions (what you need before starting)
+
+1) Access: terraform and CI/CD job permissions, kubectl to the warm-pool cluster, read access to metric dashboards (Grafana), and ability to trigger pipeline runs.
+2) Location: This runbook assumes the warm-pool is in a specific region; confirm region in step 2.
+3) State: Confirm that no active maintenance windows or upgrade locks are present (check /confluence/eng-infra/terraform-and-iac/maintenance-windows).
+
+Architecture (brief)
+
+The warm-pool system is composed of:
+- warm-controller (k8s deployment) that reconciles WarmPool CRDs and triggers provisioning workflows.
+- provisioning workers (autoscaling group or node pool) that create VM instances, bake container images via CI/CD, and register warmed targets.
+- terraform modules that declare warm-pool ASGs/nodepools and IAM roles (repo: infra/terraform/modules/warm-pool).
+- promotion pipeline in the CI system that builds/publishes golden images, triggers image-acceptance tests, and writes promotion metadata to the image registry and Terraform state (promotion artifact tags: redwood/warm:<git_sha>-<build_num>).
+
+Runbook: automated reconciliation checks (fast path)
+
+1) Dashboard check: Open Grafana dashboard "WarmPool / Reconciliation" and confirm pool_fill_ratio.
+2) Controller health: kubectl -n warm-system get deploy warm-controller -o wide. Confirm replicas >= desired and restart count < 3/24h.
+3) If pool_fill_ratio < 0.7 and controller healthy: examine provisioning worker logs: kubectl -n warm-system logs deploy/provisioner --since=15m.
+4) If worker logs show repeated failures to allocate (quota, API errors): follow "Provisioning failure" troubleshooting below.
+5) If controller reports image not found: trigger manual image promotion verification (see CI/CD promotion checks).
+
+Manual replenishment procedure (safe, step-by-step)
+
+1) Identify warm-pool target and region
+   - Command: curl -s https://internal-api.redwood/v1/warmpools | jq '.[] | select(.name=="<pool>")'
+   - Confirm: pool.name, region, target_count.
+2) Confirm Terraform state vs live resources
+   - Navigate to infra/terraform/modules/warm-pool in the monorepo.
+   - Run: terraform workspace select <region>-warm || terraform workspace new <region>-warm
+   - Run: terraform plan -var 'pool_name=<pool>' -out plan.tfplan
+   - If plan shows drift that will remove resources unexpectedly, DO NOT apply; escalate to infra-terraform@redwood.com.
+3) If Terraform state is missing recently-created resources (common after CI/CD promotion race), import the resource instead of recreating:
+   - Example import: terraform import module.warm_pool.aws_autoscaling_group.this <asg-id>
+   - Update state note: record import in CHANGELOG.md for traceability.
+4) Scale warm-pool manually (temporary)
+   - For AWS ASG: aws autoscaling set-desired-capacity --auto-scaling-group-name <asg> --desired-capacity <n> --honor-cooldown
+   - For GCP nodepool: gcloud container clusters resize <cluster> --node-pool <pool> --num-nodes <n> --region <region>
+   - After scaling up, watch: pool_fill_ratio and boot_latency_ms until target met.
+5) If new nodes fail container registration, capture logs and restart provisioning service: kubectl -n warm-system rollout restart deploy/provisioner
+
+Terraform and IaC sync checklist (table-like text)
+
+| Item | Command / Check | Expected outcome | Remediation |
+|------|-----------------|------------------|-------------|
+| Workspace | terraform workspace show | correct region workspace | select/create workspace |
+| State drift | terraform plan | no destructive changes | do not apply, investigate drift |
+| Missing resource | terraform state list | resource present | terraform import or recreate via CI \n| Promotion tag mismatch | grep 'redwood/warm' in image registry | tag matches last-promoted | rerun promotion pipeline |
+
+CI/CD promotion checks
+
+- Verify last promoted artifact: curl -s https://ci.internal/api/promotions?component=warm | jq .latest
+- If promotion job failed: open the CI job, examine image build logs, re-run the promotion for the artifact with known-good tests.
+- Promotion pipeline tip: use parameter "--skip-smoke=false" for a full end-to-end rehearse when re-promoting images to warm-pool.
+
+Automated rollback and fallback behavior
+
+- Controller fallback: if new image fails health checks > 3 consecutive reconcilations, controller will revert to previous image tag and mark the pool with annotation warmpool/rollback=true.
+- If ASG scale-up encounters quota limits, provisioner will fall back to smaller instance types (policy: instance-families: p4->a10->g5) and annotate the pool with warmpool/fallback-instance-family.
+
+Troubleshooting common failure modes
+
+1) Provisioning API rate limits (AWS/GCP errors 429):
+   - Symptom: repeated API throttling in provisioner logs, pool never reaches target.
+   - Actions: throttle provisioner concurrency (configmap warm-system/provisioner: concurrency=4), open cloud support ticket, and temporarily scale desired capacity lower to spread retries.
+2) Image promotion mismatch:
+   - Symptom: warm-controller cannot find image tag referenced by Terraform or promotion metadata.
+   - Actions: check image registry tags, re-run promotion job with same git SHA, then update Terraform variable image_tag to the promoted tag and plan/apply.
+3) Unexpected Terraform drift after automated CI apply:
+   - Symptom: CI applied a change that replaced ASG or nodepool, warm-pool emptied.
+   - Actions: revert CI change, import resources back to state if destroyed resources still exist, run a controlled apply with team notification.
+
+Emergency escalation procedure (fast path)
+
+1) If pool_fill_ratio < 0.4 and latency impact observed:
+   - Trigger immediate manual scale (see manual step 4) to a conservative cap (e.g., +30% desired).
+   - Post a status update in #incident with current metrics, affected routes, and mitigation steps.
+2) If Terraform state corruption suspected:
+   - Lock state: terraform lock: workflow to acquire state lock via remote backend.
+   - Create a rollback plan using last known-good state snapshot (S3 path: s3://infra-state-backups/warmpool/<date>).
+   - Engage infra-terraform lead (pager).
+
+Post-incident follow-up checklist
+
+- Record timeline, root cause, and remediation in the internal incident tracker.
+- If drift was caused by CI: add gating job to promotion pipeline to run terraform plan against a dry-run workspace and fail-build on destructive changes.
+- Add a regression alert: pool_fill_ratio change > 20% within 5m triggers a severity-2 incident.
+
+Runbook automation and CI integration notes
+
+- The promotion pipeline writes a promotion.json artifact containing image_tag, build_num, and terraform_metadata which the warm-controller consumes. Ensure the artifact schema version matches controller expectations.
+- CI should create a Terraform plan artifact when promoting images. The controlled apply must be gated by a canary pipeline that monitors warm-pool metrics for 30 minutes before applying broadly.
+
+Related docs and references
+
+- Terraform module: infra/terraform/modules/warm-pool (internal repo).
+- CI job: ci/pipelines/warm-image-promotion.
+- Grafana dashboard: WarmPool / Reconciliation.
+- Warm-pool CRD spec: internal://k8s-api/crd/warmpool.v1.yaml
+
+Owners and points of contact
+
+- GPU Fleet (primary): @gpu-fleet-lead (Aisha Patel)
+- Infra-Terraform (secondary): infra-terraform@redwood.com
+- CI/CD (promotion issues): @ci-pipeline-owner
+
+Change history
+
+- 2024-03-12: Created by Aisha Patel.
+- 2024-08-02: Added Terraform import guidance after a postmortem (reviewers: Diego Ramos).
+- 2025-11-05: Expanded CI/CD promotion checks and automation notes (reviewers: Jin Park, Sofia Martin).
+
+End of runbook

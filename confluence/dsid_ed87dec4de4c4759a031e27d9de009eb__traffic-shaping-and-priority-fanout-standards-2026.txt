@@ -1,0 +1,150 @@
+Traffic shaping and priority fanout standards
+
+Overview
+======
+
+This document defines standards for traffic shaping, request priority fanout, and related operational controls across Redwood’s inference platform. It covers API-level shaping, per-tenant and global priority classes, model fanout rules, backpressure and circuit-breaker behavior, observability and SLOs, plus rollout and testing guidance. The goal is predictable performance and graceful degradation during contention while preserving fairness and cost predictability.
+
+Scope
+-----
+- Applies to all user-facing inference endpoints (generation, chat, embeddings, rerank) served by Hosted, Dedicated, and Private runtimes.
+- Includes per-tenant shaping, global ingress throttles, model-variant fanout, and priority routing used by internal control-plane and per-customer routing policies.
+- Excludes low-level GPU kernel scheduling (covered in runtime docs) and network-level QoS applied by cloud provider (see infra network topo).
+
+Motivation & Background
+-----------------------
+Redwood supports mixed workloads: latency-sensitive interactive traffic and large batch/async requests. Without disciplined shaping and priority-aware fanout, hotspots can:
+- Increase tail latency for premium customers
+- Cause excessive cache/kv churn across hosts
+- Escalate cost by triggering unnecessary model fallbacks or overprovisioned capacity
+
+We adopt a layered approach: lightweight API ingress shaping, tenant-aware scheduling, controlled model-level fanout, and circuit-breakers at the model/instance boundary. This document records the standards and concrete configuration suggested for new services and updates to existing services.
+
+Standards (high level)
+----------------------
+1) Priority classes
+   - class=interactive (highest): short requests, p95 latency SLOs, enterprise customers; preemptible only per policy.
+   - class=background: batch jobs and async generation; higher throughput tolerance, lower priority.
+   - class=best_effort: free-tier, burst-limited.
+
+2) Ingress shaping (per-route)
+   - Rate limit tokens: default 300 req/s per route for interactive; configurable via product plan.
+   - Burst window: allow bursts up to 3x sustained for interactive, 1.2x for background.
+   - Leaky-bucket queueing with max-queue-depth 200 (interactive) and 1000 (background). Excess is rejected with HTTP 429 and x-retry-after header.
+
+3) Fanout rules (model selection and routing)
+   - Primary fanout: when a request requires model-side parallelism (e.g., multi-encoder or split-LLM pipelines), fanout must be limited to at most 4 replicas by default and documented in the model manifest.
+   - Overflow fanout: On queue pressure, automatically reduce fanout to 1 and prefer lower-cost quantized variants (see model manifest tags: fallback_candidates).
+   - Deterministic ordering: fanout router must try replicas in affinity order to preserve cache locality.
+
+4) Backpressure and circuit-breakers
+   - Circuit open threshold: error-rate > 10% or consecutive timeouts > 5 within 1 minute for an instance.
+   - Throttle degradation: upon crossing 75% CPU or 80% queue depth, reduce per-tenant concurrency by 25% (configurable).
+
+Concrete configuration table (recommended defaults)
+-------------------------------------------------
+| scope | key | default | notes |
+|-------|-----|---------|-------|
+| route | ingress.rate_limit.rps | 300 | interactive routes; override per-tier |
+| route | ingress.burst_multiplier | 3.0 | max burst factor |
+| route | ingress.max_queue | 200 | requests queued before 429 |
+| runtime | fanout.max_replicas | 4 | documented in model manifest |
+| runtime | fanout.fallback_variant_order | quantized,fp16,fp32 | router uses this order when reducing fanout |
+| instance | circuit.error_rate_pct | 10 | rolling 60s window |
+| instance | circuit.consecutive_timeouts | 5 | timeouts in 60s |
+| scheduler | tenant.max_concurrency | 50 | soft limit; enforced by scheduler |
+
+Examples (YAML configs)
+-----------------------
+api_route: 
+  name: chat.v1.generate
+  ingress: 
+    rate_limit: 300
+    burst_multiplier: 3.0
+    max_queue: 200
+  priority_class: interactive
+  fanout: 
+    max_replicas: 4
+    fallback_candidates: ["redwood-7b-q4", "redwood-7b-fp16"]
+
+Router pseudocode (behavioral example)
+-------------------------------------
+```
+receive(request):
+  if request.priority==best_effort and global_queue_depth > 10000:
+    reject(429)
+  route = select_route(request)
+  if route.ingress.full():
+    return 429 with x-retry-after
+  replicas = pick_affine_replicas(route.fanout.max_replicas)
+  for r in replicas:
+    if r.circuit_open:
+      continue
+    send(r)
+  if all attempts fail:
+    fallback_to_variant(route.fanout.fallback_candidates[0])
+```
+
+Observability & SLOs
+--------------------
+- Exported metrics (per route, per model instance, per tenant):
+  - request_rate (rps)
+  - queue_depth
+  - p50/p95/p99_latency_ms
+  - error_rate_pct
+  - fanout_inflight_replicas
+  - circuit_state (open/half/closed)
+- Dashboards: new service onboarding must include a traffic-shaping dashboard with: total ingress, queue depth, per-priority latencies, top rejected tenants, fanout distribution.
+- Alerts (examples):
+  - P95 latency for interactive routes > 120ms sustained for 5m -> P1 alert to oncall (Escalation playbook: increase capacity, enable emergency routing).
+  - Queue depth > 80% of max_queue for 3m -> P2 alert to platform team.
+  - Circuit open ratio > 10% of instances for 2m -> P2.
+
+Rollout and testing guidance
+---------------------------
+1) Simulation tests before production change: feed synthetic traffic shaped to mix of priority classes. Validate p95/p99 latency and rejection rate under 1.5x expected peak.
+2) Canary phases:
+   - Step 1: Apply routing rule to 1% of traffic; run 30m with synthetic burst tests.
+   - Step 2: 10% for 2 hours; monitor newly created dashboards.
+   - Step 3: 100% after 24h with continuous monitoring.
+3) Chaos scenario runbook:
+   - Simulate a stuck instance by setting artificially high latency; ensure router respects circuit breaker and reduces fanout.
+   - Validate fallback to quantized variant does not drop correctness beyond product-defined regression threshold (see quality-guardrails).
+
+Security & Compliance considerations
+----------------------------------
+- Rate-limiting headers must be preserved and logged for auditing (x-tenant-id, x-route-id, x-rate-limit, x-retry-after).
+- For Private deployments, local network QoS may override cloud ingress limits; document deviations in customer-specific runbooks.
+
+Ownership and responsibilities
+------------------------------
+- Platform Networking & Router Team: implement ingress shaping primitives and fanout router (owner).
+- Serving Runtime Team: expose circuit state and variant metadata via instance telemetry (collaborator).
+- Observability Team: add dashboards and alert rules on onboarding checklist.
+- Product: define per-plan defaults and priority class assignment.
+
+Decision record (summary)
+------------------------
+We chose layered shaping + fanout reduction (instead of global reject-first approach) to: preserve low-latency service for premium users; minimize model-variant thrash; and enable predictable cost behavior. Alternatives considered: strict global queue (rejected for poor tenant isolation) and pure per-instance caps (insufficient for model-level cache locality).
+
+Related pages and references
+---------------------------
+- Resource QoS and profiling playbook (infra-standards)
+- ADR: request segmentation and priority routing (decision-records)
+- Quality guardrails and fallback evaluation guidelines (applied-ml-and-evals)
+
+Appendix: quick CLI test recipes
+--------------------------------
+- Simulate load: `ab -n 10000 -c 50 -H "Authorization: Bearer $TOKEN" https://api.redwood.ai/v1/chat`
+- Check queue depth metric: `curl -s https://observability/api/metrics?name=queue_depth&route=chat.v1.generate`
+- Force circuit open (dev only): `curl -X POST http://router-admin/instance/1234/simulate-latency -d '{"latency_ms": 10000}'`
+
+Change history
+--------------
+- 2025-11-15: Draft created by Aisha Patel.
+- 2025-12-10: Review and examples added (Miguel Santos).
+- 2026-02-10: Updated SLO thresholds and rollout steps after platform load test (Rina Takahashi).
+
+Contact
+-------
+For questions or suggested updates, contact the Platform Networking & Router Team (router-team@redwood.ai) or the doc owner, Aisha Patel.

@@ -1,0 +1,147 @@
+tenant-snapshot-and-safe-replay-runbook-2026
+
+Summary:
+
+This runbook describes the approved, auditable process for capturing production-like snapshots of a tenant (configuration + sanitized telemetry + optional minimal payloads) and safely replaying traffic in a controlled sandbox for debugging hard-to-reproduce issues. The goal is to enable Customer Success and Support to reproduce customer-facing failures while minimizing data exposure and preserving customer SLAs and compliance commitments.
+
+Scope:
+- Applies to Dedicated and Private tenants and to hosted tenants where customer consent and legal approvals are present.
+- Intended for escalations where live debugging is not possible (non-deterministic model regressions, KV-cache corruption, routing anomalies, telemetry sampling gaps, prefix-caching defects).
+- Excludes full PII exports; any snapshot containing sensitive data must be redacted per the Data Handling section below.
+
+Owner & Roles:
+- Requestor: Customer Success or Support engineer who opened the escalation (owner of the ticket).
+- Data Guardian: Security & Compliance engineer responsible for approving redaction and retention policy for the snapshot.
+- Sandbox Operator: Platform engineer who performs the capture and replay steps.
+- Observability Lead: Owner of tenant telemetry dashboards who validates that replay data surfaced expected signals.
+
+SLO / Safety Requirements:
+- Snapshot requests must be approved within 4 business hours for Sev2 and within 24 business hours for Sev3 after ticket triage.
+- Replays must not be performed against production model endpoints. Replays occur in an isolated sandbox (no egress to customer endpoints).
+- All artifacts stored in snapshot buckets expire automatically within 30 days; retention extensions require Data Guardian sign-off.
+- Audit records (who requested, who approved, who executed) must be recorded in the ticket and the snapshot metadata.
+
+Prerequisites & Approvals:
+1. Customer consent recorded in the ticket (link to signed form or email).
+2. Data Guardian approval if snapshot includes any of the following fields: email, ssn, phone, or free-text fields longer than 2k characters.
+3. Sandbox namespace and replay cluster provisioned (see Commands section).
+4. Dry-run of redaction script must pass local test vectors before execution.
+
+Data Handling & Privacy Controls:
+- Redaction-first policy: before any storage or transfer, run the redaction pipeline. Redaction steps: mask_email, pseudonymize_ids, remove_attachments, truncate_large_text.
+- Redaction tool: redwood-data-sanitize v1.3 (see example below).
+- Pseudonymization: replace tenant_user_id with deterministic salt keyed by tenant-id to allow joinability within the replay but not to reidentify the user set.
+- Access control: snapshot buckets use encryption (KMS) and are only accessible by the Data Guardian and Sandbox Operator principals for the duration of the retention window.
+
+Runbook: Capture a tenant snapshot (step-by-step)
+1) Open a ticket and collect approvals (see Prerequisites).
+2) Create snapshot job:
+```bash
+# create job metadata in support-api
+support-cli snapshots create --tenant-id=tenant-123 --reason="Investigate intermittent truncation" --duration-days=30 --notify="#cust-success-ops"
+```
+- This registers the snapshot request and assigns an id (SNAP-<id>).
+
+3) Run redaction pipeline against a streaming export (managed by telemetry exporter):
+```bash
+telemetry-exporter stream --tenant tenant-123 --from="2026-06-20T00:00:00Z" --to="2026-06-20T01:00:00Z" | \ 
+  redwood-data-sanitize --policy minimal --salt="tenant-123-salt" > /tmp/SNAP-SNAPID.jsonl
+```
+- The policy flags available: minimal, default, strict (strict removes nearly all free-text fields). Default should be avoided without Data Guardian approval.
+
+4) Validate sanitization: run the snapshot validator which checks for residual PII markers and for field size anomalies.
+```bash
+snapshot-validator /tmp/SNAP-SNAPID.jsonl --check-pii --check-length
+```
+- Validator returns non-zero on issues; resolve them before proceeding.
+
+5) Upload to secure bucket:
+```bash
+aws s3 cp /tmp/SNAP-SNAPID.jsonl s3://redwood-snapshots/tenant-123/SNAP-SNAPID.jsonl --sse aws:kms --tagging "retention=30d,requestor=alice"
+```
+- File metadata in support-api: link to S3 object, retention expiry, approvers.
+
+Runbook: Safe replay (isolated sandbox)
+1) Provision sandbox replay cluster (if not already available for tenant): request via infra-ops-runbook. Typical cluster name pattern: replay-tenant-123-<shortid>.
+2) Load snapshot into replay environment:
+```bash
+replayctl create --name=replay-tenant-123-01 --snapshot=s3://redwood-snapshots/tenant-123/SNAP-SNAPID.jsonl --model-variant=redwood/ggml-13b-q4_0 --no-external-io
+```
+- --no-external-io enforces that any external callbacks are disabled in the runtime layer.
+
+3) Execute replay scenario sets (start with conservative traffic profile):
+```bash
+replayctl run --name=replay-tenant-123-01 --traffic-profile=conservative --duration=15m --trace=on
+```
+- Traffic profiles defined: conservative (10% of peak QPS), nominal (30%), aggressive (70%); aggressive requires Observability Lead sign-off.
+
+4) Observe telemetry and capture diffs: validate tokenization traces, latency percentiles (p50/p95/p99), KV-cache hit ratios, model logits diffs exported to /tmp/replay-diffs.json.
+
+Decision matrix: When to escalate after replay
+- If replay reproduces incident: open RCA path and schedule a model/serve fix with engineering. Attach replay artifacts, diffs, and sanitized logs.
+- If replay does not reproduce: increase traffic conservatively (one step) and re-run once. If still not reproducible, capture a second, longer snapshot (no more than 2x duration) with approver consent.
+- If redaction fails to meet compliance checks: stop and escalate to Security & Compliance; do not store or forward the artifact.
+
+Rollback & Clean-up
+- After troubleshooting completes, the Sandbox Operator must delete the replay cluster and all ephemeral compute and then mark the snapshot as archived.
+- Archival: snapshot objects remain in S3 until retention expiry. To remove early: Data Guardian must sign removal request.
+- Deletion steps (example):
+```bash
+replayctl destroy --name=replay-tenant-123-01 || true
+aws s3 rm s3://redwood-snapshots/tenant-123/SNAP-SNAPID.jsonl
+```
+- Record deletion confirmation in the ticket with timestamps and operator identity.
+
+Audit & Logging
+- All snapshot actions produce an audit entry in the support-api: create, approve, sanitize, upload, replay-start, replay-end, destroy.
+- Tickets must include the snapshot id and KMS key id used for encryption.
+
+Common failure modes & mitigations
+- Sanitizer rejects edge-case attachments: convert attachments to metadata-only and reference a stub file; escalate to Data Guardian if attachments are required for repro.
+- Model variant mismatch: use the model-variant-matrix to choose a closest compatible variant; note differences in result artifacts.
+- Replays diverge due to random seeds: run with seed fixed when available (replayctl --seed=42).
+
+Checklist (pre-playback)
+- [ ] Ticket has customer consent link.
+- [ ] Data Guardian approval recorded.
+- [ ] Redaction pipeline run and validator OK.
+- [ ] Snapshot uploaded to KMS-encrypted bucket.
+- [ ] Replay cluster provisioned and network-isolated.
+- [ ] Observability dashboard configured for replay traces.
+
+Commands & Example Configs
+- Redaction config snippet (YAML):
+```yaml
+policy: minimal
+fields:
+  - mask_email
+  - pseudonymize: [tenant_user_id]
+  - truncate: {field: user_input, max_chars: 2000}
+```
+- Replay traffic profile JSON (example):
+```json
+{
+  "name": "conservative",
+  "qps_multiplier": 0.1,
+  "arrival_process": "poisson"
+}
+```
+
+Ownership & Escalation Contacts
+- Customer Success: Aisha Ramirez (aisha@redwood.com)
+- Platform / Sandbox Ops: Jonas Park (jonas@redwood.com)
+- Security & Compliance (Data Guardian): Meera Gupta (meera@redwood.com)
+- Observability Lead: Lars Hoffman (lars@redwood.com)
+
+References & Related Docs
+- See tenant-observability-contract-lifecycle-and-versioning-playbook for telemetry contract requirements.
+- See tenant-data-classification-and-onboarding-privacy-scan-playbook for data classification thresholds.
+
+Appendix: Quick play example (minimal reproduction)
+1) request snapshot: support-cli snapshots create ... -> SNAP-42
+2) export + sanitize -> /tmp/SNAP-42.jsonl
+3) upload -> s3://redwood-snapshots/tenant-foo/SNAP-42.jsonl
+4) create replay -> replayctl create --name=tmp-replay --snapshot=... --no-external-io
+5) run conservative profile and collect diffs
+
+This runbook is intended to be used verbatim when possible. Where local or customer-specific policies diverge, follow the stricter control. If any step is unclear, contact the Security & Compliance Data Guardian before proceeding.

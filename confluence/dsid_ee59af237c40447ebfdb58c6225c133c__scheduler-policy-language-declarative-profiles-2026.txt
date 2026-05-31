@@ -1,0 +1,169 @@
+Scheduler Policy Language (SPL) and Declarative Profile Library
+
+Overview
+
+This page introduces the Scheduler Policy Language (SPL): a compact, declarative format for expressing kernel scheduling and resource partitioning intent in the Redwood serving runtime. SPL is intended for runtime operators and product/infra owners who need predictable SLOs, multi-tenant fairness, and reproducible rollbackable scheduling changes without modifying code paths in the dispatcher or kernel selector.
+
+Goals
+- Provide a human-readable policy DSL that maps to runtime kernel scheduling primitives (priority, batch slicing, preemption windows, kernel selector hints).
+- Make tenant-level SLOs, cost tiers, and fallback policies first-class and auditable.
+- Enable safe staged rollouts via validation, dry-run, and automatic fallback to default profiles.
+- Support observability mapping: each policy declares the metrics and traces it depends on and the telemetry it will emit.
+
+Quick summary
+- SPL is YAML-first (examples below) with a strict type schema enforced by the runtime controller.
+- Policies live in the configstore (git-backed), validated by the policy service, and pushed to dispatchers as signed bundles.
+- Key concepts: profile, rule, target, threshold, kernel_hint, preempt_window, admission_bucket.
+
+When to use SPL
+- Constraining latency for high-priority endpoints (e.g., chat-completion interactive)
+- Guaranteeing fair GPU time slices across customers in Dedicated clusters
+- Implementing cold-start soft-limits and warmup priorities
+- Expressing region/instance-specific kernel selection preferences for cost-saving quantized variants
+
+SPL primitives (human description)
+- profile: a named collection of rules and defaults. Profiles are versioned.
+- target: selector expression that matches request attributes (route, model, customer_tier, region).
+- rule: an ordered policy clause (match -> action) with a priority and safety guard.
+- action parameters: priority_level, batch_cap, preempt_window_ms, kernel_hint, cache_weight, fallback_sequence.
+- threshold metrics: p50, p95, cpu_ms_per_token, token_rate, queue_length.
+
+Example policy (YAML)
+# Enforce interactive-latency profile for platinum customers using gpt-4x variants
+profile: interactive-platinum-v1
+description: Preserve 99th percentile tail latency for interactive endpoints owned by platinum customers
+version: "2026-02-01"
+rules:
+  - target:
+      route: "/v1/chat/completions"
+      customer_tier: platinum
+      model_family: "gpt-4x*"
+    match: true
+    actions:
+      priority_level: 1        # 1=highest, larger numbers lower priority
+      batch_cap: 8
+      preempt_window_ms: 12
+      kernel_hint: "fp16-low-latency"
+      cache_weight: 0.9
+    safety_guards:
+      - metric: p95_latency_ms
+        operator: "<"
+        value: 120
+      - metric: gpu_memory_util_pct
+        operator: "<="
+        value: 92
+  - target:
+      route: "/v1/embeddings"
+      customer_tier: platinum
+    match: "request_tokens < 1024"
+    actions:
+      priority_level: 2
+      batch_cap: 32
+      kernel_hint: "int8-quant-emb"
+
+Compatibility note: actions.kernel_hint is advisory; runtime will map to the closest supported kernel variant for the host GPU. The mapping is visible in the kernel catalogue.
+
+Simple JSON equivalent (used by controller)
+{
+  "profile":"interactive-platinum-v1",
+  "rules":[{"target":{"route":"/v1/chat/completions","customer_tier":"platinum"},"actions":{"priority_level":1}}]
+}
+
+Policy grammar (abridged)
+- selector := attribute (== | != | match | in | < | > | <= | >=) value
+- target := { attribute: value, ... }
+- match := boolean or expression combining selectors with AND/OR
+- action := { priority_level: int, batch_cap: int, preempt_window_ms: int, kernel_hint: str, cache_weight: float }
+- safety_guard := { metric: string, operator: one-of(<, <=, ==, !=, >=, >), value: number }
+
+Validation matrix (controller checks)
+1) Schema validation: required fields present, types correct.
+2) Semantic validation: batch_cap within [1, 256], preempt_window_ms within [0, 2000], cache_weight in [0.0,1.0].
+3) SLO collision check: if two profiles target same route+tier with overlapping windows, require explicit decision (priority or merge).
+4) Kernel hint compatibility: warn if kernel_hint maps to an unsupported kernel on the target pool.
+
+Table: Allowed ranges and default values
+- priority_level: int, allowed 1..100, default 50
+- batch_cap: int, allowed 1..512, default 16
+- preempt_window_ms: int, allowed 0..2000, default 100
+- cache_weight: float, allowed 0.0..1.0, default 0.5
+- admission_bucket: string, allowed [interactive, burst, batch, low_cost], default batch
+
+Runtime behavior and mapping
+- The dispatcher reconciler converts an SPL profile into a policy bundle per node pool. A bundle contains: compiled match tree, action table, and telemetry hooks.
+- Priority levels are translated to scheduler lanes; lower numeric priority is scheduled ahead of higher numbers.
+- preempt_window_ms defines the soft window in which a running kernel can be preempted and requeued with cooperative preemption handshake. Values larger than 500ms are reserved for long-running batch jobs.
+- batch_cap interacts with the kernel-slicer to decide whether to use continuous batching (low-latency path) or slice-per-batch (throughput path).
+
+Operational concerns and playbook steps (change management)
+1) Author policy in the policy repo branch. Add unit tests using the policy validator harness.
+2) Open PR and assign "eng-serving-runtime" and "sre" reviewers.
+3) Run `policylint` and `policysim` locally: `./tools/policylint policy.yaml` then `./tools/policysim --profile policy.yaml --trace sample-trace.json`
+4) Dry-run deploy to Canary pool: push bundle with tag `canary` and enable dry-run mode (no active enforcement, emits telemetry).
+5) Observe metrics for 24-72 hours (p50/p95 latency, queue_length, eviction_rate, preempt_count).
+6) If metrics are within expected bounds, promote to staged rollout (10% -> 50% -> 100%) with automated rollback triggers defined below.
+7) On rollback, use `policyctl rollback <profile> --to <version>`; controller will resume previous bundle atomically.
+
+Automated rollback triggers (recommended defaults)
+- p95 latency increase > 15% sustained for 15 minutes.
+- preempt_count increase > 3x baseline in 10 minutes.
+- gpu_memory_util_pct > 95% for longer than 2 minutes.
+
+Testing and benchmarks
+- Each policy should include representative trace inputs in `policies/test_traces/`. Use the benchmarking harness to simulate traffic across sequences (long-form, short-chat, bursty embeddings).
+- Recommended benchmark matrix:
+  - short interactive: 8k requests, seqs 32 tokens avg, target p95 < 120ms
+  - long-halting: 1k requests, seqs 5k tokens avg, target p95 < 2.5s (for batch lanes)
+  - embeddings-burst: 5k requests, seqs 1024 tokens avg, cost per 1k req < budgeted baseline
+- Use the `bench-runner` with `--policy` flag to evaluate policy-level effects on throughput and tail latency. Example: `bench-runner --config bench.yaml --policy policy.yaml --out results.json`
+
+Observability contract
+- Every applied SPL profile must declare at least these emitted metrics: `slo.p50_ms`, `slo.p95_ms`, `slo.queue_length`, `slo.preempt_count`, `slo.eviction_rate`, `slo.gpu_mem_pct`
+- Traces must include policy_id and rule_id tags for per-rule attribution.
+- Telemetry sampler targets: 1% traces for general traffic, 10% for canaries and affected routes.
+
+Fallback and graceful degradation rules
+- If controller detects kernel_hint mismatch for > 5% of dispatched kernels in 1 minute, it will automatically replace kernel_hint with the nearest compatible variant and emit `policy.kernel_hint_fallback` event.
+- A profile can declare a fallback_sequence (ordered list of profile names). When resource pressure triggers, runtime will progressively demote the request to the next profile in sequence.
+
+Security and signing
+- Policy bundles are signed with the policy service key. Dispatchers reject unsigned or expired bundles.
+- Access to the policy repo is RBAC-gated: only owners in `infra-schedulers` and `platform-owners` may merge to `main`.
+
+Migration notes for existing configs
+- The controller will import legacy priority JSONs via `policyctl import-legacy --source legacy-priorities.json` and map top-level fields to a profile with version `migrated-<date>`. Manual review is required for kernel_hint translation.
+
+Ownership and contacts
+- Primary author: Aisha Patel (eng-serving-runtime)
+- Operational owner: SRE (oncall rotation, contact via pager duty team `SRE-Serving`)
+- Kernel-variant mapping owner: Kernel Team (kernel-team@redwood.ai)
+
+Appendix: Example policysim output (abbreviated)
+- Summary: 95th latency delta: +4.2% (expected)
+- Preempt events: 12 per minute -> stable under threshold
+- Kernel fallback events: 2 (kernel_hint -> fp16-fallback)
+
+CLI snippets
+- Validate: `./tools/policylint path/to/policy.yaml`
+- Simulate: `./tools/policysim --policy path/to/policy.yaml --trace traces/platinum-chat-2026.json`
+- Deploy (canary): `policyctl apply --profile interactive-platinum-v1 --env canary --dry-run=false`
+- Rollback: `policyctl rollback --profile interactive-platinum-v1 --to interactive-platinum-v0`
+
+Change log (high level)
+- 2025-11-03: Draft created and initial grammar specified.
+- 2025-12-14: Added safety guards and validation matrix after internal review.
+- 2026-01-20: Canary support and telemetry contract finalized.
+- 2026-02-12: Publishing the first stable SPL spec and profile library.
+
+Related artifacts and repo locations
+- Policy repo: git@repo.redwood.ai:infra/scheduler-policies.git
+- Validator: //tools/policylint (internal binary)
+- Simulator: //tools/policysim
+- Controller service: infra/policy-service (k8s namespace: infra-policy)
+
+Notes and open items
+- Draft an automated test that injects a kernel_hint mismatch and verifies fallback semantics.
+- Consider adding cost-aware policy expressions (cost_per_token < X) in the next SPL revision.
+- Evaluate integration with Optimize recommendation engine so product tiers can be automatically suggested SPL profiles.
+
+End of document

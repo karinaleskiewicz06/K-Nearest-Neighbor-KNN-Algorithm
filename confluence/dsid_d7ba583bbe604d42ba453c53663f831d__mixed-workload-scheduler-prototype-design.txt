@@ -1,0 +1,427 @@
+Mixed-workload scheduler prototype (short/long prompt-aware) — Design
+
+## Summary
+This document proposes a scheduler prototype to reduce user-visible p95 tail latency for **text generation** under **mixed prompt-length distributions** (short chat prompts interleaved with long-context prompts), without materially regressing throughput or fairness.
+
+We introduce a **prompt-aware, class-based scheduling policy** that:
+- Classifies requests into **SHORT** and **LONG** classes using prompt/context length and (optionally) a predicted prefill cost.
+- Maintains **two queues** and applies a **biased dispatch policy** that favors SHORT while guaranteeing progress for LONG.
+- Separates **prefill** and **decode** scheduling decisions to avoid long-prefill head-of-line (HoL) blocking.
+- Adds guardrails: **aging**, **burst caps**, **max skew**, and **token budgets**.
+- Ships behind a feature flag with safe defaults and a staged rollout plan.
+
+Owner: Serving Runtime / Scheduling (Tech lead: Lena Fischer; EM: Sofia Ivanova)
+
+---
+
+## Motivation and problem statement
+### What we see in production
+Redwood’s continuous batching and KV-cache-heavy decode path performs well for homogeneous workloads. Under mixed workloads, we see a consistent pattern:
+- A long-context request enters the batch with a large prefill cost.
+- Prefill dominates the iteration selection for several cycles.
+- Short requests accumulate behind it (queue time increases).
+- Result: **TTFT and p95 latency for SHORT-like requests spike**, even when aggregate throughput remains acceptable.
+
+This is a classic **head-of-line blocking** issue amplified by:
+- Large variance in prompt/context length.
+- Prefill compute “spikes” compared to steady decode.
+- Batch construction heuristics that implicitly favor large, ready-to-run sequences.
+
+### Goal
+Reduce p95 latency for latency-sensitive short prompts (especially chat) in mixed workloads.
+
+### Non-goals (prototype)
+- No customer-configurable multi-class QoS product in this phase.
+- No full redesign of admission control/backpressure; we only minimally couple to existing mechanisms.
+
+---
+
+## Design principles
+1. **Prefer predictable tail improvements** over theoretical optimality (SRPT-like policies can be fragile without accurate remaining-time estimates).
+2. **Guarantee progress for LONG** (no starvation).
+3. **Minimal disruption to runtime invariants** (continuous batching, KV cache semantics, kernel selection).
+4. **Feature-flagged + observable**: new policy must be safe to canary and easy to rollback.
+
+---
+
+## Background: serving pipeline (prefill vs decode)
+We use the terms:
+- **Prefill**: first forward pass over prompt/context to populate KV cache.
+- **Decode**: subsequent token generation steps using KV cache.
+
+In mixed workloads, long-context prefill acts like a “compute bubble” that can block short TTFT.
+
+### Current (simplified) flow
+(Conceptual; details vary by model/runtime config)
+
+1) Request arrives
+2) Enqueued into a single scheduler queue
+3) Scheduler picks a set of requests to form the next batch
+4) Runtime executes either:
+   - Prefill for new sequences, and/or
+   - Decode for active sequences
+
+### Proposed flow (class-aware)
+We explicitly split selection signals for:
+- **New-prefill admission** (which new requests to prefill now)
+- **Decode continuation** (which active sequences continue decoding)
+
+We treat these as related but separable decisions, each with class-based guardrails.
+
+---
+
+## Proposed architecture
+### High-level components
+- **Classifier**: assigns each incoming request a class {SHORT, LONG} and computes a lightweight cost estimate.
+- **Two queues**: `short_q` and `long_q`.
+- **Dispatcher**: selects work each scheduler iteration using class-aware rules.
+- **Aging / starvation prevention**: escalates priority for long-waiting LONG requests.
+- **Token budget guardrails**: caps per-iteration prefill and decode work contributed by each class.
+
+### Text diagram: queues and pipeline
+
+Client Requests
+   |
+   v
++-------------------+
+|  Request classify |
+|  (SHORT / LONG)   |
++-------------------+
+   |           |
+   v           v
++--------+  +--------+
+| short  |  |  long  |
+| queue  |  |  queue |
++--------+  +--------+
+   \          /
+    \        /
+     v      v
+ +-------------------+        +------------------+
+ | Class-aware       |  --->  | Batch builder    |
+ | dispatcher        |        | (prefill/decode) |
+ +-------------------+        +------------------+
+            |                          |
+            v                          v
+      +-----------+              +------------+
+      |  Prefill  |              |   Decode   |
+      +-----------+              +------------+
+
+Key point: dispatcher provides a *class-balanced* candidate set and budgets; batch builder remains responsible for kernel-friendly packing within those constraints.
+
+---
+
+## Classification: SHORT vs LONG
+### Inputs available at enqueue time
+- `prompt_tokens` (tokenized prompt length)
+- `context_tokens` (if continuing a conversation or multi-turn context)
+- `max_new_tokens` (generation limit)
+- `model_id` / architecture hints
+- Optional: a cheap predicted prefill cost (tokens * model factor) derived from prior observations
+
+### Default heuristic (prototype)
+We classify as LONG if any of the following are true:
+- `prompt_tokens + context_tokens >= long_prompt_threshold_tokens`
+- OR predicted prefill cost >= `long_prefill_cost_threshold`
+
+Otherwise classify as SHORT.
+
+Rationale:
+- The simplest signal that correlates with prefill time is context length.
+- Prefill cost can diverge across models/SKUs; we allow an optional calibrated threshold.
+
+### Threshold selection
+Initial default thresholds will come from anonymized production trace distributions (see trace analysis sheet) and validated via benchmark sweeps.
+
+Recommended starting points (to be tuned per SKU/model):
+- `long_prompt_threshold_tokens`: 1024 (hosted chat) / 1536 (dedicated mixed workloads)
+- `long_prefill_cost_threshold`: disabled by default (0 = off)
+
+### Edge cases
+- Very short prompt but extremely large `max_new_tokens`: still SHORT by default. This is intentional for TTFT focus; decode fairness is handled by decode budgets.
+- Streaming: treated the same; class affects scheduling but not token emission semantics.
+- Tool/function calling: class assignment based on prompt/context only, not tool latency.
+
+---
+
+## Scheduling policy: two-queue with biased dispatch + fairness
+### Goals of policy
+- Improve p95 for SHORT by avoiding HoL blocking from long prefill.
+- Maintain throughput by not overly fragmenting batches.
+- Guarantee progress for LONG with explicit fairness and aging.
+
+### Core idea
+Maintain two FIFO queues:
+- `short_q`: latency-sensitive
+- `long_q`: throughput-oriented but must not starve
+
+On each scheduler iteration, the dispatcher:
+1. Computes **eligible work** (requests ready for prefill; active sequences ready for decode).
+2. Enforces **per-class token budgets** for both prefill and decode.
+3. Selects a candidate set with a **target class share** for admission.
+4. Applies **aging** to ensure LONG requests that wait too long are promoted.
+
+### Dispatch algorithm (prototype)
+The dispatcher runs every scheduling iteration (or when GPU becomes available):
+
+Inputs:
+- `short_q`, `long_q`
+- `active_decode_short`, `active_decode_long` (optional conceptual partitions)
+- Current load signals: queue depths, average prefill time, decode backlog
+- Config knobs (see below)
+
+Outputs:
+- A set of selected sequences for the next batch
+- Budget caps for prefill/decode work
+
+Pseudocode (conceptual):
+1) Determine budgets:
+   - `prefill_budget_tokens_total`
+   - `decode_budget_tokens_total`
+   - Split into per-class budgets using `short_prefill_share` and `short_decode_share`
+
+2) Apply aging:
+   - For long requests with `time_in_queue > long_aging_threshold_ms`, temporarily treat as SHORT for selection purposes (promotion), capped by `aging_promotion_max_fraction`.
+
+3) Prefill admission:
+   - Admit from short_q up to `prefill_budget_short_tokens`.
+   - Admit from long_q up to `prefill_budget_long_tokens`.
+   - If one class is empty, allow borrowing within `borrow_cap_fraction`.
+
+4) Decode continuation:
+   - Continue decode for active sequences with per-class caps.
+   - If decode backlog is high, reduce new prefill admission via `prefill_backoff_on_decode_pressure`.
+
+5) Guardrails:
+   - Enforce `max_class_skew_ratio` between admitted SHORT and LONG over a rolling window.
+   - Enforce `long_progress_min_tokens_per_sec` (derived) by ensuring minimum decode/prefill slices.
+
+### Why two-queue vs SRPT
+We considered SRPT and remaining-time estimators; rejected for prototype due to:
+- Need for accurate remaining-time prediction across models and sequence lengths.
+- High risk of oscillation/thrashing and difficult explainability.
+- Two-queue gives a stable, controllable behavior with a smaller surface area.
+
+(See ADR for the full decision record.)
+
+---
+
+## Starvation prevention and fairness
+We define starvation as: LONG requests experiencing unbounded waiting time under sustained SHORT traffic.
+
+Mechanisms:
+1. **Guaranteed LONG slice**
+   - Ensure `prefill_budget_long_tokens` and/or `decode_budget_long_tokens` never go to zero unless long_q is empty.
+
+2. **Aging-based promotion**
+   - After `long_aging_threshold_ms`, a LONG request is eligible for promotion.
+   - Promotion is bounded to avoid flipping the system entirely to LONG.
+
+3. **Rolling-window skew constraint**
+   - Track admitted work over `fairness_window_ms`.
+   - If short dominates beyond `max_class_skew_ratio`, force LONG admission until back within bound.
+
+4. **Burst caps**
+   - SHORT bursts can be beneficial for p95 but harmful for LONG; limit via `short_burst_max_iters` and `short_burst_cooldown_iters`.
+
+Notes:
+- Fairness is defined at the runtime level (not tenant level) for this prototype.
+- Interaction with existing per-API-key quotas is unchanged.
+
+---
+
+## Prefill vs decode separation (kernel/runtime interaction)
+Mixed workloads trigger kernel instability when sequence length distributions swing quickly. We aim to reduce thrash by:
+- **Stabilizing batch composition**: keep decode-heavy batches decode-heavy and prefill admission bounded.
+- **Token budgeting**: cap prefill tokens per iteration to avoid a single long prefill dominating.
+- **Avoiding rapid alternation**: use `prefill_backoff_on_decode_pressure` so when decode backlog is high, we don’t keep injecting large prefill work.
+
+Constraints:
+- Batch builder remains responsible for selecting compatible kernels and ensuring memory limits.
+- The dispatcher must not create impossible constraints (e.g., too many tiny fragments) that reduce occupancy.
+
+Kernel team review notes (actioned in prototype):
+- Track “kernel selection churn” metric (see Observability).
+- Maintain minimum batch sizes when possible; when not possible, prioritize latency but keep within throughput guardrails.
+
+---
+
+## Configuration knobs (feature-flagged)
+All knobs are runtime-configurable per pool and per model (with safe bounds). Names below are the intended config keys; final naming must match config plumbing.
+
+### Feature flags
+- `scheduler.mixed_workload.enabled` (bool, default: false)
+- `scheduler.mixed_workload.mode` (enum: off | two_queue, default: off)
+
+### Classification
+- `scheduler.mixed_workload.long_prompt_threshold_tokens` (int, default: 1024)
+- `scheduler.mixed_workload.long_prefill_cost_threshold` (int, default: 0 = disabled)
+- `scheduler.mixed_workload.classify_on` (enum: prompt_tokens | prompt_plus_context | predicted_prefill_cost, default: prompt_plus_context)
+
+### Budgeting
+- `scheduler.mixed_workload.prefill_budget_tokens_total` (int, default: model/SKU-tuned)
+- `scheduler.mixed_workload.decode_budget_tokens_total` (int, default: model/SKU-tuned)
+- `scheduler.mixed_workload.short_prefill_share` (float 0..1, default: 0.80)
+- `scheduler.mixed_workload.short_decode_share` (float 0..1, default: 0.65)
+- `scheduler.mixed_workload.borrow_cap_fraction` (float 0..1, default: 0.20)
+
+### Fairness / aging
+- `scheduler.mixed_workload.long_aging_threshold_ms` (int, default: 250)
+- `scheduler.mixed_workload.aging_promotion_max_fraction` (float 0..1, default: 0.15)
+- `scheduler.mixed_workload.fairness_window_ms` (int, default: 2000)
+- `scheduler.mixed_workload.max_class_skew_ratio` (float, default: 6.0)
+
+### Burst controls
+- `scheduler.mixed_workload.short_burst_max_iters` (int, default: 6)
+- `scheduler.mixed_workload.short_burst_cooldown_iters` (int, default: 2)
+
+### Decode pressure coupling
+- `scheduler.mixed_workload.prefill_backoff_on_decode_pressure` (float 0..1, default: 0.30)
+- `scheduler.mixed_workload.decode_pressure_threshold` (int, default: SKU-tuned; proxy for decode backlog)
+
+### Safety bounds (validation)
+- Shares clamped to [0.05, 0.95]
+- Threshold tokens clamped to [128, 8192]
+- Aging threshold clamped to [50ms, 5000ms]
+- Any invalid config should fail closed to baseline scheduler (and emit a config error event)
+
+---
+
+## Observability (metrics, traces, dashboards)
+We add per-class scheduler telemetry to enable safe canarying and fast debugging.
+
+### Required metrics
+Names are illustrative; final names must match our runtime metrics naming conventions.
+
+Queueing and wait time:
+- `runtime.scheduler.queue_depth{class=short|long}`
+- `runtime.scheduler.time_in_queue_ms_p50{class=...}`
+- `runtime.scheduler.time_in_queue_ms_p95{class=...}`
+
+Latency breakdown:
+- `runtime.request.ttft_ms_p50{class=...}`
+- `runtime.request.ttft_ms_p95{class=...}`
+- `runtime.request.e2e_ms_p95{class=...}`
+- `runtime.prefill.latency_ms_p95{class=...}`
+
+Dispatch / fairness:
+- `runtime.scheduler.dispatch_share{class=...}` (rolling)
+- `runtime.scheduler.token_budget_overrun_total{class=..., phase=prefill|decode}`
+- `runtime.scheduler.starvation_promotion_total{class=long}`
+- `runtime.scheduler.long_forced_admission_total`
+
+Kernel stability proxies:
+- `runtime.kernels.selection_churn_rate` (per minute)
+- `runtime.batch.sequence_length_stddev` (optional; helps detect pathological mixing)
+
+### Tracing
+Add trace spans/annotations:
+- `scheduler.class` on request span
+- `scheduler.queue_enter_ts` / `scheduler.queue_exit_ts`
+- `scheduler.dispatch_iteration_id`
+- `scheduler.phase_selected=prefill|decode|both`
+
+### Dashboards and alerts
+See dashboard spec page for layout. Canary-critical alerts:
+- SHORT p95 TTFT regression beyond SLO guardrail
+- LONG time-in-queue p95 exceeding aging threshold by >X for sustained periods
+- Starvation promotion spikes (indicates mis-tuning)
+
+---
+
+## Benchmarking and evaluation plan (summary)
+We will validate using:
+- Synthetic mixes: 80/20 short/long, 50/50, and long-spike (sudden long burst)
+- Replay of anonymized trace distributions
+- Multiple SKUs (representative hosted and dedicated pools)
+
+Primary success metrics:
+- p95 TTFT improvement for SHORT under 80/20 mix (target: 15–30% reduction)
+- No worse than 3–5% throughput regression (tokens/sec) on steady-state mixes
+- LONG request progress: no starvation; bounded p95 time-in-queue
+
+See benchmark plan page for full protocol.
+
+---
+
+## Rollout plan
+### Phase 0: analysis + design review (1–2 weeks)
+- Confirm threshold candidates from production distributions.
+- Review with Kernel team (kernel selection churn risk) and SRE (guardrails/rollback).
+- Publish ADR and finalize config validation bounds.
+
+### Phase 1: implementation behind flag (2–4 weeks)
+- Implement classifier + two queues + dispatch policy + aging.
+- Add instrumentation (metrics + traces).
+- Add unit/regression tests for:
+  - classification correctness
+  - starvation prevention
+  - budget borrowing behavior
+  - config validation
+
+### Phase 2: benchmarking + perf-canary (2–3 weeks)
+- Run parameter sweeps to identify stable defaults per SKU.
+- Add nightly perf-canary mixed workload jobs.
+- Record pass/fail thresholds and set alerts.
+
+### Phase 3: limited production canary (1–2 weeks)
+- Enable in one region (initial: us-east) and a subset of Dedicated pools.
+- Ramp: 1% → 5% → 25% traffic share (or pool-by-pool) with hold periods.
+- Decision checkpoint after each hold based on SLO guardrails.
+
+### Rollback plan
+Immediate rollback actions:
+1. Disable `scheduler.mixed_workload.enabled` (reverts to baseline scheduler)
+2. If required, revert to known-safe runtime release candidate
+3. Keep dashboards pinned for postmortem analysis
+
+Owner during ramp: Rafael Mendes (canary ops) + oncall runtime + SRE sponsor
+
+---
+
+## Risks and mitigations
+1. **LONG starvation under sustained SHORT traffic**
+   - Mitigation: hard minimum LONG slice + aging promotion + skew constraint + regression tests.
+
+2. **Throughput regression due to batch fragmentation**
+   - Mitigation: token budgets tuned per SKU; borrowing allows filling; enforce minimum batch size when feasible.
+
+3. **Kernel selection instability / thrash**
+   - Mitigation: reduce alternation via decode pressure backoff; add churn metrics; kernel team review during benchmarks.
+
+4. **Misclassification (threshold too low/high)**
+   - Mitigation: per-SKU defaults, safe bounds, sensitivity analysis via trace replay.
+
+5. **Operational complexity**
+   - Mitigation: constrained set of knobs with documented defaults; runbook + dashboards; feature-flag gating.
+
+---
+
+## Open questions
+1. Should we classify based on **(prompt + context)** universally, or do we need model-specific weighting (e.g., attention complexity differences) from day one?
+2. Do we need a third class (e.g., “XLONG”) for extremely long contexts, or can token budgets handle it?
+3. What is the best proxy for “decode pressure” that is robust across models and hardware?
+
+---
+
+## Appendix A: Example configuration (canary)
+Example (conceptual) runtime config for a canary pool:
+
+- `scheduler.mixed_workload.enabled=true`
+- `scheduler.mixed_workload.mode=two_queue`
+- `scheduler.mixed_workload.long_prompt_threshold_tokens=1024`
+- `scheduler.mixed_workload.short_prefill_share=0.80`
+- `scheduler.mixed_workload.short_decode_share=0.65`
+- `scheduler.mixed_workload.long_aging_threshold_ms=250`
+- `scheduler.mixed_workload.max_class_skew_ratio=6.0`
+- `scheduler.mixed_workload.short_burst_max_iters=6`
+- `scheduler.mixed_workload.prefill_backoff_on_decode_pressure=0.30`
+
+Note: actual defaults will be set per SKU/model after benchmark sweeps; do not copy blindly into production pools.
+
+---
+
+## Appendix B: Change log
+- 2025-11-12: Initial draft shared for design review.
+- 2025-11-20: Added token budget guardrails and decode pressure coupling.
+- 2025-12-02: Incorporated SRE guardrails + rollback triggers; clarified observability requirements.
+- 2025-12-09: Updated classification thresholds and added burst control knobs based on benchmark iteration.

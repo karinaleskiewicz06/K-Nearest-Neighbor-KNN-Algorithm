@@ -1,0 +1,131 @@
+CUDA sparse-attention degradation under burst load (investigation & mitigations)
+
+Summary
+-------
+This page documents a recurring production degradation mode observed in inference fleets running CUDA-accelerated sparse-attention kernels under short, high-intensity request bursts. Symptoms include elevated 99th/99.9th percentile token latency, sudden KV-cache thrashing, and transient GPU SM saturation that persists longer than the burst window. We describe detection signals, reproducible steps, short-term mitigations (runbook), and the engineering plan for a permanent fix.
+
+Background
+----------
+We onboarded a custom sparse-attention kernel (sparse-cuda-v2) in Q4 2025 to reduce memory pressure and token compute for long-context models. In low-to-moderate steady-state traffic the kernel performs as expected. Over the last two months, multiple SRE and runtime teams observed repeated incidents where microbursts (50–300 concurrent short requests, <200 tokens) cause a 3–6x jump in tail latency and an increase in dropped streaming connections.
+
+Scope and impact
+----------------
+- Affects: heterogeneous GPU pool types using sparse-cuda-v2 kernel (A100 and H100 variants tested).
+- Percent of fleet observed: ~12% of nodes in west-2 region over Jan–Feb 2026.
+- Customer impact: elevated tail latency for hosted API routes using these model variants; some enterprise customers observed timeouts against strict 500ms SLOs.
+
+Observed symptoms & measurements
+--------------------------------
+- 99.9th token latency increases from baseline ~420ms to 1.8s during incidents.
+- GPU SM util jumps to sustained 95–100% for 2–8s after a burst.
+- Average batch size drops (due to preemption/priority shuffling) while in-flight kernels show increased warp serialization.
+- KV-cache churn rate metric (kvcache.churn_rate) spikes by 5–12x.
+
+Repro recipe (lab)
+------------------
+1. Use a test driver to send 250 concurrent 80-token requests over a 1s window to the model variant with sparse-cuda-v2. Example:
+
+   sh ./tools/loadgen/run_burst.sh --concurrency 250 --tokens 80 --duration 1s --host inference-west-2.internal --model my-sparse-model:v2
+
+2. Collect GPU traces (nsys) on a target node and record the kernel timeline:
+
+   nsys profile --stats=true --output burst-profile %PID%
+
+3. Capture runtime traces and KV metrics via the runtime tracer:
+
+   curl -sS http://localhost:9080/debug/trace > /tmp/trace.json
+
+4. Confirm the same signature: tail-latency spike aligned to a burst window and sustained SM saturation.
+
+Telemetry & detection rules
+--------------------------
+We recommend the following production detectors to triage quickly. Add to alerts and dashboards where missing.
+
+Table: Detection thresholds (text table)
+Metric | Alert threshold | Recommended action
+kvcache.churn_rate | > 8x baseline (5m) | Route to SRE, enable burst-mitigation runbook
+gpu.sm_utilization | > 90% (1m sustained) combined with tail latency | Auto-scale eligible pool/shift traffic
+model.tail_latency.99.9 | > 1200ms (5m) | Trigger rolling routing policy to fallback model-variant
+
+Example Prometheus alert rule (yaml snippet):
+
+ALERT SparseAttentionBurst
+IF increase(kvcache_churn_rate_total[2m]) > 8
+AND avg_over_time(gpu_sm_utilization[1m]) > 0.9
+FOR 2m
+LABELS {severity="page", team="runtime"}
+ANNOTATIONS {summary="Sparse-attention burst signature: kvcache churn + gpu saturation"}
+
+Immediate mitigations (runbook)
+------------------------------
+These steps are for on-call SREs to contain customer impact quickly. Follow the numbered procedure.
+
+Runbook: emergency containment (SRE)
+1) Identify affected nodes: query fleet telemetry for nodes with matching model variant and sm_utilization > 90%.
+   - CLI: curl -sS http://telemetry-api.internal/query?query="gpu_sm_utilization>0.9 and model_variant=\"sparse-cuda-v2\""
+2) Temporarily shift traffic for the impacted routing key to the dense fallback model-variant (dense-cuda-v1) via the routing API:
+   - curl -X POST https://routing.internal/v1/route-shift -d '{"route":"/v1/generate","from_variant":"sparse-cuda-v2","to_variant":"dense-cuda-v1","percent":100}'
+3) If shifting traffic is not possible, enable per-node burst backpressure by setting admission_controller.max_burst_inflight=50 on the node agent and trigger a graceful drain:
+   - kubectl patch daemonset runtime-node-agent -n runtime --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/env/0/value","value":"50"}]'
+4) If nodes remain saturated, scale the pool by +20% capacity or enable emergency autoscale for the dedicated pool.
+5) After mitigation, collect traces and attach to the incident ticket. Note any repro artifacts and timestamps.
+
+Short-term engineering remediation (2–4 weeks)
+----------------------------------------------
+- Hotfix A (config): Reduce the eager thread concurrency in sparse-cuda-v2 kernel launcher when per-GPU concurrent requests exceed 96. Configuration patch: set kernel_launch.max_worker_threads = 64 for burst conditions. This reduces thread oversubscription and warp serialization.
+- Hotfix B (runtime): Add a rapid cool-down slot for KV-cache eviction to avoid over-eviction during bursts: kvcache.eviction_cooldown_ms = 5000.
+- Monitoring: Add per-kernel warp-serialization counters and expose them through kernel telemetry.
+
+Long-term engineering plan (Q2–Q3)
+----------------------------------
+1) Kernel rewrite: introduce cooperative micro-scheduling within sparse kernel so that kernel work yields when global stream stalls are detected (non-blocking cooperative yield). Goal: reduce post-burst SM hang time by >50%.
+2) Admission-controller enhancement: predictive admission controller that uses short-term traffic forecasts (burst detector) to apply temporary batching policies and pre-warm KV-cache for hot keys.
+3) Scheduler: extend GPU scheduler to prefer batch-consolidation over preemptive micro-batching when the burst is predicted to finish within X seconds (configurable X).
+4) Regression tests: add a burst-sculpting synthetic test to the benchmarking suite that asserts tail latency and kvcache churn bounds.
+
+Root cause hypothesis
+---------------------
+Our working hypothesis is a compound interaction: a) the sparse kernel's internal thread-launch strategy aggressively spans SM warps to improve utilization under steady-state; b) during a microburst the host enqueues many small kernel launches causing kernel serialization and increased register pressure; c) combined with aggressive KV-cache eviction policy, the runtime thrashes cache and prolongs kernel busy signals, leading to sustained SM saturation beyond the burst window.
+
+Data to collect for RCA
+-----------------------
+- nsys timeline and kernel launch parameters (grid, block, shared mem) for affected windows.
+- kvcache.events (evict, fetch, miss) with per-key provenance.
+- per-kernel warp-serialization and occupancy metrics.
+- host-side thread pool statistics and kernel launch latencies.
+
+Acceptance criteria for a permanent fix
+--------------------------------------
+- Tail latency 99.9th reduced to <= 750ms under the same synthetic burst profile.
+- kvcache.churn_rate under bursts reduced to <= 2x baseline.
+- No regression in steady-state throughput (within 5% of current).
+
+Open action items and owners
+---------------------------
+- SRE: add detection alert and dashboard — Miguel Torres (owner) — due 2026-03-05
+- Runtime: implement eviction_cooldown and config gate — Chen Li (owner) — due 2026-03-12
+- Kernel: prototype cooperative-yield in sparse-cuda-v3 — Rina Sato (owner) — due 2026-04-02
+- Bench: add burst-sculpting test to perf-suite — Priya Bhandari (owner) — due 2026-03-22
+
+Related artifacts and logs (examples)
+------------------------------------
+- Example kernel launch line from nsys:
+  Kernel: sparse_attention_v2 grid=(128,1,1) block=(256,1,1) shared=64KB regs=64
+- Sample kvcache event: {timestamp: 2026-02-04T16:03:12.123Z, node: gpu-12, key: "sess:abcd1234:prefix", event: "evict", reason: "memory_pressure", age_ms: 12}
+
+Operational notes and follow-ups
+-------------------------------
+- When shifting routes to a dense variant, watch for memory pressure on dense nodes; do not exceed 70% memory utilization per GPU.
+- Add a scheduled run of the lab repro every week to catch regressions.
+- Document kernel-exported telemetry fields in the telemetry contract docs before v3 rollout.
+
+Appendix: quick detection checklist (for on-call)
+------------------------------------------------
+1. Check alerts: SparseAttentionBurst firing?
+2. Inspect gpu.sm_utilization and model.tail_latency.99.9 aligned to burst timeframe.
+3. If confirmed, run mitigation runbook steps 1–4.
+4. Attach traces and escalate to Runtime oncall if Hotfix A/B needed.
+
+If you have additional logs or repro traces, attach them to the incident ticket and ping #runtime-incidents with the ticket link.
+
+-- Priya Bhandari, Runtime Performance Engineering

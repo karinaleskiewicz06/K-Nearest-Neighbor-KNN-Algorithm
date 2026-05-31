@@ -1,0 +1,130 @@
+edge-cache-consistency-and-embedding-sync-strategy-2026
+
+Overview
+--------
+This playbook describes an operational and engineering pattern for keeping edge caches, local CDN layers, and downstream embedding indexes (vector DBs) consistent for enterprise customers during normal operation, model upgrades, and bulk backfills. It is intended for integration engineers, customer success engineers (CSEs), and SREs working with enterprise tenants that maintain local inference front-ends, CDN caching layers, or dual-write ingestion paths to Redwood-hosted vector stores.
+
+Goals
+- Minimize end-user staleness for retrieval/semantic search use cases (target: median staleness < 30s for streaming ingest workloads).
+- Provide clear invalidation and reconciliation primitives so Customer Success and Engineering can recover from divergence without data loss.
+- Keep operational complexity reasonable for customers using a mix of Redwood-hosted vector stores and on-prem caching.
+
+Scope and audience
+- Applies to enterprise onboarding where customers integrate: local edge caches (Redis/ElastiCache/Memcached), CDN edge (Fastly/Cloudflare), and/or self-hosted vector databases with Redwood telemetry and webhook sinks.
+- Not meant for simple read-only CDN caching of static assets (those are covered by CDN caching policy docs).
+
+Key concepts and invariants
+1) Source of truth: The canonical ingestion stream is the customer’s committed write to the canonical dataset (event platform, S3 object commit, or Redwood ingestion API). Vector stores and edge caches are derived stores.
+2) Causal ordering: Ingest events must carry a monotonic sequence token (event_id or commit_ts) so that out-of-order delivery can be detected and reconciled.
+3) Idempotency: All ingest APIs and webhook handlers must accept a client-generated idempotency_key or event_id.
+4) Soft-state & TTL: Edge caches are soft-state and should have conservative TTLs that reflect ingestion velocity and desired staleness SLAs.
+
+Recommended architecture patterns
+- Dual-write with durable queue: Customer writes to their primary store and emits an event to a durable pub/sub (Kafka/Kinesis). Redwood subscribes to the durable queue. Edge caches and downstream vectorization pipelines consume from the same stream to ensure consistent ordering.
+- Single-writer reconciliation: If the customer cannot dual-write, Redwood provides a periodic reconciliation job that compares the canonical dataset (via list-objects/manifest) with the vector DB index watermark.
+- Watermark propagation: Each processed document must propagate a processing watermark (doc_id + commit_ts + model_hash) into the vector DB metadata and cache keys.
+
+Configuration reference (recommended defaults)
+| parameter | meaning | recommended default | rationale |
+|-----------|---------|--------------------|----------|
+| edge_cache_ttl_seconds | TTL for edge key | 45 | Balances low-latency reads with frequency of writes for typical chat/search workloads |
+| reconciliation_interval_minutes | Interval for full index reconciliation job | 60 | Hourly ensures outliers are caught quickly without heavy compute |
+| webhook_retry_policy | Exponential retry config for webhooks | 5 attempts, base 2s | Works with most customer endpoints behind load balancers |
+| idempotency_key_ttl_days | How long to keep idempotency keys server-side | 14 | Allows safe replays during backlog windows |
+| stale_threshold_seconds | Alert threshold for embedding staleness | 300 | Triggers investigation into backpressure or pipeline failures |
+
+Example integration patterns and sample configs
+- Sample webhook payload (customer -> Redwood ingestion):
+
+{
+  "event_id": "evt-20260501-0001",
+  "doc_id": "tenant/123/doc/456",
+  "commit_ts": "2026-05-01T14:22:07Z",
+  "content_url": "s3://tenant-prod/objects/456.json",
+  "metadata": {"tenant_id":"tenant-123","source":"app-frontend"},
+  "idempotency_key": "uuid-v4-client-generated"
+}
+
+- Sample Redis cache key schema: 
+  key: tenant:{tenant_id}:doc:{doc_id}:v{model_hash}:watermark:{commit_ts}
+  value: {embedding_vector_base64, vector_ts, model_hash}
+
+- Example webhook consumer pseudocode (idempotent):
+  1. parse payload, validate auth signature
+  2. if seen_event(event_id): ack and return 200
+  3. fetch content_url for vectorization (or use payload embedding if provided)
+  4. compute embedding (model_hash), upsert vector DB with metadata (id, vector, commit_ts, model_hash)
+  5. write edge cache key with TTL and watermark
+  6. ack event
+
+Operational signals to monitor (SLOs and alerts)
+- Ingest throughput: events/sec per tenant (alert if sustained > 2x baseline without scaling).
+- Embedding processing backlog: number of events older than 2x median processing latency (alert: >500 events).
+- Staleness metric: proportion of top-100 retrievals that read documents with vector_ts older than commit_ts by > stale_threshold_seconds (SLA: <1% daily).
+- Edge cache miss spike: rate of cache misses per tenant per minute (alert threshold: 3x baseline).
+- Reconciliation drift: percent of doc_ids mismatched during hourly reconciliation (alert: >0.5% for 3 consecutive runs).
+
+Runbook: common incident scenarios and play actions
+A. Missing embeddings for new documents (symptoms: retrieval returns older version or null)
+1. Check ingestion stream health: verify upstream durable queue consumer lag (Kafka consumer lag metrics).
+2. Confirm webhook delivery: check webhook delivery logs for 4xx/5xx responses. Look for recent retry storms.
+3. If backlog present: kick off backfill job (one-off reprocess) scoped to tenant+time window. Use the safe backfill process below.
+4. Post-backfill: run quick reconciliation (sample top 500 doc_ids) and validate retrieval quality. Communicate to CSE and affected product stakeholders.
+
+B. Edge cache returns stale vectors after model upgrade
+1. Verify model_hash propagated into new vector records. If model_hash mismatch between cache and vector DB, invalidate cache keys for affected tenant/model_hash combos.
+2. Force soft invalidation via pub/sub invalidate topic: publish {tenant_id, model_hash, since_commit_ts}. Edge cache consumers should delete keys or set zero-TTL marker.
+3. If invalidation publishing failed, run targeted keyscan and delete patterns (use guarded delete job with QPS limit to avoid thrashing).
+4. Notify customer success and schedule a validation query batch.
+
+C. Divergence after network partition (partial writes)
+1. Identify diverged namespaces by comparing watermarks between canonical manifests and vector DB metadata.
+2. Run snapshot reconciliation for namespaces with divergence, then queue up differential revectorization.
+3. Coordinate a maintenance window with the customer if the reconciliation workload will cause increased latency or incur costs.
+
+Safe backfill and throttled reconciliation procedure
+1. Create a reconciliation manifest (list of doc_ids and commit_ts) for target tenant/time range.
+2. Stage on a reconciliation worker fleet with rate limits configured (default: 100 docs/sec per tenant).
+3. Use idempotent upserts to vector DB and do not evict cache until the worker completes the document and writes the new watermark key.
+4. Emit progress metrics: processed_count, failures_count, average_latency. Alert if failure_rate > 1%.
+5. When complete, publish completion event and run a sampling sanity check (n=100).
+
+Communication & customer success playbook for divergence events
+- Triage owner: Assigned CSE + oncall platform engineer.
+- Initial customer comms (within 60 minutes): acknowledge, scope impact (estimated % of affected queries), mitigation steps underway.
+- Follow-up (24–72 hours): provide RCA draft, remediation timeline, and any credit/compensation guidance (use enterprise SLA matrix).
+
+Tooling and dashboards to ship with an integration
+- Per-tenant ingestion lag dashboard (95th/median lag)
+- Reconciliation job dashboard (processed rate, drift %, error rate)
+- Recent invalidation events list (with status: queued, in-progress, completed)
+- Top retrieval divergence samples (side-by-side vectors and commit_ts)
+
+Troubleshooting checklist (quick)
+- Are webhook signatures failing? Check shared secret rotation windows.
+- Is the durable queue healthy? Check partition reassignment or hot partitions.
+- Are reconciliations running and reporting zero progress? Inspect worker autoscaling and IAM permissions for reading canonical manifests.
+- Are cache eviction patterns coordinated with model upgrades? Always deploy upgrade + invalidation together.
+
+Owner & escalation path
+- Integration lead (owner): CSE assigned in the onboarding engagement.
+- Platform escalation (24/7): platform-sre oncall via Slack #sre-redwood and PagerDuty.
+- Engineering escalation: eng-serving-runtime oncall for vectorization pipeline failures.
+
+Appendix: example CLI snippets
+- Trigger a targeted backfill for tenant-123 for last 6 hours:
+  redwood-cli backfill start --tenant tenant-123 --from "2026-05-04T00:00:00Z" --to "2026-05-04T06:00:00Z" --rate 50
+
+- Publish an invalidate event to pubsub (idempotent):
+  curl -X POST https://pubsub.redwood.internal/invalidate \
+    -H "Authorization: Bearer ${TOKEN}" \
+    -d '{"tenant_id":"tenant-123","model_hash":"m-2026-05-01-a1b2","since_commit_ts":"2026-05-01T00:00:00Z"}'
+
+Related reading
+- embeddings-index-consistency-and-rollback-workarounds-2026 (internal)
+- tenant-stability-synthetic-scenarios-and-mtr-playbook-2026 (internal)
+
+Change log
+- 2026-03-10: Initial draft by Lena Murray.
+- 2026-04-12: Added watermark patterns and reconciliation defaults (reviewer: Diego Santos).
+- 2026-05-04: Expanded runbook sections and added CLI examples (reviewer: Priya Nair).

@@ -1,0 +1,159 @@
+Spot Drainer Terraform Operator: design, module interface, and runbook
+
+Summary
+
+This document specifies the design, Terraform module interface, operational runbook, and rollout plan for the Spot Drainer Terraform Operator (SDTO). SDTO is a small operator (controller + Terraform module) whose goal is to detect upcoming spot/interrupt events and orchestrate graceful eviction and live migration of tenant inference/eval workloads on GPU nodes with minimal latency impact and predictable cost.
+
+Goals
+- Provide a reusable Terraform module that provisions the operator and cloud resources (kinesis/pubsub watchers, IAM roles, drain-queue, ephemeral storage buckets).
+- Define the operator behaviour: detection -> quiesce -> migrate/evict -> drain-complete -> decommission.
+- Ensure safety invariants: not evicting below minimum capacity for a tenant, preserving KV cache where feasible, and respecting tenant priority buckets.
+- Expose metrics and events for SLOs and post-incident analysis.
+
+Non-goals
+- This is not a full replacement for the autoscaler or batch preemption mitigations; it complements them by focusing on tenant-aware graceful drain.
+- Not intended to provide cross-region cold-start migration in the initial release.
+
+Context and motivation
+- Spot/Preemptible GPU instances reduce unit costs but introduce occasional 30–120s termination windows. Without coordination, terminations cause high tail-latency and lost KV cache state. SDTO coordinates tenant-aware migration to reduce 95/99p latency spikes.
+
+Architecture overview
+- Terraform module (redwood-sdto): provisions operator deployment, IAM bindings, alerting rules, and a small SQS/Kafka topic for drain commands.
+- Kubernetes operator: listens to cloud termination signals, reconciles NodeDrains custom resources, enforces drain policies, triggers migration jobs or pod-level graceful shutdowns, and writes events to the drain topic.
+- Migration job runner: a CRD-managed Job which performs cache checkpointing (when enabled), cordon/drain, and induces lightweight failover at the application layer (e.g., proxy route update).
+- Safety controller: central service (owned by infra) that enforces cross-tenant capacity minimums and throttle limits.
+
+Design principles
+- Minimal privileges: operator uses scoped IAM role with explicit permissions for termination-notice read, instance metadata, tagging, and message publishing.
+- Irreversible actions require two-step consensus for high-impact tenants.
+- Observable: every decision emits a structured event with node, tenant, reason, and action taken.
+
+Terraform module interface (redwood/terraform-redwood-sdto)
+- Module inputs (HCL variables):
+  - name_prefix (string) — prefix for resources (default: "sdto").
+  - operator_image (string) — container image for operator.
+  - drain_topic_arn (string) — optional pre-existing SNS/SQS topic.
+  - min_tenant_capacity (map) — per-tenant min available GPU count, format: { tenantA = "2", tenantB = "1" }
+  - interrupt_source (string) — "aws-spot-event" | "gcp-preempt" | "generic-webhook"
+  - enable_cache_checkpointing (bool) — whether operator will attempt KV/cache checkpointing.
+- Outputs:
+  - operator_deployment_name (string)
+  - drain_topic (string)
+  - iam_role_arn (string)
+
+Sample HCL usage
+```
+module "spot_drainer" {
+  source = "github.com/redwood/terraform-redwood-sdto"
+  name_prefix = "prod-sdto"
+  operator_image = "docker.redwood.ai/sdto:v0.3.0"
+  interrupt_source = "aws-spot-event"
+  min_tenant_capacity = { "search" = "3", "eval" = "1" }
+  enable_cache_checkpointing = true
+}
+```
+
+Operator behaviour and state machine
+- States: Observed -> PendingQuiesce -> Checkpointing -> MigrationScheduled -> Draining -> Completed -> Failed
+- Detection: operator listens to cloud metadata endpoints / provider event bus. On received notice it creates a NodeDrain CR with detected_by and notice_expires_at.
+- Quiesce window: operator signals the workload proxy to stop accepting new long-running requests for a tenant and returns 503 for new sessions to affected pods.
+- Checkpointing (optional): the operator triggers a checkpoint sidecar to persist KV cache to an object store. If checkpoint fails and tenant is marked critical, operator will attempt partial failover rather than immediate eviction.
+- Migration scheduling: operator consults Safety controller and tenant min capacity; if below min, the operator will delay drain (max delay configurable) and emit an alert.
+- Pod-level actions: prefer in-cluster live migration (GRPC handoff) if available; otherwise drain with gracefulPeriodSeconds and SIGTERM hooks to application-level savepoints.
+
+Safety checks and invariants
+1) Do not reduce tenantAvailableGPU < min_tenant_capacity[tenant].
+2) Only perform cache deletion after successful checkpoint and verification.
+3) If notice_expires_at - now < minimumDrainingWindow (default 20s), prioritize fast-evict fallback path (best-effort).
+4) Respect tenant priority and tenancy-affinity labels; high-priority tenants can opt into extended checkpointing at the cost of delayed host reclamation.
+
+IAM and cloud permissions (minimum set)
+- Read: Spot/Preempt events (EC2: DescribeSpotInstanceRequests; GCP: notifications subscription).
+- Tag/Label update: nodes and instances (to mark draining state).
+- Message publish: SQS/SNS/Kafka topic for downstream tooling.
+- Object store write/read: if enable_cache_checkpointing is true (S3/GCS).
+
+Example IAM policy (AWS, minimal)
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": ["ec2:DescribeSpotInstanceRequests", "ec2:DescribeInstances"], "Resource": "*" },
+    { "Effect": "Allow", "Action": ["sqs:SendMessage", "sqs:ReceiveMessage"], "Resource": "arn:aws:sqs:REGION:ACCOUNT:sdto-*" },
+    { "Effect": "Allow", "Action": ["s3:PutObject", "s3:GetObject"], "Resource": "arn:aws:s3:::redwood-sdto-checkpoints/*" }
+  ]
+}
+
+Network and cross-account notes
+- For private clusters, termination events are delivered via a small polling agent that posts to the operator via a webhook; the Terraform module can provision an internal ALB + target group for that webhook.
+- For cross-account ephemeral bursting, the module includes optional cross-account IAM role creation to allow the operator to tag instances in the billing account.
+
+Observability, metrics and events
+- Every NodeDrain CR emits a structured event to drain_topic with fields: node, tenant, action, start_time, end_time, result, checkpoint_status.
+- Prometheus metrics (m/r): sdto_drains_total (labels: result, tenant), sdto_drain_latency_seconds, sdto_checkpoint_success_total, sdto_checkpoint_fail_total.
+- Alerts (recommended):
+  - SDTO:High-Failure-Rate -> if checkpoint_fail_rate > 1% over 5m
+  - SDTO:Throttle-Delay -> if average drain delay due to min_capacity > 30s across cluster
+
+Runbook: emergency flow (on-call)
+1) Pager: SDTO drains causing capacity alarms (alert: SDTO:Throttle-Delay or NodeUnavailable) -> On-call acknowledges.
+2) Quick check: run `kubectl get nodedrains -A` and `kubectl describe nodedrain <name>` to see reason and tenant.
+3) If tenant min capacity prevents drain and cluster has free capacity, consider temporary scaling: `terraform apply -var='extra_gpu_nodes=2'` against autoscaler module or manually launch hot spare nodes in the same AZ.
+4) If checkpointing is failing broadly: identify object store permission errors, S3/GCS throttling, or operator IAM misconfig — rollback operator to previous image (SDTO image tag) and reprocess NodeDrain.
+5) If a migration job is stuck in Pending due to image pull or quota, manually create emergency migration job with reduced checkpoint settings (see Appendix CLI).
+
+Testing and rollout strategy
+- Canary in staging: deploy module with interrupt_source="generic-webhook" and run a synthetic termination generator to validate path.
+- Failure injection: run game-day to simulate simultaneous 10% node terminations and validate 99p latency and checkpoint success.
+- Gradual rollout: 5% of GPU nodes have operator enabled -> 25% -> 100% across two weeks, with monitoring for sdto_checkpoint_fail_total and sdto_drain_latency_seconds.
+
+Metrics SLOs (target for GA)
+- 95p client-impact latency due to spot preemption reduced by >= 50% compared to baseline.
+- Checkpoint success rate >= 99% for non-critical tenants, >= 99.9% for critical tenants (when enabled).
+
+Operational ownership
+- Primary owner: infra/eng-infra (oncall: infra-gpu).
+- Backup owner: eng-serving-runtime for application-integration issues.
+- Escalation: if cross-tenant capacity enforcement fails, escalate to SRE leads and product owners for tenant-level decisions.
+
+Open questions / future work
+- Tight integration with Redwood Caching layer to allow byte-range checkpointing rather than full KV dumps.
+- Cross-region live migration for long-running eval jobs.
+- Integration with Dedicated offering billing to surface reclaimed spot value back to tenants.
+
+Appendix: CLI and manual emergency commands
+- List in-progress drains: `kubectl get nodedrains -A --output=wide`
+- Describe a drain: `kubectl describe nodedrain <name> -n redwood-sdto`
+- Force-complete drain (admin): `kubectl patch nodedrain <name> -p '{"status":{"phase":"Completed"}}' --type=merge` (use with extreme caution).
+
+- Example emergency migration job (YAML snippet):
+```
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sdto-emergency-migrate-tenant-search-202502
+  namespace: redwood-sdto
+spec:
+  template:
+    spec:
+      containers:
+      - name: migrate
+        image: docker.redwood.ai/sdto-migrate:v0.3.0
+        env:
+        - name: TENANT
+          value: search
+        - name: CHECKPOINT_MODE
+          value: fast
+      restartPolicy: Never
+```
+Related pages
+- eng-infra/runbooks/preflight-gpu-deployment-validation-and-rollback-playbook (see preflight checks)
+- eng-infra/gpu-fleet-and-capacity/gpu-tenant-credit-buckets-and-granular-throttling-policy (for tenant quotas)
+
+Next steps and actions
+- Finalize Terraform module variable names and publish registry module (owner: Priya).
+- Run staging canary and report metrics in two-week window (owner: Liam).
+- Book game-day with SRE and serving-runtime to test at 10% simultaneous terminations (owner: María).
+
+Document history
+- 2025-01-15: Draft created by Priya Kapoor.
+- 2025-02-12: Design updated: added checkpoint verification step and runbook emergency commands.

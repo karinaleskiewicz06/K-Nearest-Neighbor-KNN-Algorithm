@@ -1,0 +1,156 @@
+Eviction Rewind and State Reconstruction Playbook
+
+Overview
+========
+This playbook documents the procedure to recover from kvcache eviction events that cause request-level state divergence or incomplete KV reconstruction during model swaps, preemption, or kernel handoffs. It covers triage, automated rewind and state reconstruction action sequences, verification checks, rollback criteria, and safety tests. The intended audience is oncall SREs, serving-runtime engineers, and incident responders.
+
+Why this matters
+-----------------
+- Eviction-induced state gaps can lead to incorrect completions, user-facing hallucinations, or repeated model fallbacks.
+- Fast, deterministic reconstruction preserves SLOs and avoids large-scale reroutes to lower-fidelity fallback models.
+- This playbook provides a safe, repeatable sequence to reconstruct per-session KV state and safely resume traffic.
+
+When to run this playbook
+-------------------------
+Run this playbook when one or more of the following are observed:
+- Sudden spike in kvcache_reconstruction_failures (> 10/min sustained for 5 minutes)
+- Increase in tail latency correlated with eviction_rate or kernel_handoff_rate
+- Model swap incidents where > 0.5% of sessions show token regression or repeated left-pad artifacts
+- Automated canary signals mark warmup_failure=true during rollout
+
+Impact and SLOs
+---------------
+- Target: recover affected sessions and restore p95 inference latency within 10 minutes of start of remediation.
+- Acceptable interim error budget consumption: up to 2x normal error budget for the affected service for a single incident.
+- Escalate to incident commander if reconstruction extends beyond 30 minutes or if reconstruction failures exceed 1% of total affected sessions.
+
+Ownership and permissions
+-------------------------
+- Primary owner: Serving Runtime (runtime-sre)
+- Secondary owner: Kernel Scheduling Team (kernel-scheduler)
+- Required permissions: ability to trigger kvcache reconstruction jobs, pause model-swap-agent rollouts, and modify scheduler admission controls.
+- Contacts: runtime-oncall@redwood.ai, kernel-scheduler@redwood.ai, runtime-release@redwood.ai
+
+Pre-incident checklist (quick)
+-----------------------------
+- Confirm current SLA window and active deployments.
+- Check if any maintenance or known rollouts are in progress (model-swap-agent, kernel rollouts).
+- Ensure a recent snapshot of kvcache index exists (last 24h).
+- Open a dedicated incident channel and note affected clusters/regions.
+
+Immediate triage (first 10 minutes)
+-----------------------------------
+1) Tag and isolate: Identify affected shard sets and tag them in the incident channel. Use the runtime incident tool:  `rtctl shards list --filter=\"eviction_rate>0.1\"`
+2) Confirm metric correlations: Dashboard: Runtime / KVCACHE / Reconstruction. Check metrics: eviction_rate, kvcache_reconstruction_failures, kvcache_warmup_seconds, kernel_handoff_rate, p95_latency.
+3) Stop compounding actions: Pause any model-swap-agent rollouts for affected model-versions: `rtctl rollout pause --model vX --clusters shard-a,shard-b`.
+4) Reduce admission pressure: Temporarily tighten admission control to reduce new sessions to affected shards: `schedulerctl admission set --target 60% --scope shard-a`
+
+Automated reconstruction flow (recommended)
+------------------------------------------
+Use the automated reconstruction pipeline (recon-runner) to attempt fast rewind and state rebuild before manual steps. Steps it performs:
+- Fetch latest durable prefix snapshots from persistent-store (S3 / object-store).
+- Rehydrate session KV caches using checkpointed KV deltas.
+- Replay last N tokens from request logs (N default 32) into warmed kernel contexts to re-establish KV validity.
+- Validate by running synthetic trace assertions.
+
+Command to start automated run on a shard set:
+- `recon-runner start --shards shard-a,shard-b --max-parallel 4 --replay-window 32 --dry-run=false`
+
+Manual reconstruction procedure (if automated runner fails)
+---------------------------------------------------------
+1) Stop accepting new traffic to affected shards: `schedulerctl drain --shard shard-a --mode immediate`
+2) Snapshot live kernel state (if available): `rtctl kernel snapshot --shard shard-a --out /tmp/shard-a-snap.tgz`
+3) Extract last-request logs for affected sessions: `logql query \"{service=\"runtime-gpu-proxy\", shard=\"shard-a\"} | json | last(5000)\" > /tmp/shard-a-requests.ndjson`
+4) Run replay tool in isolated reconstruction cluster (no external traffic):
+   a) `replay-tool --input /tmp/shard-a-requests.ndjson --model-model-path gs://models/vX --kv-checkpoint gs://kvcache/snapshots/shard-a/latest --replay-window 64 --out /tmp/shard-a-replay-results.json`
+   b) Inspect replay failures: `jq '.failures | length' /tmp/shard-a-replay-results.json`
+5) Apply KV deltas to in-memory cache with controlled rate-limiter: `kvcachectl apply-deltas --shard shard-a --source /tmp/deltas --rate 1000/s`
+6) Re-enable traffic with traffic shaping: `schedulerctl admission set --target 30% --ramp 10m --scope shard-a`
+
+Verification checks (post-reconstruction)
+----------------------------------------
+- Metric convergence: kvcache_reconstruction_failures -> 0/min; kvcache_hit_rate >= previous baseline - 2% within 15 minutes.
+- Synthetic assertion: run 100 representative prompts (from canary prompt-set) against reconstructed shards and assert token-by-token parity >= 99.5% (or within acceptable fidelity reg thresholds).
+- Latency: p95 within 10% of baseline for reconstructed shards.
+- Error logs: no new kernel panics or repeated model-fallback events for 30 minutes.
+
+Rollback and fallback policy
+---------------------------
+If reconstruction fails or fidelity is unacceptable:
+- Immediately revert model swap (if the swap caused the state divergence) using: `rtctl rollout revert --model vX --to vX-previous --scope shard-a`
+- If revert is not possible, route affected traffic to a hardened fallback pool (fallback-tier-2) with conservative admission limits.
+- Mark incident as "stalled reconstruction" and escalate to runtime product and kernel-scheduler leads.
+
+Post-incident actions (within 72 hours)
+--------------------------------------
+- Run a formal postmortem with causal timeline, including kernel handoff signals and eviction bursts.
+- Bake-in new canary checks if missing: add warmup_failure assertion to canary pipeline.
+- Create a blocker ticket for any persistent root cause (e.g., persistent NVMe contention, faulty eviction heuristics).
+
+Testing and canary protocol for recon changes
+--------------------------------------------
+1) Unit tests for recon-runner with synthetic KV deltas and deterministic replay.
+2) Integration test: deploy recon-runner in canary A (single shard) with traffic mirror of 2% for 2 hours. Assert: warmup_success=true, reconstruction_latency < 300s.
+3) Rollout: gradual - 5% clusters -> 25% -> 100% with automated rollback on warmup failure.
+
+Telemetry and dashboards to consult
+----------------------------------
+- Runtime / KVCACHE / Eviction Rate (eviction_rate)
+- Runtime / KVCACHE / Reconstruction Failures (kvcache_reconstruction_failures)
+- Runtime / KVCACHE / Warmup Duration (kvcache_warmup_seconds)
+- Runtime / Kernel / Handoff Rate (kernel_handoff_rate)
+- APIGW / Inference / p95 latency (p95_inference_latency)
+- Runtime / Synthetic / Canary Fidelity (canary_token_parity)
+
+Diagnostic commands and snippets
+-------------------------------
+- List active recon jobs: `reconctl list --status active`
+- Tail kernel logs for shard: `kubectl -n runtime logs -l shard=shard-a -c kernel --since=20m | grep -i eviction`
+- Inspect last kvcache checkpoint manifest: `gsutil cat gs://kvcache/snapshots/shard-a/manifest.json | jq`
+
+Config table (important params)
+------------------------------
+Parameter | Default | Purpose / Impact
+--------- | ------- | ------------------
+replay_window | 32 | Number of tokens replayed to reconstruct KV. Increasing improves fidelity but increases time.
+max_parallel_recon | 4 | Maximum parallel reconstruction jobs per region. Higher value speeds recovery but raises load.
+apply_delta_rate | 1000/s | Rate at which KV deltas are applied to in-memory kvcache to avoid memory spikes.
+snapshot_ttl | 24h | How long persistent snapshots are kept. Longer TTL increases recovery surface but costs storage.
+warmup_assertion_threshold | 0.995 | Minimum token parity to consider reconstruction successful.
+
+Example reconstruction config (YAML)
+-----------------------------------
+reconstruction:
+  shards: ["shard-a", "shard-b"]
+  replay_window: 64
+  max_parallel_recon: 2
+  apply_delta_rate: 750/s
+  synthetic_canary_set: "canary-recon-v2"
+  notify_on: ["success","failure"]
+
+Safety notes and caveats
+------------------------
+- Never apply deltas across model-version boundaries unless the model architecture and tokenizer are compatible. Cross-version KV application will produce corruption.
+- If kernel snapshot feature is unavailable for a shard, prefer routing traffic away rather than performing blind reconstruction.
+- Reconstruction may surface latent bugs in quantization path; watch for sudden increase in soft-errors from kernel telemetry.
+
+Appendix: quick checklist (one-pager)
+------------------------------------
+1) Pause rollouts and tag shards.
+2) Run recon-runner (dry-run first if time permits).
+3) If recon-runner fails, drain shard and run replay-tool in isolated cluster.
+4) Apply KV deltas with rate-limiter and re-enable traffic with ramp.
+5) Verify fidelity with canary prompt-set and metrics.
+6) Revert or fallback if fidelity/latency unacceptable.
+
+Related links and artifacts
+--------------------------
+- Kernel signal handbook: /confluence/eng-serving-runtime/kernel-and-scheduling/eviction-coordinate-protocol-and-kernel-signal-handbook-2026
+- Reconstruction automation repo: git@github.com:redwood-inference/recon-runner
+- Canary prompt sets: gs://runtime-canaries/canary-recon-v2/prompts.ndjson
+
+Document history
+----------------
+- 2026-01-15: Created by Sophie Chen (initial draft).
+- 2026-04-08: Added automated recon-runner section and YAML config (Marco Alvarez).
+- 2026-07-02: Updated verification thresholds and telemetry lists (Dmitri Sokolov).

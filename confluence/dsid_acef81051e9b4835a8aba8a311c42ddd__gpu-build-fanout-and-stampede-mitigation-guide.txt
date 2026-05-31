@@ -1,0 +1,156 @@
+GPU build fan-out and stampede mitigation guide
+
+Overview
+
+Purpose: This guide describes patterns, Terraform/IaC examples, monitoring signals, and an operational runbook to prevent and mitigate GPU stampedes and uncontrolled fan-out from CI pipelines and evaluation jobs. It targets infra engineers, CI owners, and platform SREs who operate GPU pools used for builds, evaluations, and canary workloads.
+
+Summary: When large CI/eval jobs scale concurrently (nightly evals, multi-PR dependency checks, or mass rollouts), we observe sudden demand spikes that cause long queue times, warm-pool depletion, preemptions, and downstream latency for customer-facing inference. The mitigation strategy here is multi-layered: admission control + backpressure at CI, rate-limited fan-out adapters, autoscaler safeguards, pre-warm and warm-pool budgeting, token-bucket throttles, and telemetry-driven emergency throttles.
+
+Key goals
+- Ensure 95th percentile CI queue time to acquire a GPU stays below 4 minutes for short jobs (<= 30m).
+- Bound impact of bulk-eval windows to < 10% of production capacity at any time.
+- Provide fast operational controls to throttle/unwind runaway fan-outs within 2 minutes.
+
+Scope and audience
+- CI pipelines (Buildkite, GitHub Actions runner fleet) that request GPU nodes via internal provisioner.
+- Evaluation clusters (ephemeral vs reserved) and scheduled eval grids.
+- Autoscaler and GPU pool managers implemented in terraform + operator.
+- Platform SRE, Eng-Infra, and Evaluation owners.
+
+Patterns and controls (high level)
+1) Source-side admission control (preferred):
+   - Gate large fan-outs in the pipeline DSL: add a controlled "fanout" step that calculates effective concurrency and respects a per-repo concurrency quota.
+   - Example policy: max 8 concurrent GPU jobs per repo by default; increase via request.
+2) Rate-limited fanout adapter (thin service):
+   - Implement an adapter between CI and the provisioner which enforces a token-bucket per-tenant and per-repo. The adapter emits telemetry for queue depth and throttle events.
+3) Warm-pool budgeting and reservation:
+   - Reserve a small fraction of capacity for latency-sensitive workloads (e.g., 10% of steady-state production) and a separate warm-pool for CI burst absorbtion.
+4) Autoscaler soft/hard limits and plateau detection: 
+   - Autoscaler must support: soft_scale_thresholds, hard_capacity_cap, plateau-detection (sustained increase > X mins), and cooldown windows.
+5) Emergency throttles and circuit breakers:
+   - Automated circuit breaker that reduces non-critical starter tokens (evals, scheduled CI) when the cluster cross-stage: GPU eviction rate > 2% OR avg token acquisition latency > 5m for 1 minute.
+
+Operational metrics and dashboards
+- Required metrics emitted by adapter and provisioner:
+  - adapter.requests_total (counter)
+  - adapter.tokens_acquired (counter)
+  - adapter.tokens_throttled (counter)
+  - provisioner.queue_depth (gauge)
+  - provisioner.token_acquire_latency_seconds (histogram)
+  - pool.warm_nodes (gauge)
+  - pool.preemptions_per_minute (counter)
+  - autoscaler.scale_events (counter)
+
+SLOs and alerts (recommended thresholds)
+- SLO: CI GPU token acquire P95 <= 4 minutes. Alert if P95 > 4m for 10m.
+- Alert: queue_depth > 200 for any single cluster for 5m.
+- Alert: preemption_rate > 2% sustained for 5m.
+- Alert: tokens_throttled > 5% of requests for 1m (indicates adapter saturation).
+
+Terraform / IaC patterns (examples)
+- Purpose: keep module surface small and pluggable to both ephemeral eval and shared production pools. Use variables to express budgets and emergency throttle knobs.
+
+Example terraform variables (text table)
+- Variable: name | type | default | description
+- max_concurrent_per_repo | number | 8 | Default admission concurrency per repo for CI tokens
+- warm_pool_size | number | 20 | Number of pre-warmed GPU nodes reserved for CI/eval bursts
+- emergency_throttle_pct | number | 15 | Percent of non-prod tokens to disable when circuit breaker trips
+
+Example terraform snippet (pseudo-HCL)
+-----BEGIN HCL-----
+module "gpu_fanout_adapter" {
+  source = "git::ssh://git@github.com/redwood/gpu-adapter.git//terraform/module"
+  max_concurrent_per_repo = var.max_concurrent_per_repo
+  warm_pool_size          = var.warm_pool_size
+  emergency_throttle_pct  = var.emergency_throttle_pct
+  monitoring_topic        = module.monitoring.topic
+}
+-----END HCL-----
+
+CI pipeline changes (practical checklist)
+- Replace raw parallel map steps with "fanout-step" that:
+  1. requests N tokens from adapter APIs with a single bulk request,
+  2. implements backoff (exponential with jitter) if tokens are denied,
+  3. publishes telemetry labels (repo, pr, build_id).
+- Example: Buildkite YAML patch (conceptual)
+-----BEGIN YAML-----
+steps:
+  - label: "run-eval-grid"
+    commands: 
+      - scripts/request-gpu-tokens --count 16 --timeout 30m --tags ${BUILDKITE_PIPELINE_SLUG}
+      - if: "\"$TOKENS_GRANTED\" == \"true\""
+        commands: ["./run-grid.sh"]
+      - else:
+        commands: ["./notify-throttled.sh"]
+-----END YAML-----
+
+Adapter implementation notes
+- Keep adapter state small: token-bucket counters in redis (per-tenant, per-repo), with TTLs to avoid leaks.
+- Emit metrics at token request and token release. Tag metrics with owner, repo, job-type, and build_id.
+- Add a soft-deny reason string to event logs so CI owners can detect whether denial is due to 'per_repo_quota', 'global_capacity_safety', or 'circuit_breaker'.
+
+Warm-pool sizing guidance
+- Base warm_pool_size calculation:
+  - warm_pool_size = max(ceil(steady_state_prod_gpus * 0.08), 8)
+  - Example: if production steady state is 250 GPUs, warm_pool_size = max(ceil(250*0.08)=20, 8) = 20.
+- Use scheduled warm-pool daily windows (nightly evals) but cap the fraction of production used for scheduled batches to 10%.
+
+Scaling safety: plateau detection and gradual scale-up
+- When demand spike occurs, require autoscaler to do:
+  1. fast warmup + limited scale (scale up to 30% over current)
+  2. plateau detection (if tokens_acq_latency keeps increasing or queue_depth keeps growing, pause further scale and evaluate)
+- Rationale: prevents us from autoscaling into a runaway eviction loop or cold-start cost spiral.
+
+Runbook: Mitigate an active stampede (priority playbook)
+1) Triage (0-2 minutes)
+   - Owner: oncall infra/ci-cd SRE.
+   - Dashboard to open: CI Token Health, Cluster queue_depth, Preemptions, Warm-pool utilization.
+   - Immediate check: is global preemption_rate > 2%? Is token_acquire_latency P95 > 5m? If yes, escalate.
+2) Contain (2-8 minutes)
+   - Flip adapter emergency_throttle to 100% for non-prod and scheduled-evals. CLI: curl -XPOST https://internal-adapter/controls/throttle 
+     Payload: {"scope":"non_prod","throttle_pct":100,"reason":"stampede-mitigation"}
+   - If adapter not responsive: add iptables rate-limit on provisioner port for eval CI agents (last-resort).
+3) Stabilize (8-30 minutes)
+   - Reduce autoscaler max scale rate to 10% per 10m window.
+   - Spin additional warm nodes only into a dedicated buffered pool; do not attach to production until preemption_rate < 1% for 10m.
+4) Root-cause and fix (30m-4h)
+   - Identify offending pipelines (use adapter logs -> tag build_id). 
+   - Reconfigure pipelines: reduce per-repo fanout, batch tests into chunked runs, or move large eval grids to off-peak windows with prebooked capacity.
+   - If a buggy PR is identified that caused exponential fan-out, block that PR by pipeline gate and notify respective owners.
+
+Post-incident actions
+- Postmortem must include: timeline, top 5 callers, % capacity consumed by offender, advisory to CI owners, and proposed change to admission control.
+- Consider introducing scheduled capacity reservations (paid reservations) for large eval jobs to reduce contention with on-demand usage.
+
+Testing and rollout checklist
+- Unit and integ tests for adapter token-bucket behavior (race conditions around concurrent release).
+- Load test harness: simulate X=200 concurrent repo builds with variable job durations and preemption interactions.
+- Canary rollout: deploy adapter to single region and enable per-repo quotas set at 50% of expected. Monitor metrics for 48hrs before global rollout.
+
+Ownership and contacts
+- Primary owner: eng-infra/ci-cd team (oncall alias: oncall-ci-cd@redwood.com)
+- Secondary escalation: platform-sre@redwood.com
+- Pager escalation policy: if token_acquire_latency P95 > 10m for 15m, page platform-sre.
+
+Related resources and links
+- Implementation repo: git@github.com:redwood/gpu-adapter (internal)
+- Dashboard: Grafana -> CI GPU Token Health (link internal)
+- IaC modules: internal terraform registry -> gpu_fanout_adapter module
+- Follow-up docs: runbook for warm-pool orchestration, CI pipeline best-practices for fan-out
+
+Appendix: example telemetry alert rule (pseudo PromQL)
+- Alert: CI_GPU_Token_Acquire_P95_High
+  expr: histogram_quantile(0.95, sum by (le) (rate(provisioner_token_acquire_latency_seconds_bucket[5m]))) > 240
+  for: 10m
+  labels: {severity: "page"}
+  annotations: {summary: "CI GPU token acquire p95 > 4m"}
+
+Notes and rationale
+- We prioritize source-side admission control because it is the most deterministic and lowest-cost mitigation. Fallbacks (adapter throttles, warm pools) are safety nets.
+- Warm pools reduce latency but cost money; budget decisions should be aligned with business priorities (e.g., scheduled evals contributing to core product quality may deserve higher reservations).
+
+Document revision history
+- 2024-05-10: Initial draft.
+- 2024-09-03: Added terraform variables and adapter implementation notes.
+- 2025-06-18: Updated warm-pool sizing heuristics and autoscaler plateau logic after incident IR-2025-06-gpu-spike.
+- 2026-01-12: Finalized emergency throttle API and added rollout checklist.

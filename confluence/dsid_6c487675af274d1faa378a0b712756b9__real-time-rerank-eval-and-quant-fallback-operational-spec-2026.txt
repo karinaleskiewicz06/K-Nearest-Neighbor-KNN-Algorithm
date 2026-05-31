@@ -1,0 +1,136 @@
+Real-time Rerank Eval and Quant Fallback Operational Spec
+
+Summary:
+This operational spec defines the evaluation harness, probe generation, metric thresholds, and automated fallback procedures for deploying quantized model variants of the real-time rerank pipeline (service name: rerank-service). The goal is to allow safe promotion of quantized rerankers into production traffic with automated detection and graceful fallback to full-precision variants when quality or latency SLOs degrade.
+
+Scope:
+- Applies to rerank-service endpoints behind the inference gateway (route: /v1/rerank).
+- Covers shadow evaluations, canary rollout, automated monitoring, and rollback.
+- Includes quantized variants (int8/4-bit hybrid) and mixed-precision fallbacks.
+- Excludes offline batch re-ranking jobs and non-rerank ranking pipelines.
+
+Key terminology:
+- Probe: a synthetic or sampled request used to measure quality and latency.
+- Shadow run: mirrored traffic evaluated against target model without affecting user responses.
+- NDCG-delta: change in NDCG@10 versus baseline model.
+- Quant-gatekeeper: the component that decides whether to route requests to quantized variant.
+
+Stakeholders and ownership:
+- Service owner: Search & Ranking team (primary oncall: @search-ranking-oncall).
+- Eval harness owner: Applied ML (owner: Priya Nair).
+- Observability: Eng Platform (dashboards: rerank/quantization-eval).
+- Rollout approvals: Product + Applied ML for market-impacting models.
+
+SLOs and acceptance criteria (must be met in shadow + canary phases):
+- Latency SLO (production): P95 <= 50 ms for single-query rerank at 128 tokens, P99 <= 120 ms.
+- Latency impact (quantized vs baseline): P95 delta <= +10 ms.
+- Quality SLO: NDCG@10 delta >= -0.007 (i.e., loss must be < 0.007 absolute).
+- Hallucination / safety sentinel: flagged rates must not increase by >0.2% absolute.
+- Tokenization fidelity: OOV token rate change < 0.05%.
+
+Metric telemetry and thresholds to publish to the console:
+- ndcg_at_10, ndcg_delta, rerank_latency_ms_p95, rerank_latency_ms_p99, tokens_generated, hallucination_signal_rate, oov_rate, quant_error_rate.
+- Alert rules (examples):
+  - high-quality-delta: trigger if ndcg_delta < -0.007 for 5m rolling window AND sample-size >= 2000.
+  - latency-regression: trigger if rerank_latency_ms_p95 increase > +12 ms vs baseline for 10m.
+
+Probe synthesis strategy (how we create test traffic):
+1) Seeded shadow probes: sample 10% of production queries with user-consented telemetry flags and mirror to shadow-sequencer.
+2) Synthetic perturbations: augment real queries with adversarial paraphrases and long-context extensions to stress KV-cache and quantization.
+3) Rare-slice amplification: upsample low-frequency slices (locale=en-IN, conversational multi-turn) to reach minimum statistical power.
+
+Probe composition and size guidance:
+- Minimum per evaluation window: 5k probes across slices.
+- Recommended slice allocation: 60% head queries, 30% medium-tail, 10% longtail/edgecases.
+- Time windows: rolling 1h for latency, rolling 24h for quality stability before canary promotion.
+
+Quant-sensitivity test matrix (example):
+| Variant | Bits | KV cache enabled | Target SLO notes | Acceptance delta |
+| Baseline | fp16 | yes | Reference | 0.0 |
+| int8-ldq | 8 | yes | Expected minimal fidelity loss | ndcg >= -0.005 |
+| hybrid-4+8 | mixed | yes | aggressive cost trade | ndcg >= -0.007 and latency <= +8ms |
+| int4-edge | 4 | limited | experimental, only shadow | ndcg >= -0.01 and manual review |
+
+Automated evaluation pipeline (high-level):
+1) build-artifact: produce quantized model artifact and push to artifact repo (artifact tag: rerank/{model}:{quant-profile}:{sha}).
+2) smoke-run: run local throughput + deterministic-output checks (tool: evaluator-sdk smoke-run).
+3) shadow-run: replay probes via shadow-sequencer to quant variant. Collect metrics to telemetry-ingest and evaluator-db.
+4) aggregation: compute slice-level metrics (ndcg, latency percentiles, hallucination rate).
+5) gate decision: quant-gatekeeper consults rules engine and posts recommended action to rollout-service.
+
+Example CI job config (YAML):
+job_name: rerank-quant-eval
+cron: "*/30 * * * *"
+steps:
+  - name: download-artifact
+    run: |
+      aws s3 cp s3://artifacts/rerank/${MODEL_TAG}.tar.gz .
+  - name: run-shadow
+    run: |
+      evaluator-sdk run --config configs/rerank-shadow.yaml --artifact ${MODEL_TAG} --out /tmp/results.json
+  - name: upload-results
+    run: |
+      curl -X POST -H "Authorization: Bearer $EVAL_API_TOKEN" -F results=@/tmp/results.json https://eval-orchestrator.internal/api/results
+
+Rollout & canary process (step-by-step):
+1) Shadow-only (48h): quant variant must pass shadow acceptance across all high-priority slices.
+2) Micro-canary (0.5% traffic for 6h): route 0.5% user traffic through quant-gatekeeper with real-time comparison telemetry collected.
+3) Ramp (0.5 -> 5 -> 20%): increase only if quality and latency remain within thresholds at each checkpoint (24h windows at each stage).
+4) Full promotion: require stakeholder sign-off and documentation of observed deltas and mitigation plan.
+
+Automated fallback & rollback behavior:
+- If alert high-quality-delta or latency-regression fires during canary/ramp, quant-gatekeeper will automatically route new requests to baseline for the affected region + model and open a high-priority incident.
+- Fallback TTL: immediate re-route for 60 minutes; the rollout-service pauses ramps until manual review.
+- For transient anomalies (blips <5m with <1% probes affected) hold and continue monitoring; do not auto-rollback unless condition persists for 10m and sample-size > 500.
+
+Triage playbook for failures (oncall steps):
+1) Acknowledge pager and pull up rerank/quantization-eval dashboard.
+2) Confirm which slices triggered the alert and query sample IDs.
+3) Run evaluator-sdk isolate --slice <slice_id> --artifact <artifact_tag> to reproduce locally.
+4) If quant-error suspected, trigger auto-fallback (rerankctl fallback --artifact <artifact_tag> --region <region>).
+5) Postmortem: capture root cause, affected slice, mitigation steps, and rollback timeline.
+
+Example CLI snippets (for oncall):
+# Check recent ndcg deltas
+curl -s "https://telemetry.internal/api/metrics?name=ndcg_delta&service=rerank-service&window=1h" | jq .
+# Trigger a targeted fallback
+rerankctl fallback --model rerank_v2026 --profile hybrid-4+8 --slice locale=en-IN
+
+Evaluation report template (required before full promotion):
+- Artifact tag:
+- Shadow window (start/end):
+- Probe volume by slice:
+- NDCG@10 baseline vs quant (table):
+- Latency P95/P99 comparison (table):
+- Safety sentinel comparison (table):
+- Known limitations & edge cases:
+- Recommended action (promote / widen shadow / rollback):
+
+Privacy and data handling:
+- All shadow probes must follow the privacy budget policy: PII redaction enabled, retention 7d for probe payloads, annotation artifacts stored with encryption at rest.
+- Rare-slice amplification must not include user-identifiable content — use redacted proxies or synthetic variants.
+
+Testing checklist before on-call signoff:
+- [ ] Smoke-run passed with deterministic checks.
+- [ ] Shadow-run completed with required probe counts per slice.
+- [ ] No slice-level ndcg_delta breaches for 24h.
+- [ ] Latency regression within limits for 24h.
+- [ ] Documentation of expected cost delta and deployment runbook.
+
+References and related pages:
+- evaluator-sdk README: internal link (evaluator-sdk docs).
+- Quant profile playbooks (see related_pages above).
+- rerank-service runbook: sources/confluence/eng-serving-runtime/runbooks/rerank-service-runbook-2025.json
+
+Appendix: quick troubleshooting matrix
+- Symptom: increased ndcg_delta on locale=en-IN only -> Action: inspect tokenization differences between artifacts, run tokenization-diff tool, verify vocab alignment.
+- Symptom: P95 latency increase -> Action: check batching behavior, KV-cache hit rate, and hardware scheduling (gpu-util).
+
+Contact list:
+- Applied ML (owner): priya.nair@redwood.ai
+- Search & Ranking oncall: search-ranking-oncall@redwood.ai
+- Observability: monitoring@redwood.ai
+
+Document changelog:
+- 2026-02-08: Created initial spec (Priya Nair).
+- 2026-03-01: Added automated fallback TTL rules and updated acceptance thresholds (reviewers: Ethan Chen, Maya Ortiz).

@@ -1,0 +1,336 @@
+Routing Policy Failover Controller — Operational Runbook
+
+## Purpose
+This runbook covers day-to-day operations for the **Routing Policy Failover Controller** ("failover-controller"): enabling/disabling automation, using **dry-run** mode, handling **approval workflows**, performing **rollbacks**, and troubleshooting.
+
+The controller evaluates region-level impairment signals (reachability, error burn, tail latency burn, capacity exhaustion) and (optionally) executes routing policy changes to shift traffic away from impacted regions while preventing oscillation and overload.
+
+## Scope
+**In scope**
+- Hosted API + Dedicated routing policy flips across regions
+- Controller operation modes (disabled / dry-run / execute with approvals / execute fully automated)
+- Anti-flap behavior (hold-down timers, rate limits)
+- Rollback and stabilization workflows
+- Auditability and incident-bot integration
+
+**Out of scope**
+- Customer-specific Private deployment automation (see Private guidance)
+- Changing SLO contract language
+- Core serving runtime changes
+
+## Service overview
+**Components**
+- **failover-controller**: control loop that reads signal inputs and recommends/executes policy actions.
+- **policy-engine**: deterministic evaluation of signal hierarchy; outputs recommended routing actions.
+- **region-health-service**: aggregates raw signals into region-level health states with TTL + jitter.
+- **routing control plane**: applies policy changes (route weights, region allow/deny, fallback model/region).
+- **audit log**: emits structured failover events (recommendation/execution/rollback) with evidence.
+- **incident-bot**: posts summaries to incident channels when actions occur.
+
+**Primary on-call ownership**
+- **Platform On-call (Routing/Control Plane)** owns controller health and routing action execution.
+- **SRE On-call** owns incident coordination and go/no-go for production experiments/game days.
+
+**Escalations**
+- Routing policy tech lead: Ravi Menon
+- Failover architecture lead: Miles Thornton
+- SRE delivery lead: Rafael Mendes
+- Network reachability lead: Victor Alvarez
+
+## Preconditions / safety principles
+1) **Prefer safety over speed** when signal quality is uncertain.
+2) **No single noisy metric** should trigger failover without corroboration (per ADR-042).
+3) **Rate-limit changes** to avoid policy flapping (per ADR-043).
+4) **Failing over can cause overload**; verify destination capacity headroom and circuit breakers.
+5) Keep an **always-available escape hatch**: ability to disable execution and/or freeze routing.
+
+## Controller modes
+The controller can be run in one of these modes. Confirm current mode before making changes.
+
+| Mode | Description | Typical usage |
+|---|---|---|
+| Disabled | Controller runs no decision loop (or is scaled to 0). | Emergency stop; maintenance. |
+| Observe-only | Controller evaluates signals and writes internal metrics/logs, but does not emit recommendations. | Early rollout; validating inputs. |
+| Dry-run | Controller emits recommendations + audit events marked DRY_RUN, but does not execute. | Staging validation; pre-prod rehearsal; incident analysis. |
+| Execute w/ approvals | Controller executes only after on-call approval within a time window. | Production initial rollout; game days. |
+| Execute (auto) | Controller executes automatically within safety limits. | Mature state after proven signals + guardrails. |
+
+## Key configuration knobs (production defaults)
+These values are managed in the controller config (helm values + config store) and should match ADRs.
+
+**Signal evaluation (high level)**
+- Authoritative signals (highest priority):
+  - Cross-region reachability failing (synthetic probes) for >= **60s**
+  - Region-health-service state = **UNREACHABLE** or **SEVERE**
+- Corroborating signals:
+  - 5xx burn rate (fast): **14x / 5m** window
+  - 5xx burn rate (slow): **6x / 30m** window
+  - Tail latency burn: p99 > SLO threshold with **6x / 30m** burn
+  - Capacity headroom below threshold for >= **2m**
+
+**Anti-flap / dampening**
+- Corroboration requirement: at least **2 independent sources** unless reachability is failing.
+- Hold-down timer after a flip: **20 minutes** (no further flips for the same route/tenant unless reachability is hard-down).
+- Minimum time in healthy state before rollback: **15 minutes** stable.
+
+**Action rate limits (blast radius protection)**
+- Max automated flips per tenant per hour: **2**
+- Max automated flips per route per hour: **3**
+- Max % traffic shift in a single step (Hosted): **50%** unless explicitly overridden by approval
+- Dedicated: drain workflow must be acknowledged; do not hard-cut unless approved
+
+## Operational quick-start (what to do first)
+When a page indicates a possible regional impairment:
+1) Open the **Failover Signals Dashboard** and confirm whether signals are region-scoped or service-scoped.
+2) Check the controller status: mode, last evaluations, and recent actions.
+3) If production impact is possible and automation is in execute mode, ensure approvals are working or disable execution.
+
+## Access and tooling
+**CLI**: `failoverctl` (internal tool)
+- Auth: SSO + production break-glass group (Platform On-call)
+- All commands should attach a reason string (for auditability).
+
+**Kubernetes**
+- Namespace: `routing-system`
+- Deployment: `failover-controller`
+
+**Audit events**
+- Stream: `audit.failover_events`
+- Dashboard panel: “Automation Decisions (with evidence)”
+
+## Common procedures
+
+### 1) Check current status (mode, health, last action)
+1. Run:
+   - `failoverctl status --env prod`
+2. Confirm:
+   - `mode` (disabled/dry-run/execute)
+   - `config_version`
+   - `signal_ingestion_ok` (region-health-service + probes)
+   - `last_decision_at` within last 60s
+   - `last_action` details (route/tenant/region/from->to)
+3. If controller loop appears stalled, jump to Troubleshooting ("Controller not making decisions").
+
+### 2) Enable dry-run (recommended first step)
+Use dry-run to validate that decisions match expectation without changing traffic.
+
+Pre-checks:
+- Confirm on-call lead and comms channel are established (incident channel or #eng-sre).
+- Verify dashboards have the required panels and annotations enabled.
+
+Steps:
+1. `failoverctl set-mode --env prod --mode dry-run --reason "Validate signal pipeline after alert"`
+2. Watch for:
+   - DRY_RUN audit events
+   - incident-bot summaries posted (should say DRY_RUN)
+3. Validate recommendations against current known symptoms.
+
+Exit criteria:
+- Recommendations are stable (no oscillation), evidence includes expected signals.
+
+### 3) Enable execute mode with approvals (production)
+This is the default for early production rollout and game days.
+
+Pre-checks (go/no-go):
+- Destination region headroom >= **25%** for relevant GPU pools (Hosted) and Dedicated pools per capacity plan.
+- API gateway circuit breakers are at failover-safe settings (timeouts/retry budgets) for the route.
+- Synthetic reachability probes are green for target region.
+- SRE on-call agrees to proceed; rollback authority assigned.
+
+Steps:
+1. `failoverctl set-mode --env prod --mode execute-with-approvals --reason "Enable guarded automation"`
+2. Confirm approval provider:
+   - `failoverctl approvals status --env prod`
+3. Confirm per-tenant safety limits are active:
+   - `failoverctl safety-limits get --env prod`
+
+What happens next:
+- Controller will emit a recommendation with an approval window (default **10 minutes**).
+- Approval is required per action (route/tenant pair).
+
+### 4) Approve a recommended action
+Use this when the controller proposes a flip and you have validated symptoms.
+
+Steps:
+1. Inspect evidence:
+   - `failoverctl recommendations list --env prod --since 30m`
+   - `failoverctl recommendation show --env prod --id <REC_ID>`
+2. Confirm evidence aligns with ADR-042 priority order (e.g., reachability or corroborated 5xx burn).
+3. Confirm destination region capacity and error budget risk.
+4. Approve:
+   - `failoverctl approve --env prod --id <REC_ID> --reason "Confirmed us-east reachability failures; shift to eu-west"`
+5. Monitor execution:
+   - `failoverctl actions tail --env prod --route <ROUTE> --duration 15m`
+
+### 5) Disable execution immediately (emergency stop)
+Use if:
+- False positives are causing unsafe flips
+- Controller is flapping
+- You suspect a bad config rollout
+
+Preferred: freeze execution but keep signal evaluation.
+1. `failoverctl set-mode --env prod --mode dry-run --reason "Emergency stop: prevent automated flips"`
+
+If CLI/control plane is degraded:
+1. `kubectl -n routing-system scale deploy/failover-controller --replicas=0`
+2. Pin routing policies manually (Routing On-call) until stable.
+
+Post-step:
+- Announce in incident channel that automation execution is disabled and why.
+
+### 6) Rollback an action (revert routing policy)
+Rollback policy is governed by ADR-043. Rollback can be automated (after stability) or manual.
+
+Manual rollback is appropriate when:
+- Failover caused overload in target region
+- Root cause is not region-wide (service-only)
+- Customer tier constraints require restoration
+
+Steps:
+1. Identify the action:
+   - `failoverctl actions list --env prod --route <ROUTE> --since 2h`
+2. Verify anti-flap timers:
+   - `failoverctl anti-flap status --env prod --route <ROUTE>`
+3. Prepare rollback with a controlled ramp (recommended):
+   - 10% -> 25% -> 50% -> 100% over 10–20 minutes (depending on SLO burn)
+4. Execute rollback:
+   - `failoverctl rollback --env prod --action-id <ACTION_ID> --strategy ramp --reason "Target region saturation; restore primary"`
+5. Monitor:
+   - 5xx rate, p99 latency, queue depth, capacity headroom, retry-after rates
+
+### 7) Dedicated pool drain coordination (when failover impacts Dedicated)
+Dedicated failover must coordinate with drain/evacuation to protect reserved workloads.
+
+Steps:
+1. Confirm Dedicated customer(s) and pools affected:
+   - `failoverctl dedicated impacted --env prod --region <REGION>`
+2. Start drain workflow (do not hard-cut without approval):
+   - `failoverctl dedicated drain start --env prod --pool <POOL_ID> --reason "Regional impairment"`
+3. Track progress metrics:
+   - `failoverctl dedicated drain status --env prod --pool <POOL_ID>`
+4. Only after drain gates are satisfied, approve/execute routing shift.
+
+## Validation checklist (after enabling or after an action)
+Within 5–15 minutes, confirm:
+- Error rate returns to baseline; no sustained elevated 5xx
+- p95/p99 latency stabilizes within SLO thresholds
+- No surge in retries or reconnects (especially streaming)
+- Target region capacity headroom remains >= 15–25%
+- Audit events are being emitted and linked to the incident timeline
+- Customer-visible comms are aligned (status page / support macros if needed)
+
+## Troubleshooting
+
+### A) Controller not making decisions (status shows stale last_decision_at)
+Symptoms:
+- `last_decision_at` older than 2–3 minutes
+- No new recommendation metrics
+
+Checks:
+1. Pod health:
+   - `kubectl -n routing-system get pods -l app=failover-controller`
+2. Logs:
+   - `kubectl -n routing-system logs deploy/failover-controller --since=15m`
+3. Confirm region-health-service availability and latency.
+4. Confirm perf-canary probe ingestion is current.
+
+Fixes:
+- If crash looping due to missing signal stream, switch to dry-run and apply hotfix configuration (missing-signal tolerant), then restart.
+- If downstream control plane is degraded, keep controller in dry-run to avoid compounding issues.
+
+Escalate:
+- Ethan Park (control plane) if routing API is failing
+- Allison Grant if telemetry ingestion appears delayed or missing
+
+### B) Recommendations look wrong (false positives)
+Common causes:
+- Tail-latency spikes due to client retry storms rather than region impairment
+- Partial control plane degradation misclassified as region reachability
+- Metric label cardinality or aggregation issues causing incorrect burn calculations
+
+Actions:
+1. Verify signal evidence bundle:
+   - Does the recommendation cite at least two corroborating sources?
+2. Compare reachability probes vs. internal service metrics.
+3. Increase dampening temporarily (with SRE approval) and keep execution disabled.
+4. File a follow-up issue with examples (REC_IDs) and links to dashboards.
+
+### C) Flapping / oscillation between regions
+Immediate response:
+1. Disable execution:
+   - `failoverctl set-mode --env prod --mode dry-run --reason "Automation flapping"`
+2. Freeze routing policies at the current safest state.
+
+Diagnosis:
+- Check hold-down timer settings and whether emergency override is being triggered.
+- Look for correlated signal volatility (reachability intermittent, capacity borderline).
+
+Fixes:
+- Increase hold-down timer; adjust corroboration logic per ADR-042.
+- Adjust capacity thresholds; ensure target region has enough headroom before allowing flips.
+
+### D) Approvals not working (cannot approve or approvals timing out)
+Checks:
+- `failoverctl approvals status --env prod`
+- Confirm you are in the correct on-call group.
+- Confirm incident-bot / approval provider is reachable.
+
+Fallback:
+- Temporarily switch to manual routing change (Routing On-call) while leaving controller in dry-run for evidence.
+
+### E) Failover executed but customer still errors (no improvement)
+Possible causes:
+- Client DNS caching / TTL behavior delaying traffic shift
+- Gateway retry budgets amplifying overload
+- Streaming clients not handling redirect/reconnect correctly
+
+Actions:
+1. Verify actual traffic distribution by region (not just policy state).
+2. Check DNS TTL/anycast notes and whether expected shift time matches reality.
+3. Confirm gateway circuit breakers and retry-after behavior are active.
+4. If streaming-specific: correlate disconnects with redirect events.
+
+## Audit and documentation requirements
+For any production execution (including game days):
+- Ensure a reason is attached to mode changes, approvals, and rollbacks.
+- Link REC_ID/ACTION_ID in the incident timeline.
+- Confirm audit log retention meets enterprise expectations for affected tiers.
+- Add a short summary in the incident channel and (if needed) a support note.
+
+## Game day / controlled failover notes (operator-specific)
+During controlled tests:
+- Default posture: **execute-with-approvals**.
+- Limit blast radius to approved tenants/routes/models.
+- Use staged ramps (traffic weights) unless the scenario explicitly tests hard cut.
+- Pre-write rollback commands and confirm authority.
+
+## Post-incident / post-test tasks
+1. Return mode to the intended steady state (usually dry-run or execute-with-approvals depending on rollout stage).
+2. Verify alert tuning: ensure no excess paging noise.
+3. Create follow-up tasks for:
+   - Signal quality gaps
+   - Dashboard/annotation gaps
+   - Anti-flap/rollback tuning
+   - Runbook edits based on operator confusion
+
+## Appendix: Suggested commands
+- Status:
+  - `failoverctl status --env prod`
+- Mode changes:
+  - `failoverctl set-mode --env prod --mode dry-run --reason "..."`
+  - `failoverctl set-mode --env prod --mode execute-with-approvals --reason "..."`
+- Recommendations:
+  - `failoverctl recommendations list --env prod --since 30m`
+  - `failoverctl recommendation show --env prod --id <REC_ID>`
+- Approvals:
+  - `failoverctl approve --env prod --id <REC_ID> --reason "..."`
+- Actions and rollback:
+  - `failoverctl actions list --env prod --since 2h`
+  - `failoverctl rollback --env prod --action-id <ACTION_ID> --strategy ramp --reason "..."`
+- Emergency stop:
+  - `kubectl -n routing-system scale deploy/failover-controller --replicas=0`
+
+## Changelog
+- 2026-02-12: Added approval failure fallback path; clarified anti-flap and ramp rollback guidance; added Dedicated drain coordination section.
+- 2026-01-20: Updated defaults to match ADR-043; added audit requirements and incident-bot expectations.
+- 2026-01-05: Initial version (dry-run + execute-with-approvals workflows).

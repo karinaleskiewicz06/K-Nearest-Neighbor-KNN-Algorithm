@@ -1,0 +1,181 @@
+SDK telemetry mismatch — canonical detection & fixes
+
+Summary
+=======
+
+This document describes the common telemetry-mismatch patterns we see between Redwood client SDKs and the Redwood serving/control plane, concrete detection heuristics, triage steps, canonical fixes (SDK and server-side), and recommended tests to prevent regressions. The audience is SDK engineers, developer-experience support, and oncall SREs.
+
+Why this matters
+------------------
+
+Telemetry fidelity is required for accurate cost attribution, latency breakdowns, and automatic routing decisions. Mismatches lead to:
+- Incorrect token counts in billing dashboards
+- Misattributed latency or error spikes that obscure root cause
+- Invalid sampling for analytics or A/B rollouts
+- Failed dependability checks in canary deployments
+
+Common symptom categories
+-------------------------
+
+1) Token count delta — SDK reports fewer/more tokens than server: typically caused by encoding differences, retry double-counting or missing streaming ack points.
+2) Event ordering drift — SDK emits events out of order (e.g., start->complete swapped) due to async middleware.
+3) Missing error codes — SDK surface layer catches and transforms internal codes to generic errors, stripping server codes used by routing.
+4) Sampling mismatch — SDK sampling config (telemetry.sample_rate) different from platform defaults causing uneven analytics coverage.
+
+Detection heuristics (quick checks)
+----------------------------------
+
+- Compare per-route token_count_sdk vs token_count_platform aggregated by 5m windows. Flag routes with absolute delta > 5% and > 1k tokens in window.
+- Alert when SDK-side success rate diverges from platform success rate by >2 percentage points for 10m.
+- Monitor event latency histogram skew: if client-observed p95 differs from server p95 by >50ms and correlation with 'retry' tag is >10%, inspect retry handling.
+
+Automated diagnostic queries (examples)
+---------------------------------------
+
+1) Token delta (SQL-ish pseudocode)
+
+SELECT route, window_start, SUM(token_count_sdk) AS sdk_tokens, SUM(token_count_server) AS server_tokens,
+  (SUM(token_count_server)-SUM(token_count_sdk))/NULLIF(SUM(token_count_server),0) AS relative_delta
+FROM telemetry_ingest.tokens
+WHERE window_start >= now() - interval '1 hour'
+GROUP BY route, window_start
+HAVING SUM(server_tokens) > 1000 AND ABS(relative_delta) > 0.05;
+
+2) Event ordering mismatches (log query)
+
+index=client-telemetry OR index=platform-telemetry |
+  transaction_id | sort timestamp | dedup transaction_id | where first.event != last.event
+
+Canonical root causes and fixes
+--------------------------------
+
+A. Encoding/Tokenizer mismatch
+- Root cause: SDK and server use different tokenizer versions or normalization rules (e.g., unicode normalization, pre-tokenization truncation).
+- Fix: Pin tokenizer version in SDK packages and ensure platform tokenizer metadata is available in model catalog.
+- SDK patch checklist:
+  1. Add tokenizer-version metadata to every request header: X-Redwood-Tokenizer: "tkn-v2025-11"
+  2. Expose a compatibility check API: redwood.sdk.compatibility.checkTokenizer(model, tokenizerVersion)
+  3. Add unit tests asserting token counts for a canonical prompt set (see tests/telemetry/token-compat-sets).
+- Server-side mitigation: When mismatch exceeds threshold, annotate request with token_estimate_source="client-est" and route to an investigational queue.
+
+B. Retry double-counting
+- Root cause: Retries increment telemetry counters both on the original request and on the retry path; duplicate transaction_id is not deduped.
+- Fix: Use idempotency key + platform-level dedup TTL.
+- SDK patch checklist:
+  1. Generate idempotency_key per logical request and attach header: Idempotency-Key: <uuid4>
+  2. Ensure retries reuse the same key; backoff middleware must not regenerate it.
+  3. Document the behavior: retries are counted once on platform if idempotency_key present and dedupe TTL=30s.
+- Server-side mitigation: Implement duplicate transaction detection using (idempotency_key, route, model) keys and de-duplicate metrics increments.
+
+C. Streaming vs. Final-event mismatch
+- Root cause: SDK emits a "response_complete" event when stream is closed locally, while platform waits for final server ack; missing streaming-ack messages cause underreporting.
+- Fix: Align client and server streaming lifecycle and add explicit ack messages.
+- SDK patch checklist:
+  1. Implement websocket-level "stream_ack" message after final chunk is processed.
+  2. Emit events in order: request.start -> chunk.* -> stream_ack -> request.complete.
+  3. Add tests that simulate partial disconnects and ensure stream_ack is retried.
+- Server-side mitigation: Accept client-side stream_ack as authoritative for final token count if signed by SDK key.
+
+D. Telemetry sanitization middleware swallowing server codes
+- Root cause: Middleware transforms platform error 503 -> SDKError("transient") and drops structured_code. Downstream systems rely on structured_code for routing.
+- Fix: Preserve structured_error_code and include a mapping in SDK error objects.
+- SDK patch checklist:
+  1. Extend Error class: StructuredError { message, structured_code, server_timestamp }
+  2. Surface structured_code in telemetry events as metadata.
+  3. Do not convert structured_code to free text.
+- Server-side mitigation: Add assertion tests in the CI that call each SDK and verify structured_code arrives unmodified.
+
+Operational runbook (high-level)
+--------------------------------
+
+When an alert fires for telemetry mismatch:
+1) Pager oncall receives alert and checks pre-baked diagnostic queries (Token delta, Event ordering).
+2) If delta localized to a specific SDK version -> open a bug in SDK repo and tag "telemetry-high"; escalate to SDK release lead.
+3) If delta global across SDK versions -> trace by model/region and check for server deployment or tokenizer change; open incident if >5% customers affected.
+4) Apply temporary mitigations: enable server-side token_estimate_source tagging, pause affected routing automations, and reduce sampling of analytics to avoid noise.
+5) After root cause fix, run golden prompt set and deploy compatibility test before closing the ticket.
+
+Detailed triage checklist (step-by-step)
+-----------------------------------------
+
+1. Collect IDs: transaction_id, request_id, sdk_version, model, route, region.
+2. Run token delta query for the transaction_id.
+3. Search logs for idempotency_key collisions.
+4. Reproduce locally with the same SDK version and tokenizer bundle.
+5. If streaming: run controlled disconnect test to see if stream_ack missing.
+6. If error codes missing: replay requests with debug-telemetry enabled and capture raw server response.
+7. Draft PR with minimal SDK change and smoke tests, request expedited review from reviewer list.
+
+Preventing regressions (tests and release gates)
+------------------------------------------------
+- Add a required pre-merge check in SDK repositories: "telemetry-integration-check" that runs the token-compat fixture (10 canonical prompts) and fails on >1% token count variance.
+- Platform CI must run an SDK compatibility matrix (current SDK stable + previous two versions) on every tokenizer or tokenization-related commit.
+- Add e2e canary that compares client-observed vs server-observed telemetry for a synthetic traffic profile every hour and opens a ticket on drift >2%.
+
+Snippets & examples
+-------------------
+
+1) Example: attaching headers in Python SDK
+
+```python
+from redwood import Client
+client = Client(api_key="REDACTED")
+resp = client.generate(
+  model="redwood-alpha-1",
+  prompt="Summarize the Q1 goals.",
+  headers={
+    "X-Redwood-Tokenizer": "tkn-v2025-11",
+    "Idempotency-Key": "6f5f0f6a-1b5c-4caa-b2aa-bb1f0e2d3f4a",
+  }
+)
+```
+
+2) Example server-side de-dup pseudocode (Go)
+
+```go
+func recordTelemetry(req TelemetryReq) {
+  key := fmt.Sprintf("%s:%s:%s", req.IdempotencyKey, req.Route, req.Model)
+  if cache.Exists(key) {
+    return // already counted
+  }
+  cache.Set(key, true, 30*time.Second)
+  metrics.Inc("tokens", req.TokenCount)
+}
+```
+
+Configuration table (recommended defaults)
+-----------------------------------------
+
+| Setting | SDK default | Platform default | Notes |
+|---|---:|---:|---|
+| telemetry.sample_rate | 0.05 | 0.05 | Ensure SDK default matches platform to avoid sampling mismatch |
+| telemetry.tokenizer_version_header | "X-Redwood-Tokenizer" | required | Set and assert at request time |
+| telemetry.idempotency_ttl_seconds | 30 | 30 | Deduplication window for token counting |
+| telemetry.stream_ack_enabled | true | true | Required for websocket/stream transports |
+
+Ownership & escalation
+-----------------------
+
+- Primary owner: Developer Experience (SDK team) — triage and release SDK patches.
+- Secondary owner: Eng Platform — server-side dedup and compatibility checks.
+- If customer-visible billing impact > $5k in 24h -> page finance-legal and account managers; start incident response.
+
+Communications templates
+------------------------
+
+Short customer notification (billing-impacting):
+"We detected a telemetry reporting discrepancy affecting X requests between SDK version Y and the platform during YYYY-MM-DD. We have deployed a mitigation and are rolling an SDK fix. We will provide a follow-up with corrected billing if required."
+
+Internal slack template to #dx-oncall:
+"ALERT: telemetry-drift route={route} sdk={sdk_version} delta={percent}% action=triage assigned={owner}"
+
+Appendix: canonical prompt set (for token compatibility tests)
+-----------------------------------------------------------
+- 10 prompts covering: JSON generation, long legal text, unicode normalization edge cases, heavily tokenized code, multi-lingual inputs (zh, es, ar), and streaming-chunked responses.
+- Stored at repo: redwood/telemetry/canonical-prompts/compat-2026.json
+
+Revision history
+----------------
+- 2026-02-10: Document created by Ava Chen.
+- 2026-02-20: Added server de-dup pseudocode and configuration table (reviewer: Diego Ramirez).
+- 2026-03-01: Added streaming ack guidance and updated triage thresholds (reviewer: Priya Nandakumar).

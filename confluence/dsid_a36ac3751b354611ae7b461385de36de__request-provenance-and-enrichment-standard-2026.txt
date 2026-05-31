@@ -1,0 +1,111 @@
+Request Provenance and Enrichment Standard
+
+Summary
+
+This standard defines how Redwood services must attach, propagate, and enrich request provenance signals for cross-service correlation, cost attribution, and model-inference lineage. The goal is a minimal, well-typed request envelope that every front-end, edge, router, and model-serving component can read and extend without breaking contracts.
+
+Goals
+- Enable deterministic traceability from API request -> routing decisions -> model variant -> billing record.
+- Keep per-request overhead small (<= 256 bytes added to request headers by default).
+- Make enrichment deterministic and idempotent (retries and hedging must not duplicate lineage).
+- Provide runtime hooks for late-binding enrichment (e.g., region, model-shard, quantization-profile).
+
+Scope
+- Applies to: Redwood public API gateway (redwood-api-gw), edge routing (edge-router), request-router, model-proxy, serving runtime (inference-agent), and billing-pipeline ingestion adapters.
+- Not in scope: internal background jobs that do not participate in request flows (they should follow a lighter provenance pattern described in Appendix B).
+
+High-level contract
+1) Request envelope: all external-facing requests MUST include an X-RW-Req header with a base64-encoded JSON envelope carrying: request_id, client_id (if provided), received_at (ISO8601), and trace_context (W3C traceparent).
+2) Each service MAY enrich the envelope by appending an `enrichments` array of keyed tuples. Each enrichment entry MUST contain: key, value, actor, ts, and idempotency_key. Example (decoded):
+
+{
+  "request_id": "rw-2b8f3f1a-...",
+  "client_id": "acct-12345",
+  "received_at": "2026-02-10T18:22:31.123Z",
+  "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+  "enrichments": [
+    {"key":"route_decision","value":"dedicated/us-west-2/pool-a","actor":"edge-router@v2.3","ts":"2026-02-10T18:22:31.200Z","idempotency_key":"edge-router:route:123"}
+  ]
+}
+
+Data model and types
+- request_id: string (UUID v4, prefixed rw-)
+- client_id: string | null (opaque account id)
+- received_at, ts: ISO8601 UTC
+- traceparent: follow W3C tracecontext
+- enrichments: list of objects with keys: key (string), value (string), actor (service@version), ts, idempotency_key (string)
+
+Design constraints and rationale
+- Size cap: services MUST cap total decoded envelope size to 8KB. Beyond that, services should attach a server-side pointer (enrichment_store_id) and stop inline enrichment.
+- Idempotency: every enrichment MUST include an idempotency_key; if a downstream service receives an enrichment with a key+idempotency_key it has already persisted, it must ignore duplicates.
+- Security: Do not include PII or secrets in enrichments. Sensitive attributes (e.g., customer prompt text) must be referenced by a secure pointer and only resolved in components with explicit access controls.
+- Backpressure: enrichment operations must be asynchronous where possible. Synchronous path enrichment is allowed only for essential routing decisions and must respect hard latency caps (see SLOs).
+
+Enrichment pipeline patterns
+- Inline enrichment: small, deterministic fields added synchronously (route_decision, shard_id, quant_profile). Use when <10ms added latency is guaranteed.
+- Deferred enrichment: non-critical fields (cost_estimate, model-version-heuristic) are populated by the enrichment service (enricher) asynchronously. A unique enrichment_store_id is returned and placed in the envelope.
+- Sidecar enrichment: inference-agent sidecar populates runtime fields (gpu_id, kernel_variant) prior to token emission and persists them to the enrichment store with idempotency_key = request_id + ":sidecar".
+
+Examples of enrichment keys (recommended canonical set)
+- route_decision: string (e.g., dedicated/us-west-2/pool-a)
+- pool_affinity: string (tenant bucket)
+- model_variant: string (e.g., redwood-7b-q4f32:2026-02-01)
+- quant_profile: string
+- runtime_kernel: string
+- cost_charge_window: string (billing bucket id)
+- ingest_pointer: string (enrichment_store_id)
+
+SLOs and thresholds (observable targets)
+- Enrichment success rate: 99.5% (measured as fraction of requests where either inline enrichment or enrichment_store_id is produced).
+- Inline enrichment latency contribution: p95 <= 8ms; p99 <= 20ms. If a service cannot meet this, switch to deferred enrichment.
+- Enrichment store write latency (for deferred writes): p95 <= 50ms, p99 <= 250ms.
+- Trace correlation coverage: 99% of requests with a traceparent header must be correlated end-to-end (front door -> billing adapter).
+- Cost attribution completeness: >=95% of billed inference events must have a model_variant enrichment or an enrichment_store_id that resolves to a model_variant.
+
+Runtime behavior and failure modes
+1. If enrichment store is unavailable: services must fall back to returning a lightweight enrichment_store_id placeholder of the form "degraded:<service>:<ts>" and emit a diagnostic metric enrichment.store.degraded with tags service=<name>.
+2. If adding inline enrichment would exceed size cap: attach an enrichment_store_id and emit enrichment.inline.size_exceeded.
+3. If idempotency conflict occurs: log at WARN and ignore the duplicate; do not surface a user-facing error.
+
+Operational playbook (runbook excerpt)
+- Symptom: enrichment.success_rate drops below 98%
+  1) Check enrichment-store cluster health (metrics: write_errors, write_latency).
+  2) Verify API gateway is still producing X-RW-Req headers (logs: missing_headers_count).
+  3) Validate consumers (billing-adapter) are reading enrichment pointers (consumer_lag).
+  4) If write_errors are high, scale enrichment-store write path and flip to degraded mode by toggling feature flag: feature.enrichment.fail_open=true
+
+Rollout plan and compatibility rules
+- Backwards compatibility: new enrichment keys can be added safely. Consumers MUST ignore unknown keys.
+- Hard contract change (e.g., removing traceparent): requires ADR and 3-stage rollout (canary, regional ramp, global).
+- Feature flags: introduce feature.enrichment.v2 for any change that alters envelope encoding. Default false; enable in canary region for 72 hours and monitor enrichment.success_rate and trace.correlation_coverage.
+
+Ownership and contact points
+- Standard owners: observability-infra (pager), serving-runtime (secondary), api-platform (integration).
+- On-call escalation: pager to observability-infra; for cross-service data mismatches escalate to the inference-data steward (email inference-data@redwood.ai).
+
+Appendix: CLI and JSON examples
+1) Decode X-RW-Req header (example):
+$ echo 'eyJyZXF1ZXN0X2lkIjoi...' | base64 --decode | jq
+
+2) Example: sidecar persistence call (HTTP):
+POST https://enrichment-store.internal/v1/persist
+Content-Type: application/json
+{
+  "id": "enr-20260210-0001",
+  "request_id": "rw-2b8f3f1a-...",
+  "payload": {"gpu_id":"gpu-71","kernel_variant":"kv-v3"},
+  "idempotency_key":"rw-2b8f3f1a:sidecar"
+}
+
+Appendix B: Lightweight internal-job pattern
+- Internal batch jobs should use a simplified provenance header X-RW-Job with job_id, owner_team, and run_ts. This lighter pattern avoids the full enrichment payload and is not intended for billing attribution.
+
+References and related pages
+- request-context-bridge-and-cross-stack-telemetry-contract-2025
+- model-telemetry-lifecycle-contract-and-ingestion-guidelines-2026
+- observability-sampling-stewardship-and-cost-aware-sli-playbook-2026
+
+Revision history
+- 2025-10-12: Drafted by Lena Park
+- 2025-11-08: Added idempotency guidance and sidecar pattern (reviewers: Omar Ruiz)
+- 2026-02-15: Finalized SLOs and rollout plan

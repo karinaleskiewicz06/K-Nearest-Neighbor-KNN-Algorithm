@@ -1,0 +1,170 @@
+Capacity split simulation playbook and operator cheat sheet
+
+Overview:
+
+This playbook defines a repeatable, low-risk process to run capacity-split simulations for Redwood’s multi-tenant inference platform and provides a compact operator cheat sheet for executing and remediating experiments. The goal is to validate: autoscaler behavior, tenant split performance, cross-region routing, and SLO preservation under controlled capacity fragmentation scenarios.
+
+Intended audience:
+- Platform operators
+- Capacity planners
+- Oncall engineers running live experiments
+- SREs validating degradation/runback strategies
+
+Goals:
+- Verify that the autoscaler and priority-tenant logic maintain p99 latency SLOs within budget when capacity is split across regions/pools.
+- Surface regressions in KV-prefix cache hit-rate, batching efficiency, and queue saturation.
+- Validate operator rollback and tenant merge procedures with <30m customer-impact window.
+
+Scope and safety:
+- This playbook targets non-production synthetic tenants and a select set of canary customers (explicit consent required).
+- All simulations must run in the designated simulation region (sim-1) or enabled staging accounts unless explicitly approved by Product Ops.
+- Abort window: Any sustained SLO burn >20% for >10m triggers immediate safe-stop (see abort procedure).
+
+Ownership:
+- Run owner: oncall platform operator (primary)
+- Validation owner: capacity-planning (secondary)
+- Stakeholder notifications: product infra, customer success (if canary customers involved)
+
+Pre-simulation checklist (must be green):
+- [ ] Simulation fleet health: all nodes in sim clusters show Ready and have thermal budget >= 20%.
+- [ ] Dashboards deployed: "Platform / Simulation / Capacity Split" and "Platform / Token Latency" visible to run owner.
+- [ ] Canary set defined: tenant IDs and cardinality verified in the simulation manifest.
+- [ ] Rollback runbook loaded to operator clipboard (commands below).
+- [ ] Incident channel created: #ops-simulations-<YYYYMMDD>-<run-id>.
+
+Configuration artifacts:
+- Simulation manifest (example):
+
+```yaml
+run_id: split-sim-20260203-01
+duration: 30m
+tenants: 1200
+profiles:
+  - name: small-embed
+    qps: 0.2
+    model: eco-embed-1
+  - name: chat-burst
+    qps: 1.0
+    model: rdx-chat-2
+split_policy:
+  - region_a: sim-1 (60% weight)
+  - region_b: sim-2 (40% weight)
+safeties:
+  abort_slo_burn_pct: 20
+  abort_window_minutes: 10
+```
+
+Simulation orchestration commands (platform-simctl):
+- Start: platform-simctl start --manifest=manifests/split-sim-20260203-01.yaml --dry-run=false --notes="operator:asha"
+- Pause: platform-simctl pause --run=split-sim-20260203-01
+- Resume: platform-simctl resume --run=split-sim-20260203-01
+- Force-stop (safe-stop): platform-simctl stop --run=split-sim-20260203-01 --graceful=true
+
+Operator quick-checks (first 5m):
+1) Verify request distribution: query the simulation summary endpoint: curl -s https://sim-control.internal/runs/split-sim-20260203-01/summary | jq
+2) Confirm p95/p99 token latency is within expected band: p95 < 120ms, p99 < 420ms (simulation tolerance).
+3) Spot-check kernel selection rates: dashboard tile "Kernel switch rate" should not exceed 8% per-minute.
+
+Primary simulation steps (detailed):
+1. Preflight (T-60m):
+   - Announce run in #ops-simulations and schedule a 60m monitoring window with key stakeholders.
+   - Snapshot autoscaler config and current pool allocations: kubectl -n platform get configmap autoscaler-config -o yaml > /tmp/autoscaler-config.pre.yaml
+   - Create snapshot of telemetry retention and sampling rates.
+2. Inject synthetic load (T+0):
+   - Start small cohort (10% of tenants) for 10m to validate routing and cache warmup.
+   - Expand to target cardinality incrementally (10% steps every 5m) until full load.
+3. Stabilize (mid-run):
+   - Observe batching efficiency and KV hit-rate. If KV hit-rate drops >15% from baseline for >8m: enable prefetch hint for affected prefixes (operator UI > Prefetch -> "enable-hints") or run prefetch script: platform-prefetchctl --cohort=split-sim-20260203-01 --enable
+4. De-escalation (T+duration - 10m):
+   - Stop new tenant injections and observe tail-latency recovery.
+5. Post-run snapshot:
+   - Export runtime metrics, tracing spans, and autoscaler decisions to the run archive.
+
+Failure scenarios, detection, and mitigations (condensed table):
+
+| Scenario | Detection signal | Immediate mitigation | Owner |
+|---------|------------------|----------------------|-------|
+| Autoscaler overshoot (throttled queues) | Queue length > 1500 reqs for 5m; token-burn spike | Pause simulator injection; reduce split weight to region_a by 20% | platform operator |
+| KV-prefix cache collapse | KV hit-rate drop >20% and burst of remote fetch traces | Enable per-prefix prefetch; temporarily increase cache retention by 2x | runtime team |
+| Model variant fallback storm | >3% of requests invoking fallback model per-minute | Force model pin for canary tenants to a stable variant, disable JIT kernel switching | serving-runtime |
+| Thermal throttle (GPU) | Node thermal alarms or >90% GPU thermally constrained | Shift tenants to alternate pools; initiate safe-stop if >2 nodes affected | infra ops |
+
+Observability and dashboards to watch:
+- Platform / Simulation / Capacity Split (aggregate request distribution, run status)
+- Platform / Token Latency (p50/p95/p99, per-tenant and per-profile breakdown)
+- Runtime / KV Cache (hit-rate, cold fetch rate, prefix-level metrics)
+- Autoscaler / Decisions (scale events, reasons, predicted vs actual)
+- Hardware / GPU Thermal (per-node temperature, throttling events)
+
+Alert thresholds (operator-facing):
+- sim-run:token-p99:fire when p99 > 500ms for >5m (critical)
+- sim-run:queue-length:warn when queue_length > 900 for >10m
+- sim-run:kv-hit-drop:warn when kv_hit_rate drops >15% from baseline for >8m
+- sim-run:autoscaler-oscillation:warn when >5 scale_up/scale_down cycles within 10m
+
+Abort (safe-stop) procedure (immediate steps):
+1) Run owner posts to #ops-simulations and calls the incident bridge.
+2) platform-simctl stop --run=<run_id> --graceful=true (stop new injections, let in-flight finish within 60s).
+3) If SLOs continue to burn after graceful stop, escalate to emergency rollback: platform-operator rollback-autoscaler --snapshot=/tmp/autoscaler-config.pre.yaml --force
+4) Reallocate traffic away from simulation region: routingctl set-weight sim-1=0 --reason="abort-<run_id>"
+
+Post-simulation analysis checklist:
+- Archive run artifacts: metrics, traces, simulation manifest, autoscaler logs. Location: s3://redwood-sim-archives/<run_id>
+- Run the regression detector: sim-analysis --run <run_id> --baseline <last-good-run> --report out/<run_id>-comparison.html
+- Fill the quick retro: root_cause, detection_time, mitigation_effectiveness, operator_notes.
+
+Retro template (to paste into a page):
+- Run ID: 
+- Run owner: 
+- Duration: 
+- Observed regressions (metrics + evidence): 
+- Primary cause (suspected): 
+- Mitigation taken: 
+- Time to mitigate: 
+- Post-mortem required: yes/no
+- Action items (owner + due date):
+
+Operator cheat sheet (commands and snippets):
+- Start simulation (full): platform-simctl start --manifest=manifests/split-sim.yaml --notes="operator:<you>"
+- Quick status: platform-simctl status --run=<run_id>
+- Snapshot autoscaler config: kubectl -n platform get cm autoscaler-config -o yaml > /tmp/autoscaler-config.pre.yaml
+- Increase cache retention (temporary): runtimectl cache set-retention --multiplier=2 --prefix=sim-
+- Safe-stop (fast): platform-simctl stop --run=<run_id> --graceful=false && routingctl set-weight sim-1=0
+
+Known pitfalls and mitigation heuristics:
+- Pitfall: starting full cardinality immediately leads to cold-cache thrash. Mitigation: ramp cohorts in 10% increments and validate KV hit-rate after each step.
+- Pitfall: autoscaler hysteresis hides slow regressions. Mitigation: enable debug verbosity on autoscaler for the run and collect predicted decision deltas.
+
+Metrics to export for post-analysis (minimum):
+- p50/p95/p99 token latency (per-profile)
+- token consumption per-tenant per-minute
+- KV cache hit-rate by prefix and by cohort
+- batching efficiency (tokens per batch, batches per-second)
+- autoscaler scale events (timestamped decisions)
+
+Change and rollout notes after a successful run:
+- If the experiment uncovers a safe improvement (e.g., prefetch hint reduces p99 by >10% without cost increase), create a change proposal and schedule a staged rollout using the canary flow in /confluence/eng-platform/how-tos/canary-orchestration-dsl-and-safe-rollback-playbook-2026.
+
+Appendix: Example simulation post-run command sequence
+- platform-simctl export --run=split-sim-20260203-01 --dest=s3://redwood-sim-archives/split-sim-20260203-01
+- sim-analysis --run split-sim-20260203-01 --baseline split-sim-20251201-01 --out reports/split-sim-20260203-01.html
+
+FAQ (short):
+Q: Can we run this against production tenant traffic?
+A: No. Production runs require an explicit enterprise signoff and use special traffic shadowing that mirrors live traffic but does not affect customer request paths. See eng-private-deployments/onprem-packaging for additional constraints.
+
+Q: How long should a standard simulation run?
+A: Typical runs are 30m to 90m depending on scope. Longer runs (>2h) are reserved for capacity regression windows and require escalated approvals.
+
+Related pages and references:
+- Platform autoscaler design doc: /confluence/eng-platform/systems-and-services/predictive-batching-routing-roadmap-2026 (for background heuristics)
+- Runbook: regional-capacity-thaw-freeze-and-conservation-runbook-2026 (for thaw/freeze safety)
+
+Contact and escalation:
+- Primary: oncall-platform@redwood (pager)
+- Capacity planning: capacity-planning@redwood
+- Runtime team pager: runtime-sre@redwood
+
+Version history:
+- 2025-11-12: Draft created by Asha Patel
+- 2026-02-03: Updated with platform-simctl v0.9 command additions and abort thresholds

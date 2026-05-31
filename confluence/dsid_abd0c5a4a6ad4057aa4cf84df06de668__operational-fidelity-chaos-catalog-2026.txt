@@ -1,0 +1,210 @@
+Operational Fidelity Chaos Catalog
+
+Overview
+
+Purpose: This catalog documents a set of reproducible, safety-gated chaos and fidelity experiments designed to test the serving runtime end-to-end across kernel scheduling, KV cache, batching, quantization transitions, and multi-tenant noise. The goal is to exercise realistic failure and stress modes to validate SLO-preservation strategies, fallback policies, and telemetry coverage before rollouts or public releases.
+
+Audience: SREs, runtime engineers, profiling team, release engineers, and test engineers running canaries or pre-prod certification.
+
+Scope and non-goals:
+- In scope: per-cluster and per-node experiments that interact with the runtime scheduler, kernel selection pipeline, KV cache, request router, and model-variant fallbacks.
+- Out of scope: customer-facing data exfiltration tests, controlled workload generation for feature validation (use separate workload harness).
+
+Safety gating and preconditions:
+1) Always run in a staging or certification environment that mirrors production topology (same shard counts, kernel versions, quantization profiles).
+2) Confirm backups: ability to revert model variant pins and routing policies within 2 minutes.
+3) Run with an experiment observer (SRE on-call) and an A/B traffic split, not on live customer traffic.
+4) Have monitoring playbooks and rollback commands in your terminal (see "Execution checklist").
+
+Execution checklist (pre-run):
+- Verify baseline SLO: 95th p99 latency targets and per-token cost metrics for this workload.
+- Ensure canary traffic stream is available (traffic mirror or synthetic generator).
+- Snapshot current route and model pins: `redwoodctl routes snapshot --out=/tmp/route-snapshot.json`.
+- Annotate the run in the experiment tracking sheet and create an incident stub for notes.
+
+Experiment catalog (high-level index):
+A. KV cache eviction cascade
+B. Kernel preemption storm
+C. Small-sequence microburst with back-to-back batching
+D. Quantization variant mismatch (rollout safety)
+E. NVLink/accelerator interconnect degradation simulation
+F. Scheduler plugin rejection and graceful degradation
+G. Multi-tenant noisy neighbor admission spike
+H. Model-variant fallback oscillation (oscillation detection)
+
+Experiment A: KV cache eviction cascade
+- Intent: Validate cold-start latency behavior, prefix warmup heuristics, and prefix cache prefetching under coordinated shard eviction.
+- Expected SLO impact: increased p95/p99 for affected session classes for up to 90s, throughput drop for long chat sessions.
+- Preconditions: Test cluster with at least 3 KVCACHE shards and warm prefix distribution.
+- Steps:
+  1) Mark two cache shards read-only (simulate eviction) using `admin-tool shard-evict --shard-id=shard-12 --drain-seconds=10`.
+  2) Generate a mixed workload: 60% long-context (>=2k tokens), 40% short responses. Use workload generator: `wrk-llm --profile=long-mix --rps=120`.
+  3) Observe metrics for `kvcache.kv_miss_rate`, `runtime.latency.p95`, and `request.kvcache_warmup_seconds`.
+  4) After 60s, reintroduce shards and validate warmup completion.
+- Success criteria:
+  - Warmup completes within configured warmup_timeout (default 180s) and miss rate converges to baseline.
+  - Runtime triggers transparent fallback to on-host memory-prefetch hints.
+- Mitigation / rollback:
+  - Run `admin-tool shard-reinstate --shard-id=shard-12` and scale burst warmers: `redwoodctl warmers scale --count=4`.
+- Ownership: runtime-cache@redwood.com
+
+Experiment B: Kernel preemption storm
+- Intent: Stress the scheduler and kernel handoff code path by injecting high-priority preempt events and force rapid kernel swaps to surface races.
+- Expected SLO impact: short-lived tail spikes, occasional RPC retries.
+- Preconditions: Kernel instrumentation enabled (tracing level = debug).
+- Steps:
+  1) Deploy a synthetic priority-stepped workload: alternating low/critical priority requests (pattern: 9 low, 1 critical) with `priority-storm-runner --pattern=9:1 --rps=200`.
+  2) Simulate preemption by toggling `scheduler.priority_preempt=true` via feature-flag for 2 minutes.
+  3) Capture kernel handoff traces: `trace-collector collect --span=kernel-handoff --duration=180s --out=/tmp/handoff-trace.pb`.
+  4) Run post-run trace analysis: `trace-analyzer analyze /tmp/handoff-trace.pb --rule=handoff-race-detect`.
+- Success criteria:
+  - No kernel-level panics; <0.5% of requests must require user-visible retry.
+  - Trace analysis should show no unbounded queue growth at the scheduler ingress.
+- Mitigation / rollback:
+  - Set `scheduler.priority_preempt=false`; drain in-flight kernels using `schedulerctl drain --grace=30s`.
+- Ownership: runtime-scheduler@redwood.com
+
+Experiment C: Small-sequence microburst with back-to-back batching
+- Intent: Validate batching heuristics for sequences under 32 tokens and the correctness of batch-splitting under small-window bursts.
+- Expected SLO impact: increased mean latency if batching window misfires; potential CPU pressure on batching daemon.
+- Preconditions: Batching debug logs enabled.
+- Steps:
+  1) Run synthetic microburst generator: `microburst-gen --seq-len=16 --burst-size=500 --interburst=5s --duration=10m` targeting a single shard.
+  2) Monitor `batcher.batch_size_histogram`, `batcher.batch_wait_time_ms`, and `runtime.cpu_usage`.
+  3) Toggle bloom-style adaptive batching policy: `policyctl set batching.adaptive=true --confidence=0.7` mid-run to observe behavior change.
+- Success criteria:
+  - Adaptive batching reduces average per-token CPU cost by at least 8% without increasing p95 latency > 10%.
+- Mitigation / rollback:
+  - Revert policy: `policyctl set batching.adaptive=false` and restore static window.
+- Ownership: runtime-batching@redwood.com
+
+Experiment D: Quantization variant mismatch (rollout safety)
+- Intent: Exercise the model-variant routing and fallback when a quantized variant produces degraded output or increased latency due to kernel mismatch.
+- Expected SLO impact: potential quality regression and latency change on <1% of requests if not detected.
+- Preconditions: Two model variants present: float32 baseline and int8 quantized candidate; route pins available.
+- Steps:
+  1) Pin 5% of canary traffic to quantized variant: `redwoodctl rollout set-variant --route=chat-main --variant=chat-quant-int8 --pct=5`.
+  2) Run quality check harness: `eval-harness run --promptset=regression-smoke --variants=both --retries=3`.
+  3) Watch `eval.quality.delta` and `runtime.latency.variant_delta_ms`.
+  4) If delta_quality < -0.03 or latency_delta > 30ms persist for 10 minutes, automatic rollback should engage.
+- Success criteria:
+  - Automatic rollback triggers within configured threshold, or quality delta remains within tolerance.
+- Mitigation / rollback:
+  - Manual rollback: `redwoodctl rollout set-variant --route=chat-main --variant=chat-float32 --pct=100` and open quantization regression ticket.
+- Ownership: runtime-quantization@redwood.com
+
+Experiment E: NVLink/accelerator interconnect degradation simulation
+- Intent: Surface runtime behavior when device interconnect bandwidth degrades (affects multi-GPU shards and cross-GPU KV transfers).
+- Expected SLO impact: increased p99 latency for cross-shard requests and potential queueing.
+- Preconditions: Multi-GPU shard topology in staging.
+- Steps:
+  1) Use the interconnect emulator to enforce a degraded bandwidth profile: `link-emulator --target=node-7 --bandwidth=40% --latency-ms=2 --duration=300`.
+  2) Run a cross-shard request generator that intentionally exercises KV transfers: `kv-replay --topology=multi-gpu --rps=80`.
+  3) Monitor `nvlink.utilization`, `runtime.cross_shard_latency.p99`, and `gpu.kernel_queue_depth`.
+- Success criteria:
+  - Runtime must surface helpful remediation suggestions in the console (e.g., promote to single-GPU for heavy cross-shard sessions).
+- Mitigation / rollback:
+  - Revert emulator: `link-emulator reset --target=node-7`.
+- Ownership: infra-accelerator@redwood.com
+
+Experiment F: Scheduler plugin rejection and graceful degradation
+- Intent: Validate that a faulty scheduler plugin does not cascade to runtime-wide failures; the system should degrade to conservative default scheduling and emit clear alerts.
+- Expected SLO impact: conservative throughput drop with preserved latency SLO for high-priority classes.
+- Preconditions: Plugin framework enabled with a test plugin.
+- Steps:
+  1) Deploy a bug-introduced plugin to the scheduler: `schedulerctl plugin deploy --name=flight-test-plugin --image=staging/flight-bug:canary`.
+  2) Trigger admission decisions that route through the plugin using `admit-stim --pattern=stress-low-high`.
+  3) Confirm alert: `ALERT: SchedulerPluginError` fires in 30s and fallback policy `scheduler.default.conservative` activates.
+- Success criteria:
+  - No unhandled panics; fallback policy restores predictable latency for priority classes.
+- Mitigation / rollback:
+  - Remove plugin: `schedulerctl plugin remove --name=flight-test-plugin` and restart admission controller.
+- Ownership: runtime-scheduler@redwood.com
+
+Experiment G: Multi-tenant noisy neighbor admission spike
+- Intent: Ensure tenant isolation and admission control preserve enterprise tenant SLAs when background noisy tenants spike.
+- Expected SLO impact: non-enterprise tenants should be throttled, enterprise SLAs preserved.
+- Preconditions: Multi-tenant admission policy with token bucket quotas configured.
+- Steps:
+  1) Increase background tenant RPS using `mt-loadgen --tenant=background-123 --rps=2000 --duration=15m`.
+  2) Watch `admission.throttle_rate`, `tenant.latency.enterprise.p95`, and `tenant.latency.background.p95`.
+  3) Validate `quota_rebalance` triggers and enterprise lanes are prioritized.
+- Success criteria:
+  - Enterprise tenant p95 remains within 10% of baseline while background gets throttled.
+- Mitigation / rollback:
+  - Manually throttle noisy tenant: `admissionctl set-quota --tenant=background-123 --rps=100`.
+- Ownership: runtime-admission@redwood.com
+
+Experiment H: Model-variant fallback oscillation (oscillation detection)
+- Intent: Detect oscillation when automatic fallback and re-rollout between variants happens repeatedly (feedback loop).
+- Expected SLO impact: transient flapping of quality and small latency variance; risk of increased rollback noise in release process.
+- Preconditions: Auto-fallback enabled with re-probing every 60s.
+- Steps:
+  1) Configure variant-prober: `prober set --route=translate --interval=60s --sensitivity=0.02`.
+  2) Introduce a synthetic output jitter in the quantized candidate to cause probes to flip decisions: `prober-jitter --variant=quant-cand --delta=0.025 --duration=10m`.
+  3) Observe `variant.probe_decision_rate`, `release.rollbacks`, and `eval.quality.time_series`.
+- Success criteria:
+  - Oscillation detector triggers and raises `OscillationSuppression` mode after 3 flips in 10 minutes.
+- Mitigation / rollback:
+  - Manually set `prober.suppress=true` and schedule an offline eval.
+- Ownership: runtime-varianting@redwood.com
+
+Telemetry and observability cookbook (select queries and dashboards)
+- Key metric names to watch:
+  - runtime.latency.p50/p95/p99
+  - batcher.batch_size_histogram
+  - kvcache.kv_miss_rate
+  - scheduler.priority_queue_depth
+  - admission.throttle_rate
+  - nvlink.utilization
+  - eval.quality.delta
+  - trace.errors.kernel_handoff
+
+- Example PromQL queries (adjust labels to your cluster):
+  - p95 latency: `histogram_quantile(0.95, sum(rate(runtime_request_duration_seconds_bucket[2m])) by (le,route))`
+  - kvcache miss rate: `sum(rate(kvcache_miss_total[1m])) / sum(rate(kvcache_lookup_total[1m]))`
+  - batch wait time 99th: `histogram_quantile(0.99, sum(rate(batcher_wait_seconds_bucket[5m])) by (le))`
+
+- Trace slices to capture on each experiment: kernel-handoff, batch-placer, kv-warmup, scheduler-decision, variant-prober. Ensure trace IDs are correlated with experiment-id tags.
+
+Experiment run report template (post-run)
+1) Experiment ID and operator(s)
+2) Environment and topology snapshot (kernel versions, quant profiles, shard map)
+3) Baseline metrics (5m prior) and observed deltas (p50/p95/p99, throughput, error-rate)
+4) Telemetry traces and attached trace IDs
+5) Success/failure with rationale and binary pass/fail of success criteria
+6) Actions taken and time to mitigation/rollback
+7) Open action items (tickets assigned)
+8) Learnings and suggested product/runtime changes
+
+Runbook snippets: rollback commands and hotfixes
+- Re-pin route to stable variant: `redwoodctl rollout set-variant --route=$ROUTE --variant=$STABLE --pct=100`
+- Disable experimental scheduler flag: `ffctl set scheduler.priority_preempt false`
+- Reinstate KVCACHE shard: `admin-tool shard-reinstate --shard-id=$SHARD`
+- Revert plugin deploy: `schedulerctl plugin remove --name=$PLUGIN`
+
+Safety, ethics, and customer impact notes:
+- Never run chaos experiments against production customer traffic without explicit approval from security and customer success.
+- If customer-impacting behavior is observed, notify CS and security immediately and trigger the incident process.
+
+Maintenance and cadence:
+- This catalog should be executed as part of the quarterly pre-release SLO certification and after major runtime kernel or scheduler changes.
+- Owners are responsible for refreshing the catalog when their component receives significant changes (kernel version upgrade, new quantization profile, admission logic change).
+
+Appendix: artifacts and sample payloads
+- Example JSON for variant pin (use safely in staging):
+  {
+    "route": "chat-main",
+    "variant": "chat-quant-int8",
+    "pct": 5
+  }
+- Workload generator profiles location: `git://redwood/internal/bench/profiles/microburst`
+- Contact list: runtime-scheduler@redwood.com, runtime-batching@redwood.com, runtime-quantization@redwood.com
+
+Related reading:
+- See the runtime canary blueprint and the scheduler observability contract for integration points.
+
+Document history:
+- 2026-02-11: Created by Priya Shah (draft)
+- 2026-02-20: Reviewed by Marco Ruiz, Anita Desai (in_review)
+- 2026-03-01: Published (minor edits to telemetry queries)

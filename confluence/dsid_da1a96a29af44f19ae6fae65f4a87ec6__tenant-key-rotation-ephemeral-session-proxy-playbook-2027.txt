@@ -1,0 +1,152 @@
+Tenant Key Rotation and Ephemeral Session Proxy Playbook
+
+Summary
+This playbook describes the recommended architecture, operator procedures, and validation checks for tenant key rotation in private (VPC / on-prem) deployments using Redwood's Ephemeral Session Proxy (ESP). The goal is to provide a low-friction, auditable process that: (1) rotates tenant encryption keys and wrapping keys with minimal impact to traffic, (2) issues short-lived session credentials for runtime components, and (3) preserves forensic evidence for compliance reviews.
+
+Scope
+- Applies to private deployments (VPC and on-prem) using customer-managed KMS or HSM integrations.
+- Covers rotation for: tenant-data encryption-at-rest keys, model-blob encryption keys, and service-to-service wrapping keys used by runtime proxies.
+- Does NOT replace customer-specific key custody policies (customers may require additional approvals).
+
+When to run this playbook
+- Scheduled rotation cadence (recommended): every 90 days for wrapping keys, every 180 days for tenant data keys.
+- Forced rotation: after key compromise, suspicious access detected, or regulatory requirement.
+
+Owner and Roles
+- Security (owner): maintains playbook, approves rotation windows, reviews audit evidence.
+- Customer Success / Field Engineering: coordinates customer notifications and assist during run.
+- Runtime / Operator team: executes the on-host commands, monitors latency and error rates.
+- Customer (if customer-managed KMS): approves key actions in their KMS/HSM.
+
+High-level Architecture
+- Ephemeral Session Proxy (ESP): issues short-lived tokens (TTL <= 15m) to runtime components to access model blobs and tenant data stores.
+- Key hierarchy: Customer Master Key (CMK) in KMS/HSM -> Wrapping Keys (rotatable by Redwood) -> Data Keys (DEKs) used to encrypt models and snapshots.
+- Rotation path: CMK (if customer rotates) -> rotate wrapping key -> rewrap DEKs -> re-encrypt any cached artifacts if required.
+
+Text diagram (logical flow)
+Customer KMS/HSM (CMK) --sign/unwrap--> Redwood Key Service --wrap/rotate--> Wrapping Key vN --used to encrypt--> DEK (model, tenant DB snapshot) --cached in--> Runtime KV / Artifact store
+
+Prerequisites
+- Operator has access to the deployment control plane and the operator CLI (redwoodctl).
+- KMS/HSM integration validated: key ARN/ID, IAM principals, and allowlist for Redwood service account.
+- Nightly snapshot and one successful restore in the last 30 days.
+- Monitoring baseline established: token issuance rate, per-request latency, 5xx error rate, and KV cache hit ratio.
+
+Safety windows and SLOs
+- Rotation should be scheduled during the agreed maintenance window (customer SLA dependent).
+- Target: no more than 1.5x baseline p95 latency and <0.5% new 5xx errors attributable to rotation. If either threshold is exceeded, abort and roll back.
+
+Key Rotation Procedure (operator runbook)
+Pre-rotation validation (run in staging or canary tenant first)
+1. Verify latest backups: confirm snapshot timestamp and checksum (operator CLI):
+   redwoodctl snapshot list --tenant <TENANT_ID> --last 3
+2. Validate KMS access and policy by performing a test encrypt/decrypt with current credentials:
+   aws kms encrypt --key-id <CMK> --plaintext test-string | aws kms decrypt --ciphertext-blob fileb://-
+3. Ensure all runtime nodes report healthy in the runtime dashboard and token-issuing rate within 10% of baseline.
+
+Create a rotation plan and ticket
+1. Open rotation ticket with the following fields: tenant, rotation type (wrapping|data|full), maintenance window, rollback criteria, and contact list.
+2. Notify customer contacts (if applicable) and oncall with an expected timeline.
+
+Rotation steps (safe path)
+1. Create new wrapping key (WrKey vN+1) in the KMS/HSM or request Redwood-managed wrap key. Record new key id (WR_KEY_ID).
+2. In a canary tenant: rewrap DEKs using WrKey vN+1 (non-destructive):
+   - For each DEK: fetch encrypted_DEK_vN -> call KMS rewrap operation -> store encrypted_DEK_vN+1 as pending.
+   Example (pseudocode):
+   for dek in list_deks(tenant):
+     dek_plain = kms.unwrap(encrypted_dek_vN, WRAP_KEY_ID=vN)
+     encrypted_dek_vNplus1 = kms.wrap(dek_plain, WR_KEY_ID=vNplus1)
+     store_pending_rewrap(dek_id, encrypted_dek_vNplus1)
+3. Update ESP to read pending rewrapped DEKs (ESP supports atomic dual-key read mode).
+4. Promote pending DEKs to active one-by-one and validate service operations:
+   - Warm caches and run synthetic inference/embedding traffic at 10% of normal load.
+   - Observe latency/error SLOs for 15 minutes.
+5. If canary is successful, roll forward to remaining tenants in parallel groups of N (N depends on operator capacity).
+
+Full rotation (when DEK re-encryption required)
+- For very sensitive key changes or algorithm changes requiring full re-encryption: stage data re-encryption to an offline node or a rolling background job that re-encrypts blobs while leaving read path intact using dual-key strategy. See "Re-encryption background job" section below.
+
+Re-encryption background job (recommendations)
+- Job runs at low priority and honors the runtime backpressure API.
+- Maintain a checkpoint table: blob_id -> last_reencrypted_at -> status.
+- Throttle concurrent re-encryption workers to keep p95 latency < 1.5x baseline.
+
+Rollback plan
+- Abort promotion and revert ESP to read WrKey vN only.
+- Re-point runtime processes to encrypted_DEK_vN copies (prior active).
+- If datastore corruption is suspected, restore the most recent validated snapshot and reapply the key state.
+
+Validation checks and evidence to collect
+- Key operations log (KMS audit): create, rewrap, decrypt/unwrap calls during rotation window.
+- ESP issuance events: token_id, issued_at, ttl, subject (service/host).
+- Runtime error traces filtered by operation type that occurred within rotation window.
+- Snapshot of DEK metadata (hashes) pre and post rotation for tamper evidence.
+
+Operational telemetry (what to monitor)
+- Token issuance rate and failure rate (metric: esp.token.issue_count, esp.token.fail_count)
+- KMS error rate (kms.api.errors) and latency (kms.api.p95)
+- Runtime 5xxs and p95 latency per tenant
+- Re-encryption worker throughput and backlog length
+
+Commands and examples
+- Create a new wrapping key (example for AWS KMS):
+  aws kms create-key --description "Redwood tenant wrapping key" --tags TagKey=tenant,TagValue=<TENANT_ID>
+  aws kms create-alias --target-key-id <KEY_ID> --alias-name alias/redwood/wrap/<TENANT_ID>/v2
+
+- Sample rewrap (pseudocode using redwoodctl):
+  redwoodctl keys rewrap --tenant <TENANT_ID> --from-key alias/redwood/wrap/<TENANT_ID>/v1 --to-key alias/redwood/wrap/<TENANT_ID>/v2 --dry-run
+
+Post-rotation verification (15–60 minutes after promotion)
+1. Run synthetic traffic against primary tenant endpoints and validate correct responses with golden prompt set.
+2. Confirm no increase in token-related failures: esp.token.fail_count delta < 0.25% absolute.
+3. Confirm KMS 5xxs returned to baseline and that total KMS calls are within expected inflation factor (<=1.1x).
+4. Archive rotation evidence: KMS logs, ESP token issuance snapshot, operator runbook steps in ticketing system.
+
+Ephemeral Session Proxy (ESP) details
+- ESP issues short-lived JWTs signed with an internal service key and includes key-version metadata (wrap_ver) so the runtime can request the correct DEK variant.
+- Token TTL default: 900s (15m), maximum 1800s if customer approves.
+- ESP supports a dual-key read mode where it returns both DEK variants under a single fetch API (used during atomic promotion).
+
+Security considerations and hardening
+- Ensure ESP service account has least privilege in KMS: only ReEncrypt/Decrypt/Wrap operations for the allowed keys.
+- Use HSM-backed CMKs for customers with FIPS/PCI requirements.
+- Rotate internal signing keys for ESP on a separate cadence (recommended 180 days).
+- Enforce operator two-person approval for production wrap key creation when tenant sensitivity level is "high".
+
+Audit & compliance artifacts
+- Rotation ticket with timestamps and operator signatures.
+- Exported KMS audit logs for the rotation window.
+- Checksum manifest of DEK metadata before and after rotation.
+
+Edge cases and troubleshooting
+- If rewrap calls start failing with throttling (ThrottlingException): backoff and retry with jitter, and reduce parallelism.
+- If runtime nodes begin failing to fetch DEKs after promotion: revert ESP to vN-only reads and escalate to oncall.
+- If partial promotion leaves mixed key states across replicas: run recovery script to re-sync DEK pointer map from the authoritative metadata store.
+
+Dry-run and canary recommendations
+- Always run --dry-run for the rewrap operation to collect the list of affected DEKs and approximate runtime impact.
+- Canary plan: select a low-traffic tenant with similar artifact volume and run full rotation. Document differences in performance.
+
+Operator checklists (short)
+- Pre-check: backups verified, KMS test pass, monitoring baseline captured.
+- Canary: rewrap pending -> enable dual-key reads -> promote -> validate.
+- Bulk: group rollouts, promote, validate, archive evidence.
+
+Related runbooks and links
+- Third-party KMS/HSM integration requirements (internal): /confluence/eng-private-deployments/customer-requirements-library/thirdparty-kms-hsm-integration-requirements-2026
+- Airgapped KMS rotation playbook: /confluence/eng-private-deployments/onprem-packaging/airgapped-kms-hsm-offline-rotation-and-cert-renewal-playbook-2026
+
+Appendix A — JSON example: pending rewrap manifest
+{ "tenant_id": "tenant-123", "deks": [ {"id": "dek-01", "active_wrap": "v1", "pending_wrap": "v2", "blob_count": "42"}, {"id": "dek-02", "active_wrap": "v1", "pending_wrap": "v2", "blob_count": "7"} ], "created_at": "2026-02-20T01:23:45Z", "operator": "aisha.mensah@redwood.ai" }
+
+Appendix B — Safe automation knobs (operators should expose these flags)
+- --max-parallel-rewrap=N (default 4)
+- --worker-backoff-ms=2000
+- --dry-run (no writes, produce manifest)
+- --throttle-to-restore-baseline (true|false)
+
+Revision history
+- 2025-10-03: initial draft by Aisha Mensah
+- 2026-02-25: updated canary guidance and added dual-key promotion strategy (reviewed by Mateo Ruiz)
+
+End of document

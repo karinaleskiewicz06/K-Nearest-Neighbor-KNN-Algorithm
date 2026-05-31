@@ -1,0 +1,365 @@
+Runbook: Restore Kubernetes Cluster from etcd Snapshot
+
+## Purpose
+This runbook describes how to perform a **cluster-level recovery** by restoring the Kubernetes control plane’s **etcd** datastore from an **etcd snapshot**.
+
+This procedure is **high impact**: it rewinds the entire Kubernetes API state (including built-in resources and CRDs) to the point-in-time of the snapshot. Use this only when application-level restore is not feasible.
+
+**Primary audience:** Infrastructure on-call / Private Deployments SREs supporting Redwood Private (VPC/on-prem).
+
+---
+
+## When to use this vs. application-level restoration
+### Prefer application/control-plane restore (Redwood runbooks) when:
+- Redwood control-plane services are unhealthy but **Kubernetes itself is intact**.
+- You need to restore **Redwood configuration state** (tenants, routing policies, release configs) without rolling back unrelated cluster state.
+- Only Redwood components are affected (e.g., bad migration, corrupted app DB, misconfiguration).
+
+See: **eng-private-deployments/day-2-ops/runbook-control-plane-restore**.
+
+### Use etcd restore when:
+- Kubernetes API state is corrupted (e.g., accidental deletion of critical namespaces/resources, broken admission config, catastrophic control plane change).
+- You cannot reliably access/operate the cluster through `kubectl` due to API errors attributable to etcd state.
+- A failed automation or operator action caused widespread deletion/modification of cluster objects.
+
+### Do NOT use etcd restore for:
+- Data-plane issues (model serving pods, node pool issues, GPU driver issues).
+- Restoring application data in external datastores (Postgres, object storage, etc.).
+- “We need rollback” scenarios where GitOps/Helm can reapply desired state.
+
+---
+
+## Impact and caveats (read before proceeding)
+- **RPO:** You lose all Kubernetes state changes after the snapshot timestamp.
+- **RTO:** Typically 30–120 minutes depending on HA topology and post-restore reconciliation.
+- **Drift:** Nodes, PVs, and cloud resources may not match the restored API state. You must reconcile after restore.
+- **CRDs and operators:** Restoring an older state can break operators that have since been upgraded.
+- **Secrets:** Kubernetes Secrets stored in etcd revert to snapshot version. If your environment uses external secrets injection, ensure controllers reconcile correctly.
+- **Certificates:** Cluster certs are usually file-based (not in etcd) and won’t roll back. Time skew or cert rotations can cause surprises.
+- **Managed Kubernetes:** This runbook assumes you control etcd (common for on-prem / kubeadm-based control planes). For EKS/GKE/AKS etc., you generally cannot restore etcd directly; use provider DR mechanisms.
+
+**Hard stop:** If you suspect compromise or malicious tampering, involve Security (Marcus Lin / Hanae Suzuki) before restoring. Snapshot restore can destroy forensic evidence.
+
+---
+
+## Preconditions / requirements
+1. **Confirmed snapshot source**
+   - Snapshot file path and timestamp.
+   - Snapshot corresponds to the target control plane cluster.
+   - Snapshot encryption/handling meets customer requirements.
+
+2. **Maintenance window + comms**
+   - Announce outage to stakeholders (SRE lead / Private Deployments).
+   - For customer environments: follow customer incident comms plan.
+
+3. **Console access** to at least one control plane node
+   - SSH / iLO / IPMI / serial console for on-prem.
+
+4. **Correct etcd version**
+   - `etcdctl snapshot restore` is sensitive to etcd major/minor versions.
+   - Use the same etcd version that produced the snapshot when possible.
+
+5. **Backup current state** (even if broken)
+   - Take a fresh snapshot of current etcd (if possible) before restoring.
+   - Archive `/etc/kubernetes/manifests` and etcd data dir.
+
+---
+
+## Identify topology (choose the correct path)
+This runbook covers the common self-managed patterns:
+
+A) **Stacked etcd (kubeadm static pod)**
+- etcd runs as a static pod on each control plane node.
+- Manifest typically at `/etc/kubernetes/manifests/etcd.yaml`.
+
+B) **External etcd cluster (systemd-managed)**
+- etcd runs as a systemd service on dedicated nodes.
+- Data dir commonly `/var/lib/etcd`.
+
+If you are unsure, check on a control plane node:
+- `ls -l /etc/kubernetes/manifests/etcd.yaml` (exists => stacked etcd)
+- `systemctl status etcd` (active => likely external etcd)
+
+---
+
+## Safety checks (before making changes)
+### 1) Confirm the snapshot is valid
+On a node with `etcdctl` available (or in an etcd tools container):
+
+```bash
+export ETCDCTL_API=3
+etcdctl snapshot status /path/to/snapshot.db -w table
+```
+
+Expected: snapshot metadata prints without error.
+
+### 2) Confirm disk space
+Restoring will write a new data directory (often comparable to snapshot size):
+
+```bash
+df -h
+```
+
+### 3) Capture current config
+Record (copy/paste into incident doc):
+- `hostname`
+- etcd member list (if available)
+- etcd endpoints
+- data dir location
+- peer/client URLs
+
+If etcd is healthy enough:
+
+```bash
+export ETCDCTL_API=3
+etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt \
+  --key=/etc/kubernetes/pki/etcd/healthcheck-client.key \
+  endpoint health
+```
+
+---
+
+## Procedure A: Stacked etcd (kubeadm static pod)
+> Goal: Stop the control plane components, restore etcd data, restart components.
+
+### Step A1 — Stop static pods (on the control plane node you are restoring)
+Kubelet will recreate static pods when the manifest exists. To stop them, temporarily move manifests out of the watched directory.
+
+```bash
+sudo mkdir -p /var/tmp/k8s-manifests-backup-$(date +%F-%H%M)
+sudo cp -a /etc/kubernetes/manifests/* /var/tmp/k8s-manifests-backup-$(date +%F-%H%M)/
+
+# Stop etcd and API server first (prevents writes during restore)
+sudo mv /etc/kubernetes/manifests/etcd.yaml /var/tmp/k8s-manifests-backup-$(date +%F-%H%M)/
+sudo mv /etc/kubernetes/manifests/kube-apiserver.yaml /var/tmp/k8s-manifests-backup-$(date +%F-%H%M)/
+
+# Optionally stop controller-manager and scheduler to avoid thrash
+sudo mv /etc/kubernetes/manifests/kube-controller-manager.yaml /var/tmp/k8s-manifests-backup-$(date +%F-%H%M)/
+sudo mv /etc/kubernetes/manifests/kube-scheduler.yaml /var/tmp/k8s-manifests-backup-$(date +%F-%H%M)/
+```
+
+Wait for pods to terminate:
+
+```bash
+sudo crictl ps | egrep 'etcd|kube-apiserver|kube-controller-manager|kube-scheduler' || true
+```
+
+### Step A2 — Locate etcd data dir
+For kubeadm stacked etcd, the data dir is typically `/var/lib/etcd`. Confirm from the saved manifest backup:
+
+```bash
+sudo grep -n "--data-dir" /var/tmp/k8s-manifests-backup-*/etcd.yaml
+```
+
+### Step A3 — Backup existing data dir
+
+```bash
+sudo mv /var/lib/etcd /var/lib/etcd.bak.$(date +%F-%H%M)
+sudo mkdir -p /var/lib/etcd
+sudo chown -R root:root /var/lib/etcd
+sudo chmod 700 /var/lib/etcd
+```
+
+### Step A4 — Restore snapshot into a new data dir
+Run restore on the node that will host the initial member.
+
+```bash
+export ETCDCTL_API=3
+
+# Restore writes a new member data dir.
+# Note: choose a new token to avoid accidental join with old cluster.
+etcdctl snapshot restore /path/to/snapshot.db \
+  --name=$(hostname -s) \
+  --data-dir=/var/lib/etcd \
+  --initial-cluster=$(hostname -s)=https://127.0.0.1:2380 \
+  --initial-advertise-peer-urls=https://127.0.0.1:2380 \
+  --initial-cluster-token=etcd-restore-$(date +%F)
+```
+
+**Important:** The peer URL and initial cluster values above are examples. They must match your environment’s expected peer URLs. If your etcd peer URL is not localhost, use the node’s peer address.
+
+### Step A5 — Put manifests back and restart control plane
+Return manifests in the correct order.
+
+```bash
+# Start etcd first
+sudo mv /var/tmp/k8s-manifests-backup-*/etcd.yaml /etc/kubernetes/manifests/
+
+# Wait until etcd is listening (you can tail kubelet logs if needed)
+# Then start API server
+sudo mv /var/tmp/k8s-manifests-backup-*/kube-apiserver.yaml /etc/kubernetes/manifests/
+
+# Finally controller-manager and scheduler
+sudo mv /var/tmp/k8s-manifests-backup-*/kube-controller-manager.yaml /etc/kubernetes/manifests/
+sudo mv /var/tmp/k8s-manifests-backup-*/kube-scheduler.yaml /etc/kubernetes/manifests/
+```
+
+### Step A6 — Validate etcd and API
+On the control plane node:
+
+```bash
+export ETCDCTL_API=3
+etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt \
+  --key=/etc/kubernetes/pki/etcd/healthcheck-client.key \
+  endpoint health
+```
+
+Then validate Kubernetes API:
+
+```bash
+kubectl get nodes
+kubectl get pods -A | head
+```
+
+If `kubectl` is not available on-node, use `/etc/kubernetes/admin.conf`:
+
+```bash
+export KUBECONFIG=/etc/kubernetes/admin.conf
+kubectl get --raw='/readyz?verbose'
+```
+
+---
+
+## Procedure B: External etcd cluster (systemd-managed)
+> Goal: Stop etcd on all members, restore snapshot to one member, then re-form the cluster.
+
+**Note:** HA etcd restores are sensitive. In many cases the safest approach is:
+1) restore a single member from snapshot,
+2) bring it up as the initial cluster,
+3) add additional members back.
+
+### Step B1 — Stop Kubernetes control plane writes
+Stop API servers (or place the cluster in a hard maintenance mode) to prevent ongoing writes during etcd downtime.
+
+### Step B2 — Stop etcd on all members
+
+```bash
+sudo systemctl stop etcd
+sudo systemctl status etcd --no-pager
+```
+
+### Step B3 — Backup current etcd data dir
+
+```bash
+sudo mv /var/lib/etcd /var/lib/etcd.bak.$(date +%F-%H%M)
+sudo mkdir -p /var/lib/etcd
+sudo chmod 700 /var/lib/etcd
+```
+
+### Step B4 — Restore snapshot
+
+```bash
+export ETCDCTL_API=3
+
+etcdctl snapshot restore /path/to/snapshot.db \
+  --name=<member-name> \
+  --data-dir=/var/lib/etcd \
+  --initial-cluster=<member-name>=https://<peer-ip>:2380 \
+  --initial-advertise-peer-urls=https://<peer-ip>:2380 \
+  --initial-cluster-token=etcd-restore-$(date +%F)
+```
+
+### Step B5 — Start the restored member
+
+```bash
+sudo systemctl start etcd
+sudo systemctl status etcd --no-pager
+```
+
+Validate endpoint health using your cluster cert paths:
+
+```bash
+export ETCDCTL_API=3
+etcdctl --endpoints=https://<client-ip>:2379 \
+  --cacert=/etc/etcd/pki/ca.crt \
+  --cert=/etc/etcd/pki/client.crt \
+  --key=/etc/etcd/pki/client.key \
+  endpoint health
+```
+
+### Step B6 — Re-add additional etcd members (if applicable)
+This step varies by topology and is **easy to get wrong**. If you are not deeply familiar with the cluster’s etcd membership, stop and escalate to Infra/SRE leadership.
+
+At a high level:
+- Start from one healthy restored member.
+- Use `etcdctl member add` to add new members.
+- Configure each new member with a fresh empty data dir and the correct initial cluster configuration.
+
+---
+
+## Post-restore reconciliation checklist
+After the API is back, the cluster may be inconsistent relative to the underlying infrastructure.
+
+1. **API readiness**
+   - `kubectl get --raw='/readyz?verbose'` returns `ok`.
+
+2. **Node readiness**
+   - `kubectl get nodes` and confirm expected nodes are `Ready`.
+   - If many nodes are `NotReady`, confirm CNI/CSI components are healthy.
+
+3. **Core system pods**
+   - `kubectl -n kube-system get pods` and confirm DNS, CNI, kube-proxy, CSI controllers.
+
+4. **Workload reconciliation**
+   - Expect Deployments/StatefulSets to roll.
+   - If you use Helm/GitOps, re-sync once the cluster is stable.
+
+5. **CRDs/operators**
+   - Validate critical CRDs exist and controllers are running.
+   - If a restore rewound CRDs, operator upgrades may need to be re-applied.
+
+6. **Storage sanity**
+   - Check PVC/PV binding status:
+     ```bash
+     kubectl get pvc -A | egrep -v 'Bound' || true
+     kubectl get pv | egrep -v 'Bound|Available' || true
+     ```
+
+7. **Defragment etcd (optional, once stable)**
+   - Only after confirming health; defrag can be disruptive in large clusters.
+
+---
+
+## Abort / rollback guidance
+If restore makes things worse:
+- Stop control plane writes immediately.
+- Revert to the backed-up etcd data dir (`/var/lib/etcd.bak.<timestamp>`) by swapping directories back.
+- Restart etcd and API server.
+
+Rollback is not guaranteed to succeed if additional writes occurred after changes.
+
+---
+
+## Common failure modes and fixes
+### API server won’t start after restore
+- Check kubelet logs and container runtime logs for etcd connectivity errors.
+- Validate etcd is listening on expected client URL/port.
+- Validate cert paths in manifests/systemd config.
+
+### etcd starts but `endpoint health` fails
+- Wrong peer/client URLs in restore configuration.
+- Version mismatch between snapshot and etcd binary.
+- Corrupted snapshot (re-download/re-verify checksums).
+
+### Cluster comes up but many controllers crashloop
+- CRD version skew after rollback.
+- Operators were upgraded after snapshot; re-apply operator manifests.
+
+---
+
+## Escalation and ownership
+- **Primary:** Infra/SRE on-call (eng-infra).
+- **Consult:** Sean Gallagher (SRE lead), Rafael Mendes (SRE manager).
+- **Private control plane impact:** Ethan Park (Control plane engineering lead).
+- **Customer comms / expectations:** Vivek Kulkarni (Product owner), Markus Klein (Solutions lead).
+
+---
+
+## Notes for Redwood Private DR planning
+- etcd restore is a **last resort** for cluster recovery; customer-facing DR plans should emphasize **application/control-plane backups and deterministic redeploy**.
+- If a customer requests “Kubernetes backup/restore,” clarify that this is a **cluster administration** procedure with broad blast radius and typically requires customer infra ownership.
+- For Redwood-supported DR, prefer the documented Private backup/restore toolkit and validation workflow.

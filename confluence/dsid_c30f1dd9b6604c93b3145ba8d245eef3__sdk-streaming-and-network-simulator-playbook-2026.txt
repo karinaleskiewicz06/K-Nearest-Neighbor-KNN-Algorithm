@@ -1,0 +1,159 @@
+SDK Streaming and Network Simulator Playbook
+
+Overview
+
+Purpose:
+This playbook documents an engineer-focused, reproducible local sandbox and network simulation workflow for developing, testing, and debugging Redwood SDKs and API integrations that use streaming, retries, and stateful token-level behavior. It prescribes a lightweight toolchain, canonical examples (Python + Node + curl), CI test harness patterns, and an incident remediation checklist aimed at reducing flakiness in SDK behavior and protecting downstream consumers from regressions.
+
+Goals:
+- Provide a repeatable local environment that simulates realistic network conditions (latency, jitter, packet loss) while preserving streaming semantics.
+- Offer canonical SDK examples for streaming, chunked responses, and function/tool-calling fallbacks.
+- Define CI patterns and synthetic tests to catch common regressions (partial streams, duplicate messages, connection resets).
+- Document recommended timeouts, backoff strategies, and SDK-level telemetry points.
+
+Audience:
+- SDK maintainers, runtime engineers, developer-experience engineers, and platform integrators.
+
+Scope:
+- Covers the Redwood public REST/SDK streaming flows and the developer-facing SDKs (Python, Node). Does NOT cover Dedicated or Private deployment packaging specifics beyond network differences.
+
+Prerequisites
+- Docker (>= 24.0) and docker-compose
+- Python 3.10+ with virtualenv support and Node 18+
+- access to Redwood dev API key (redwood-dev-*), or a local mock credential for offline mode
+
+Quickstart: Local sandbox with streaming + network simulator
+1) Clone the devx-sim repo (internal): git clone git@github.com:redwood/inference-devx-sim.git
+2) Start sandbox (single command): docker compose up --build
+   - Services started: redwood-mock-api (HTTP + SSE), netem-proxy (Toxiproxy wrapper), sandbox-ui (optional)
+
+3) Configure your client to point at sandbox endpoints:
+   - REST endpoint: http://localhost:8080/v1
+   - SSE/streaming endpoint: http://localhost:8080/v1/stream
+   - Env example (.env.local):
+     REDWOOD_API_BASE=http://localhost:8080
+     REDWOOD_API_KEY=local-test-key
+
+Canonical examples (snippets)
+- Python streaming (requests + SSE parsing):
+
+  import os
+  import requests
+  from sseclient import SSEClient
+
+  url = os.getenv('REDWOOD_API_BASE') + '/v1/stream/generate'
+  headers = {'Authorization': 'Bearer ' + os.getenv('REDWOOD_API_KEY')}
+  resp = requests.get(url, headers=headers, stream=True)
+  client = SSEClient(resp)
+  for event in client.events():
+      if event.event == 'message':
+          print(event.data)
+      elif event.event == 'done':
+          break
+
+- Node streaming (fetch + server-sent events via eventsource-js):
+
+  const EventSource = require('eventsource');
+  const es = new EventSource('http://localhost:8080/v1/stream/generate', { headers: { Authorization: 'Bearer local-test-key' } });
+  es.onmessage = (e) => console.log('chunk', e.data);
+  es.addEventListener('done', () => es.close());
+
+- curl (quick smoke):
+  curl -H "Authorization: Bearer local-test-key" http://localhost:8080/v1/stream/generate -N
+
+Network simulation matrix
+- Use the netem-proxy service to alter conditions. The table below is a recommended baseline for tests to include in PR checks:
+
+  | Test name                 | Latency | Jitter | Loss | Reorders | Purpose |
+  |--------------------------|---------|--------|------|----------|---------|
+  | stable-low-latency       | 10ms    | 2ms    | 0%   | 0%       | fast-path validation
+  | high-latency             | 200ms   | 20ms   | 0%   | 0%       | latency-sensitive timeouts
+  | intermittent-loss        | 50ms    | 10ms   | 2%   | 0%       | small packet loss handling
+  | burst-loss               | 120ms   | 30ms   | 10%  | 5%       | simulate flaky mobile networks
+  | reorder-and-jitter       | 80ms    | 80ms   | 0%   | 3%       | ordering and partial-chunk handling
+
+Timeouts, batching, backoff (recommended defaults)
+- Use these as starting points in SDKs and allow overrides via client config. Add to SDK docs as parameterized examples.
+
+  | Component          | Default     | Rationale |
+  |-------------------|-------------|-----------|
+  | connectionTimeout | 10s         | connection establishment under load
+  | readTimeout       | 60s (streaming) | long-running streams can be open, but SDK should use heartbeat enforcement
+  | requestTimeout    | 120s        | overall request cap for heavy generation
+  | maxBatchTokens    | 2048        | default batching to avoid OOMs on 16GB GPU nodes
+  | retryBackoffBase  | 200ms       | jittered exponential backoff base
+  | retryMaxAttempts  | 5           | covers transient infra failures
+
+CI test harness recommendations
+1) Unit tests: isolate serializer, chunk-merger, and retry/backoff logic. Use fake SSE stream generator.
+2) Integration tests (job): run two matrix entries: stable-low-latency and intermittent-loss. Assert: no duplicate chunks, final "done" event received, and stream ordering preserved.
+3) E2E smoke (gated): one high-latency run against stage-orange (hosted test shard) to validate server-induced delays.
+4) Flakiness budget: allow up to 1 flaky run / 100 CI runs; exceed triggers flakiness investigation.
+
+Sample CI job snippet (bash):
+
+  #!/usr/bin/env bash
+  docker compose -f docker-compose.ci.yml up -d netem-proxy redwood-mock-api
+  export REDWOOD_API_BASE=http://127.0.0.1:8080
+  pytest tests/integration/test_streaming.py::test_stream_resilience --maxfail=1 -q
+
+Telemetry and logging guidance
+- Emit these SDK-level metrics (tag by client_id and model):
+  - stream_open_count (counter)
+  - stream_close_count (counter)
+  - stream_chunk_bytes (histogram)
+  - stream_error_rate (counter + labels: error_type)
+  - reconnect_attempts (counter)
+
+- Log shape: JSON lines with these top-level fields: timestamp, client_id, model, request_id, event (open|chunk|error|close), chunk_index, chunk_size, latency_ms, netem_profile. Include sample log line in docs.
+
+Common failure modes and canonical fixes
+- Duplicate chunk ingestion:
+  - Symptom: consumer observes identical text chunk twice after a reconnect.
+  - Cause: server replay + client naive dedupe by content only.
+  - Fix: SDK should attach and persist monotonic sequence tokens per stream (sequence_id + offset) and dedupe by (request_id, sequence_id, offset). If sequence metadata missing, fall back to content hashing with sliding window.
+
+- Premature stream close on network blip:
+  - Symptom: stream closes with HTTP 499 or socket reset during long generation.
+  - Fix: implement soft-reconnect with resume token. Server supports resume token header X-Resume-Token. SDK steps:
+    1) On transient network error, attempt_resume = true if resume token present.
+    2) Reconnect with header X-Resume-Token: <token> and request resume range.
+
+- Partial JSON messages (chunk boundary splits):
+  - Symptom: JSON decoder failure in consumer when a JSON object is split across chunks.
+  - Fix: SDK should buffer incomplete frames and only parse after assemble. Provide tolerant parser that recovers from trailing commas and whitespace.
+
+Troubleshooting checklist (Dev-on-call)
+1) Reproduce locally using netem profile matching incident.
+2) Capture wiretrace (curl -v and tcpdump) and SDK logs.
+3) Validate server-side: check request_id, model shard and kv-cache usage.
+4) Run checksum of chunks to detect replays/duplicates.
+5) If resume tokens were used, verify server accepted resume header.
+
+Docs-site operating procedure for examples and code snippets
+- All SDK code snippets in docs must be runnable with a single script in the devx-sim repo. For each docs change that touches code samples:
+  - Add an integration test under examples/ that executes the snippet in CI container.
+  - Update the snippet’s test-case id in examples/index.yml used by docs build.
+  - Warnings: avoid auth leakage — use environment variable placeholders in docs.
+
+Ownership, escalation, and SLAs
+- Owners: devx-sdk-team (primary), serving-runtime-team (secondary for server resume/token issues).
+- Pager: devx-sdk-oncall rotation; escalate to runtime on-call if server-side resume tokens or kernel-level OOMs suspected.
+- Target triage time for production incidents: 30 minutes.
+
+Change log
+- 2025-11-20: initial draft with sandbox blueprint and netem-profiles.
+- 2026-01-12: added resume token and dedupe guidance after incident INC-2026-0011.
+- 2026-02-10: published: added CI job templates and telemetry guidance.
+
+Appendix: Helpful commands
+- Start sandbox: docker compose up --build
+- Toggle netem profile: curl -X POST http://localhost:8474/profiles -d '{"profile":"burst-loss"}'
+- Dump SSE traffic: curl -H "Authorization: Bearer local-test-key" http://localhost:8080/v1/stream/generate -v -N > /tmp/trace.sse
+
+Related pages and references
+- See SDK retry/backoff standards (link in related_pages) and runtime resume token spec (internal RFC link).
+
+Contact
+- Primary owner: Maya Chen (maya@redwood.com)
+- DevX Slack: #devx-sdk

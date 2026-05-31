@@ -1,0 +1,196 @@
+GPU workload characterization and pool-tiling guidelines
+
+Overview
+--------
+This document captures an operationally-actionable approach for classifying GPU workloads, estimating pool sizes, and applying a pool-tiling (micro-pool) strategy to improve throughput, latency predictability, and cost-efficiency across Redwood's multi-tenant GPU fleet. It is intended for infra engineers, SREs, and platform owners who make capacity and scheduling decisions.
+
+Goals
+-----
+- Provide a repeatable workload characterization methodology using sampled traces and eval job profiles.
+- Define pool-tiling (micro-pool) patterns and when to apply them (latency-sensitive vs batch).
+- Give concrete Terraform module knobs, Prometheus queries, and autoscaler settings for implementing tiled pools.
+- Describe an operational playbook for pool lifecycle (create, scale, drain, retire) with rollback steps.
+
+Scope and non-goals
+-------------------
+Scope:
+- GPU-backed inference and eval batches run in hosted and dedicated modes.
+- Both fractional GPU multiplexed jobs (mps/containers) and whole-card allocations.
+
+Non-goals:
+- Model quantization guidance (see quantization-profiles).
+- Low-level kernel selection or model-specific optimization (see serving-runtime/kernel-and-scheduling).
+
+Definitions
+-----------
+- Tile: a small, functionally-homogeneous GPU pool (e.g., 2 x A100:80GB cards in a single AZ) with a fixed scheduling policy.
+- Workload class: label for job characteristics (latency-sensitive, throughput-batch, eval, CI-eval, spot-burst).
+- Tail-latency SLO: 95th/99th percentile latency requirement for a workload class.
+- Effective GPU-seconds: a unit for capacity planning (tokens * average-seq-length * cost-factor).
+
+Measurement methodology
+-----------------------
+1. Data sources:
+   - Request traces: sample of production RPCs from gateway (1% sample over 7 days).
+   - Job metadata: cluster job logs and scheduler labels (job_type, model_family, seq_len_est).
+   - Prometheus metrics: per-node nvidia_smi metrics, runtime token / step throughput, and per-request latency histograms.
+
+2. Minimum dataset to characterize a workload class:
+   - 1000 requests or 3 days of traffic (whichever is larger).
+   - Distribution of request sizes (tokens), arrival process (poisson vs bursty), and concurrency per tenant.
+
+3. Core metrics to compute:
+   - P50/P95/P99 latency by model and route.
+   - Average tokens-per-request and variance.
+   - CPU / host memory / GPU utilization percentiles.
+   - KV cache hit fraction (for chat-like workloads).
+
+Standard Prometheus queries (examples)
+------------------------------------
+- 95th token generation latency for model X:
+  sum(rate(request_duration_seconds_bucket{model="m-x",route=~".*"}[5m])) by (le) | histogram_quantile(0.95, sum_rate...)
+- Average GPU utilization across tile:
+  avg_over_time(nvidia_smi_utilization_gpu[5m])
+
+Note: adapt exact label names to the cluster exporter. Use the dashboard template at /eng-infra/dashboards/gpu-tile-overview to visualize.
+
+Workload classification matrix (example)
+--------------------------------------
+- Latency-sensitive inference (LSI): p95 <= 200ms, token mean <= 128, good KV hit (>60%)
+- Interactive chat (IC): p95 <= 500ms, stateful, KV hit variable, high concurrency spikes
+- Throughput batch (TB): throughput-optimized, best-effort latency (p95 unconstrained), long sequences
+- CI/Eval (CI): scheduled, high GPU-seconds, tolerant to preemption
+- Spot-burst (SB): intermittent bursts, fallback tolerant
+
+Pool-tiling patterns and when to use them
+----------------------------------------
+1. Single-sku latency tile (LSI tile)
+   - Composition: homogeneous high-memory GPU (e.g., A100-80GB), strict colocated NVLink disabled for multi-tenant safety.
+   - Scheduler: strict preemption protection, minimal packing, conservative overcommit (0.6 CPU per GPU thread).
+   - Use when: per-request latency SLO is priority and KV cache locality matters.
+
+2. Fractional-multiplex tile (High-density tile)
+   - Composition: GPUs with high multiprocessor utilization allowed (mps/container multiplexing).
+   - Scheduler: bin-packing allowed, enable fractional-GPU runtime profile, eviction grace period = 90s.
+   - Use when: throughput batch / CI-eval jobs dominate and demand is elastic.
+
+3. Spot-burst tile (Economy tile)
+   - Composition: cheaper spot instances and mixed-sku.
+   - Scheduler: aggressive preemption allowed, automatic fallback routing to LSI tile if critical route.
+   - Use when: non-critical evals, background retraining, and scheduled jobs.
+
+Sizing guidance and formulae
+---------------------------
+1. Baseline capacity estimate (per workload class)
+   - Required GPU-seconds per day = sum_over_jobs(average_tokens * token_cost_coefficient * requests_per_day)
+   - Convert to number_of_cards = ceil((GPU-seconds-per-day) / (day_seconds * card_throughput_factor * utilization_target))
+
+2. Tile sizing rules
+   - Keep tiles small: 4–16 cards per tile is recommended for isolation and easier rolling upgrades.
+   - For latency classes, bias toward more tiles with fewer cards (e.g., 6 cards/tile) to reduce blast radius.
+
+Terraform module knobs (example table)
+-------------------------------------
+The table below lists common vars to expose in our gpu-pool module. Adapt names to module in sources/confluence/eng-infra/terraform-and-iac.
+
+| var_name | description | recommended default | notes |
+| pool_name | logical name for the tile | "lsi-tile-<region>-v1" | include workload_class tag |
+| gpu_sku | GPU instance type | "a100-80gb" | select homogeneous sku |
+| desired_cards | target number of physical cards | "6" | integer |
+| min_cards | autoscaler min | "2" | safety floor |
+| max_cards | autoscaler max | "24" | upper bound |
+| preemptible_ok | allow spot / preemptible nodes | "false" | true for spot tiles |
+| eviction_grace_seconds | drain wait before force-evict | "120" | tune per workload |
+
+Scheduling policy (decision flow)
+--------------------------------
+1. Classify incoming request/job: attach label workload_class.
+2. Lookup tile candidates that accept that class. Prefer exact tile match.
+3. If no tile has capacity and workload_class is latency-sensitive:
+   - Check fallback routing policy: attempt warm spare in dedicated LSI tile.
+   - If still no capacity: enqueue short-circuit throttle and return 429 with backoff header.
+4. For CI/Batch: schedule to any high-density tile with sufficient card quota.
+
+Autoscaler parameters and heuristics
+----------------------------------
+- Scale-up trigger: sustained (>2m) tile-level GPU utilization > 70% and queue length > 2.
+- Scale-down trigger: sustained (<10m) tile-level GPU utilization < 25% and queue length == 0.
+- Cooldown windows: 2m upstream and 10m downstream for scale-down to avoid oscillation.
+- Safety caps: never grow > 2x in a single scaling step for a tile.
+
+Operational lifecycle: create -> warm -> active -> drain -> retire
+---------------------------------------------------------------
+Create:
+1. Open infra change request with module parameters and cost estimate.
+2. Terraform apply with preview and approval.
+
+Warm:
+1. Deploy tile in a non-production AZ initially.
+2. Run synthetic traffic generator (see /eng-infra/ci-cd-and-build/ephemeral-gpu-pools-for-ci-and-eval-runs.json) to validate latency and throughput.
+
+Active:
+1. Shift traffic via traffic-router flags. Monitor tile dashboards for p95/p99 and util.
+
+Drain (safe retire):
+1. Toggle tile label accept_new_workloads=false.
+2. Set eviction_grace_seconds to configured value.
+3. Monitor for active sessions; for stateful chats, wait for idle window (default 15m).
+4. Force-evict only after grace + safety wait with manager approval.
+
+Retire:
+1. Terraform destroy with state backup.
+2. Update capacity plan and run cost reconciliation.
+
+Runbook: emergency scale and failover (quick steps)
+------------------------------------------------
+- Symptom: p95 increase > 2x for LSI routes and tile GPU util > 95%
+1. Identify tile with highest p95 via dashboard.
+2. Temporarily re-route 20% of LSI traffic to a cold spare LSI tile using traffic-router.
+3. If no spare tile: enable expedited scale policy (allow 1.5x immediate scale) and notify oncall.
+4. If issue persists > 15m, throttle non-critical tenants and turn on token-based rate-limiting per tenant.
+5. Post-incident: run root-cause triage and update workload classification if pattern recurs.
+
+Monitoring and alerts (recommended thresholds)
+--------------------------------------------
+- Tile p95 latency > SLO * 1.5 for 5m -> P0 alert to oncall.
+- Tile GPU util > 92% for 3m and queue > 5 -> P1 to infra-runner.
+- Eviction rate on tile > 1% of running sessions per 10m -> P2; investigate preemption dynamics.
+
+CI/CD and testing guidance
+-------------------------
+- Use ephemeral tiles for validation of new autoscaler or scheduling changes. Reuse pipeline in /eng-infra/ci-cd-and-build/canary-gpu-provisioning-safety-net-pipeline.json.
+- Add integration tests that assert: tile creation/destruction via Terraform, traffic-router flag changes, safe drain behavior.
+- Backward compatibility: do not rename tile tags consumed by traffic-router; instead add new tags and deprecate old names for one release cycle.
+
+Cost estimation example
+-----------------------
+- Input: 1M requests/day, avg_tokens=200, token_cost_coefficient=0.002 GPU-seconds/token -> GPU-seconds = 400,000
+- Card throughput factor (A100-80): 0.9 -> day_seconds=86400 -> cards = ceil(400k / (86400*0.9*0.6)) = ceil(400k / 46656) = 9 cards
+- Add 20% buffer for headroom and failover -> 11 cards -> split into 2 tiles of 6 and 5.
+
+Ownership and escalation
+------------------------
+- Tile owner: infra-gpu-ops@redwood.dev (primary), infra-sre (secondary).
+- Change approvals: infra lead + cost-control.
+- Escalation path: oncall -> infra-ops -> eng-sre -> CTO for >4h unresolved production degradation.
+
+Appendix: useful commands and snippets
+-------------------------------------
+- Terraform plan (example):
+  cd infra/modules/gpu-pool && terraform init && terraform plan -var-file=overrides.tfvars
+- Simulate traffic (loadgen):
+  python tools/gpu_loadgen.py --model m-x --qps 50 --duration 600
+- Force drain with grace:
+  curl -XPOST "https://infra-api.internal/tiles/lsi-nyc-v2/drain?grace=300" -H "Authorization: Bearer $ADMIN_TOKEN"
+
+Related documents and dashboards
+-------------------------------
+- /eng-infra/gpu-fleet-and-capacity/gpu-placement-slo-driven-provisioning-playbook.json
+- /eng-infra/ci-cd-and-build/ephemeral-gpu-pools-for-ci-and-eval-runs.json
+- Dashboard: /eng-infra/dashboards/gpu-tile-overview
+
+Change log
+----------
+- 2024-10-15: Initial draft and experimentation notes (Maya Patel).
+- 2024-12-10: Added autoscaler heuristics and Terraform knobs (Ethan Roberts).
+- 2025-02-02: Published with sizing formulas and emergency runbook (Lena Kowalski).

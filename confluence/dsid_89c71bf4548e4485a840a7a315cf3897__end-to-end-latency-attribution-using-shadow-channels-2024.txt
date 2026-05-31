@@ -1,0 +1,143 @@
+end-to-end-latency-attribution-using-shadow-channels-2024
+
+Summary
+
+This playbook describes our "shadow channel" methodology for attributing end-to-end latency to internal components (kernel dispatch, NVLink latency, KV-cache misses, prefix-serialization, enqueue/dequeue overhead) without impacting production SLOs. It documents design, instrumentation, sampling, cost constraints, and an on-call runbook for triage.
+
+Scope
+
+- Applies to all hosted and dedicated model-serving clusters running the Redwood runtime.
+- Focus: high-p99 tail and intermittent spikes that are not explained by request size or known deployments.
+- Out of scope: offline microbenchmarks, model-level correctness regressions.
+
+Why shadow channels?
+
+Traditional profiling (heavy tracing on live requests) risks increased latency and cost. Shadow channels replicate a small fraction of live requests and route them through alternative, instrumented execution paths that capture per-stage timestamps and kernel-level markers, while ensuring no user-facing effects. Shadow runs are asynchronous and do not block the original request flow.
+
+Design overview
+
+1) Sampling and routing
+- Global sample rate: default 0.5% of eligible requests. Adjustable per-tenant via token metadata.
+- Eligibility: production requests with sequence_length >= 8 and not marked internal_test or contain PII flags.
+- Routing: the live request continues on the low-latency path; the shadow copy is forked and sent to an instrumented runtime instance pool (shadow pool) with lower priority scheduling and strict CPU/GPU time quotas.
+
+2) Shadow pool characteristics
+- Separate node label: node-role=shadow-instrumented.
+- Scheduler policy: preemptible, batch slicing disabled, per-request kernel trace hooks enabled.
+- Capacity: sized to handle worst-case sample burst for 30s at configured sample rate. Autoscaling disabled; use fixed pools to minimize side effects.
+
+3) Instrumentation surface
+- Per-stage timestamps (monotonic): request_received, prefix_deserialize_start/end, kvcache_lookup_start/end, kernel_dispatch_start/end (per kernel), nvlink_wait_start/end, response_serialize_start/end.
+- Kernel markers: kernel_id, kernel_variant, quantization_path, cuStream id.
+- Hardware telemetry: GPU occupancy, SM utilization, memory allocation delta, NVLink per-transfer latency (where available).
+- Correlation IDs: original_request_id, shadow_request_id, sample_seed, tenant_id.
+
+4) Data retention and privacy
+- Shadow payloads are hashed; payloads with detectable PII are dropped from storage. Raw request text is never stored in long-term telemetry buckets.
+- Shadow logs retained 30 days in hot storage and 365 days in compressed cold storage for regression analysis.
+
+Attribution algorithm (high level)
+
+- Preprocess: discard shadow samples with error codes or model-variant mismatches. Normalize for request size and token counts.
+- Stage delta calculation: compute t_stage = end - start for each instrumented stage. Produce per-sample vector [t_prefix, t_kv, t_kernels_total, t_nvlink, t_serialize].
+- Noise filtering: apply median absolute deviation (MAD) filter to remove outliers caused by background maintenance (OOM kills, node reboots).
+- Attribution score: for each sample compute fraction f_stage = t_stage / t_total. Aggregate by time window (1m, 5m) and compute p90/p95/p99 of f_stage per kernel_id.
+- Cross-correlation: time-shifted cross-correlation between GPU occupancy and t_kernels_total to detect resource contention patterns.
+
+Dashboards and alerts
+
+Minimum dashboards to implement (Prometheus/Grafana):
+- Shadow sample throughput (samples/s) and sample success rate
+- Per-stage p50/p90/p99 latency heatmap over time
+- Kernel variant p99 latency by model family
+- NVLink transfer latency distribution (if available)
+- Shadow vs live p99 delta trend (should be <= 3% in steady state)
+
+Alerting suggestions:
+- shadow_sample_success_rate < 95% for 5m -> pager (symptom: instrumentation errors)
+- Any single kernel variant p99 increase > 30% relative to baseline for 10m -> page on-call runtime
+- shadow_vs_live_p99_delta > 2x for 2m -> page SRE and runtime team
+
+Benchmarks and thresholds
+
+| Metric | Normal | Warning | Critical | Owner | Notes |
+|---|---:|---:|---:|---|---|
+| Shadow sample throughput | >= 10/s global | < 5/s | < 1/s | runtime-observability | indicates telemetry pipeline issues |
+| Shadow sample success rate | >= 99% | < 97% | < 95% | runtime-instrumentation | includes kernel trace completion |
+| Kernel variant p99 (baseline) | <= 120 ms | 120-180 ms | > 180 ms | kernel-team | baseline measured on synthetic stable workload |
+| NVLink per-transfer p99 | <= 5 ms | 5-12 ms | > 12 ms | infra-systems | only for NVLink-enabled nodes |
+
+Operational runbook (triage steps)
+
+1) Detect: Pager fires for kernel p99 increase.
+2) Verify scope: open dashboard and filter by tenant/model ID. Check if issue affects multiple kernels or a single variant.
+3) Confirm with shadow samples: run query for last 15m shadow samples and inspect per-stage vectors.
+
+Example PromQL to pull kernel p99 per variant (Prometheus):
+```
+histogram_quantile(0.99, sum(rate(kernel_dispatch_duration_seconds_bucket{job="shadow-pool"}[5m])) by (le, kernel_variant))
+```
+
+Example BigQuery to inspect raw vectors (pseudocode):
+```
+SELECT
+  shadow_request_id,
+  model_family,
+  ARRAY_AGG(STRUCT(stage, duration_ms) ORDER BY stage) AS stage_vector,
+  total_duration_ms
+FROM `redwood.telemetry.shadow_samples`
+WHERE ingestion_time BETWEEN TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 15 MINUTE) AND CURRENT_TIMESTAMP()
+AND model_family = 'gpt-commercial-v1'
+AND sample_success = true
+GROUP BY shadow_request_id, model_family, total_duration_ms
+ORDER BY total_duration_ms DESC
+LIMIT 200
+```
+
+4) Hypothesis generation: use stage vector to identify dominant contributor (e.g., kernels_total > 60% of total -> focus kernel team; nvlink > 25% -> infra network).
+5) Confirm with correlates: GPU occupancy, recent kernel rollouts, node reboots, thermal events.
+6) Immediate mitigations: a) lower shadow sample rate if telemetry stream is saturated, b) throttle affected kernel variant via scheduler constraint (quarantine), c) fallback to alternate model variant.
+7) Incident follow-up: capture 1h window of shadow and live requests, save traces, and open a triage ticket referencing the kernel_variant and top contributing stage. Attach BigQuery export.
+
+Cost and safety considerations
+
+- Cost: estimate approx 0.3% additional GPU time at 0.5% sample rate, but peak bursts may increase GPU billing. Monitor with cost center tags.
+- Safety: shadow pool is strictly non-mutating. Shadow requests must not call external APIs or perform charged operations.
+- Access: shadow telemetry data is restricted to runtime, infra, and observability teams.
+
+Implementation notes and improvements backlog
+
+- Short term (Q1): implement per-tenant sample knobs and rate-limiter to prevent small tenants from being over-sampled.
+- Mid term (Q2): enrich kernel markers with per-kernel callstack hints and quantization decision reasons.
+- Long term (Q3+): automated root-cause hints: an algorithm that maps stage pattern signatures to probable causes (e.g., kernel regression, NVLink degradation, oversized KV-cache churn).
+
+Example developer checklist for enabling a new shadow pool
+
+1) Create k8s nodepool with label node-role=shadow-instrumented and taints: shadow-only=true:NoSchedule.
+2) Deploy shadow runtime image with instrumentation enabled (ENV SHADOW_MODE=true, TRACE_LEVEL=full).
+3) Configure scheduler policy: lower priority_class, preemptible=true, disable autoscaler.
+4) Update sampling service config: sample_rate=0.005, eligible_routes=[/v1/generate,/v1/chat/completions], tenant_exceptions=[internal-test]
+5) Validate: generate 500 synthetic production-like requests through the shadow-enabled gateway and confirm 0.5% are forked to pool and traces are present in telemetry.
+
+Ownership and contacts
+
+- Runtime instrumentation: Marco Alvarez (runtime-instrumentation@redwood.company)
+- Observability dashboards & alerts: Priya Nambiar (observability@redwood.company)
+- Kernel team (investigations): Jonah Li (kernel@redwood.company)
+
+References
+
+- Runtime profiling playbook (internal): /confluence/eng-serving-runtime/profiling-playbook/runtime-profiling-playbook-guidelines-2025
+- Telemetry cost-aware sampling patterns: /confluence/eng-serving-runtime/team-wiki/runtime-telemetry-sampling-cost-aware-profiling-2027
+
+Appendix: quick queries and helpers
+
+- Small script to fetch latest shadow sample IDs from the Prometheus push gateway (bash):
+```
+#!/bin/bash
+curl -s "https://prometheus:9090/api/v1/query?query=sum(rate(shadow_samples_total[5m]))" | jq -r '.data.result[0].value[1]'
+```
+
+- Repro notes when filing a triage ticket: include 1) sample_seed(s), 2) top 20 shadow_request_ids, 3) kernel_variant hashes, 4) node_ids, 5) BQ export link.
+
+This playbook is expected to evolve as kernel-level observability and NVLink telemetry improve. If you modify instrumentation, add a short note to the implementation backlog and inform the reviewers listed above.

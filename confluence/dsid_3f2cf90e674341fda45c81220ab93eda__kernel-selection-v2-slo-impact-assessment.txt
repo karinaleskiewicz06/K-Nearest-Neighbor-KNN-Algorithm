@@ -1,0 +1,230 @@
+Kernel Auto-Selection v2 — SLO Impact Assessment (Runtime 1.21 Rollout)
+
+## Summary
+Kernel Auto-Selection v2 ("KASv2") changes the kernel choice logic in the Serving Runtime based on model family/architecture, sequence-length regime (prefill/decode characteristics), and GPU SKU. The change is intended to reduce p95/p99 latency and stabilize throughput across heterogeneous fleets (A100/H100/L40S), but it introduces a new failure surface: mis-selection (wrong kernel for a workload or SKU), tail-latency spikes on long-context prefill, and telemetry-driven alert noise.
+
+This SRE assessment defines:
+- Projected SLO impact (positive/negative risks) and what we will measure to validate.
+- Canary criteria and stop/rollback triggers.
+- Alert adjustments required for safe staging and to prevent false positives.
+- Error-budget policy during rollout (Hosted first, then Dedicated pools).
+
+**Decision:** Proceed with staged rollout behind feature gates with strict regression budgets and automated rollback recommendations. Default state remains KASv1 unless allowlisted.
+
+## Scope
+In-scope for this assessment:
+- Hosted API runtime pools in managed regions (initially: us-east-1, us-west-2, eu-west-1).
+- Dedicated GPU pools (customer-isolated) where we can enable by pool/model allowlist.
+- KASv2 selection telemetry, dashboards, and SLO gating checks used by Release Engineering.
+
+Out of scope:
+- Model quality/output correctness evaluation (owned by Perf & Evals). We require that correctness gates remain hard blockers.
+- Hardware/driver upgrades. Driver/CUDA guardrails are treated as prerequisites (denylist/disable v2).
+
+## Services and user journeys impacted
+KASv2 primarily impacts runtime execution latency and request success paths:
+- **Text generation/chat:** latency distribution (prefill vs decode dominated), time-to-first-token (TTFT), tokens/sec.
+- **Embeddings/rerank:** minimal kernel selection exposure in this release (still monitored; no planned enablement in initial canary).
+
+Key user journeys:
+1) Short prompts with moderate decode (typical chat).
+2) Long-context prefill (summarization, retrieval-augmented prompts).
+3) Mixed workloads (heterogeneous seq lengths interleaved) where scheduling hints may influence selection.
+
+## Current SLOs (reference)
+SLOs below reflect the operational guardrails we use for Hosted inference pools. Dedicated/Private have contract-specific SLAs; this doc defines rollout safety gates independent of contract language.
+
+### Hosted SLOs (runtime-facing)
+| Metric | SLO target | Notes |
+|---|---:|---|
+| Request success rate | >= 99.90% (30d) | Success = non-5xx, non-timeout from runtime. |
+| p95 end-to-end latency | Service-defined per route/model tier | We gate on *regressions* rather than absolute due to heterogeneity. |
+| p99 end-to-end latency | Service-defined per route/model tier | Tail protection is primary risk area. |
+| Runtime error rate (5xx) | <= 0.10% | Includes OOM, kernel launch failures surfaced as 5xx. |
+
+### Rollout regression budgets (guardrails)
+Because KASv2 is a performance initiative, the acceptance criteria are expressed as **delta vs control** (KASv1) within the same region/SKU/model.
+
+**Hard gates (stop the rollout):**
+- p99 latency regression > **+5%** (relative) sustained for **>= 30 minutes** in canary slice.
+- p95 latency regression > **+3%** sustained for **>= 60 minutes**.
+- Runtime 5xx error rate increase > **+0.05 percentage points** sustained for **>= 15 minutes**.
+- Any detected correctness regression or determinism/replay mismatch (as reported by runtime CI/replay tests) associated with the candidate build.
+
+**Soft gates (investigate, may proceed if understood and mitigated):**
+- Selection distribution shift > **20% absolute** for a given (model_family, sku, seq_bucket) without an explained reason.
+- TTFT regression > **+3%** where end-to-end p95 is flat (often indicates prefill kernel mismatch).
+- Increased variance in throughput (tokens/sec) beyond **+10% CV** in steady-state workloads.
+
+## Projected impact (expected vs risk)
+### Expected improvements (based on pre-rollout perf characterization)
+- Lower p95/p99 on SKUs where v1 used conservative kernels.
+- Reduced tail spikes for mixed workloads via better seq-regime classification and scheduler hints.
+- More stable throughput in heterogeneous fleets by avoiding SKU-mismatched kernels.
+
+### Primary risks to SLOs
+1) **Long-context prefill misclassification**
+   - Symptom: TTFT and p99 increase disproportionately on long prompts (e.g., 8k–32k tokens).
+   - Mitigation: long-context thresholds + explicit fallback hierarchy; denylist rules for affected (model_family, sku, driver).
+
+2) **SKU normalization gaps (A100 variants, MIG, cloud naming)**
+   - Symptom: kernel registry lookup misses → unexpected fallback kernel; may be safe but slower or unstable.
+   - Mitigation: canonical SKU mapping in runtime + control-plane-config; metric dimensions must use canonical SKU.
+
+3) **Kernel instability on specific driver/CUDA combos**
+   - Symptom: kernel launch failures → elevated 5xx.
+   - Mitigation: guardrail to disable KASv2 on known-bad driver versions; rollout requires driver allowlist coverage.
+
+4) **Observability overhead and metric cardinality**
+   - Symptom: elevated CPU overhead, increased ingestion cost, noisy alerts (esp. due to high-cardinality labels).
+   - Mitigation: sampling policy; strict label set; aggregation strategy; alert query updates before canary.
+
+## Required telemetry and dashboard readiness
+KASv2 must emit sufficient context to diagnose regressions quickly without creating uncontrolled cardinality.
+
+### Required per-request / sampled event fields
+Required (always present; sampled emission allowed):
+- selector_version (v1|v2)
+- selected_kernel
+- model_id (stable internal id)
+- model_family (llama|mistral|qwen|gemma|other)
+- gpu_sku_canonical (e.g., a100-80gb, h100-sxm, l40s)
+- seq_bucket (short|medium|long|xl) based on prefill tokens
+- prefill_tokens, decode_tokens (binned for metrics; exact values only in traces)
+- fallback_reason (none|missing_kernel|denylisted|unstable_driver|safety_rule)
+
+Optional (trace-only, not in metric labels):
+- candidate_kernels list
+- selector_feature_vector hash
+- selector_decision_trace
+
+### Sampling policy (SRE requirement)
+- Default telemetry sampling for KASv2 decision events: **0.5%** of requests per (region, model_id) with burst cap.
+- Temporarily increase sampling to **2%** for a canary model/SKU during incident investigation, time-boxed to **<= 2 hours**.
+- Trace sampling for detailed decision traces: **0.05%** with explicit oncall enablement.
+
+### Rollout dashboards
+Before any production canary enabling KASv2, the following must be green and validated:
+- Dashboard panels: selection distribution by (model_family, sku, seq_bucket) and selector_version.
+- Latency delta panels: p50/p95/p99 for v1 vs v2 slices.
+- TTFT panel split by seq_bucket.
+- Error rate panel split by selector_version and sku.
+- Fallback reason panel (top contributors).
+
+Owner for dashboard readiness: **Allison Grant** (SRE/Observability) with **Omar El-Sayed** (Runtime observability) for runtime-side emission.
+
+## Alert adjustments and new alerts
+We will adjust existing alerts and add a small number of rollout-specific alerts.
+
+### Alert changes (to reduce false positives)
+1) **High cardinality guardrails**
+   - Remove/avoid alerting directly on labels: model_id + selected_kernel + gpu_sku simultaneously.
+   - Prefer aggregation: by selector_version and region; drill down in dashboards.
+
+2) **Use comparative canary alerts**
+   - During rollout, latency alerts should compare v2 slice to v1 slice rather than to a static threshold.
+
+3) **Adjust evaluation windows**
+   - p99 is noisy; require sustained breaches over 30 minutes for rollback triggers, unless accompanied by error rate increases.
+
+### New rollout-specific alerts
+| Alert | Trigger | Action |
+|---|---|---|
+| KASv2 p99 regression vs v1 | > +5% for 30m in canary slice | Page oncall + recommend rollback; follow runbook. |
+| KASv2 error rate increase | +0.05pp for 15m | Page oncall; disable v2 for affected model/SKU/region. |
+| KASv2 fallback spike | fallback_reason != none exceeds 5% for 15m | Investigate registry gaps or denylist overreach; may preempt regressions. |
+| Selection distribution anomaly | >20% shift in selected_kernel share for stable workload | Investigate scheduler hints/feature extraction changes; consider freezing canary. |
+
+## Canary plan and criteria
+KASv2 rollout proceeds in phases with explicit entry/exit criteria. Canary always starts with a model allowlist and a limited region/SKU slice.
+
+### Phase 0: Pre-prod and readiness
+Entry criteria:
+- KASv2 determinism/replay tests passing in CI.
+- Benchmark suite coverage includes at minimum: Llama/Mistral/Qwen/Gemma across short/long seq buckets on A100/H100/L40S.
+- Dashboard panels deployed and validated against a known dataset.
+
+Exit criteria:
+- No correctness regressions.
+- No unexplained >3% p95 regression in perf canary environments.
+
+### Phase 1: Hosted canary (single region)
+Plan:
+- Enable KASv2 in **us-east-1** only.
+- Traffic allocation: **1%** of eligible requests (by model allowlist) with ability to hard-disable by (model_id, sku, region).
+- Target SKUs: a100-80gb and h100-sxm first; l40s after 48 hours of stable results.
+
+Entry criteria:
+- Oncall staffed with named rollback authority.
+- Rollback knobs verified (feature gate + allow/deny list hot reload).
+
+Success criteria (48-hour window):
+- p99 regression <= +2% (aggregate) and no sustained breaches of hard gates.
+- Error rate non-inferior vs v1 (<= +0.02pp change).
+- Fallback rate < 1% overall, with no single fallback_reason dominating unexpectedly.
+
+### Phase 2: Hosted expansion (multi-region)
+Plan:
+- Increase to **5%** in us-east-1 and add **us-west-2** at 1%.
+- After 24h stable, add **eu-west-1** at 1%.
+
+Success criteria (72-hour window):
+- No region shows p99 regression > +3% sustained.
+- No increase in incident rate attributable to kernel selection.
+
+### Phase 3: Dedicated pools (opt-in)
+Plan:
+- Enable per-pool and per-model allowlist for 1–2 internal Dedicated pools first.
+- Expand to external customers only after Hosted GA and after SKU mapping is validated for that customer’s GPU types.
+
+Dedicated criteria:
+- Customer has agreed rollback plan and a defined escalation path.
+- For constrained SKUs, keep KASv2 behind a “pinned kernel fallback available” requirement.
+
+## Error budget policy during rollout
+We treat the rollout as a **change event** but do not relax customer-facing reliability expectations. Instead, we define how to consume error budget for KASv2-related regressions and when to halt.
+
+### Hosted error budget policy
+- If any KASv2-related incident consumes > **10% of monthly error budget** for a region/service tier, pause expansion and return to KASv1 defaults while investigating.
+- If KASv2 canary slice causes repeated near-misses (3+ soft gate breaches in 7 days), require a formal review with Runtime + SRE before proceeding.
+
+### Dedicated error budget policy
+- Dedicated rollouts are treated as **opt-in changes**; we will not use customer error budget as a test harness.
+- Any customer escalation indicating tail-latency regression results in immediate disable/pin per the runbook, followed by a postmortem if impact lasted > 30 minutes.
+
+### Rollback authority and comms
+- Rollback authority during canary: **SRE oncall** (primary) with **Connor O’Brien** (Release) as secondary.
+- Runtime engineering must provide a “known-safe” configuration (KASv1 default + pinned kernel options) that oncall can apply without code deploy.
+- For customer-facing impact, follow standard incident comms; for canary-only impact, log an internal incident entry if rollback is triggered.
+
+## Operational playbook (what oncall does)
+When a regression is suspected during KASv2 canary:
+1) Confirm scope: region, model_id, gpu_sku_canonical, seq_bucket.
+2) Check comparative panels: v2 slice vs v1 slice.
+3) If hard gate breached, execute immediate mitigation:
+   - Disable KASv2 by (model_id, region) first; if localized, disable by (sku) as well.
+   - Optionally pin kernel to last-known-good for affected tuple.
+4) Validate recovery:
+   - p99 returns to baseline within 15–30 minutes.
+   - Error rate returns to baseline within 10 minutes.
+5) Escalate to Runtime Kernels + Observability with selection traces and fallback_reason distributions.
+
+See: Kernel Selection v2 Override and Rollback Runbook (linked in Related Pages).
+
+## Known monitoring pitfalls and mitigations
+- **Metric cardinality changes can break alerts.** All alert queries must be validated against the new label set before enabling KASv2 in production.
+- **Workload shifts can resemble regressions.** Use matched cohorts where possible (same model_id, sku, region) and confirm traffic mix (seq_bucket distribution).
+- **Small canary slices have noisy p99.** Use longer windows and confirm with TTFT + error signals.
+
+## Open items / follow-ups
+- Confirm canonical GPU SKU mapping coverage for MIG and cloud-specific A100 variants; track remaining gaps before Dedicated expansion.
+- Validate long-context thresholds for model families not in the primary benchmark matrix.
+- Post-GA: reduce sampling to baseline and remove rollout-only alerts, keeping only high-signal anomaly detection.
+
+## Approvals
+- SRE: Aisha Bello (owner), Sean Gallagher
+- Runtime: Noah Patel, Yuki Sato
+- Release Engineering: Connor O’Brien
+- Observability/Standards: Allison Grant
+
+Last reviewed for Runtime 1.21 canary readiness on 2026-02-24.

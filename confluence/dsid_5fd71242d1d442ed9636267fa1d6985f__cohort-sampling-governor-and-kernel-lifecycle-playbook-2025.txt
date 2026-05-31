@@ -1,0 +1,153 @@
+Cohort Sampling Governor and Kernel Lifecycle Playbook
+
+Summary
+-------
+This playbook documents the Cohort Sampling Governor (CSG) — the runtime component that determines how we sample live inference traffic for profiling and fidelity checks — and the kernel lifecycle safeguards that control how kernel changes are rolled out against sampled cohorts. The goal is to keep profiling cost bounded while ensuring representative coverage and safe kernel change rollouts that preserve SLOs.
+
+Scope and intended audience
+- Audience: serving runtime engineers, oncall, profiling team, runtime SREs, and release engineers.
+- Scope: live sampling policies, cohort definitions, governor tuning knobs, kernel lifecycle states, rollout/rollback procedures, validation queries, and incident remediation.
+
+Why this matters
+- Sampling informs quantization, batching and kernel selection decisions. Incorrect sampling bias -> bad kernel hints -> fidelity regressions at scale.
+- Kernel rollouts must be coordinated with sampling to avoid unobserved regressions impacting production SLOs.
+
+Key concepts and definitions
+- Cohort: a stable grouping of requests (by client, route, model_version, or token-rate percentile) used for sampling.
+- Governor: dynamic service that assigns a sampling probability to each cohort based on budgets, recent coverage, and anomaly score.
+- Kernel lifecycle states: "canary", "shadowed", "gradual", "broad", "paused", "rollback".
+- Fidelity sample: a captured trace that includes prompt, response, kernel version, and annotations (latency, token counts, cost).
+
+High-level architecture
+1. Ingress: request classification service tags request with cohort_id (rules: route, model, customer_tier, token_count_bin).
+2. CSG: computes sample_prob in realtime using policy inputs (budget, entropy, last_seen, anomaly_score).
+3. Shard router: duplicates requests to profiling pipeline if sampled; otherwise normal path.
+4. Profiler pipeline: stores traces, computes fidelity metrics, runs automated evals.
+5. Release controller: consults sampling coverage before moving kernel lifecycle forward.
+
+Sampling policy and knobs
+- Global budget: maximum profiling QPS allowed (default 50 QPS for hosted clusters).
+- Per-cohort min/max probability: ensures low-volume customers still sampled and high-volume customers capped.
+- Entropy-driven boost: increase sample_prob for requests with surprising model output (high perplexity / low confidence).
+- Decay window: weight recent coverage more heavily (default 24h).
+
+Recommended baseline policy (table)
+| cohort_type | rule | min_prob | max_prob | rationale |
+|-------------|------|----------|----------|-----------|
+| enterprise-high | customer_tier = "enterprise" AND SLA = "gold" | 0.005 | 0.02 | guarantee representation for high impact customers |
+| public-api | route startswith /generate | 0.001 | 0.01 | common surface area sampling |
+| tail-token | request_length_percentile >= 99 | 0.02 | 0.1 | capture long-sequence regressions |
+| experimental-model | model_tag in ["alpha","exp"] | 0.05 | 0.5 | prioritize new variants |
+
+Dynamic adjustments
+- If global budget saturated, CSG reduces probabilities proportionally, maintaining every cohort's min_prob floor.
+- If an anomaly detector triggers for a cohort (latency or error spike), sample_prob is boosted by factor (2x by default) for 1h.
+
+Telemetry and metrics to monitor
+- Sampling QPS per-cohort (gauge) — expected vs actual.
+- Profiled-fidelity-lag (histogram): time between request and availability of trace in profiler. Target: p95 < 90s.
+- Coverage-entropy (gauge): fraction of distinct cohorts sampled in last 24h; target >= 0.85.
+- Kernel-impact delta (histogram): change in p95 latency post-kernel-change on sampled cohort. Trigger alert if delta > 15% absolute.
+
+Example telemetry alert rules (PromQL-like)
+1) Coverage drop: 1 - (sum(sampled_cohorts_last_24h) / sum(known_cohorts)) > 0.15 -> Sev2
+2) Profiling backlog: increase(profile_queue_depth) > 2000 for 5m -> Sev2
+3) Kernel-regression signal: increase(kernel_impact_delta_bucket{le=\"0.15\"}[15m]) / increase(kernel_impact_delta_count[15m]) > 0.2 -> Sev1
+
+Config snippet: cohort sampling YAML (example)
+---
+version: v1
+global_budget_qps: 50
+cohorts:
+  - id: enterprise-high
+    match: "customer_tier == 'enterprise' and sla == 'gold'"
+    min_prob: 0.005
+    max_prob: 0.02
+  - id: tail-token
+    match: "request_length_percentile >= 99"
+    min_prob: 0.02
+    max_prob: 0.1
+policy:
+  anomaly_boost_factor: 2.0
+  decay_hours: 24
+---
+
+Runbook: adjusting governor parameters (oncall)
+1. Verify alerts in PagerDuty and Slack (#runtime-incidents).
+2. Check sampling QPS and profile queue depth:
+   - kubectl -n runtime exec -it csg-0 -- /bin/csgctl metrics --cohort-metrics
+   - grafana dashboard: "CSG / Sampling Overview"
+3. If global_budget_qps is saturated and profile_queue_depth > 1000, increase global_budget by +10 qps:
+   - curl -X POST https://config.internal/api/v1/sampling/budget -d '{"global_budget_qps":60}' -H 'Authorization: Bearer $CONFIG_TOKEN'
+4. If coverage drops (coverage < 0.7), temporarily increase per-cohort max_prob for underrepresented cohorts:
+   - Update YAML and push to config service (see CI validation below).
+5. Monitor consequences (p95 profiling lag, storage ingestion rates) for 30 minutes.
+
+Kernel lifecycle and safe rollout guardrails
+- Precondition: for a kernel to move from "canary" -> "gradual", coverage_entropy must be >= 0.8 for cohorts exposed to the kernel and no regressions flagged in the last 72h.
+- Canary phase: 0.5% of traffic from targeted cohorts; run for minimum 6 hours.
+- Shadowed mode: shadow execution on 5% of sampled requests (no external user impact) for fidelity comparison.
+- Gradual phase: linear ramp to 20% over 24h if metrics stable.
+- Broad: >80% traffic only after 7 days of stable metrics and at least 10k sampled traces.
+
+Kernel rollout checklist
+1. Create a release with kernel metadata and associated cohort whitelist.
+2. Ensure profiler pipeline healthy (profile_queue_depth < 200).
+3. Start canary and notify #kernel-rollouts channel.
+4. Run automated fidelity checks (see validation queries) and manual spot checks.
+5. If any Sev1/Sev2 alerts triggered, invoke rollback.
+
+Validation queries and spot checks
+- SQL: sample extraction to validate canonical traces (run against profiler DB)
+  SELECT cohort_id, count(1) AS traces, avg(latency_ms) AS avg_latency
+  FROM profiler.traces
+  WHERE kernel_version = 'k-v2.4.1' AND ts >= now() - interval '24 hours'
+  GROUP BY cohort_id
+  ORDER BY traces DESC;
+
+- Automated evaluation: run prompt set suite against new kernel using shadowed mode and compare metrics (exact_match, leniency_score, p95 latency).
+
+Incident remediation: kernel regression detected
+1. Pause rollout (controller -> state=paused).
+2. Immediately increase sampling for impacted cohorts (min_prob -> min(min_prob*3, 0.5)).
+3. Collect 5k failing traces or 30 minutes of incidents, whichever comes first.
+4. Open an incident with tags: runtime, kernel, regression. Include trace set, diff of eval metrics, and host telemetry.
+5. If rollback criteria met (p95 delta > 10% or error_rate increase > 0.5pp), perform automated rollback to last green kernel.
+
+Rollback command (example)
+- curl -X POST https://release-controller.internal/api/v1/rollback -d '{"kernel_id": "k-v2.4.0", "reason": "p95-latency-regression"}' -H 'Authorization: Bearer $RC_TOKEN'
+
+Safe experimentation guidelines (for engineers)
+- When adding a new cohort rule, test in staging with a synthetic traffic generator.
+- Avoid cohort rules that overlap ambiguously (use priority ordering).
+- New kernel builds require a sampling policy declaration (YAML) that lists expected cohorts and initial min_prob.
+
+Ownership and contact points
+- CSG service owner: runtime-profiling (pager oncall: @runtime-profiling-oncall).
+- Release controller and kernel rollout: runtime-releases (oncall: @runtime-releases-oncall).
+- Profiler pipeline: profiling-data-team.
+
+CI validation for sampling config changes
+1. Lint: config linter rejects overlapping cohort match expressions.
+2. Simulator: run a 1h synthetic run that checks coverage_entropy >= 0.75 under expected QPS.
+3. Safety gate: changes that increase global_budget_qps > 100 require engineer + SRE approval.
+
+Troubleshooting tips and common gotchas
+- Gotcha: high sampling for experimental-model cohorts can overwhelm ingestion. Counter: set an ingestion cap flag per-cohort.
+- Gotcha: cohort rule regression after route refactor. Counter: add a stable attribute (model_family) to cohort rules.
+- Gotcha: profiler storage spike during kernel-broad rollouts. Counter: enable short-term retention and archive pipeline.
+
+Appendix: quick reference commands
+- csgctl show-config: kubectl -n runtime exec -it csg-0 -- /bin/csgctl config\- csgctl set-budget 60: kubectl -n runtime exec -it csg-0 -- /bin/csgctl set-budget 60
+- Release inspect: curl -s https://release-controller.internal/api/v1/releases/k-v2.4.1 | jq
+
+Change log
+- 2025-07-12: initial draft and baseline policy (Priya Rangan).
+- 2025-11-01: added entropy-driven boosting and decay policy (Ethan Morales).
+- 2026-02-03: tightened preconditions for canary->gradual transitions and added CI validation steps (Sofia Chen).
+
+Related reading
+- Profiling playbook: variance-driven-sampling-and-cost-correlation-playbook (internal link).
+- Scheduler design: predictive-slotting-and-quota-orchestration (internal link).
+
+End of document.

@@ -1,0 +1,167 @@
+Operational Signal Fabric and Cohorted Scheduler Handbook
+
+Summary
+-------
+This handbook describes the Operational Signal Fabric and the Cohorted Scheduler approach used by Redwood's serving runtime to map runtime observability signals to scheduler decisions, incident triage actions, profiling experiments, and benchmarking checks. It is written for runtime engineers, SREs, and subsystem owners responsible for scheduler policies, telemetry alignment, and production rollouts.
+
+Goals
+-----
+- Define a single signal taxonomy (the Signal Fabric) that is consumed by scheduling heuristics, alerting rules, and profiling experiments.
+- Describe how execution cohorts are derived, annotated, and persisted for deterministic investigations.
+- Provide concrete runbooks for common scheduler/resilience incidents and profiling experiments.
+- Give a rollout checklist for scheduler policy changes that minimizes regressions in latency, cost, and fidelity.
+
+Scope
+-----
+Applies to: all runtime scheduler components (priority governor, admission controller, kernel mapper), kernel plugins that expose telemetry hooks, and the profiling/benchmarking suites that validate scheduling changes. This document does NOT specify kernel implementation details; it focuses on operational mapping between signals and scheduler behavior.
+
+Core concepts
+-------------
+1) Signal Fabric: canonical names, units, and retention for runtime signals consumed by scheduling logic. Signals are emitted at three layers: request-surface (API/router), kernel-dispatch (runtime kernels), and infra (node/accelerator).
+2) Cohorts: deterministic classification of requests into buckets based on stable attributes (model_id, model_variant, sequence_length_bucket, client_tier, route_flags). Cohorts allow targeted profiling and rollback.
+3) Decision Bindings: declarative rules that map signal thresholds and cohort identities to scheduler actions (prioritize, throttle, preempt, fallback to variant).
+4) Fidelity Guards: safety checks (quality/eval) attached to any scheduler action that can change model variant/quantization.
+
+Signal Fabric (canonical table)
+--------------------------------
+| Signal name                     | Layer           | Unit           | Cardinality | Producer                 | TTL   | Use cases |
+|---------------------------------|-----------------|----------------|-------------|--------------------------|-------|-----------|
+| request.p90_latency_ms          | request-surface | milliseconds   | per-route   | router                   | 90d   | SLO monitoring, alerts |
+| kvcache.hit_rate                | kernel-dispatch | fraction (0-1) | shard       | kvcache                  | 30d   | batching hints, warmup |
+| kernel.queue_depth              | kernel-dispatch | integer        | shard       | dispatcher               | 14d   | admission control, preempt decisions |
+| node.gpu_util_pct               | infra           | percent        | node        | node_agent               | 60d   | capacity planning, admission |
+| token.emission_rate_per_s       | request-surface | tokens/s       | tenant      | runtime_router           | 30d   | billing/cost throttles |
+| request.sequence_bucket         | request-surface | enum (S/M/L/XL) | per-request | router                   | 90d   | cohorting, kernel hints |
+| kernel.latency_per_op_ms        | kernel-dispatch | ms/op          | kernel      | kernel_profiler          | 90d   | kernel selection, canary gating |
+
+Note: Cardinality indicates the level at which the signal is indexed. Keep high-cardinality signals off the hot path unless sampled.
+
+Cohort definition and lifecycle
+-------------------------------
+- Cohort keys: model_id, model_variant_id, sequence_bucket, client_tier, route_tag.
+- Generation: router computes the cohort_key at request admission and attaches headers: X-Runtime-Cohort: model=v3.1;var=quant-8bit;len=XL;tier=gold;route=chat_inline
+- Storage: cohort annotations are copied into trace/span baggage and a lightweight cohort index (redis-backed) for 72 hours to simplify postmortem replay.
+- Decay policy: if a cohort observes < 0.1% of traffic over 24h, mark as transient and expire cohort metadata to reduce index noise.
+
+Decision bindings (examples)
+---------------------------
+Decision bindings are simple JSON-like rules (stored in policy-service) that map signal predicates to actions. Example binding: 
+
+```
+{
+  "binding_id": "bind-high-queue-preempt-2026-01",
+  "predicate": "kernel.queue_depth > 120 AND node.gpu_util_pct > 85",
+  "cohort_filter": "*",
+  "action": "preempt_background_slots",
+  "action_params": {"max_preempt_per_node": 2, "backoff_minutes": 5},
+  "safety_check": "fidelity_guard_alpha"
+}
+```
+
+- Predicates are evaluated by the decision engine at 10s cadence. Keep predicates simple to avoid evaluation amplification.
+- Actions include: increase_priority, decrease_priority, admit_burst, preempt_background_slots, route_to_variant, throttle_tenant.
+
+Scheduler resilience runbooks (triage-first)
+-------------------------------------------
+1) Symptom: sudden p99 latency increase for a high-traffic route.
+   - Owner: runtime-oncall
+   - Steps:
+     1. Query recent cohorts for the route: kubectl run query-cohorts --route=<route> --since=1h
+     2. Check request.p90_latency_ms and kernel.queue_depth across cohorts.
+     3. If kernel.queue_depth > 100 on > 3 nodes, execute emergency admission: policy-service apply emergency-admit=throttle-background
+     4. If queue depth is concentrated in a cohort with sequence_bucket=XL, enable sequence-length-capping variant: policy-service route cohort -> variant=shortened-context
+     5. Open incident with SRE and attach cohort index snapshot and the last 3 kernel.profiler traces.
+
+2) Symptom: kernel plugin experiencing increased op failure rate.
+   - Owner: kernel-team
+   - Steps:
+     1. Collect kernel.latency_per_op_ms and kernel.plugin_errors by kernel version.
+     2. If error rate > 0.5% for 5m, pin runtime to previous kernel and trigger canary rollback: rollout-service rollback kernel-plugin --to=stable-20260201
+     3. Run controlled profiling (see Profiling experiments) for the failing kernel on a replay corpus.
+
+Profiling experiments: structure and templates
+--------------------------------------------
+Purpose: isolate scheduler and kernel interactions for targeted cohorts.
+Template steps:
+1. Select cohort(s) and timeframe (use cohort index).
+2. Construct replay corpus (use request-surface traces and synthetic sequences to reproduce distribution).
+3. Baseline: run 3x baseline runs with current scheduler policy, collect kernel.latency_per_op_ms, kvcache.hit_rate, and tail latency distribution.
+4. Apply one policy change at a time (decision binding tweak), re-run 3x, and compare deltas.
+5. Metrics to record: p50/p90/p99 latency, per-token energy (if available), kvcache warmup time, variance across runs.
+6. Tag experiment with experiment_id and attach results to policy change PR.
+
+Profiling CLI snippets
+---------------------
+- Build replay corpus: 
+  ./tooling/replay-builder --cohort "model=v3.1;len=M" --since 2026-02-14T00:00:00Z --out corpus.tgz
+- Run replay with scheduler override (local lab):
+  ./tooling/runtime-replay --corpus corpus.tgz --scheduler-overrides ./overrides/policy-test.json --repeat 3 --collect-traces
+
+Benchmark and validation checklist for scheduler change
+-----------------------------------------------------
+- Unit gates (automated):
+  - scheduler-policy-lint: no circular bindings
+  - predicate-safety-check: no policy that can reduce admitted capacity below 60% for any tenant without a manual guard
+- Staging gates (synthetic):
+  - run mixed-load benchmark against production-like mix for 30m; verify p90 delta < 8% and p99 delta < 15% for stable cohorts.
+  - run capacity burst test to verify no kernel plugin regressions.
+- Canary gates (shadow & live):
+  - enable policy for 5% tenant shadow for 24h, compare decisions and ensure no negative action rate > 0.1%
+  - live canary on non-critical region for 4h; require rollback if any cohort exceeds fidelity-guard threshold.
+
+Release and rollout checklist (scheduler policy changes)
+-----------------------------------------------------
+1. Author creates policy change PR with decision bindings and rationale.
+2. Automated policy lint and unit tests pass.
+3. Run profiling experiments and attach results to PR.
+4. Execute staging benchmark checklist and attach artifacts.
+5. Reviewer sign-off from kernel-team and SRE.
+6. Staged canary (shadow + 5% live) for 24h.
+7. If canary is green, ramp to 25% for 12h, then 100% with monitoring.
+8. Post-rollout 48h observation window; capture cohort-indexed telemetry and store artifacts under /artifacts/scheduler-rollouts/<pr-number>.
+
+Safety and fidelity guards
+-------------------------
+- Any action that routes to a lower-fidelity variant must require an active fidelity_guard check that validates the last known eval delta < configured threshold (default 0.03 quality drop).
+- Quality-eval integration: policy-service must call eval-api with a short prompt set for the affected cohort before allowing auto-variant-routing in production.
+
+Operational telemetry dashboards and alerts (recommended)
+------------------------------------------------------
+- Dashboard: "Scheduler Decision Surface" (node-level tiles, cohort heatmap, decision-rate chart).
+- Essential alerts:
+  - A1: kernel.queue_depth > 150 for > 3 nodes (P0)
+  - A2: preempt_action_rate > 5% sustained for 10m (P1)
+  - A3: fidelity_guard_failures > 0.1% for 30m (P1)
+  - A4: cohort.latency_regression_delta_p99 > 20% (P0)
+
+Ownership and contacts
+---------------------
+- Scheduler policy service: owner "runtime-policy-team" (pager: #runtime-policy)
+- Kernel plugins: owner "kernel-team" (pager: #kernel-team)
+- Oncall escalation path: runtime-oncall -> runtime-sre -> kernel-lead -> eng-manager
+
+Appendix A: sample decision binding catalog (short)
+--------------------------------------------------
+1) Background fairness governor (default): throttle tenants consuming > 75% of background credits in 5m window.
+2) Sequence-length capper: for cohorts with median_sequence_length > XL and p99 queue_depth > 100, cap to L variant.
+3) Opportunistic admission: if node.gpu_util_pct < 35% and queue_depth < 20, allow burst admissions up to 50 concurrent short jobs.
+
+Appendix B: common investigation commands and scripts
+-----------------------------------------------------
+- cohort index dump for route: ./tools/cohort-dump --route=chat_inline --since=2h --out=cohort-dump.json
+- decision binding dry-run: curl -X POST https://policy-service.internal/v1/dry-run -d @overrides/policy-test.json -H "Authorization: Bearer $TOKEN"
+- collect trace bundle for a node: ./tools/collect-trace --node node-123 --since 2026-02-17T12:00:00Z --out node-123-traces.tgz
+
+Related reading and links
+-------------------------
+- Kernel telemetry synthesis (internal): /confluence/eng-serving-runtime/team-wiki/kernel-telemetry-annotation-guidelines-2025
+- Runtime decision graphs and behavior catalog: /confluence/eng-serving-runtime/runtime-architecture/runtime-decision-graph-and-observed-behaviour-catalog-2026
+
+Change history
+--------------
+- 2025-11-13: created by Ava Martinez (initial draft)
+- 2026-02-18: added profiling templates and updated cohort decay policy (Samir Patel review)
+
+Contact and feedback
+--------------------
+Send feedback to #runtime-policy or email avam@redwood-inference.example."
