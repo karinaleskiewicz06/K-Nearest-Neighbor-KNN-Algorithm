@@ -12,6 +12,7 @@ Workflow
        python pipline.py ask "How do we handle candidate onboarding?"
        python pipline.py ask                       # interactive REPL
        python pipline.py batch                     # runs every line of questions.txt
+       python evaluate.py                          # measure RAG metrics (see evaluate.py)
 
 The API key is read from the .env file (key: OPENROUTER_API_KEY).
 
@@ -36,12 +37,15 @@ Retrieval is multi-stage:
   6) Cross-encoder rerank again; keep FINAL_K with a per-source cap (LLM context)
 """
 
+import json
 import os
 import pickle
 import re
 import sys
 
-import faiss
+# Avoid tokenizer subprocess warnings / loky leaks on macOS.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import numpy as np
 from chonkie import RecursiveChunker
 from dotenv import load_dotenv
@@ -63,12 +67,22 @@ META_PATH = os.path.join(INDEX_DIR, "chunks.pkl")
 BM25_PATH = os.path.join(INDEX_DIR, "bm25.pkl")
 BM25_INDEX_VERSION = 2  # v2 indexes filename + body (rebuild after bumping)
 QUESTIONS_FILE = "./questions.txt"
+EMBED_CHECKPOINT_DIR = os.environ.get(
+    "EMBED_CHECKPOINT_DIR", os.path.join(INDEX_DIR, "build_checkpoint")
+)
+EMBED_CHECKPOINT_ARRAY = os.path.join(EMBED_CHECKPOINT_DIR, "embeddings.npy")
+EMBED_CHECKPOINT_META = os.path.join(EMBED_CHECKPOINT_DIR, "progress.json")
+EMBED_CHECKPOINT_EVERY = 50  # save partial embeddings every N batches
+EMBEDDINGS_EXPORT_PATH = os.path.join(INDEX_DIR, "embeddings.npy")
+CHUNKS_EXPORT_PATH = os.path.join(INDEX_DIR, "chunks_export.pkl")
 
-# BGE small-v1.5: 384-dim, ~33M params, much stronger than MiniLM on retrieval.
-# v1.5 has the query instruction baked in -- no prefix needed.
-EMBED_MODEL_NAME = "BAAI/bge-small-en-v1.5"
-EMBED_QUERY_PREFIX = ""  # set to "Represent this sentence for searching relevant passages: " for BGE-v1
-EMBED_DIM = 384
+# Jina Embeddings v4: retrieval task, asymmetric query/passage prompts.
+# Matryoshka truncate_dim=512 (default is 2048; 512 is a good speed/quality tradeoff).
+# Requires: pip install sentence-transformers  &&  trust_remote_code=True on load.
+EMBED_MODEL_NAME = "jinaai/jina-embeddings-v4"
+EMBED_DIM = 512
+EMBED_BATCH_SIZE = 8   # v4 is ~3.8B params; lower if you hit OOM during build
+EMBED_QUERY_PREFIX = ""
 
 # HNSW (used as the IVF coarse quantizer)
 HNSW_M = 32
@@ -79,10 +93,10 @@ HNSW_EF_SEARCH = 64
 NLIST_TARGET = 256
 NPROBE = 16
 
-# PQ 
-PQ_M = 48
+# PQ (PQ_M must divide EMBED_DIM; 512 / 64 = 8 sub-vectors)
+PQ_M = 64
 PQ_NBITS = 8
-PQ_MIN_TRAINING = (1 << PQ_NBITS) * 39  
+PQ_MIN_TRAINING = (1 << PQ_NBITS) * 39
 
 # Chunking + retrieval
 CHUNK_SIZE = 800
@@ -100,8 +114,8 @@ FILENAME_BOOST = 0.35          # added to doc peak score when query tokens hit f
 BM25_DOC_BOOST_SCALE = 0.25    # boost source selection from per-doc max BM25 in candidates
 FILENAME_CONFIDENT = 0.25      # only use exclusive single-doc mode above this overlap
 
-# Cross-encoder reranker (downloaded on first use, ~80 MB)
-RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+# Jina cross-encoder reranker (pairs with jina-embeddings-v4 for retrieval)
+RERANK_MODEL_NAME = "jinaai/jina-reranker-v2-base-multilingual"
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
@@ -164,22 +178,129 @@ def chunk_documents(loaded_docs, chunk_size=CHUNK_SIZE):
 
 
 # ==========================================
-# 2. EMBED
+# 2. EMBED (Jina v4: task=retrieval, query vs passage prompts)
 # ==========================================
-def embed_texts(model, texts, batch_size=64):
+def load_embedding_model():
+    kwargs = {"trust_remote_code": True}
+    device = os.environ.get("EMBED_DEVICE")
+    if device:
+        kwargs["device"] = device
+    return SentenceTransformer(EMBED_MODEL_NAME, **kwargs)
+
+
+def load_reranker_model():
+    return CrossEncoder(
+        RERANK_MODEL_NAME,
+        automodel_args={"torch_dtype": "auto"},
+        trust_remote_code=True,
+    )
+
+
+def sanitize_text_for_jina_embedding(text: str) -> str:
+    """Jina v4 treats strings starting with 'http' as image URLs (requests.get).
+
+    Confluence chunks often start with Prometheus names like
+    http_request_duration_seconds_bucket{...} — that crashes the build.
+    A zero-width space breaks startswith('http') without changing retrieval text.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    leading = len(text) - len(text.lstrip())
+    if text[leading:].lower().startswith("http"):
+        return text[:leading] + "\u200b" + text[leading:]
+    return text
+
+
+def embed_texts(model, texts, batch_size=EMBED_BATCH_SIZE, resume=True):
+    """Encode document chunks (passage side of asymmetric retrieval)."""
+    from tqdm import tqdm
+
+    texts = [sanitize_text_for_jina_embedding(t) for t in texts]
+    n = len(texts)
+    os.makedirs(EMBED_CHECKPOINT_DIR, exist_ok=True)
+
+    embeddings = np.zeros((n, EMBED_DIM), dtype=np.float32)
+    start = 0
+
+    if resume and os.path.exists(EMBED_CHECKPOINT_ARRAY) and os.path.exists(EMBED_CHECKPOINT_META):
+        with open(EMBED_CHECKPOINT_META, encoding="utf-8") as f:
+            meta = json.load(f)
+        if meta.get("n") == n and meta.get("embed_dim") == EMBED_DIM:
+            done = int(meta.get("done", 0))
+            if 0 < done < n:
+                embeddings = np.load(EMBED_CHECKPOINT_ARRAY)
+                start = done
+                print(
+                    f"Resuming embeddings from chunk {start:,}/{n:,} "
+                    f"(~{100 * start / n:.1f}% already done)."
+                )
+
+    encode_kwargs = {
+        "batch_size": batch_size,
+        "show_progress_bar": False,
+        "convert_to_numpy": True,
+        "normalize_embeddings": True,
+        "task": "retrieval",
+        "prompt_name": "passage",
+        "truncate_dim": EMBED_DIM,
+    }
+
+    total_batches = (n + batch_size - 1) // batch_size
+    batch_starts = range(start, n, batch_size)
+    pbar = tqdm(
+        batch_starts,
+        initial=start // batch_size,
+        total=total_batches,
+        unit="batch",
+    )
+
+    for batch_num, i in enumerate(pbar):
+        batch = texts[i : i + batch_size]
+        embeddings[i : i + len(batch)] = model.encode(batch, **encode_kwargs)
+
+        done = i + len(batch)
+        if (batch_num + 1) % EMBED_CHECKPOINT_EVERY == 0 or done >= n:
+            np.save(EMBED_CHECKPOINT_ARRAY, embeddings)
+            with open(EMBED_CHECKPOINT_META, "w", encoding="utf-8") as f:
+                json.dump({"n": n, "embed_dim": EMBED_DIM, "done": done}, f)
+
+    return embeddings.astype("float32")
+
+
+def _clear_embed_checkpoint():
+    for path in (EMBED_CHECKPOINT_ARRAY, EMBED_CHECKPOINT_META):
+        if os.path.exists(path):
+            os.remove(path)
+    if os.path.isdir(EMBED_CHECKPOINT_DIR) and not os.listdir(EMBED_CHECKPOINT_DIR):
+        os.rmdir(EMBED_CHECKPOINT_DIR)
+
+
+def embed_query(model, query):
+    """Encode a single user question (query side of asymmetric retrieval)."""
+    q = (EMBED_QUERY_PREFIX + query) if EMBED_QUERY_PREFIX else query
+    q = sanitize_text_for_jina_embedding(q)
     return model.encode(
-        texts,
-        batch_size=batch_size,
-        show_progress_bar=True,
+        [q],
+        normalize_embeddings=True,
         convert_to_numpy=True,
-        normalize_embeddings=True,  # IP on unit vectors == cosine similarity
+        task="retrieval",
+        prompt_name="query",
+        truncate_dim=EMBED_DIM,
     ).astype("float32")
 
 
 # ==========================================
 # 3. BUILD ANN INDEX (IVF + HNSW quantizer + PQ with ADC)
 # ==========================================
+def _import_faiss():
+    """Import faiss lazily. On macOS, importing faiss before torch models can segfault."""
+    import faiss
+
+    return faiss
+
+
 def build_index(embeddings):
+    faiss = _import_faiss()
     n, d = embeddings.shape
     assert d == EMBED_DIM, f"Embedding dim mismatch: {d} != {EMBED_DIM}"
 
@@ -309,12 +430,7 @@ def build_bm25(chunks):
 
 
 def _vector_search(index, model, query, k):
-    q_text = (EMBED_QUERY_PREFIX + query) if EMBED_QUERY_PREFIX else query
-    q = model.encode(
-        [q_text],
-        normalize_embeddings=True,
-        convert_to_numpy=True,
-    ).astype("float32")
+    q = embed_query(model, query)
     scores, ids = index.search(q, k)
     return [(int(idx), float(s)) for idx, s in zip(ids[0], scores[0]) if idx != -1]
 
@@ -663,9 +779,132 @@ def generate_answer_streaming(query, retrieved_chunks, api_key):
     )
 
 
+def generate_answer(query, retrieved_chunks, api_key):
+    """Non-streaming generation for evaluation. Returns (answer_text, model_name)."""
+    prompt = _build_prompt(query, retrieved_chunks)
+    client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+    for model in OPENROUTER_MODELS:
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                stream=False,
+            )
+        except Exception:
+            continue
+        msg = resp.choices[0].message if resp.choices else None
+        content = (msg.content if msg else None) or ""
+        if content.strip():
+            return content.strip(), model
+    return None, None
+
+
+def retrieval_context_string(chunks):
+    """Plain-text context from retrieved chunks (for eval / judges)."""
+    return "\n\n---\n\n".join(c["text"] for c in chunks)
+
+
 # ==========================================
 # 6. BUILD / LOAD ORCHESTRATION
 # ==========================================
+def persist_built_index(chunks, embeddings, index=None, bm25=None):
+    if index is None:
+        index, _kind = build_index(embeddings)
+    if bm25 is None:
+        bm25 = build_bm25(chunks)
+
+    os.makedirs(INDEX_DIR, exist_ok=True)
+    _import_faiss().write_index(index, INDEX_PATH)
+    with open(META_PATH, "wb") as f:
+        pickle.dump({
+            "embed_model": EMBED_MODEL_NAME,
+            "embed_dim": EMBED_DIM,
+            "rerank_model": RERANK_MODEL_NAME,
+            "bm25_version": BM25_INDEX_VERSION,
+            "chunks": chunks,
+        }, f)
+    with open(BM25_PATH, "wb") as f:
+        pickle.dump(bm25, f)
+    print(f"\nSaved FAISS index -> {INDEX_PATH}")
+    print(f"Saved metadata    -> {META_PATH}")
+    print(f"Saved BM25 index  -> {BM25_PATH}")
+
+
+def _load_chunks_for_index(chunks_path, expected_n):
+    if chunks_path and os.path.exists(chunks_path):
+        with open(chunks_path, "rb") as f:
+            data = pickle.load(f)
+        chunks = data["chunks"] if isinstance(data, dict) and "chunks" in data else data
+    else:
+        print("No chunks export found — re-chunking local documents (must match cloud run).")
+        docs = []
+        for folder in FOLDERS_TO_READ:
+            docs.extend(load_all_documents(folder))
+        chunks = chunk_documents(docs)
+
+    if len(chunks) != expected_n:
+        raise ValueError(
+            f"Chunk count mismatch: {len(chunks)} chunks vs {expected_n} embeddings.\n"
+            "Use the chunks_export.pkl produced on Colab, or rebuild embeddings."
+        )
+    return chunks
+
+
+def embed_export_for_cloud():
+    """Embed on a GPU machine (Colab/Kaggle); copy outputs to your Mac."""
+    print("--- Loading documents ---")
+    docs = []
+    for folder in FOLDERS_TO_READ:
+        print(f"Reading {folder}...")
+        docs.extend(load_all_documents(folder))
+    print(f"Loaded {len(docs)} files.")
+
+    print("\n--- Chunking ---")
+    chunks = chunk_documents(docs)
+    print(f"Created {len(chunks)} chunks.")
+
+    print(f"\n--- Embedding ({EMBED_MODEL_NAME}, dim={EMBED_DIM}) ---")
+    model = load_embedding_model()
+    embeddings = embed_texts(model, [c["text"] for c in chunks])
+    print(f"Embeddings: shape={embeddings.shape}, dtype={embeddings.dtype}")
+
+    os.makedirs(INDEX_DIR, exist_ok=True)
+    np.save(EMBEDDINGS_EXPORT_PATH, embeddings)
+    with open(CHUNKS_EXPORT_PATH, "wb") as f:
+        pickle.dump(chunks, f)
+    print(f"\nSaved embeddings -> {EMBEDDINGS_EXPORT_PATH}")
+    print(f"Saved chunks     -> {CHUNKS_EXPORT_PATH}")
+    print(
+        "\nCopy both files to your Mac (same paths under faiss_index/), then run:\n"
+        "    python pipline.py build-index"
+    )
+
+
+def build_index_from_embeddings(embeddings_path=None, chunks_path=None):
+    """Finish FAISS + BM25 on Mac from precomputed Jina v4 embeddings (~15 min)."""
+    embeddings_path = embeddings_path or EMBEDDINGS_EXPORT_PATH
+    chunks_path = chunks_path or CHUNKS_EXPORT_PATH
+
+    if not os.path.exists(embeddings_path):
+        print(f"Missing embeddings file: {embeddings_path}")
+        sys.exit(1)
+
+    print(f"--- Loading embeddings from {embeddings_path} ---")
+    embeddings = np.load(embeddings_path)
+    print(f"Embeddings: shape={embeddings.shape}, dtype={embeddings.dtype}")
+
+    chunks = _load_chunks_for_index(chunks_path, embeddings.shape[0])
+
+    print("\n--- Building ANN index ---")
+    index, kind = build_index(embeddings)
+    print(f"Index built: {kind}")
+
+    print("\n--- Building BM25 (lexical) index ---")
+    persist_built_index(chunks, embeddings, index=index)
+    _clear_embed_checkpoint()
+    print("\nDone. Now run:  python pipline.py ask \"your question\"")
+
+
 def build_and_persist():
     print("--- Loading documents ---")
     docs = []
@@ -678,8 +917,8 @@ def build_and_persist():
     chunks = chunk_documents(docs)
     print(f"Created {len(chunks)} chunks.")
 
-    print(f"\n--- Embedding ({EMBED_MODEL_NAME}) ---")
-    model = SentenceTransformer(EMBED_MODEL_NAME)
+    print(f"\n--- Embedding ({EMBED_MODEL_NAME}, dim={EMBED_DIM}) ---")
+    model = load_embedding_model()
     embeddings = embed_texts(model, [c["text"] for c in chunks])
     print(f"Embeddings: shape={embeddings.shape}, dtype={embeddings.dtype}")
 
@@ -688,21 +927,8 @@ def build_and_persist():
     print(f"Index built: {kind}")
 
     print("\n--- Building BM25 (lexical) index ---")
-    bm25 = build_bm25(chunks)
-
-    os.makedirs(INDEX_DIR, exist_ok=True)
-    faiss.write_index(index, INDEX_PATH)
-    with open(META_PATH, "wb") as f:
-        pickle.dump({
-            "embed_model": EMBED_MODEL_NAME,
-            "bm25_version": BM25_INDEX_VERSION,
-            "chunks": chunks,
-        }, f)
-    with open(BM25_PATH, "wb") as f:
-        pickle.dump(bm25, f)
-    print(f"\nSaved FAISS index -> {INDEX_PATH}")
-    print(f"Saved metadata    -> {META_PATH}")
-    print(f"Saved BM25 index  -> {BM25_PATH}")
+    persist_built_index(chunks, embeddings, index=index)
+    _clear_embed_checkpoint()
     print("\nDone. Now run:  python pipline.py ask \"your question\"")
 
 
@@ -717,16 +943,25 @@ def load_persisted():
     if isinstance(meta, list):
         chunks = meta
         saved_model = "sentence-transformers/all-MiniLM-L6-v2"
+        saved_dim = None
         saved_bm25 = 1
     else:
         chunks = meta["chunks"]
         saved_model = meta.get("embed_model", "unknown")
+        saved_dim = meta.get("embed_dim")
         saved_bm25 = meta.get("bm25_version", 1)
 
     if saved_model != EMBED_MODEL_NAME:
         print(
             f"Index was built with embedding model '{saved_model}', "
             f"but EMBED_MODEL_NAME is now '{EMBED_MODEL_NAME}'.\n"
+            f"Rebuild with:  python pipline.py build"
+        )
+        sys.exit(1)
+
+    if saved_dim is not None and saved_dim != EMBED_DIM:
+        print(
+            f"Index embed_dim={saved_dim} but EMBED_DIM is now {EMBED_DIM}.\n"
             f"Rebuild with:  python pipline.py build"
         )
         sys.exit(1)
@@ -738,17 +973,19 @@ def load_persisted():
         )
         sys.exit(1)
 
-    index = faiss.read_index(INDEX_PATH)
-    if hasattr(index, "nprobe"):
-        index.nprobe = NPROBE
-
     with open(BM25_PATH, "rb") as f:
         bm25 = pickle.load(f)
 
-    print(f"Loading embedding model: {EMBED_MODEL_NAME}")
-    model = SentenceTransformer(EMBED_MODEL_NAME)
+    # Load torch models before faiss on macOS (faiss import + ST load = segfault).
+    print(f"Loading embedding model: {EMBED_MODEL_NAME} (dim={EMBED_DIM})")
+    model = load_embedding_model()
     print(f"Loading reranker:        {RERANK_MODEL_NAME}")
-    reranker = CrossEncoder(RERANK_MODEL_NAME)
+    reranker = load_reranker_model()
+
+    index = _import_faiss().read_index(INDEX_PATH)
+    if hasattr(index, "nprobe"):
+        index.nprobe = NPROBE
+
     return index, chunks, model, reranker, bm25
 
 
@@ -915,7 +1152,9 @@ def cmd_batch(_args):
 # ==========================================
 USAGE = """\
 Usage:
-    python pipline.py build                      # embed docs and build index
+    python pipline.py build                      # full local build (slow on Mac)
+    python pipline.py embed-export               # GPU step: save embeddings + chunks
+    python pipline.py build-index [embeddings.npy] [chunks.pkl]  # Mac step (~15 min)
     python pipline.py ask "your question"        # one-shot question
     python pipline.py ask                        # interactive REPL
     python pipline.py batch                      # run every line of questions.txt
@@ -933,6 +1172,16 @@ def main(argv):
 
     if command == "build":
         build_and_persist()
+    elif command == "embed-export":
+        embed_export_for_cloud()
+    elif command == "build-index":
+        # macOS: FAISS train segfaults if PyTorch was imported in the same process.
+        if sys.platform == "darwin":
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build_faiss_only.py")
+            os.execv(sys.executable, [sys.executable, script, *rest])
+        emb_path = rest[0] if len(rest) > 0 else None
+        chunks_path = rest[1] if len(rest) > 1 else None
+        build_index_from_embeddings(emb_path, chunks_path)
     elif command == "ask":
         cmd_ask(rest)
     elif command == "batch":
